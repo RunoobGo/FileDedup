@@ -197,6 +197,8 @@
 | main | 构建 | 三平台产物（wails build）+ 冒烟 |
 | tag | 发布 | 安装包 + SHA-256 checksum + release notes（模板：变更/已知问题/基准数据） |
 
+> **落地状态（M4 交付后）**：`.github/workflows/ci.yml` 已创建，覆盖 PR 检查阶段的 **gofmt + go vet + go test -race + 前端 build** 四项，四平台交叉编译沿用本地验证（M1-T01 已过）。**未纳入**：eslint / vitest（前端尚未配置该工具链）、契约 diff 检查（需专门的"Go json tag ↔ TS 接口"校验器，见 08 §7.5 第 3~4 项）；基准/nightly/构建/发布四个阶段属 M5 范围。
+
 ---
 
 ## 5. 里程碑验收门禁汇总

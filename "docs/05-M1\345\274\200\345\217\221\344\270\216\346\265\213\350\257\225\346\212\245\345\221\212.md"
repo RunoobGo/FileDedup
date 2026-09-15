@@ -206,7 +206,7 @@ Windows FileKey（GetFileInformationByHandle 按需解析）已通过编译验�
 1. **Windows 真机验证**（M3-T04 平台 checklist）：FileKey 按需解析、大小写折叠、长路径——已过交叉编译，运行时待真机；
 2. **512MB+ 文件分段路径**运行时验证（等价性已由小参数测试保证）；
 3. **fdd-cli files_total** 与进度快照接入（M2-T02 契约实现时补全）（**后注：M4 交付后审查时补全，见 08 §7.3 第 20 项**）；
-4. **CI 接入**（M1-T01 已具备本地脚本化条件，.github/workflows 在首个 git 仓库初始化时落地）。
+4. **CI 接入**（M1-T01 已具备本地脚本化条件，.github/workflows 在首个 git 仓库初始化时落地）（**后注：仓库初始化时已落地 `.github/workflows/ci.yml`：gofmt + go vet + go test -race + 前端 build；并顺带用 gofmt 修正了 6 个存量未合规文件，见 04 §4 落地状态**）。
 
 ## 8. 结论
 

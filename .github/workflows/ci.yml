@@ -1,0 +1,67 @@
+# CI 流水线（04 §4：PR 检查阶段）
+#
+# 覆盖 04 §4 CI 表中 PR 阶段可实现项：gofmt + go vet + go test -race + 前端 build。
+#
+# 顺序约束（勿调换）：main.go 使用 `//go:embed all:frontend/dist`，
+# 而 frontend/dist 属构建产物（.gitignore 排除），因此必须先构建前端，
+# 否则 go vet / go test 会因 embed 找不到目录而失败。
+#
+# 本流水线不依赖 wails CLI：前端由 npm 直接构建，后端由 go 直接编译。
+#
+# 尚未纳入（原因见 08 §7.5）：
+#   - eslint / vitest：前端尚未配置相应工具链
+#   - 契约 diff 检查：需专门的"Go json tag ↔ TS 接口"校验器（尚未实现）
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: gofmt / vet / test / frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: gofmt 检查
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请执行 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: 前端依赖安装
+        working-directory: frontend
+        run: npm ci
+
+      - name: 前端构建（须先于 Go 步骤：go:embed 依赖 frontend/dist）
+        working-directory: frontend
+        run: npm run build
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
