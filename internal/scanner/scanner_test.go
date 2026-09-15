@@ -27,7 +27,7 @@ func setupTree(t *testing.T) string {
 	mk("a/b/inner.txt", "world")             // 供重叠根测试
 	mk("a/b/.hidden.txt", "h")               // 隐藏文件
 	mk("a/zero.txt", "")                     // 0 字节
-	mk("a/nodeps/drop.js", "console.log(1)")  // 供路径排除
+	mk("a/nodeps/drop.js", "console.log(1)") // 供路径排除
 	mk("a/tmp.log", "log")                   // 供扩展名排除
 	mk("a/big.bin", strings.Repeat("x", 500))
 	// 符号链接：不应被收集

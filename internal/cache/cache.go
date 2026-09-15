@@ -26,10 +26,10 @@ type Entry struct {
 
 // Stats 缓存统计（CacheStats 契约）。
 type Stats struct {
-	Entries      int    `json:"entries"`
-	WithFull     int    `json:"withFull"`
-	DBSizeBytes  int64  `json:"dbSizeBytes"`
-	LastEvicted  int    `json:"lastEvicted"`
+	Entries     int   `json:"entries"`
+	WithFull    int   `json:"withFull"`
+	DBSizeBytes int64 `json:"dbSizeBytes"`
+	LastEvicted int   `json:"lastEvicted"`
 }
 
 // MaxEntries 条目上限（01 §7.3：默认 50 万）。
@@ -38,9 +38,9 @@ const MaxEntries = 500_000
 // Cache 线程安全缓存（单写多读；WAL 支持并发读）。
 // Lookup 用 RLock 并行（阶段 2 多 worker 同时点查）；写操作独占。
 type Cache struct {
-	mu   sync.RWMutex
-	db   *sql.DB
-	path string
+	mu          sync.RWMutex
+	db          *sql.DB
+	path        string
 	lastEvicted int
 }
 

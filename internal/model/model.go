@@ -23,8 +23,8 @@ type FileEntry struct {
 type Filters struct {
 	IncludeExts   []string // 空 = 全部，如 ".jpg"
 	ExcludeExts   []string
-	MinSize       uint64 // 0 = 不限（默认 0）
-	MaxSize       uint64 // 0 = 不限
+	MinSize       uint64   // 0 = 不限（默认 0）
+	MaxSize       uint64   // 0 = 不限
 	ExcludePaths  []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
 	IncludeHidden bool
 }
@@ -49,7 +49,7 @@ var legalTransitions = map[TaskStatus][]TaskStatus{
 	StatusScanning:     {StatusPrefiltering, StatusPaused, StatusCancelled, StatusFailed},
 	StatusPrefiltering: {StatusHashing, StatusPaused, StatusCancelled, StatusFailed},
 	StatusHashing:      {StatusDone, StatusPaused, StatusCancelled, StatusFailed},
-	StatusPaused:        {StatusScanning, StatusPrefiltering, StatusHashing, StatusCancelled}, // 恢复回原阶段
+	StatusPaused:       {StatusScanning, StatusPrefiltering, StatusHashing, StatusCancelled}, // 恢复回原阶段
 	StatusDone:         {StatusIdle},
 	StatusCancelled:    {StatusIdle},
 	StatusFailed:       {StatusIdle},
@@ -67,7 +67,7 @@ func ValidateTransition(from, to TaskStatus) bool {
 
 // ProgressEvent scan:progress 事件载荷（01 §7.1）。
 type ProgressEvent struct {
-	Stage      string  // scan / prefilter / hash / verify
+	Stage      string // scan / prefilter / hash / verify
 	FilesDone  uint64
 	FilesTotal uint64 // 预估，未知为 0
 	BytesDone  uint64
@@ -86,7 +86,7 @@ type StageEvent struct {
 type DuplicateGroup struct {
 	GroupID     uint64
 	Files       []*FileEntry
-	Reclaimable uint64    // (n-1)*size，硬链接已在阶段 1.5 剔除
+	Reclaimable uint64   // (n-1)*size，硬链接已在阶段 1.5 剔除
 	Hash        [32]byte // 组内容 BLAKE3-256（操作前校验依据，M3）
 }
 
@@ -105,10 +105,10 @@ type KeepPolicy struct {
 
 // OpRequest 清理操作请求。
 type OpRequest struct {
-	Kind           string   // trash/delete/move/hardlink
-	FileIDs        []uint64
-	TargetDir      string   // move 时生效
-	ConfirmDanger  bool     // delete 必须显式确认（S4：后端强制）
+	Kind          string // trash/delete/move/hardlink
+	FileIDs       []uint64
+	TargetDir     string // move 时生效
+	ConfirmDanger bool   // delete 必须显式确认（S4：后端强制）
 }
 
 // OpsProgress 操作进度事件载荷。

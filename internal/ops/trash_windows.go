@@ -11,10 +11,10 @@ import (
 // SHFileOperationW + FOF_ALLOWUNDO：移入回收站（批量，双 \0 结尾路径列表）。
 
 const (
-	foDelete         = 3
-	fofAllowUndo     = 0x40
+	foDelete          = 3
+	fofAllowUndo      = 0x40
 	fofNoConfirmation = 0x10
-	fofSilent        = 0x4
+	fofSilent         = 0x4
 )
 
 type shFileOpStruct struct {
@@ -29,7 +29,7 @@ type shFileOpStruct struct {
 }
 
 var (
-	shell32            = syscall.NewLazyDLL("shell32.dll")
+	shell32             = syscall.NewLazyDLL("shell32.dll")
 	procSHFileOperation = shell32.NewProc("SHFileOperationW")
 )
 

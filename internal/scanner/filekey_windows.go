@@ -15,16 +15,16 @@ import (
 
 type byHandleFileInformation struct {
 	VolumeSerialNumber uint32
-	FileSizeHigh        uint32
+	FileSizeHigh       uint32
 	FileSizeLow        uint32
-	NumberOfLinks       uint32
+	NumberOfLinks      uint32
 	FileIndexHigh      uint32
 	FileIndexLow       uint32
 }
 
 var (
-	modkernel32                          = syscall.NewLazyDLL("kernel32.dll")
-	procGetFileInformationByHandle       = modkernel32.NewProc("GetFileInformationByHandle")
+	modkernel32                    = syscall.NewLazyDLL("kernel32.dll")
+	procGetFileInformationByHandle = modkernel32.NewProc("GetFileInformationByHandle")
 )
 
 // keyFromInfo Windows：遍历阶段不解析（避免每文件开句柄）。
