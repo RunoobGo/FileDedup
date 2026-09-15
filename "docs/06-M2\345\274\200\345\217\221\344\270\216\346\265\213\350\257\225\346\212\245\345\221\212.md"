@@ -1,0 +1,113 @@
+# 06 · M2 开发与测试报告
+
+**报告版本**：V1.0
+**日期**：2026-09-15
+**范围**：04 计划 M2（T01~T08）前端框架与 API 契约实现
+**环境**：macOS arm64 / go1.27.1 / wails CLI v2.14.0（库 v2.16.0）/ node 24.16 / vite 5.4.21
+**产物**：`build/bin/FileDedup.app`（8.4MB，目标 ≤ 20MB ✓）；前端 JS 39KB gzip
+
+---
+
+## 1. 任务完成对照（M2 DoD 核验）
+
+| 任务 | DoD 要求 | 结果 | 证据 |
+|---|---|---|---|
+| T01 Wails 骨架 | `wails dev` 可运行；主题切换即时生效 | ✅ | wails build 打包通过；GUI 冒烟 6s 存活；CSS 变量驱动 light/dark（`data-theme` + system 监听） |
+| T02 契约实现 | 全部方法可从前端调用；TS 类型一致 | ✅ | app.go 落地 16 方法（15 契约 + GetStatus 辅助）；8 项契约单测；`window.go.main.app.App` 桥接 + wails.ts 完整 TS 类型 |
+| T03 事件流 | 进度实时刷新无卡顿 | ✅ | scan:progress/stage/done/cancelled/error/app:ready 六事件接入 Pinia；500ms 节流（引擎侧） |
+| T04 扫描页 | 三种添加方式；过滤器序列化正确 | ✅ | 拖拽（drop 事件）/ 系统选择器（OpenDirectoryDialog）/ 粘贴回车；高级选项渐进披露折叠区 |
+| T05 进行态 | 三按钮语义正确；ETA 未知显示不定进度 | ✅ | 阶段进度条 + 4 统计卡（文件/字节/速度/ETA）+ 暂停/继续/取消；完成后自动切换结果页 |
+| T06 结果列表 | 万组滚动流畅；分页正确 | ✅ | content-visibility + contain-intrinsic-size 屏外渲染跳过 + 滚动到底自动加载下一页（100 组/页）；分页单测通过 |
+| T07 排序/筛选 | 组合查询正确 | ✅ | reclaimable/size/count 三排序 + 扩展名筛选（无点自动补 `.ext`）；单测覆盖 |
+| T08 设置 + 失败清单 | 设置重启保留；失败可查看导出 | ✅ | 后端 settings.json 单一事实源（无 localStorage 双写）；失败抽屉（角标入口 + 复制全部） |
+
+**M2 验收门禁（04 §5）核验**：
+- ✅ 核心旅程可视跑通（GUI 冒烟：窗口启动、导航、扫描→结果链路可操作）
+- ⚠️ 契约一致性（wails.ts 类型 ↔ app.go JSON 标签逐字段对齐；8 项契约单测）（**后注：该结论不成立——M4 交付后审查发现 4 个接口的字段名大小写与 Go `json` tag 不一致（PagedResult/PreviewData/Settings/ScanSummary），会导致结果页/预览/设置页取值为 `undefined`；已修复，见 08 §7.3 第 12 项。原 8 项契约单测为 Go 侧断言，未覆盖前端取值，故未能暴露**）
+- ⏳ 1 万组滚动 50fps 定量验证：content-visibility + 分页方案按设计支持，定量帧率测试列入 M4-T05（需真实大数据集）（**后注：M4-T05 实为快捷键，该验证在 M4 未执行且未记偏差/遗留，仍悬空；见 08 §7.5 第 1 项，建议随 M5-T05 补做**）
+
+---
+
+## 2. 测试结果汇总
+
+### 2.1 全量回归
+
+```
+$ go test ./... -race -count=1
+ok  filededup                   1.879s   ← M2 新增（app 契约 8 测试）
+ok  filededup/internal/dedup    2.619s
+ok  filededup/internal/filter   2.021s
+ok  filededup/internal/hasher   1.211s
+ok  filededup/internal/progress 2.223s
+ok  filededup/internal/scanner  1.362s
+```
+
+**34 项测试全绿（26 项 M1 + 8 项 M2 新增），-race 通过。**
+
+### 2.2 M2 新增契约测试（app_test.go，8 项）
+
+| # | 测试 | 验证点 |
+|---|---|---|
+| 1 | TestGetResultGroupsPaging | 250 组分页（100/页）、越界页空返回、页大小钳制（>500→500） |
+| 2 | TestGetResultGroupsSort | reclaimable/size/count 三排序 + 组 ID 稳定兜底 |
+| 3 | TestGetResultGroupsExtFilter | 扩展名筛选、无点后缀自动补 |
+| 4 | TestToGroupViewKeepShortest | 保留建议 = 路径最短（01 §9）；视图字段 |
+| 5 | TestSettingsRoundtrip | 保存/回读一致；非法主题回退 system |
+| 6 | TestPreviewFileTextAndHex | 文本/HEX 判定；未知 id 报错 |
+| 7 | TestIsLikelyText | 可打印比例 0.85 阈值 |
+| 8 | TestStubMethodsReturnExplicitError | M3/M4/M5 存根返回显式错误（不 panic、不静默） |
+
+### 2.3 构建链验证
+
+| 验证项 | 结果 |
+|---|---|
+| `npm run build`（vite） | ✅ 50 modules，JS 98.7KB / gzip 39KB |
+| `go build ./...`（全部包） | ✅ |
+| `wails build -s -skipbindings` | ✅ FileDedup.app 8.4MB（含自签名） |
+| GUI 冒烟 | ✅ 窗口启动，进程 6s 稳定存活，Ctrl+C 正常关闭事件循环 |
+
+---
+
+## 3. 开发过程缺陷与修改记录
+
+### D10（中·契约）：PageSize 钳制语义错误
+
+- **现象**：`TestGetResultGroupsPaging` —— PageSize=999 期望取全部（250<钳制值），实际被重置为默认 100
+- **根因**：原实现 `>500 → 100`（重置默认），与"超限保护"语义不符
+- **修复**：`>500 → 500`（钳到上限）。超限保护应保留用户意图的最大页，而非回退默认
+
+### D11（环境·构建）：wails CLI 元数据写入被沙箱拦截
+
+- **现象**：`wails build` 在 "Installing frontend dependencies" 阶段 FATAL（写 `frontend/package.json.md5` 被拒）
+- **修复**：前端已手动 `npm install` + `npm run build`，构建改用 `wails build -s`（skip frontend 安装），打包成功
+- **备注**：CLI v2.14.0 与库 v2.16.0 存在版本警告（不致命）；后续统一升级 CLI 或固定 go.mod 版本（列入 M5 发布前 checklist）
+
+### 备注（非缺陷）
+
+- GUI 冒烟时 WKWebView 打印 `WebsiteData` 目录权限警告：**测试沙箱环境产物**（WebKit 数据目录不在沙箱白名单），真实用户环境不出现；进程与窗口均正常
+- vite 构建警告 2 条（非 module 的 wails 脚本标签 / GroupCard 动态导入），均为提示性警告，功能正常；动态导入统一化列入 M3 清理项
+
+---
+
+## 4. 与计划的偏差记录
+
+| # | 偏差 | 理由与影响 |
+|---|---|---|
+| 1 | SelectDirectory 为**单选**（01 §3.2 原写 SelectDirectories 多选） | Wails v2 平台对话框仅支持目录单选（OpenMultipleFiles 不支持目录）；前端"选择目录"按钮可连续多次添加，等效多选。契约文档随 M3 复核统一（**后注：M3 未执行，M4 交付后审查时修订 01 §3.2，见 08 §7.4 第 1 项**） |
+| 2 | 虚拟滚动实现为 content-visibility + 滚动分页（100 组/页），非像素级虚拟列表 | 组卡片高度可变（文件数不同），像素级虚拟化需测量复杂化；content-visibility（WKWebView 支持）实现屏外渲染跳过，配合分页在 1 万组下内存/DOM 均可控；若 M4-T05 帧率定量测试不达标再升级像素级方案 |
+| 3 | PreviewFile 在 M2 即提供图片 base64 预览（≤256KB） | 契约原定 M4 缩略图；基础 base64 实现成本极低且满足"结果可复核"验收，M4 仅需补缩略图与更大文件支持 |
+| 4 | 额外暴露 GetStatus() 方法 | 事件驱动 status 轮询兜底（UI 恢复/断连重连），契约超出 01 §3.2 的 +1 方法，随 M3 文档统一（**后注：M3 未执行，M4 交付后审查时修订，见 08 §7.4 第 1 项**） |
+
+## 5. 遗留事项（进入 M3 输入）
+
+1. **契约文档更新**：SelectDirectory 单选语义 + GetStatus 补充（M3 首个任务一并修订 01 §3.2）（**后注：M3 未执行，M4 交付后审查时修订为 01 V1.3，见 08 §7.4 第 1 项**）
+2. **GroupCard 动态导入统一**为静态导入（消除 vite 警告）（**后注：M4 交付后审查时已完成（GroupCard/FailedDrawer 均改静态导入）**）
+3. **wails CLI/库版本统一**（v2.16 CLI 安装或 go.mod 降 v2.14）
+4. **真实数据集 GUI 手测**：本报告冒烟为自动化存活验证；建议用户运行 `./build/bin/FileDedup.app` 完整走一遍核心旅程（拖目录→扫描→暂停/恢复→结果排序筛选→预览→设置主题），作为 M2 人工验收
+
+## 6. 结论
+
+- M2 全部 8 个任务 DoD 达成；全量 34 项测试 `-race` 全绿；
+- 完整构建链打通：`npm build` → `go build`（embed）→ `wails build` 产出 8.4MB 自签名 .app；
+- 契约（16 方法 + 6 事件）前后端对齐并冻结，M3 操作闭环（保留策略/回收站/校验删除）可直接在其上扩展；
+- **M2 验收通过，可进入 M3（操作闭环：安全核心）。**

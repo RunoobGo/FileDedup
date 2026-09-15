@@ -1,0 +1,585 @@
+# 01 · 项目设计文档
+
+**项目名称**：FileDedup — 高性能跨平台文件查重工具
+**文档版本**：V1.3
+**编制日期**：2026-09-15
+**项目位置**：`/Volumes/fx/Object/FileDedup`
+**开源许可**：MIT；依赖链（Wails/xxhash/blake3/sqlite 等）均为 MIT/BSD 宽松许可，无 GPL 传染
+
+> **修订记录**
+> V1.3：**契约与实现对齐专项**（兑现 M2/M3 报告两次承诺而未执行的修订）——① §3.2 更正 `SelectDirectories→SelectDirectory`（Wails v2 对话框单选）、`ApplyKeepPolicy` 返回值改为 `[]KeepDecision`，补 `GetStatus`/`ClearKeepDecisions`/`OpenTrash`；② §7.2 `OpRequest` 补 `ConfirmDanger`、`DuplicateGroup` 补 `Hash`、`PreviewData.Data []byte → Content string`（Wails JSON 通道无法直传 []byte）、`PagedResult` 补 `TotalReclaimable`；③ §7.3 更正 `partial` 为 `NOT NULL`；④ §12.2 数据集 B 已实现（`benchgen -dataset B`）。**注意**：API 返回值的 JSON 字段名以 Go struct 的 `json` tag 为准（Wails 以 `json.Marshal` 序列化返回值），前端 TS 类型须与之逐字对齐。
+> V1.2：① FileKey 改为**按需解析**（仅候选组内，Windows 免去每文件开句柄）；② §7 补全契约引用类型（OpRequest/OpsResult/KeepPolicy/PagedResult/FailedItem 等）；③ §3.2 补 GetFailedItems/GetVersion；④ 新增缓存与结果生命周期（§7.3）、设置单一事实源；⑤ ops 增补 ENOENT 语义；⑥ §8 补 cmd/fdd-cli 与 .github/；⑦ §12.1 与 04 六层测试对齐。
+> V1.1：统一哈希口径 BLAKE3-256；统一缓存键；API 契约；跨平台差异设计；SQLite schema；测试与基准策略。
+
+---
+
+## 1. 项目概述
+
+FileDedup 是一款面向普通用户与高级用户的高性能**文件查重（重复文件清理）桌面应用**。它以"多阶段过滤 + 高速哈希 + 多线程流水线"为核心算法，在保证 100% 准确识别重复内容的同时，将扫描速度与资源占用做到同类工具最优水平，并提供现代、简洁、符合使用习惯的图形界面。
+
+### 1.1 核心价值
+
+| 维度 | 目标 |
+|---|---|
+| 速度 | 十万级文件在数十秒内完成扫描（SSD 环境） |
+| 资源 | 常驻内存占用受控，10 万文件场景峰值 ≤ 300MB |
+| 并发 | 多核并行，CPU 利用率 ≥ 80%，可手动配置线程数 |
+| 界面 | 现代化 Web 风格 UI，暗色/亮色主题，零学习成本 |
+| 平台 | Windows / macOS / Linux 三平台原生应用 |
+| 安全 | 默认回收站模式，删除前二次确认，防误删设计 |
+
+### 1.2 主要功能（V1.0 范围）
+
+1. **重复文件查找**（按内容 100% 精确匹配）
+2. **目录/文件多选扫描**，支持拖拽添加
+3. **过滤器**：扩展名包含/排除、最小/最大文件大小、路径排除、隐藏文件开关
+4. **结果分组展示**：重复组卡片、可预览、可排序、可筛选
+5. **一键保留策略**：保留最新 / 保留最旧 / 保留路径最短 / 保留指定目录 / 手动指定
+6. **清理操作**：移入回收站 / 永久删除 / 移动至指定目录 / 硬链接合并（可选）
+7. **扫描缓存**：二次扫描提速，断点续扫
+8. **实时进度**：文件数、字节数、当前阶段、预计剩余时间、速度统计
+9. **导出报告**：HTML / CSV / JSON
+
+> 扩展方向（V2.0 候选）：相似图片检测（感知哈希）、相似音频检测、重复文件夹检测、空文件夹检测。
+
+---
+
+## 2. 技术栈选型
+
+基于用户既有技术栈（Go 后端 + TypeScript/Vite 前端）与跨平台桌面需求，采用 **Wails v2** 框架（v3 尚处 alpha，不用于生产）。
+
+### 2.1 选型对比
+
+| 方案 | 体积 | 内存 | 后端并发 | UI 灵活度 | 跨平台 | 结论 |
+|---|---|---|---|---|---|---|
+| **Wails v2（Go + Web）** | ~10MB | 低 | ★★★★★ goroutine | ★★★★★ | 3 平台 | 选用 |
+| Tauri v2（Rust + Web） | ~10MB | 低 | ★★★★ | ★★★★★ | 3 平台 | 备选 |
+| Electron（Node + Web） | ~150MB+ | 高 | ★★★ | ★★★★★ | 3 平台 | 体积/内存超标 |
+| Qt / PyQt（Python） | 中 | 中 | ★★ GIL 限制 | ★★★★ | 3 平台 | 性能不足（dupeGuru 即此方案，扫描慢） |
+| 纯 Go 原生 GUI（Fyne） | 中 | 中 | ★★★★★ | ★★★ | 3 平台 | UI 美观度不足 |
+
+**选型理由**：
+
+- Go 天然擅长高并发 IO（goroutine + channel + errgroup），与"多线程哈希流水线"高度契合；
+- Wails 编译产物为单一可执行文件，体积小、无运行时依赖；
+- 前端使用 TypeScript + Vite + Vue 3，可做出高度现代化、精致美观的 UI（用户偏好 Web 风格布局）；
+- 后端与前端通过类型安全绑定（wails bindings）通信，无需本地 HTTP 服务；
+- 相比备选 Tauri：无需引入 Rust 第二后端语言，团队既有 Go 资产（并发、文件操作经验）可完全复用，维护成本更低。
+
+### 2.2 具体技术栈
+
+| 层 | 技术 | 用途 |
+|---|---|---|
+| 框架 | Wails v2 | 桌面应用壳（Win/macOS/Linux） |
+| 后端 | Go 1.22+ | 扫描引擎、哈希、调度、文件操作 |
+| 前端框架 | Vue 3 + TypeScript + Vite | UI 渲染 |
+| 前端组件 | Naive UI（可选，或自研轻量组件） | 表格、弹窗、进度、主题 |
+| 状态管理 | Pinia | 前端全局状态 |
+| 预筛哈希 | `cespare/xxhash/v2` | xxHash64 首尾指纹 |
+| 全量哈希 | `lukechampine.com/blake3` | BLAKE3-256（Go 生态最成熟实现，SIMD 加速，支持 tree hash 拼接） |
+| 缓存存储 | SQLite（`modernc.org/sqlite` 纯 Go 驱动，无 CGO 交叉编译负担） | 哈希缓存、扫描历史 |
+| 回收站 | macOS：NSWorkspace/`osascript`；Windows：`SHFileOperationW`；Linux：自研 XDG Trash 规范 | 三平台移入回收站 |
+| 并发控制 | `golang.org/x/sync/errgroup` + 自研 Worker Pool | 任务调度 |
+
+---
+
+## 3. 总体架构
+
+采用**三层架构 + 事件总线**设计，前后端解耦、算法核心独立可测。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     UI 层（Vue 3 + TS）                       │
+│   导航栏 │ 扫描配置 │ 结果视图 │ 预览面板 │ 操作确认 │ 设置     │
+└──────────────────────────▲───────────────────────────────────┘
+                           │ wails bindings（RPC 方法 + 事件订阅）
+┌──────────────────────────┴───────────────────────────────────┐
+│                   调度层（Go，app.go）                        │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ 任务编排器 │ │ 进度统计器 │ │ 结果聚合器 │ │ 操作执行器 │        │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘        │
+└──────────────────────────▲───────────────────────────────────┘
+                           │ 内部调用
+┌──────────────────────────┴───────────────────────────────────┐
+│                    引擎层（internal/*）                       │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ scanner  │ │ filter   │ │ hasher   │ │ dedup    │        │
+│  │ 并发遍历  │ │ size分组 │ │ xx/BLAKE3│ │ 分组比对  │        │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘        │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ cache    │ │ model    │ │ ops      │ │ progress │        │
+│  │ SQLite   │ │ 数据模型  │ │ 回收站等  │ │ 事件推送  │        │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.1 模块职责
+
+| 模块 | 职责 | 关键设计 |
+|---|---|---|
+| **任务编排器** | 编排多阶段流水线，管理生命周期 | 状态机：`Idle → Scanning → Prefiltering → Hashing → Done / Paused / Cancelled / Failed`；同一时刻仅允许一个活动任务 |
+| **扫描模块** | 递归遍历目录，收集文件元数据 | 并行遍历；unix 平台随 lstat 零成本附带 FileKey；**Windows 按需解析**（见 §4） |
+| **过滤模块** | 应用大小/扩展名/路径过滤器，按 size 分组 | 只保留候选组（同 size ≥ 2）；候选组内做 FileKey 硬链接去重 |
+| **哈希模块** | 分阶段计算哈希（部分哈希 → 全量哈希） | Worker Pool + 流式读取 + 缓冲池复用；小文件（≤128KiB）阶段合并 |
+| **比对模块** | 聚合哈希结果，形成重复组；可选逐字节确认 | 哈希 → map 分组；paranoid 模式二次确认 |
+| **进度统计器** | 汇总各阶段进度，向 UI 推送 | 原子计数器 + 定时推送（500ms 节流） |
+| **缓存模块** | 持久化"文件指纹 → 哈希"映射 | SQLite，按 (path, size, mtime) 校验有效性（生命周期见 §7.3） |
+| **结果聚合器** | 结果分页/排序/筛选，供 UI 查询 | 内存索引，虚拟滚动友好；结果仅存内存（见 §7.3） |
+| **操作执行器** | 执行回收站/删除/移动/硬链接 | 全量重新校验哈希后操作，逐文件安全处理；ENOENT 视为已跳过 |
+| **文件操作** | 三平台回收站与文件操作适配 | 平台差异适配层（见 §5.4） |
+
+### 3.2 Wails 绑定 API 契约（前后端并行开发依据）
+
+**RPC 方法（app.go 暴露）**：
+
+| 方法 | 签名（简） | 说明 |
+|---|---|---|
+| SelectDirectory | `() → string` | 调起系统目录选择器（**单选**：Wails v2 平台对话框不支持多选，前端可连续多次添加） |
+| StartScan | `(config ScanConfig) → string` | 创建任务返回 taskID；非法态或上一任务未收尾返回错误 |
+| PauseScan / ResumeScan / CancelScan | `() → error` | 生命周期控制（见 §5.5 语义） |
+| GetScanProgress | `() → ProgressEvent` | 主动拉取（断线重连场景） |
+| GetStatus | `() → string` | 当前任务状态字符串（`GetScanProgress` 之外的轻量轮询入口） |
+| GetResultGroups | `(ResultQuery) → PagedResult` | 分页查询重复组（含排序/扩展名筛选） |
+| ApplyKeepPolicy | `(policy KeepPolicy) → []KeepDecision` | 一键保留：newest/oldest/shortest/directory/manual；返回决策并由后端记录 keepIDs |
+| ClearKeepDecisions | `() → void` | 清除保留决策，回到默认建议（路径最短） |
+| ExecuteOperation | `(op OpRequest) → string` | trash/delete/move/hardlink，返回 opID；执行期间拒绝并发操作 |
+| GetFailedItems | `() → []FailedItem` | 拉取失败清单（扫描失败 + 操作失败） |
+| PreviewFile | `(fileID) → PreviewData` | 缩略图（≤512px JPEG）/ 文本前 4KB / HEX 前 256B |
+| RevealInFolder | `(fileID) → void` | 平台"打开所在文件夹并选中" |
+| OpenTrash | `() → error` | 打开系统回收站（恢复引导，M3-T06） |
+| ExportReport | `(format, path) → string` | html/csv/json（M5 提供） |
+| GetSettings / SaveSettings | `(Settings) → Settings` | 线程数、过滤器默认值、主题等；后端 JSON 单一事实源（§7.3） |
+| CacheStats / CacheClear | | 缓存管理 |
+| GetVersion | `() → string` | 版本号（关于页/诊断） |
+
+**事件（后端 → 前端，EventsEmit）**：
+
+| 事件名 | Payload | 频率 |
+|---|---|---|
+| `scan:progress` | `ProgressEvent`（§7） | 500ms 节流 |
+| `scan:stage` | `StageEvent{stage, desc}` | 阶段切换时 |
+| `scan:done` / `scan:cancelled` / `scan:error` | 统计摘要 / 错误详情 | 一次性 |
+| `ops:progress` | `OpsProgress{done, total, current}` | 每文件 |
+| `ops:done` | `OpsResult{ok[], failed[], skipped[], reclaimed}` | 一次性 |
+
+> 契约冻结规则：本表进入开发后即冻结，字段变更需同步更新三端（Go struct / TS interface / 事件文档）。
+
+---
+
+## 4. 核心算法流程（多阶段过滤流水线）
+
+这是本项目性能的关键。核心思想：**尽可能少地读盘、尽可能少地算哈希、尽可能少地开句柄**，让每个阶段淘汰掉绝大多数候选。
+
+```
+阶段 0：元数据扫描（遍历目录，收集 size / mtime / 路径）
+         —— unix 平台：lstat 天然携带 inode/dev，零成本附带
+         —— Windows：暂不解析 FileKey（需额外开句柄，见阶段 1.5）
+          ↓
+阶段 1：按文件大小分组（size 分组）
+         —— 不同大小必然内容不同，直接淘汰独有 size（淘汰 90%+）
+          ↓
+阶段 1.5：候选组内物理文件去重（仅候选，占文件总数 <10%）
+         —— 解析 FileKey（Windows 此时才开句柄；unix 复用 lstat 结果）
+         —— 同 FileKey 的多路径（硬链接）只保留一个；组内剩 1 个则整组淘汰
+          ↓
+阶段 2：候选组内做「首尾部分哈希」预筛
+         —— 头部 64KiB + 尾部 64KiB 的 xxHash64 双指纹
+         —— 小文件（size ≤ 128KiB）：首尾样本即全文件，一趟完成 xxHash + BLAKE3
+         —— 淘汰 99%+ 的非重复候选（避免读整个文件）
+          ↓
+阶段 3：候选组内做「全量 BLAKE3-256」哈希（仅大文件）
+         —— 加密级强哈希，吞吐可达数 GB/s
+         —— 小文件已在阶段 2 完成全量哈希，直接复用结果，跳过本阶段
+         —— 哈希相同 ⇒ 判为重复组
+          ↓
+阶段 4（可选 paranoid）：逐字节流式比对
+         —— 彻底消除任何碰撞疑虑，100% 精确
+          ↓
+结果输出：重复组（含可释放空间、文件元信息、失败清单）
+```
+
+> **FileKey 按需解析的理由**：Windows 上获取 FILE_ID_INFO 必须对每个文件 `CreateFile` 开句柄。若在阶段 0 对全部文件解析，等于为 100% 的文件多付一次 open/close；而硬链接去重只对"同 size 候选组"有意义。延迟到阶段 1.5 后，**90%+ 的文件（独 size）完全零额外开销**。unix 平台因 lstat 顺带返回 inode，则无此取舍，阶段 0 直接附带。
+
+### 4.1 阶段成本分析
+
+| 阶段 | 读盘量 | 哈希计算量 | 额外句柄 | 耗时占比（典型） |
+|---|---|---|---|---|
+| 0 扫描 | 仅元数据 | 无 | 0（unix）/ 0（win 延迟） | ~5% |
+| 1 size 分组 | 0 | 0 | 0 | ~1% |
+| 1.5 FileKey 去重 | 0 | 0 | 仅候选文件（<10%） | ~2% |
+| 2 首尾哈希 | ≤128KiB/文件（小文件 = 全量） | 极小（xxHash64） | 候选文件 | ~10% |
+| 3 全量哈希 | 仅候选大文件 | BLAKE3 全量 | 候选文件 | ~80% |
+| 4 逐字节比对 | 仅最终确认组 | 无 | 确认组 | 仅 paranoid 模式 |
+
+> 现实中大部分文件 size 互不相同（阶段 1 淘汰 90%+），同 size 的文件绝大多数首尾哈希不同（阶段 2 再淘汰 99%+），因此**真正需要全量读盘的大文件极少**——这是本项目比"无脑全量哈希"方案快几个数量级的根本原因。
+
+---
+
+## 5. 多线程、资源与跨平台设计
+
+### 5.1 并发模型
+
+- **线程数默认**：`max(1, 逻辑核心数-1)`（留 1 核余量给 WebView 渲染与系统调度），用户可配置 1 ~ 逻辑核心数；
+- **阶段 0 遍历**：目录队列 + 多 goroutine 并行 walk，按目录切分任务；
+- **阶段 2/3 哈希**：固定 Worker Pool，任务粒度 = "单文件哈希"；大文件按 16MiB 切片拆为子任务（BLAKE3 tree hashing 跨段合并），避免单个大文件长期独占 worker；
+- **IO 与计算**：流式分块读取（每块 1MiB），缓冲池（`sync.Pool`）复用，避免频繁分配；
+- **句柄管理**：哈希/FileKey 解析完立即关闭句柄；macOS 默认 soft limit 较低（256），Worker 数受其约束，必要时 `setrlimit` 提升。
+
+### 5.2 内存控制
+
+| 策略 | 说明 |
+|---|---|
+| 元数据紧凑结构体 | FileEntry 用 uint64 存 size/mtime，路径用 string |
+| 结果只存引用 | 重复组结果仅存文件 ID，不复制路径字符串 |
+| 流式读取 | 任何时刻内存中仅保留当前 1MiB 块 × worker 数 |
+| 哈希缓存 | SQLite WAL 模式，缓存条目按需加载 |
+| 进度上报节流 | 原子计数 + 500ms 定时聚合推送 |
+
+### 5.3 目标指标
+
+| 指标 | 目标值 |
+|---|---|
+| 10 万文件（50GB 数据，SSD）首扫 | ≤ 30s |
+| 二次扫描（缓存命中） | ≤ 5s |
+| 峰值内存（10 万文件） | ≤ 300MB |
+| CPU 利用率 | ≥ 80%（默认配置） |
+| 哈希吞吐 | ≥ 1.5 GB/s（BLAKE3 多核） |
+| 二进制体积 | ≤ 20MB（三平台各自） |
+
+### 5.4 跨平台差异设计（适配层统一封装）
+
+| 差异点 | macOS | Windows | Linux | 适配方案 |
+|---|---|---|---|---|
+| 回收站 | NSWorkspace trash（或 osascript） | `SHFileOperationW`（FOF_ALLOWUNDO） | XDG Trash 规范（自研：`~/.local/share/Trash` + `.trashinfo`） | ops/trash 按 build tag 分文件实现；不依赖外部命令，保持单二进制 |
+| 物理文件 ID（inode 等价物） | `Stat_t.Ino`（lstat 附带） | **无 inode**：`GetFileInformationByHandle` → `FILE_ID_INFO`（卷序列号 + 文件索引），**按需解析** | `Stat_t.Ino`（lstat 附带） | scanner 层定义 `FileKey{VolumeID, FileIndex}` 抽象；解析时机见 §4 阶段 1.5 |
+| 路径长度 | 无限制 | 默认 260 字符上限 | 无限制 | 应用清单声明 `longPathAware`；拼接路径统一走 `filepath.Join` |
+| 大小写敏感性 | APFS 默认不敏感 | NTFS 不敏感 | ext4 默认敏感 | 路径去重比较时按平台规则（大小写折叠仅在 mac/win） |
+| 打开方式 | `open -R` | `explorer /select,` | `xdg-open` | RevealInFolder 适配层 |
+| 文件描述符 | soft limit 256（可提升） | 句柄数万级 | ulimit 通常 1024+ | Worker 数 = min(配置, 平台安全句柄预算) |
+| 配置/缓存目录 | `~/Library/Application Support/FileDedup/` | `%APPDATA%\FileDedup\` | `~/.config/FileDedup/` | 统一走 `os.UserConfigDir()` |
+
+### 5.5 暂停 / 恢复 / 取消语义
+
+| 操作 | 语义 |
+|---|---|
+| 暂停 | 停止派发新哈希任务，等待 in-flight 任务完成后挂起；进度与已得结果保留在内存 |
+| 恢复 | 从挂起点继续派发（配合缓存可跨进程恢复） |
+| 取消 | `context.CancelFunc`，所有 worker 立即退出，部分结果丢弃，任务回到 Idle；已完成哈希仍写回缓存 |
+
+---
+
+## 6. UI 设计
+
+### 6.1 设计原则
+
+- **一屏一任务**：主流程（选目录 → 扫描 → 结果 → 清理）线性推进，扫描完成自动切换结果页；
+- **结果即操作**：重复组列表直接可勾选、可预览、可执行操作，无需二次跳转；
+- **安全可视化**：删除按钮默认灰色，勾选后才激活；大操作强制二次确认；
+- **信息密度合理**：文件路径可折叠为面包屑，提供"显示完整路径"开关；
+- **主题**：亮色/暗色/跟随系统，CSS 变量驱动；
+- **国际化**：V1.0 中文优先，文案全部走 `vue-i18n` 字典，预留 en。
+
+### 6.2 界面布局
+
+```
+┌──────────┬──────────────────────────────────────────────────┐
+│  侧边导航  │  主工作区（三页签）                                │
+│  ───────  │  ┌──────────────────────────────────────────┐  │
+│  扫描      │  │ ① 扫描页：目录列表（可拖拽）+ 过滤器 + 开始 │  │
+│  结果      │  │    实时统计条：已扫/候选/重复/可释放空间     │  │
+│  设置      │  ├──────────────────────────────────────────┤  │
+│  ───────  │  │ ② 结果页：重复组卡片列表（虚拟滚动）         │  │
+│  关于      │  │    每组：缩略预览 + 文件行 + 保留/删除勾选    │  │
+│           │  ├──────────────────────────────────────────┤  │
+│           │  │ ③ 设置页：线程数/过滤默认值/缓存管理/主题     │  │
+│           │  └──────────────────────────────────────────┘  │
+└──────────┴──────────────────────────────────────────────────┘
+```
+
+### 6.3 核心交互
+
+1. **添加扫描目录**：拖拽文件夹到区域 / 系统目录选择器 / 粘贴路径；
+2. **开始扫描**：展示阶段进度条 + 实时统计（文件数、数据量、速度、剩余时间）；
+3. **结果视图**：
+   - 每个重复组显示：可释放空间、文件数、代表缩略图（图片类）；
+   - 组内文件行：路径、大小、修改时间，行首复选框；
+   - 顶部"保留策略"工具条：一键保留（最新/最旧/最短路径/指定目录）；
+   - 筛选：按扩展名、按可释放空间排序、仅显示勾选；
+4. **预览面板**：选中文件后右侧弹出（图片/文本/十六进制），支持"打开所在文件夹"；
+5. **清理操作**：勾选后弹出确认框（列出将删除文件数、大小），确认后进回收站并反馈结果；
+6. **失败清单**：扫描/操作失败项统一入口（右上角角标），可查看与导出；
+7. **快捷键**：`Space` 预览选中项、`Cmd/Ctrl+A` 全选组、`Del` 标记待删、`Esc` 取消预览。
+
+### 6.4 状态与反馈
+
+- 扫描过程可**暂停/继续/取消**；
+- 操作执行时实时显示"正在处理 n/m"与失败文件列表；
+- 所有破坏性操作提供"撤销到回收站"引导。
+
+---
+
+## 7. 数据模型
+
+### 7.1 核心结构
+
+```go
+// 文件条目
+type FileEntry struct {
+    ID       uint64   // 全局唯一 ID（扫描任务内自增）
+    Path     string
+    Size     uint64
+    ModTime  int64    // UnixNano，用于缓存校验
+    Key      FileKey  // 物理文件标识；unix 阶段0 附带，win 阶段1.5 按需填充
+    Ext      string
+}
+
+// 平台物理文件标识抽象
+type FileKey struct {
+    VolumeID   uint64 // 设备/卷序列号
+    FileIndex  uint64 // inode / NTFS FileId（低 64 位）
+    Resolved   bool   // 是否已解析（win 按需解析标记）
+}
+
+type Filters struct {
+    IncludeExts    []string // 空 = 全部
+    ExcludeExts    []string
+    MinSize        uint64   // 0 = 不限；默认 0
+    MaxSize        uint64   // 0 = 不限
+    ExcludePaths   []string // glob
+    IncludeHidden  bool
+}
+
+type TaskStatus string // Idle/Scanning/Prefiltering/Hashing/Paused/Done/Cancelled/Failed
+
+type ScanConfig struct {
+    Roots    []string
+    Filters  Filters
+    Threads  int
+    Paranoid bool // 逐字节确认
+    UseCache bool
+}
+
+type ProgressEvent struct { // scan:progress payload
+    Stage      string  // scan / prefilter / hash / verify
+    FilesDone  uint64
+    FilesTotal uint64  // 预估，未知为 0（UI 显示不定进度）
+    BytesDone  uint64
+    BytesTotal uint64
+    SpeedBps   float64
+    ETASeconds int64   // 未知为 -1
+}
+
+type StageEvent struct {
+    Stage string // scan/prefilter/hash/verify
+    Desc  string // 本地化描述 key
+}
+
+type DuplicateGroup struct {
+    GroupID     uint64
+    Files       []*FileEntry
+    Reclaimable uint64 // (n-1)*size；硬链接同物理文件已在阶段 1.5 剔除
+    Hash        [32]byte // 组内容 BLAKE3-256（操作前校验依据，M3）
+}
+
+type FailedItem struct { // 失败清单条目（扫描与操作共用）
+    Path  string
+    Stage string // scan/prefilter/hash/verify/ops
+    Err   string
+}
+```
+
+### 7.2 契约引用类型（API/事件 payload）
+
+```go
+type KeepPolicy struct {
+    Kind      string // newest/oldest/shortest/directory/manual
+    Directory string // Kind=directory 时生效
+}
+
+// KeepDecision 一组文件的保留决策（ApplyKeepPolicy 返回值）
+type KeepDecision struct {
+    GroupID   uint64
+    KeepID    uint64
+    RemoveIDs []uint64
+}
+
+type OpRequest struct {
+    Kind          string   // trash/delete/move/hardlink
+    FileIDs       []uint64 // 待处理（非保留）文件
+    TargetDir     string   // move 时生效
+    ConfirmDanger bool     // delete 必须显式确认（S4：后端强制，非仅前端拦截）
+}
+
+type OpsProgress struct {
+    Done    int
+    Total   int
+    Current string
+}
+
+type OpsResult struct {
+    OK        []string    // 成功处理路径；move 时记录**源路径**（结果集清理依据）
+    Failed    []FailedItem
+    Skipped   []string    // 操作时文件已不存在（ENOENT），视为达成目标
+    Reclaimed uint64      // 实际释放空间
+}
+
+type PagedResult struct {
+    Total            uint64
+    Page             int
+    TotalReclaimable uint64      // 全量可释放空间（含未加载页）
+    Groups           []GroupView // UI 视图：含勾选建议/排序键，由后端聚合
+}
+
+type PreviewData struct {
+    Kind     string // image/text/hex/binary
+    Content  string // 文本 / HEX / 图片 base64（Wails JSON 通道须用 string，不能直传 []byte）
+    MimeType string // 图片时携带，如 image/jpeg
+}
+
+type Settings struct {
+    Threads        int
+    FiltersDefault Filters
+    Theme          string // light/dark/system
+    Language       string
+}
+```
+
+### 7.3 缓存、结果与设置的生命周期
+
+**哈希缓存（SQLite，持久）**：
+
+- 位置：`os.UserConfigDir()/FileDedup/cache.db`（平台差异见 §5.4）；
+- 写回时机：任务结束（Done/Cancelled/Paused 挂起）时**单事务批量写回**，避免边扫边写的锁竞争与写放大；
+- 清理策略：条目上限默认 50 万，超限按"最近未命中"淘汰；路径已不存在的条目在写回时顺带删除；
+- 并发：单写多读（WAL）；仅本进程访问。
+
+**结果集（内存，非持久）**：
+
+- `DuplicateGroup` 仅存内存，保留至下一次 StartScan 或应用退出；**不持久化**——分组结果依赖扫描范围与过滤器组合，持久化意义有限；缓存中持久化的只是"文件→哈希"指纹，二次扫描时基于指纹秒级重建分组。
+
+**设置（后端 JSON，单一事实源）**：
+
+- 位置：`os.UserConfigDir()/FileDedup/settings.json`；
+- 前端一律经 `GetSettings/SaveSettings` 读写，**不使用 localStorage 双写**，避免双源不一致。
+
+**SQLite 缓存 schema**：
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+
+CREATE TABLE IF NOT EXISTS hash_cache (
+    path     TEXT    NOT NULL,
+    size     INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    partial  BLOB    NOT NULL, -- xxHash64 首尾指纹（16B）；预筛通过才入库，故必有
+    full     BLOB,             -- BLAKE3-256（32B）；NULL = 未算过全量（大文件预筛后被淘汰）
+    last_hit INTEGER,         -- 最近命中时间戳（淘汰依据）
+    PRIMARY KEY (path)
+);
+CREATE INDEX IF NOT EXISTS idx_cache_size ON hash_cache(size);
+-- 命中条件：path 存在 AND size、mtime_ns 与当前一致 → 直接复用 full
+-- 小文件额外复用 partial（即全量 xxHash 指纹）
+```
+
+---
+
+## 8. 目录结构规划
+
+```
+FileDedup/
+├── main.go                  # Wails 入口
+├── app.go                   # Wails 绑定服务（§3.2 契约实现）
+├── wails.json               # Wails 配置
+├── frontend/                # Vue3 + TS 前端
+│   ├── src/
+│   │   ├── views/           # 扫描页/结果页/设置页
+│   │   ├── components/      # 重复组卡片/进度条/预览面板等
+│   │   ├── stores/          # Pinia
+│   │   ├── i18n/            # 语言字典
+│   │   └── wailsjs/         # 自动生成绑定（勿手改）
+│   └── package.json
+├── internal/
+│   ├── scanner/             # 目录遍历 + 平台 FileKey（按需解析）
+│   │   ├── scanner.go
+│   │   ├── filekey_darwin.go / _windows.go / _linux.go
+│   ├── filter/              # 过滤规则
+│   ├── hasher/              # xxHash / BLAKE3 / 多段哈希
+│   ├── dedup/               # 流水线编排 + 分组比对 + 状态机
+│   ├── cache/               # SQLite 缓存
+│   ├── ops/                 # 回收站/删除/移动/硬链接
+│   │   ├── ops.go
+│   │   ├── trash_darwin.go / _windows.go / _linux.go
+│   ├── progress/            # 进度统计与事件推送
+│   └── model/               # 数据模型
+├── cmd/
+│   ├── fdd-cli/             # CLI 冒烟与 E2E 断言工具
+│   └── benchgen/            # 合成基准数据集生成器
+├── .github/workflows/       # CI（PR 检查 / nightly 基准 / 三平台构建 / 发布）
+├── build/                   # Wails 构建资源（图标/manifest/打包）
+└── docs/                    # 本文档目录
+```
+
+---
+
+## 9. 安全性设计（防误删）
+
+1. **回收站优先**：删除默认进系统回收站，绝不直接 `os.Remove`（除非用户显式选择永久删除并二次确认）；
+2. **操作前全量校验**：删除/移动前重新计算 BLAKE3，与结果集比对，文件被改动则中止该文件并计入失败清单；
+3. **文件已消失（ENOENT）**：操作时文件不存在 → 计入 `Skipped`（目标已达成，非失败），不计入释放空间；
+4. **保留策略显式化**：每组必须明确"保留谁"，默认勾选建议项（路径最短且非隐藏目录）；
+5. **硬链接识别**：FileKey 相同的多个路径视为同一物理文件，不重复计入可释放空间，也不作为"可删除副本"；
+6. **路径处理**：所有文件操作经参数化系统调用，不拼接 shell；导出报告时对路径正确转义；
+7. **恢复引导**：删除后展示"已移至回收站"提示与回收站打开按钮。
+
+---
+
+## 10. 开发路线图
+
+| 里程碑 | 内容 | 验收标准 |
+|---|---|---|
+| M1 算法内核 | scanner/filter/hasher/dedup 流水线 + CLI 冒烟 + `cmd/benchgen` | §12 基准集上达到 §5.3 指标 |
+| M2 前端框架 | §3.2 API 契约实现 + 扫描页/进度/结果列表 | 全流程可视跑通（手动删） |
+| M3 操作闭环 | 回收站（三平台）/删除/移动/保留策略/确认框 | 三平台回收站实测 + L5 安全门禁通过 |
+| M4 缓存与体验 | SQLite 缓存、暂停/恢复、主题、预览、快捷键 | 二次扫描提速 ≥ 10x |
+| M5 打磨发布 | 导出报告、错误处理、i18n、打包三平台 | 三平台安装包冒烟通过 |
+
+---
+
+## 11. 风险与对策
+
+| 风险 | 对策 |
+|---|---|
+| 超大规模目录（百万文件）遍历慢 | 并行遍历 + 懒加载分页 + 缓存 |
+| 网络盘/慢速盘 IO 瓶颈 | 可调线程数、进度提示、失败文件隔离不阻塞 |
+| 哈希碰撞疑虑 | BLAKE3-256；paranoid 模式逐字节比对 |
+| 误删风险 | 回收站优先 + 操作前校验 + 二次确认 + ENOENT 语义明确 |
+| Windows 平台差异（无 inode/长路径） | §5.4 适配层：FileIndex 按需解析 + longPathAware 清单 |
+| Linux 回收站环境差异（无 gio/桌面） | 自研 XDG Trash 规范实现，零外部依赖 |
+| Wails 框架演进（v3 alpha） | 锁定 v2 稳定版；引擎层与框架解耦，必要时可迁移 |
+| 缓存库损坏/异常退出 | WAL 容错；启动校验，损坏即重建（丢失仅影响二次扫描速度） |
+
+---
+
+## 12. 测试与基准策略
+
+### 12.1 测试分层（与 04 文档 L1~L6 对齐）
+
+| 层级 | 内容 | 工具 |
+|---|---|---|
+| L1 单元 | hasher（含小文件 ≤128KiB 与 FileKey 按需解析路径）、filter、分组逻辑、缓存命中判定 | `go test` / `vitest` |
+| L2 并发正确性 | `-race` 下流水线冒烟；取消/暂停时序矩阵；goroutine 泄漏 | `go test -race` |
+| L3 集成/E2E | benchgen 确定性数据集全流程断言；真实目录冒烟 | CLI 脚本 |
+| L4 平台适配 | FileKey / 回收站 三平台 checklist（build tag 隔离） | 集成测试 + 手测 |
+| L5 安全验证 | 误删防护注入测试（S1~S8，见 04 §3.6） | 集成测试 |
+| L6 基准回归 | §12.2 数据集全流程耗时，防性能劣化 | `go test -bench` + benchgen |
+
+### 12.2 基准数据集（cmd/benchgen 生成，可复现）
+
+| 数据集 | 构成 | 目的 |
+|---|---|---|
+| A 小文件海 | 10 万个 1KB~256KB 随机文件，10% 重复 | 遍历与小文件路径（阶段 2 即全量） |
+| B 大文件 | 100 个 512MB~1GB，30% 重复 | 大文件分段并行哈希（`benchgen -dataset B`） |
+| C 混合真实感 | 10 万文件共 50GB（A+B+中等文件），重复率 8% | 总体指标验证（对照 §5.3） |
+
+**回归红线**：任何 PR 使数据集 C 总耗时劣化 > 10% 需说明原因方可合入。

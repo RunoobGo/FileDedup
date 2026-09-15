@@ -1,0 +1,15 @@
+# ---------- 构建产物（Wails 官方模板约定）----------
+# 注意：//go:embed all:frontend/dist 需要 frontend/dist 存在，
+# 因此全新克隆后须先构建前端（wails build 会自动执行）再跑 go build/test。
+build/bin
+frontend/dist
+
+# ---------- 前端依赖 ----------
+node_modules
+
+# ---------- Wails 生成物（每次 build 重新生成；源码不引用，见 07 报告遗留 2）----------
+frontend/wailsjs
+frontend/package.json.md5
+
+# ---------- macOS ----------
+.DS_Store
