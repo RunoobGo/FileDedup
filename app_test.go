@@ -89,6 +89,107 @@ func TestGetResultGroupsSort(t *testing.T) {
 	}
 }
 
+// BenchmarkGetResultGroupsPaged Y3 收益量化：5000 组的滚动分页查询。
+// Cached = 修复后（排序结果复用）；RebuildEach = 修复前（每次翻页全量重排）。
+func BenchmarkGetResultGroupsPaged(b *testing.B) {
+	a := NewApp()
+	a.cfgDir = b.TempDir()
+	for i := 0; i < 5000; i++ {
+		a.groups = append(a.groups, mkGroup(uint64(i+1), uint64(100+i%97),
+			"x/a.dat", "y/b.dat", "z/c.dat"))
+	}
+	q := func(i int) ResultQuery { return ResultQuery{Page: i % 40, PageSize: 100} }
+
+	b.Run("Cached", func(b *testing.B) {
+		if _, err := a.GetResultGroups(q(0)); err != nil { // 预热
+			b.Fatal(err)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := a.GetResultGroups(q(i)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("RebuildEach", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			a.mu.Lock()
+			a.invalidateViewCacheLocked() // 模拟修复前：每次翻页都重新筛选+排序
+			a.mu.Unlock()
+			if _, err := a.GetResultGroups(q(i)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// TestGetResultGroupsCacheCorrectness Y3：排序缓存复用必须正确，
+// 且结果集发生任何结构变更（含原地修改成员数）后旧缓存必须失效。
+func TestGetResultGroupsCacheCorrectness(t *testing.T) {
+	a := newTestApp(t)
+	a.groups = []*model.DuplicateGroup{
+		mkGroup(1, 100, "a", "b"),      // reclaim 100
+		mkGroup(2, 500, "c", "d"),      // reclaim 500
+		mkGroup(3, 900, "e", "f", "g"), // reclaim 1800
+	}
+	// 首次查询：建缓存（reclaimable 降序 → g3, g2, g1）
+	r1, err := a.GetResultGroups(ResultQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Total != 3 || r1.Groups[0].GroupID != 3 || r1.Groups[2].GroupID != 1 {
+		t.Fatalf("首查排序错误: total=%d first=%d", r1.Total, r1.Groups[0].GroupID)
+	}
+	if len(a.viewCache) != 1 {
+		t.Fatalf("缓存条目 = %d, want 1", len(a.viewCache))
+	}
+	// 同键复用：结果一致且不新增缓存条目
+	r2, _ := a.GetResultGroups(ResultQuery{})
+	if r2.Total != 3 || r2.Groups[0].GroupID != 3 || len(a.viewCache) != 1 {
+		t.Fatalf("缓存复用异常: total=%d cache=%d", r2.Total, len(a.viewCache))
+	}
+	// 不同键各自缓存
+	if _, err := a.GetResultGroups(ResultQuery{Sort: "size"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.viewCache) != 2 {
+		t.Fatalf("不同键应各建一条缓存, got %d", len(a.viewCache))
+	}
+	// 故意不显式失效：原地缩减某组成员数 → 指纹须变化使缓存失效
+	a.groups[0].Files = a.groups[0].Files[:1] // g1 由 2 文件变 1 文件
+	a.groups[0].Reclaimable = 0
+	r3, _ := a.GetResultGroups(ResultQuery{})
+	if r3.Groups[0].GroupID != 3 {
+		t.Fatalf("首组应仍为 g3, got %d", r3.Groups[0].GroupID)
+	}
+	// g1 现只剩 1 个文件：视图文件数须反映最新状态（陈旧缓存会给出 2）
+	found := false
+	for _, gv := range r3.Groups {
+		if gv.GroupID == 1 {
+			found = true
+			if len(gv.Files) != 1 {
+				t.Fatalf("g1 视图文件数 = %d, want 1（缓存未失效）", len(gv.Files))
+			}
+		}
+	}
+	if !found {
+		t.Fatal("未找到 g1")
+	}
+	// 新增组 → 亦须失效
+	a.groups = append(a.groups, mkGroup(4, 2000, "h", "i"))
+	r4, _ := a.GetResultGroups(ResultQuery{})
+	if r4.Total != 4 || r4.Groups[0].GroupID != 4 {
+		t.Fatalf("新增组后未失效: total=%d first=%d", r4.Total, r4.Groups[0].GroupID)
+	}
+	// 空结果集边界
+	a.groups = nil
+	r5, _ := a.GetResultGroups(ResultQuery{})
+	if r5.Total != 0 || len(r5.Groups) != 0 {
+		t.Fatalf("空结果集应为 0 组")
+	}
+}
+
 func TestGetResultGroupsExtFilter(t *testing.T) {
 	a := newTestApp(t)
 	a.groups = []*model.DuplicateGroup{
@@ -264,9 +365,51 @@ func TestThumbnailPixelBomb(t *testing.T) {
 	if _, err := thumbnail(buildPng(50000, 50000), 512); err == nil || !strings.Contains(err.Error(), "过大") {
 		t.Fatalf("解压炸弹应被像素预检拒绝: %v", err)
 	}
+	// Y5：16M 像素上限边界——25M 像素须拒绝
+	if _, err := thumbnail(buildPng(5000, 5000), 512); err == nil || !strings.Contains(err.Error(), "过大") {
+		t.Fatalf("25M 像素应被拒绝（Y5 收紧后）: %v", err)
+	}
+	// 恰好 16M 像素仍被接受（通过尺寸预检，随后因缺 IDAT 报解码错误）
+	if _, err := thumbnail(buildPng(4000, 4000), 512); err == nil || strings.Contains(err.Error(), "过大") {
+		t.Fatalf("16M 像素不应被判为过大: %v", err)
+	}
 	// 正常尺寸不受影响（真实图片路径由 TestThumbnail 覆盖）
 	if _, err := thumbnail(buildPng(64, 64), 512); err == nil {
 		t.Fatal("缺 IDAT 的 64x64 应报解码错误而非像素错误")
+	}
+}
+
+// TestPreviewFileSizeLimits Y5：源文件大小上限收紧到 20MB。
+func TestPreviewFileSizeLimits(t *testing.T) {
+	a := newTestApp(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big.png")
+	// 真实可解码 PNG（buildPng 仅含 IHDR/IEND，供像素预检用例使用）
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 64, 64))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 声明体积超过 20MB → 明确提示且不读盘解码
+	a.byID[1] = &model.FileEntry{ID: 1, Path: p, Size: 21 << 20, Ext: ".png"}
+	got, err := a.PreviewFile(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "binary" || !strings.Contains(got.Content, "20MB") {
+		t.Fatalf("超限图片应返回尺寸提示: %+v", got)
+	}
+	// 20MB 以内（真实体积）→ 正常走缩略图路径
+	info, _ := os.Stat(p)
+	a.byID[2] = &model.FileEntry{ID: 2, Path: p, Size: uint64(info.Size()), Ext: ".png"}
+	got, err = a.PreviewFile(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "image" || got.MimeType != "image/jpeg" {
+		t.Fatalf("正常图片应返回缩略图: %+v", got)
 	}
 }
 

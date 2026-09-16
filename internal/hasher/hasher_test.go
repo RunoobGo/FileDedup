@@ -153,6 +153,35 @@ func TestHashFullOpenError(t *testing.T) {
 	}
 }
 
+// TestHashFullSegmentedReusesBuffers Y2 回归：段缓冲必须复用而非每段新分配。
+// 修复前每段独立 make(seg)（nSeg 次分配）；环形池化后额外分配应仅为
+// (depth+1)×seg 量级，与段数解耦。
+func TestHashFullSegmentedReusesBuffers(t *testing.T) {
+	const seg, nseg = 1 << 20, 32 // 32MiB 文件 / 1MiB 段
+	size := seg * nseg
+	p := writeFile(t, size)
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if _, err := HashFullSegmented(f, int64(size), seg, 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+
+	allocated := after.TotalAlloc - before.TotalAlloc
+	// 环形池 (2+1)×1MiB = 3MiB；修复前为 32MiB
+	if allocated > 8<<20 {
+		t.Fatalf("分段哈希额外分配 %d 字节（>8MiB），段缓冲疑似未复用（Y2 回归）", allocated)
+	}
+	t.Logf("32MiB 文件分段哈希额外分配 = %d 字节", allocated)
+}
+
 // TestHashFullSegmentedNoGoroutineLeakOnError 回归：读错误提前返回后，
 // 生产者 goroutine 必须及时退出（旧实现阻塞在 ch <- 永久泄漏）。
 func TestHashFullSegmentedNoGoroutineLeakOnError(t *testing.T) {

@@ -7,6 +7,7 @@ import ResultView from './views/ResultView.vue'
 import SettingsView from './views/SettingsView.vue'
 import FailedDrawer from './components/FailedDrawer.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
+import ToastHost from './components/ToastHost.vue'
 
 const store = useScanStore()
 onMounted(() => store.bindEvents())
@@ -74,6 +75,7 @@ const navs = [
 
     <FailedDrawer />
     <PreviewPanel />
+    <ToastHost />
   </div>
 </template>
 

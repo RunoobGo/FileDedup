@@ -100,6 +100,11 @@ func (t *Tracker) AddFile() { t.filesDone.Add(1) }
 // AddBytes 计入完成字节数。
 func (t *Tracker) AddBytes(n uint64) { t.bytesDone.Add(n) }
 
+// Done 读取当前已完成量（阶段切换时用于重设总量口径，R2）。
+func (t *Tracker) Done() (files, bytes uint64) {
+	return t.filesDone.Load(), t.bytesDone.Load()
+}
+
 // Snapshot 主动拉取当前进度（GetScanProgress 语义）。
 func (t *Tracker) Snapshot() model.ProgressEvent {
 	t.mu.Lock()

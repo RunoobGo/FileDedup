@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"filededup/internal/cache"
 	"filededup/internal/model"
@@ -77,5 +78,47 @@ func TestCacheSecondScan(t *testing.T) {
 	}
 	if len(g3) != 1 {
 		t.Fatalf("修改后组数 = %d, want 1", len(g3))
+	}
+}
+
+// TestCacheSecondScanRefreshesLastHit R1 端到端：二扫全命中时，
+// 命中条目 last_hit 必须被续期（否则热文件会在淘汰时最先被逐出）。
+func TestCacheSecondScanRefreshesLastHit(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, b []byte) string {
+		p := filepath.Join(root, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, b, 0o644)
+		return p
+	}
+	content := []byte("refresh last_hit on cache hit")
+	a := write("a.txt", content)
+	write("b.txt", content)
+
+	cch, err := cache.Open(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cch.Close()
+
+	cfg := model.ScanConfig{Roots: []string{root}, UseCache: true}
+	if _, _, err := New().WithCache(cch).Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	h1, ok := cch.LastHit(a)
+	if !ok {
+		t.Fatal("首扫后应有缓存条目")
+	}
+	// last_hit 为秒级时间戳：跨秒确保可区分
+	time.Sleep(1100 * time.Millisecond)
+	if _, _, err := New().WithCache(cch).Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	h2, ok := cch.LastHit(a)
+	if !ok {
+		t.Fatal("二扫后条目不应消失")
+	}
+	if h2 <= h1 {
+		t.Fatalf("命中未续期 last_hit: %d -> %d（R1 回归）", h1, h2)
 	}
 }

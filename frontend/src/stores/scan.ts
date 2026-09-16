@@ -3,6 +3,10 @@ import { defineStore } from 'pinia'
 import { api, onEvent, isBackendAvailable } from '../wails'
 import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult } from '../wails'
 import { reactive, ref, computed } from 'vue'
+import { useToastStore } from './toast'
+
+// 错误提示统一走 toast（Y6：替代阻塞式 alert，且可堆叠查看多条）
+const toast = () => useToastStore()
 
 export const emptyFilters = (): Filters => ({
   IncludeExts: [],
@@ -32,6 +36,13 @@ export const useScanStore = defineStore('scan', () => {
   const reclaimableTotal = ref(0)
   const resultPage = ref(0)
   const pageSize = 100
+  // Y7：结果页 DOM 放量上限——无限滚动最多累积 DEFAULT_LOAD_CAP 组，
+  // 之后需显式「继续加载」再放量一档。渲染层有 content-visibility 兜底，
+  // 但万级组仍会让组件实例与 DOM 节点无界增长（内存无法回收）。
+  const DEFAULT_LOAD_CAP = 2000
+  const LOAD_CAP_STEP = 1000
+  const loadCap = ref(DEFAULT_LOAD_CAP)
+  const loadingPage = ref(false) // 在途请求标志：防快速滚动重复排队拉取
   const resultSort = ref('reclaimable')
   const resultExt = ref('')
   const hasResult = ref(false)
@@ -76,7 +87,7 @@ export const useScanStore = defineStore('scan', () => {
       .catch((e: any) => {
         scanning.value = false
         status.value = 'Idle'
-        alert(String(e))
+        toast().notifyError('启动扫描失败', e)
       })
   }
 
@@ -90,27 +101,42 @@ export const useScanStore = defineStore('scan', () => {
   function loadResultPage(append: boolean): Promise<void> {
     resultChain = resultChain
       .then(() => doLoadResultPage(append))
-      .catch((e: any) => alert('加载结果失败: ' + String(e)))
+      .catch((e: any) => toast().notifyError('加载结果失败', e))
     return resultChain
   }
 
   async function doLoadResultPage(append: boolean) {
-    const r = await api.getResultGroups({
-      page: append ? resultPage.value : 0,
-      pageSize,
-      sort: resultSort.value,
-      ext: resultExt.value,
-    })
-    if (append) {
-      groups.value.push(...r.groups)
-      resultPage.value++
-    } else {
-      groups.value = r.groups
-      resultPage.value = 1
+    // Y7：已达放量上限时忽略滚动追加，需经 loadMore 显式放量
+    if (append && groups.value.length >= loadCap.value) return
+    loadingPage.value = true
+    try {
+      const r = await api.getResultGroups({
+        page: append ? resultPage.value : 0,
+        pageSize,
+        sort: resultSort.value,
+        ext: resultExt.value,
+      })
+      if (append) {
+        groups.value.push(...r.groups)
+        resultPage.value++
+      } else {
+        groups.value = r.groups
+        resultPage.value = 1
+        // Y8：列表被替换（排序/筛选/新扫描/操作后刷新）时勾选已无意义 → 清空
+        resetSelection()
+      }
+      totalGroups.value = Number(r.total)
+      // 全量口径（含未加载页）：统计条与 totalGroups 同源
+      reclaimableTotal.value = Number(r.totalReclaimable)
+    } finally {
+      loadingPage.value = false
     }
-    totalGroups.value = Number(r.total)
-    // 全量口径（含未加载页）：统计条与 totalGroups 同源
-    reclaimableTotal.value = Number(r.totalReclaimable)
+  }
+
+  // loadMore 放量一档并加载下一页（Y7：显式继续加载，替代无界滚动）
+  function loadMore(): Promise<void> {
+    if (groups.value.length >= loadCap.value) loadCap.value += LOAD_CAP_STEP
+    return loadResultPage(true)
   }
 
   function reloadResults() {
@@ -124,16 +150,12 @@ export const useScanStore = defineStore('scan', () => {
 
   // ---------- M3：勾选 / 保留策略 / 操作 ----------
 
-  // 组加载后重置勾选：默认勾选全部冗余项（isKeep 不可勾）。
-  // 原地修改响应式 Set——整体替换会让所有已渲染卡片重算勾选状态
+  // resetSelection 清空勾选（Y8）。
+  // 修正前语义为「默认勾选全部冗余项」：万级结果下与常驻的「永久删除」按钮
+  // 组合，一次误点仅隔一个确认框，复核成本过高 → 改为默认不勾选 + 界面引导，
+  // 由用户显式「全选」或逐项勾选（保留项始终不可勾）。
   function resetSelection() {
-    const sel = selection.value
-    sel.clear()
-    for (const g of groups.value) {
-      for (const f of g.files) {
-        if (!f.isKeep) sel.add(f.id)
-      }
-    }
+    selection.value.clear()
   }
 
   function toggleSelect(id: number) {
@@ -165,10 +187,9 @@ export const useScanStore = defineStore('scan', () => {
   async function applyKeep(kind: string, directory?: string) {
     try {
       await api.applyKeepPolicy(kind, directory)
-      await loadResultPage(false) // 后端决策已生效，重载视图
-      resetSelection()
+      await loadResultPage(false) // 后端决策已生效，重载视图（并清空勾选）
     } catch (e: any) {
-      alert('保留策略应用失败: ' + String(e))
+      toast().notifyError('保留策略应用失败', e)
     }
   }
 
@@ -176,9 +197,8 @@ export const useScanStore = defineStore('scan', () => {
     try {
       await api.clearKeepDecisions()
       await loadResultPage(false)
-      resetSelection()
     } catch (e: any) {
-      alert(String(e))
+      toast().notifyError('重置保留决策失败', e)
     }
   }
 
@@ -194,11 +214,11 @@ export const useScanStore = defineStore('scan', () => {
       })
     } catch (e: any) {
       opsRunning.value = false
-      alert(String(e))
+      toast().notifyError('执行清理操作失败', e)
     }
   }
 
-  function openTrash() { api.openTrash().catch((e: any) => alert(String(e))) }
+  function openTrash() { api.openTrash().catch((e: any) => toast().notifyError('打开回收站失败', e)) }
 
   async function previewCurrent() {
     if (currentFileID.value != null) await openPreview(currentFileID.value)
@@ -221,8 +241,7 @@ export const useScanStore = defineStore('scan', () => {
       opsRunning.value = false
       opsResult.value = r
       await refreshFailed()
-      await loadResultPage(false)
-      resetSelection()
+      await loadResultPage(false) // 重载视图并清空勾选（结果集已变化）
     })
     onEvent('scan:progress', (ev: ProgressEvent) => {
       progress.value = ev
@@ -248,7 +267,7 @@ export const useScanStore = defineStore('scan', () => {
     onEvent('scan:error', (e: any) => {
       scanning.value = false
       status.value = 'Failed'
-      alert('扫描失败: ' + String(e?.error ?? e))
+      toast().notifyError('扫描失败', e)
     })
     onEvent('app:ready', (v: string) => {
       appVersion.value = v
@@ -277,7 +296,7 @@ export const useScanStore = defineStore('scan', () => {
       settings.value = await api.saveSettings(s)
       applyTheme(s.theme)
     } catch (e: any) {
-      alert('保存设置失败: ' + String(e))
+      toast().notifyError('保存设置失败', e)
     }
   }
 
@@ -287,7 +306,7 @@ export const useScanStore = defineStore('scan', () => {
       const f = findFile(fileID)
       preview.value = { kind: p.kind, content: p.content, mime: p.mimeType, path: f?.path ?? '' }
     } catch (e: any) {
-      alert('预览失败: ' + String(e))
+      toast().notifyError('预览失败', e)
     }
   }
 
@@ -303,13 +322,14 @@ export const useScanStore = defineStore('scan', () => {
     view, roots, filters, threads, paranoid,
     status, progress, stageDesc, scanning,
     groups, totalGroups, reclaimableTotal, resultSort, resultExt, hasResult, pageSize,
+    loadCap, loadingPage, resultPage,
     failed, failedOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     applyKeep, clearKeep, executeOp, openTrash,
     running, startScan, pauseScan, resumeScan, cancelScan,
-    loadResultPage, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,
+    loadResultPage, loadMore, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,
     refreshStatus,
   }
 })

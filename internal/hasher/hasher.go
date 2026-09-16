@@ -83,9 +83,15 @@ func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
 	return out, nil
 }
 
-// HashFullSegmented 大文件分段并行：多 goroutine ReadAt 预取各段，
+// HashFullSegmented 大文件分段流水线：单生产者 ReadAt 预取各段（深度 depth），
 // 主协程按段序喂入单一 Hasher——结果与顺序读取完全一致（等价性由测试保证），
-// 同时实现 IO 与哈希计算重叠。depth 为预取深度（0 = 顺序模式）。
+// 同时实现 IO 与哈希计算重叠。
+//
+// Y2 修复：段缓冲改为「depth+1 个缓冲的环形池」复用。此前每段 make(16MiB)
+// 用完即弃——10GiB 文件会产生 640 次 16MiB 分配，GC 压力大且内存尖峰高；
+// 环形池把在途缓冲数固定为 depth+1，分配次数与段数解耦。
+// 注意：环形池由本函数自管理，depth>0 时 buf 参数不再参与（仅 depth<=0 的顺序
+// 退化路径使用），因此调用方无需为大文件路径预借读缓冲。
 func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte) ([32]byte, error) {
 	if seg <= 0 {
 		seg = LargeSeg
@@ -97,6 +103,12 @@ func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte)
 		data []byte
 		err  error
 	}
+	// 环形缓冲池：容量 depth+1（1 个在哈希 + depth 个在途预取）。
+	// 生产者从 free 取、消费者写完后归还——池满即自然背压，不会死锁。
+	free := make(chan []byte, depth+1)
+	for i := 0; i < depth+1; i++ {
+		free <- make([]byte, seg)
+	}
 	ch := make(chan block, depth)
 	done := make(chan struct{})
 	defer close(done) // 消费方提前返回时唤醒生产者退出，防 goroutine 与段缓冲泄漏
@@ -107,8 +119,13 @@ func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte)
 			if end > size {
 				end = size
 			}
-			n := int(end - off)
-			b := make([]byte, n) // 段缓冲独立分配（预取生命周期跨段）
+			var full []byte
+			select {
+			case full = <-free:
+			case <-done:
+				return
+			}
+			b := full[:int(end-off)]
 			_, err := f.ReadAt(b, off)
 			select {
 			case ch <- block{data: b, err: err}:
@@ -120,11 +137,13 @@ func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte)
 	h := blake3.New(32, nil)
 	for b := range ch {
 		if b.err != nil {
-			return [32]byte{}, b.err
+			return [32]byte{}, b.err // 提前返回：生产者由 done 唤醒并退出
 		}
 		if _, err := h.Write(b.data); err != nil {
 			return [32]byte{}, err
 		}
+		// 归还缓冲（len 被截断，cap 仍为 seg；池容量恒够，归还不会阻塞）
+		free <- b.data[:cap(b.data)]
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))

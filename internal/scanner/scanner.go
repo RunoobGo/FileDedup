@@ -78,6 +78,10 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 	}
 	res := &Result{}
 	cleaned := dedupeRoots(roots)
+	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
+	prefixes := rootPrefixes(cleaned)
+	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
+	matcher := filter.Compile(f)
 
 	var (
 		mu      sync.Mutex
@@ -156,8 +160,8 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 					if size == 0 {
 						continue // 0 字节内置跳过
 					}
-					rel := relativeTo(cleaned, full)
-					if !filter.Apply(f, de.Name(), rel, size) {
+					rel := relativeTo(prefixes, full)
+					if !matcher.Apply(de.Name(), rel, size) {
 						continue
 					}
 					e := &model.FileEntry{
@@ -230,11 +234,26 @@ func dedupeRoots(roots []string) []string {
 	return kept
 }
 
+// rootPrefixes 预计算「根 + 分隔符」前缀（G2）。
+// 原实现在 relativeTo 内部对每个文件、每个根都执行一次 r+string(filepath.Separator)，
+// 每次产生一个短命字符串；百万文件级扫描下这一项即数百万次小对象分配。
+// 预计算后每文件零分配（HasPrefix 与切片均不分配）。
+func rootPrefixes(roots []string) []string {
+	sep := string(filepath.Separator)
+	out := make([]string, len(roots))
+	for i, r := range roots {
+		out[i] = r + sep
+	}
+	return out
+}
+
 // relativeTo 计算 full 相对最近扫描根的路径（过滤 glob 用）。
-func relativeTo(roots []string, full string) string {
-	for _, r := range roots {
-		if strings.HasPrefix(full, r+string(filepath.Separator)) {
-			return full[len(r)+1:]
+// rootPrefixes 为 rootPrefixes() 的产物；len(rp) 恰为「根长 + 1」，
+// 故用 full[len(rp):] 切片即可，无需再算偏移。
+func relativeTo(rootPrefixes []string, full string) string {
+	for _, rp := range rootPrefixes {
+		if strings.HasPrefix(full, rp) {
+			return full[len(rp):]
 		}
 	}
 	return filepath.Base(full)

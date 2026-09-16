@@ -148,3 +148,68 @@ func TestWalkUnreadableDir(t *testing.T) {
 		}
 	}
 }
+
+// ---------- G2：relativeTo 根前缀预计算 ----------
+
+// naiveRelativeTo 改造前的实现，作为语义基准与性能对照。
+func naiveRelativeTo(roots []string, full string) string {
+	for _, r := range roots {
+		if strings.HasPrefix(full, r+string(filepath.Separator)) {
+			return full[len(r)+1:]
+		}
+	}
+	return filepath.Base(full)
+}
+
+// G2 等价性：新实现必须与改造前逐例一致（多根 / 直接子文件 / 根自身 / 根外路径回退）。
+func TestRelativeToEquivalence(t *testing.T) {
+	roots := []string{"/a", "/b/c", "/d", "/aa"}
+	prefixes := rootPrefixes(roots)
+	cases := []string{
+		"/a/x", "/a/x/y/z.bin", "/b/c/m/n", "/b/other", "/d",
+		"/zzz/qq", "/a", "/b/c", "/aa/f.txt", "/a.txt",
+	}
+	for _, full := range cases {
+		want := naiveRelativeTo(roots, full)
+		if got := relativeTo(prefixes, full); got != want {
+			t.Fatalf("relativeTo(%q) = %q, want %q", full, got, want)
+		}
+	}
+}
+
+// G2 回归：每文件调用必须零分配。
+// 注意：实测发现旧写法（循环内 r+sep）也已被 Go 编译器栈分配优化，堆分配同为 0，
+// 因此本项的收益只在 CPU（省去每次调用的拼接与重复长度计算），而非堆分配。
+// 断言只锁定「新实现零分配」这一契约，避免夸大收益。
+func TestRelativeToNoAllocs(t *testing.T) {
+	prefixes := rootPrefixes([]string{"/a", "/b", "/c", "/d", "/e"})
+	full := "/e/deep/nested/dir/file.bin"
+	if got := relativeTo(prefixes, full); got != "deep/nested/dir/file.bin" {
+		t.Fatalf("rel = %q", got)
+	}
+	if n := testing.AllocsPerRun(200, func() { _ = relativeTo(prefixes, full) }); n != 0 {
+		t.Fatalf("relativeTo 每次分配 %.1f 次，期望 0（G2 未生效）", n)
+	}
+	naive := testing.AllocsPerRun(200, func() {
+		_ = naiveRelativeTo([]string{"/a", "/b", "/c", "/d", "/e"}, full)
+	})
+	t.Logf("堆分配：新实现 0.0 次/调用，旧实现 %.1f 次/调用（旧写法亦被栈分配优化）", naive)
+}
+
+func BenchmarkRelativeTo(b *testing.B) {
+	roots := []string{"/a", "/b", "/c", "/d", "/e"}
+	prefixes := rootPrefixes(roots)
+	full := "/e/deep/nested/dir/file.bin"
+	b.Run("Precomputed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = relativeTo(prefixes, full)
+		}
+	})
+	b.Run("NaiveConcat", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = naiveRelativeTo(roots, full)
+		}
+	})
+}

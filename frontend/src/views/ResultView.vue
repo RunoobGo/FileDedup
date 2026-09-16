@@ -1,12 +1,14 @@
 <script setup lang="ts">
 // 结果页（M3 版）：统计条 + 保留策略工具栏 + 操作按钮 + 执行反馈 + 组列表。
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useScanStore } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 import GroupCard from '../components/GroupCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { humanBytes } from '../utils/format'
 
 const store = useScanStore()
+const toast = useToastStore()
 const confirmKind = ref<'trash' | 'delete' | 'move' | 'hardlink' | null>(null)
 const keepKind = ref('shortest')
 const keepDir = ref('')
@@ -15,19 +17,31 @@ onMounted(() => {
   if (store.hasResult && store.groups.length === 0) store.loadResultPage(false)
 })
 
-watch(() => store.groups, () => {
-  if (store.selection.size === 0) store.resetSelection()
-}, { deep: false })
+// 列表替换时的勾选清理由 store 统一处理（Y8：默认不勾选，需显式选择）
+function changeSort() { store.loadResultPage(false) }
+function changeExt() { store.loadResultPage(false) }
 
 function onScroll(e: Event) {
   const el = e.target as HTMLElement
   if (el.scrollTop + el.clientHeight >= el.scrollHeight - 200) {
-    if (store.groups.length < store.totalGroups) store.loadResultPage(true)
+    // Y7：滚动追加受放量上限约束；loadingPage 防止快速滚动重复排队拉取
+    if (
+      store.groups.length < store.totalGroups &&
+      store.groups.length < store.loadCap &&
+      !store.loadingPage
+    ) {
+      store.loadResultPage(true)
+    }
   }
 }
 
-function changeSort() { store.loadResultPage(false).then(() => store.resetSelection()) }
-function changeExt() { store.loadResultPage(false).then(() => store.resetSelection()) }
+// 已达上限时按钮标注「继续加载」并放开一档
+const capped = computed(() => store.groups.length >= store.loadCap && store.totalGroups > store.groups.length)
+const moreLabel = computed(() =>
+  capped.value
+    ? `继续加载（已加载 ${store.groups.length} 组，点击再取一档）`
+    : `加载更多（${store.groups.length}/${store.totalGroups}）`,
+)
 
 async function applyKeep() {
   await store.applyKeep(keepKind.value, keepDir.value || undefined)
@@ -38,7 +52,7 @@ async function pickKeepDir() {
   try {
     keepDir.value = await api.selectDirectory()
   } catch (e: any) {
-    alert(String(e))
+    toast.notifyError('选择目录失败', e)
   }
 }
 
@@ -68,8 +82,8 @@ function onConfirm(targetDir?: string) {
       <input :value="store.resultExt" @change="changeExt" type="text"
         placeholder="扩展名，如 .jpg" style="width: 120px" />
       <button v-if="store.totalGroups > store.groups.length" class="btn-ghost"
-        @click="store.loadResultPage(true)">
-        加载更多（{{ store.groups.length }}/{{ store.totalGroups }}）
+        :class="{ capped }" @click="store.loadMore()">
+        {{ moreLabel }}
       </button>
     </div>
 
@@ -91,9 +105,13 @@ function onConfirm(targetDir?: string) {
       </div>
       <div class="ops">
         <span class="sel-info">
-          已选 <b>{{ store.selectedFiles.length }}</b> 项 / <b>{{ humanBytes(store.selectedBytes) }}</b>
+          <template v-if="store.selectedFiles.length">
+            已选 <b>{{ store.selectedFiles.length }}</b> 项 / <b>{{ humanBytes(store.selectedBytes) }}</b>
+          </template>
+          <template v-else>未选择——勾选文件，或点「全选」选中全部冗余项（保留项不可选）</template>
         </span>
-        <button class="btn-ghost" @click="store.selectAll()">全选</button>
+        <button class="btn-ghost" :class="{ 'btn-emph': store.selectedFiles.length === 0 }"
+          @click="store.selectAll()">全选</button>
         <button class="btn-ghost" @click="store.clearSelection()">清除</button>
         <button class="btn-primary" :disabled="store.selectedFiles.length === 0"
           @click="confirmKind = 'trash'">移入回收站</button>
@@ -156,4 +174,8 @@ function onConfirm(targetDir?: string) {
 .done .x { margin-left: auto; background: none; color: var(--text-3); padding: 2px 6px; }
 .list { flex: 1; overflow-y: auto; padding: 10px 16px 20px; }
 .empty { text-align: center; color: var(--text-3); padding: 60px 0; }
+/* Y7：达到放量上限时以警示色提示需显式继续加载 */
+.btn-ghost.capped { color: var(--warn); border-color: var(--warn); }
+/* Y8：未勾选时弱强调「全选」，引导用户显式选择（不再默认全选） */
+.btn-ghost.btn-emph { border-color: var(--primary); color: var(--primary); }
 </style>

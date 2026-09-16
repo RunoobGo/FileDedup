@@ -2,6 +2,7 @@
 // 操作确认对话框（M3-T06）：回收站/移动 一级确认；永久删除强制勾选"我已知晓"（02 决策 7）。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useScanStore } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import { humanBytes } from '../utils/format'
 
@@ -11,6 +12,7 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'close'): void; (e: 'confirm', targetDir?: string): void }>()
 
 const store = useScanStore()
+const toast = useToastStore()
 const acknowledged = ref(false)
 const moveTarget = ref('')
 const picking = ref(false)
@@ -35,7 +37,7 @@ async function pickDir() {
   try {
     moveTarget.value = await api.selectDirectory()
   } catch (e: any) {
-    alert(String(e))
+    toast.notifyError('选择目录失败', e)
   } finally {
     picking.value = false
   }

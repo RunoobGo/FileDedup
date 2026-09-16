@@ -68,6 +68,20 @@ type PagedResult struct {
 	Groups           []GroupView `json:"groups"`
 }
 
+// sortKey 结果视图缓存键（Y3）：排序方式 + 归一化扩展名筛选。
+type sortKey struct {
+	sort string
+	ext  string
+}
+
+// viewCacheEntry 缓存的有序组列表 + 生成时的结果集指纹。
+// 指纹自校验：a.groups 发生任何结构性变更（新增/清理/替换）都会使旧缓存失效，
+// 避免返回陈旧排序结果（显式失效之外的第二道防线）。
+type viewCacheEntry struct {
+	groups []*model.DuplicateGroup
+	guard  uint64
+}
+
 // ScanSummary scan:done / scan:cancelled 事件载荷。
 type ScanSummary struct {
 	Groups      int    `json:"groups"`
@@ -103,6 +117,9 @@ type App struct {
 	failed  []model.FailedItem
 	lastEvs model.ProgressEvent
 
+	// Y3：结果视图按 (sort, ext) 缓存有序组列表，避免每次翻页全量重排
+	viewCache map[sortKey]viewCacheEntry
+
 	opsRunning   bool // 清理操作执行中（互斥：拒绝并发操作/保留策略，与 goroutine 写结果集互斥）
 	scanInFlight bool // 扫描 goroutine 在途（互斥新扫描：防旧任务收尾写结果集覆盖新任务）
 
@@ -113,8 +130,9 @@ type App struct {
 // NewApp 创建绑定服务。
 func NewApp() *App {
 	a := &App{
-		pipe: dedup.New(),
-		byID: make(map[uint64]*model.FileEntry),
+		pipe:      dedup.New(),
+		byID:      make(map[uint64]*model.FileEntry),
+		viewCache: make(map[sortKey]viewCacheEntry),
 	}
 	// 引擎回调 → 事件桥（M2-T03）
 	a.pipe.OnProgress = func(ev model.ProgressEvent) {
@@ -190,6 +208,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	a.byID = make(map[uint64]*model.FileEntry)
 	a.keepIDs = nil
 	a.failed = nil
+	a.invalidateViewCacheLocked() // Y3：新任务清空旧视图
 	a.mu.Unlock()
 
 	taskID := time.Now().Format("20060102-150405")
@@ -213,6 +232,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		a.mu.Lock()
 		a.groups = groups
 		a.failed = failed
+		a.invalidateViewCacheLocked() // Y3：新结果集使旧排序缓存失效
 		for _, g := range groups {
 			for _, f := range g.Files {
 				a.byID[f.ID] = f
@@ -254,7 +274,7 @@ func (a *App) GetStatus() string { return string(a.pipe.Status()) }
 
 // ---------- 结果查询 ----------
 
-// GetResultGroups 分页查询重复组（M2-T07 排序/筛选）。
+// GetResultGroups 分页查询重复组（M2-T07 排序/筛选；Y3 排序缓存）。
 func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -267,16 +287,50 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	if q.Page < 0 {
 		q.Page = 0
 	}
-	// 扩展名筛选
+	// Y3：筛选 + 排序结果按 (sort, ext) 复用。修正前每次翻页都全量重排
+	// （O(n log n)）并重扫扩展名（O(组×文件)），且全程持锁阻塞进度事件。
+	key := sortKey{sort: q.Sort, ext: normalizeExt(q.Ext)}
+	guard := resultGuard(a.groups)
+	entry, ok := a.viewCache[key]
+	if !ok || entry.guard != guard {
+		entry = viewCacheEntry{groups: a.buildSortedGroupsLocked(key), guard: guard}
+		a.viewCache[key] = entry
+	}
+	gs := entry.groups
+
+	total := uint64(len(gs))
+	// 全量可释放空间（含未加载页）：统计条与 totalGroups 同口径
+	var totalReclaim uint64
+	for _, g := range gs {
+		totalReclaim += g.Reclaimable
+	}
+	start := q.Page * q.PageSize
+	if start >= len(gs) {
+		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
+	}
+	end := start + q.PageSize
+	if end > len(gs) {
+		end = len(gs)
+	}
+	views := make([]GroupView, 0, end-start)
+	for _, g := range gs[start:end] {
+		views = append(views, toGroupView(g, a.keepIDs))
+	}
+	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: views}, nil
+}
+
+// buildSortedGroupsLocked 执行一次扩展名筛选 + 排序（调用方须持 a.mu）。
+// 返回切片只读复用：调用方不得原地修改其元素顺序。
+func (a *App) buildSortedGroupsLocked(key sortKey) []*model.DuplicateGroup {
 	var gs []*model.DuplicateGroup
 	for _, g := range a.groups {
-		if q.Ext != "" && !groupHasExt(g, q.Ext) {
+		if key.ext != "" && !groupHasExt(g, key.ext) {
 			continue
 		}
 		gs = append(gs, g)
 	}
 	// 排序（均为降序；稳定：组 ID 兜底）
-	switch q.Sort {
+	switch key.sort {
 	case "size":
 		sort.Slice(gs, func(i, j int) bool {
 			if gs[i].Files[0].Size != gs[j].Files[0].Size {
@@ -299,34 +353,39 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 			return gs[i].GroupID < gs[j].GroupID
 		})
 	}
-	total := uint64(len(gs))
-	// 全量可释放空间（含未加载页）：统计条与 totalGroups 同口径
-	var totalReclaim uint64
-	for _, g := range gs {
-		totalReclaim += g.Reclaimable
-	}
-	start := q.Page * q.PageSize
-	if start >= len(gs) {
-		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
-	}
-	end := start + q.PageSize
-	if end > len(gs) {
-		end = len(gs)
-	}
-	views := make([]GroupView, 0, end-start)
-	for _, g := range gs[start:end] {
-		views = append(views, toGroupView(g, a.keepIDs))
-	}
-	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: views}, nil
+	return gs
 }
 
-func groupHasExt(g *model.DuplicateGroup, ext string) bool {
+// invalidateViewCacheLocked 结果集结构变更后清空视图缓存（调用方须持 a.mu）。
+func (a *App) invalidateViewCacheLocked() {
+	if a.viewCache != nil {
+		clear(a.viewCache)
+	}
+}
+
+// resultGuard 结果集指纹（Y3 缓存自校验）：长度 + 各组 ID/成员数。
+// 组被新增、移除或成员变化都会改变指纹，使陈旧缓存自动失效。
+func resultGuard(groups []*model.DuplicateGroup) uint64 {
+	h := uint64(len(groups)) * 0x9E3779B97F4A7C15
+	for _, g := range groups {
+		h ^= g.GroupID*0xD6E8FEB86659FD93 + uint64(len(g.Files))*0x9E3779B97F4A7C15
+	}
+	return h
+}
+
+// normalizeExt 归一化扩展名筛选（小写、去空白、补前导点）。
+func normalizeExt(ext string) string {
 	e := strings.ToLower(strings.TrimSpace(ext))
-	if !strings.HasPrefix(e, ".") {
+	if e != "" && !strings.HasPrefix(e, ".") {
 		e = "." + e
 	}
+	return e
+}
+
+// groupHasExt 组内是否存在该扩展名（ext 须已由 normalizeExt 归一化）。
+func groupHasExt(g *model.DuplicateGroup, ext string) bool {
 	for _, f := range g.Files {
-		if strings.EqualFold(f.Ext, e) {
+		if strings.EqualFold(f.Ext, ext) {
 			return true
 		}
 	}
@@ -401,10 +460,12 @@ func (a *App) PreviewFile(id uint64) (PreviewData, error) {
 	defer f.Close()
 
 	if _, isImg := imageMime[strings.ToLower(e.Ext)]; isImg {
-		// M4-T04：任意大小图片 → 缩略图（512px JPEG；超大文件防炸限制 50MB）
-		const srcLimit = 50 << 20
+		// M4-T04：任意大小图片 → 缩略图（512px JPEG；超大文件防炸限制）。
+		// Y5：源文件上限由 50MB 收紧到 20MB——预览峰值内存 ≈ 源体积 + 解码位图，
+		// 20MB 已覆盖绝大多数照片/截图场景，显著降低单次预览的内存尖峰。
+		const srcLimit = 20 << 20
 		if e.Size > srcLimit {
-			return PreviewData{Kind: "binary", Content: "图片超过 50MB，暂不支持预览"}, nil
+			return PreviewData{Kind: "binary", Content: "图片超过 20MB，暂不支持预览"}, nil
 		}
 		b := make([]byte, e.Size)
 		if _, err := io.ReadFull(f, b); err != nil {
@@ -642,6 +703,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			}
 		}
 		a.groups = kept
+		a.invalidateViewCacheLocked() // Y3：清理后组结构变化，排序缓存失效
 		a.mu.Unlock()
 		wruntime.EventsEmit(a.ctx, "ops:done", res)
 	}()
@@ -690,9 +752,11 @@ func (a *App) CacheClear() error {
 // thumbnail 生成缩略图（M4-T04）：解码（jpeg/png/gif 首帧）→ 最近邻缩放 → JPEG。
 // 零第三方依赖（标准库 image）。
 func thumbnail(data []byte, maxDim int) ([]byte, error) {
-	// 解压炸弹防护：编码体积小 ≠ 解码位图小（50MB PNG 可达数十亿像素），
-	// 先 DecodeConfig 预检像素总数再解码
-	const maxPixels = 64 << 20 // 64M 像素（解码后峰值约 256MB RGBA）
+	// 解压炸弹防护：编码体积小 ≠ 解码位图小（小体积 PNG 可声明数十亿像素），
+	// 先 DecodeConfig 预检像素总数再解码。
+	// Y5：上限由 64M 像素收紧到 16M（≈64MB RGBA）——512px 缩略图不需要更高的
+	// 中间精度，此前 64M 像素意味着单次预览最高约 256MB 位图常驻。
+	const maxPixels = 16 << 20 // 16M 像素（解码后峰值约 64MB RGBA）
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return nil, err

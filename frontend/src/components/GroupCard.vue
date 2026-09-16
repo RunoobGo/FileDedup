@@ -5,15 +5,17 @@ import type { GroupView } from '../wails'
 import { api } from '../wails'
 import { humanBytes, formatMtime } from '../utils/format'
 import { useScanStore } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 
 const props = defineProps<{ group: GroupView }>()
 const store = useScanStore()
+const toast = useToastStore()
 const expanded = ref(true)
 // M3：勾选与操作状态由 store 管理
 
 function reveal(id: number) {
   store.preview = null
-  api.revealInFolder(id).catch((e: any) => alert('打开文件夹失败: ' + String(e)))
+  api.revealInFolder(id).catch((e: any) => toast.notifyError('打开文件夹失败', e))
 }
 </script>
 

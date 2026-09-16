@@ -2,11 +2,13 @@
 // 设置页（M2-T08 / M4-T06）：后端 settings.json 单一事实源 + 缓存管理。
 import { onMounted, ref } from 'vue'
 import { useScanStore } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import type { Settings, CacheStats } from '../wails'
 import { humanBytes } from '../utils/format'
 
 const store = useScanStore()
+const toast = useToastStore()
 const draft = ref<Settings | null>(null)
 const saved = ref(false)
 const cacheStats = ref<CacheStats | null>(null)
@@ -18,8 +20,9 @@ async function clearCache() {
   if (!confirm('确认清空哈希缓存？下次扫描将退化为首次扫描速度。')) return
   try {
     await api.cacheClear()
+    toast.notifySuccess('哈希缓存已清空')
   } catch (e: any) {
-    alert('清空缓存失败: ' + String(e))
+    toast.notifyError('清空缓存失败', e)
   }
   await refreshCache()
 }

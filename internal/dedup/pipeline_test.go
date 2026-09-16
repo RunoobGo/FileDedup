@@ -3,11 +3,13 @@ package dedup
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,7 +152,7 @@ func TestVerifyGroupTamper(t *testing.T) {
 		{Path: p3, Size: uint64(len(base))},
 	}
 	var failed []model.FailedItem
-	kept, failed := verifyGroup(g, failed)
+	kept, failed := newVerifier().group(g, failed)
 	if len(kept) != 2 {
 		t.Fatalf("保留 = %d, want 2", len(kept))
 	}
@@ -299,6 +301,31 @@ func TestPipelineCancelNoLeak(t *testing.T) {
 	t.Fatalf("疑似 goroutine 泄漏: before=%d after=%d", before, runtime.NumGoroutine())
 }
 
+// TestPipelineCancelRace Y1：Cancel 与 Run 并发（Run 持锁写 p.cancel）。
+// 该测试配合 -race 运行：修复前 Cancel 无锁读取会触发数据竞争报告。
+func TestPipelineCancelRace(t *testing.T) {
+	root := t.TempDir()
+	genDataset(t, root)
+	p := New()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.Cancel() // 与 Run 的 p.cancel 赋值并发读写
+			}
+		}
+	}()
+	_, _, _ = p.Run(context.Background(), model.ScanConfig{Roots: []string{root}, Threads: 2})
+	close(stop)
+	wg.Wait()
+}
+
 func TestPipelinePauseResume(t *testing.T) {
 	// 较大数据集保证任务窗口覆盖预筛/哈希阶段
 	root := t.TempDir()
@@ -382,4 +409,190 @@ func TestProgressCallbackFired(t *testing.T) {
 	if fired.Load() == 0 {
 		t.Fatal("进度回调未触发")
 	}
+}
+
+// TestProgressAccountingConsistent R2 回归：进度总量口径必须与实际计入量一致。
+// 修正前预筛读量（min(size,128KiB)）与全量哈希读量（size）对同一文件重复累加，
+// BytesDone 可超过 BytesTotal → 进度条虚满、ETA 提前归零。
+func TestProgressAccountingConsistent(t *testing.T) {
+	root := t.TempDir()
+	genDataset(t, root) // 含 200KiB 大文件重复组：走「预筛 + 全量」两阶段
+	var mu sync.Mutex
+	var evs []model.ProgressEvent
+	p := New()
+	p.OnProgress = func(ev model.ProgressEvent) {
+		mu.Lock()
+		evs = append(evs, ev)
+		mu.Unlock()
+	}
+	_, failed, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}, Threads: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("不应有失败项: %+v", failed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(evs) == 0 {
+		t.Fatal("无进度事件")
+	}
+	for i, ev := range evs {
+		if ev.BytesTotal > 0 && ev.BytesDone > ev.BytesTotal {
+			t.Fatalf("事件 #%d: BytesDone(%d) > BytesTotal(%d)，口径重复累加（R2 回归）",
+				i, ev.BytesDone, ev.BytesTotal)
+		}
+		if ev.FilesDone > ev.FilesTotal {
+			t.Fatalf("事件 #%d: FilesDone(%d) > FilesTotal(%d)", i, ev.FilesDone, ev.FilesTotal)
+		}
+	}
+	// 无失败场景下终值须精确收敛（Stop 推终值）
+	last := evs[len(evs)-1]
+	t.Logf("进度终值: files=%d/%d bytes=%d/%d events=%d",
+		last.FilesDone, last.FilesTotal, last.BytesDone, last.BytesTotal, len(evs))
+	if last.FilesDone != last.FilesTotal || last.BytesDone != last.BytesTotal {
+		t.Fatalf("终值未收敛: files %d/%d, bytes %d/%d",
+			last.FilesDone, last.FilesTotal, last.BytesDone, last.BytesTotal)
+	}
+}
+
+// G1 回归：比对缓冲必须在组内复用——比对分配量不得随组内文件数线性增长。
+func TestVerifierReusesBuffers(t *testing.T) {
+	root := t.TempDir()
+	size := verifyBufSize*2 + 4096 // 跨 3 个分块，确保走满多轮循环
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	var g []*model.FileEntry
+	const n = 6
+	for i := 0; i < n; i++ {
+		p := filepath.Join(root, fmt.Sprintf("f%d.bin", i))
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		g = append(g, &model.FileEntry{Path: p, Size: uint64(size)})
+	}
+
+	ver := newVerifier() // 缓冲先分配好，排除建缓冲本身的影响
+	var failed []model.FailedItem
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	kept, _ := ver.group(g, failed)
+	runtime.ReadMemStats(&after)
+
+	if len(kept) != n {
+		t.Fatalf("保留 = %d, want %d", len(kept), n)
+	}
+	// 不复用时：n-1 = 5 次比对 × 2 × 256KiB = 2.5MiB
+	// 复用后只应有极少量杂项分配，阈值取 512KiB 留足余量
+	alloc := after.TotalAlloc - before.TotalAlloc
+	const naiveAlloc = (n - 1) * 2 * verifyBufSize
+	if alloc > 512<<10 {
+		t.Fatalf("比对分配 %d 字节，疑似未复用缓冲（不复用应为 %d 字节）", alloc, naiveAlloc)
+	}
+	t.Logf("比对分配 %d 字节（不复用应为 %d 字节，省 %.1f%%）",
+		alloc, naiveAlloc, 100*(1-float64(alloc)/float64(naiveAlloc)))
+}
+
+// G1 等价性：跨多个 256KiB 分块的比对必须正确，含仅首字节 / 仅末块不一致。
+func TestVerifierMultiChunkEquivalence(t *testing.T) {
+	root := t.TempDir()
+	size := verifyBufSize*2 + 12345
+	base := make([]byte, size)
+	if _, err := rand.Read(base); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(name string, b []byte) string {
+		t.Helper()
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	same := append([]byte{}, base...)
+
+	headDiff := append([]byte{}, base...)
+	headDiff[0] ^= 0xFF // 第 1 块不一致
+
+	tailDiff := append([]byte{}, base...)
+	tailDiff[size-1] ^= 0xFF // 最后一个不完整块不一致
+
+	pRep := write("rep.bin", base)
+	pSame := write("same.bin", same)
+	pHead := write("head.bin", headDiff)
+	pTail := write("tail.bin", tailDiff)
+
+	g := []*model.FileEntry{
+		{Path: pRep, Size: uint64(size)},
+		{Path: pSame, Size: uint64(size)},
+		{Path: pHead, Size: uint64(size)},
+		{Path: pTail, Size: uint64(size)},
+	}
+	var failed []model.FailedItem
+	kept, failed := newVerifier().group(g, failed)
+
+	if len(kept) != 2 {
+		t.Fatalf("保留 = %d, want 2 (rep + same)", len(kept))
+	}
+	if kept[0].Path != pRep || kept[1].Path != pSame {
+		t.Fatalf("保留集错误: %v, %v", kept[0].Path, kept[1].Path)
+	}
+	if len(failed) != 2 {
+		t.Fatalf("失败条目 = %d, want 2", len(failed))
+	}
+	got := map[string]bool{failed[0].Path: true, failed[1].Path: true}
+	if !got[pHead] || !got[pTail] {
+		t.Fatalf("失败集应含 head/tail 两处差异: %+v", failed)
+	}
+}
+
+// G1 等价性：代表文件句柄在每次比对前复位，多轮比对结果不受顺序影响。
+func TestVerifierSeekResetBetweenFiles(t *testing.T) {
+	root := t.TempDir()
+	size := verifyBufSize * 2
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	var g []*model.FileEntry
+	for i := 0; i < 4; i++ {
+		p := filepath.Join(root, fmt.Sprintf("s%d.bin", i))
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		g = append(g, &model.FileEntry{Path: p, Size: uint64(size)})
+	}
+	var failed []model.FailedItem
+	kept, _ := newVerifier().group(g, failed)
+	if len(kept) != 4 {
+		t.Fatalf("保留 = %d, want 4（若句柄未复位，第 3 个起会读到 EOF 而误判）", len(kept))
+	}
+}
+
+// G6 安全契约：自动并发度必须在 [1, 核数-1] 区间内——只降级不升级，
+// 且任何探测结果都不会算出非法的并发数。
+func TestAutoThreadsWithinBounds(t *testing.T) {
+	base := defaultThreads()
+	roots := []string{t.TempDir()}
+	got := autoThreads(roots)
+	if got < 1 {
+		t.Fatalf("自动并发度必须 >= 1，实际 %d", got)
+	}
+	if got > base {
+		t.Fatalf("自动并发度 %d 超过核数-1(%d)，违反「只降级不升级」", got, base)
+	}
+	// 空 roots 不得 panic，且维持默认
+	if empty := autoThreads(nil); empty != base {
+		t.Fatalf("空 roots 应维持默认 %d，实际 %d", base, empty)
+	}
+	// 不存在的根：探测失败必须维持默认，绝不降级
+	if bad := autoThreads([]string{"/definitely/not/here/xyz"}); bad != base {
+		t.Fatalf("探测失败应维持默认 %d，实际 %d", base, bad)
+	}
+	t.Logf("核数-1 = %d，实测自动并发度 = %d（根 %v）", base, got, roots)
 }

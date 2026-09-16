@@ -80,7 +80,10 @@ func openDB(path string) (*sql.DB, error) {
 			full     BLOB,
 			last_hit INTEGER NOT NULL DEFAULT 0
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_cache_size ON hash_cache(size)`,
+		// G4：idx_cache_size 为死索引——size 从不作为查询谓词或排序键
+		// （Lookup/Touch 走 path 主键，淘汰走 last_hit 索引），
+		// 仅按行付出 B-tree 维护成本与库体积。旧库可能已建，故显式清除。
+		`DROP INDEX IF EXISTS idx_cache_size`,
 		`CREATE INDEX IF NOT EXISTS idx_cache_last_hit ON hash_cache(last_hit)`,
 	} {
 		if _, err := db.Exec(p); err != nil {
@@ -148,6 +151,45 @@ func (c *Cache) Store(entries []Entry) error {
 		return err
 	}
 	return c.evictLocked()
+}
+
+// Touch 批量刷新命中条目的 last_hit（LRU 语义：命中即续期）。
+// R1 修复：此前命中条目永不续期，高频命中的热文件反而最先被淘汰。
+// 单事务执行；空列表无操作。
+func (c *Cache) Touch(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now().Unix()
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE hash_cache SET last_hit = ? WHERE path = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, p := range paths {
+		if _, err := stmt.Exec(now, p); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LastHit 读取条目 last_hit（诊断/测试用：验证命中续期语义）。
+func (c *Cache) LastHit(path string) (int64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var ts int64
+	if err := c.db.QueryRow(`SELECT last_hit FROM hash_cache WHERE path = ?`, path).Scan(&ts); err != nil {
+		return 0, false
+	}
+	return ts, true
 }
 
 // evictLocked 超上限淘汰（last_hit 最旧优先）。

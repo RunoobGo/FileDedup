@@ -9,7 +9,14 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 )
 
-//go:embed all:frontend/dist
+// assets 前端产物（生产构建）。
+// G5：此处**不能**用 all: 前缀——all: 会把 .DS_Store 等点开头文件一并编入，
+// 使 macOS 的 Finder 元数据（6KB / 每个目录一份）被打进发布二进制。
+// 去掉 all: 后 Go 的 embed 规则天然排除 "." 与 "_" 开头的文件，
+// 构成编译期保证：无论 dist 被谁怎么污染，元数据都不可能进包。
+// 注意：若将来 dist 需要正常发布点开头文件（如 .well-known），须改用其他方案。
+//
+//go:embed frontend/dist
 var assets embed.FS
 
 func main() {
