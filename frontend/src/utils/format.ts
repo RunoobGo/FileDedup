@@ -28,6 +28,13 @@ export function humanTimeShort(ms: number): string {
   return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`
 }
 
+/** P2-6：计数类整数统一加千分位。
+ *  此前 12 万条缓存显示为「128394 条目」，位数一多就难以一眼读出量级。 */
+export function formatCount(n: number | undefined | null): string {
+  if (n === undefined || n === null || !Number.isFinite(n)) return '—'
+  return n.toLocaleString('zh-CN')
+}
+
 export function formatMtime(ns: number): string {
   if (!ns) return '—'
   const d = new Date(ns / 1e6)

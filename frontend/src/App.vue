@@ -8,6 +8,8 @@ import SettingsView from './views/SettingsView.vue'
 import FailedDrawer from './components/FailedDrawer.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import ToastHost from './components/ToastHost.vue'
+import Icon from './components/Icon.vue'
+import type { IconName } from './components/icons'
 
 const store = useScanStore()
 onMounted(() => store.bindEvents())
@@ -37,11 +39,12 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
-const navs = [
-  { key: 'scan', label: '扫描', icon: '◎' },
-  { key: 'result', label: '结果', icon: '⧉' },
-  { key: 'settings', label: '设置', icon: '⚙' },
-] as const
+// P2-1：导航图标由文字符号（◎ ⧉ ⚙）改为统一线性图标集的图标名。
+const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName }[] = [
+  { key: 'scan', label: '扫描', icon: 'scan' },
+  { key: 'result', label: '结果', icon: 'layers' },
+  { key: 'settings', label: '设置', icon: 'gear' },
+]
 </script>
 
 <template>
@@ -57,7 +60,7 @@ const navs = [
           :title="n.label"
           @click="store.switchView(n.key)"
         >
-          <span class="icon">{{ n.icon }}</span>
+          <Icon class="icon" :name="n.icon" :size="18" />
           <span class="label">{{ n.label }}</span>
           <span v-if="n.key === 'result' && store.failed.length" class="badge">{{
             store.failed.length
@@ -90,21 +93,21 @@ const navs = [
   flex-direction: column;
   align-items: center;
   padding: 12px 0;
-  gap: 8px;
+  gap: var(--sp-2);
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
 }
 .logo {
   font-weight: 700;
-  font-size: 15px;
-  color: var(--primary);
+  font-size: var(--fs-lg);
+  color: var(--primary-ink);
   margin-bottom: 10px;
   letter-spacing: 1px;
 }
 nav {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--sp-1);
   flex: 1;
 }
 .nav-btn {
@@ -115,28 +118,31 @@ nav {
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   color: var(--text-2);
   background: transparent;
 }
 .nav-btn:hover { background: var(--bg-hover); }
-.nav-btn.active { background: var(--primary-weak); color: var(--primary); }
-.icon { font-size: 16px; line-height: 1; }
-.label { font-size: 10.5px; }
+.nav-btn.active { background: var(--primary-weak); color: var(--primary-ink); }
+/* P2-1：图标改为 SVG 后不再需要 font-size，只保证固定行盒，避免导航高度随字体度量抖动 */
+.icon { display: block; height: 18px; }
+.label { font-size: var(--fs-xs); }
 .badge {
   position: absolute;
-  top: 2px;
-  right: 4px;
-  min-width: 14px;
-  height: 14px;
+  top: 1px;
+  right: 3px;
+  /* P2-2：字号由 9px 提到 --fs-xs(11px)。9px 已在可读性下限之下，
+     且是导航徽章里唯一承载数字的文本。盒高随之 14 → 17 以容纳新的字高。 */
+  min-width: 17px;
+  height: 17px;
   padding: 0 3px;
-  border-radius: 7px;
+  border-radius: var(--r-md);
   background: var(--danger);
-  color: #fff;
-  font-size: 9px;
-  line-height: 14px;
+  color: var(--on-danger);
+  font-size: var(--fs-xs);
+  line-height: 17px;
   text-align: center;
 }
-.ver { font-size: 10px; color: var(--text-3); }
+.ver { font-size: var(--fs-xs); color: var(--text-3); }
 .main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 </style>

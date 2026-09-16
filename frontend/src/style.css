@@ -1,28 +1,94 @@
 /* 主题变量（01 §6：亮/暗/跟随系统，CSS 变量驱动） */
 :root {
+  /* P0-2：声明 color-scheme 才能让原生控件（复选框、滚动条、隐式下拉）跟随主题。
+     缺失时浏览器一律按 light 渲染 UA 样式，暗色主题下复选框会成为纯白方块。 */
+  color-scheme: light;
   --bg: #f6f7fb;
   --bg-panel: #ffffff;
   --bg-hover: #f0f2f7;
   --bg-active: #e8ecf7;
   --border: #e3e6ee;
   --text: #1c2333;
-  --text-2: #5a6478;
-  --text-3: #9aa3b5;
-  --primary: #3b82f6;
-  --primary-weak: rgba(59, 130, 246, 0.12);
-  --danger: #ef4444;
-  --danger-weak: rgba(239, 68, 68, 0.1);
+  /* P0-3：原 --text-2(#5a6478) 与 --text-3(#9aa3b5) 的间隔极小、且 --text-3 全线不达 AA
+     （2.54:1，却承载路径/时间等关键信息）。这里把两个次级色一起下压：
+     --text-2 留出层次空间，--text-3 提升到在 bg-panel / bg-hover / bg 三种底色上
+     都 ≥4.5:1（实测 5.30 / 4.73 / 4.95），同时两者仍可区分。 */
+  --text-2: #4a5464;
+  --text-3: #646c79;
+  --primary: #2563eb;
+  --primary-weak: rgba(37, 99, 235, 0.12);
+  --danger: #dc2626;
+  --danger-weak: rgba(220, 38, 38, 0.1);
   --success: #10b981;
   --warn: #f59e0b;
+  /* P1-1：填充面上的文字色。亮色主题的填充色要足够深才能承载白字
+     （--primary #3b82f6 配白字只有 3.68:1、--danger #ef4444 只有 3.76:1），
+     故把两个填充色各压深一档（白字实测 5.17 / 4.83）。暗色主题反过来用深色文字。 */
+  --on-primary: #fff;
+  --on-danger: #fff;
+  /* P0-3 补充：--primary/--success/--warn/--danger 是为填充面与边框设计的，
+     直接当小字号文字色用时在亮色主题下只有 2.15~3.76:1（实测 .keep-tag 2.17、
+     .stage 2.15、.err 3.76、.reclaim 3.68）。以下 -ink 变体专供文字，
+     目标 ≥4.5:1（实测 5.0~6.9 on 面板底）。
+     注：--primary-ink 与压深后的 --primary 取值相同，保留两个名字是为了让
+     「填充色」与「文字色」两个角色各自可独立演进。
+     P2-2 修正：-ink 变体的**最差底色不是面板白，而是各自的 -weak 变体**——
+     激活态导航（`.nav-btn.active`）就是「--primary-ink 文字 + --primary-weak 底」。
+     原值 #2563eb 在该底色上实测仅 4.37:1，差一点点没到正文 AA 的 4.5:1
+     （全站对比度扫描中唯一一处失败）。压深到 #1d4ed8 后：
+       on --primary-weak 5.66:1（原 4.37）· on 面板白 6.70:1（原 5.17）。 */
+  --primary-ink: #1d4ed8;
+  --success-ink: #065f46;
+  --warn-ink: #b45309;
+  --danger-ink: #b91c1c;
+  --success-weak: rgba(16, 185, 129, 0.12);
+  --warn-weak: rgba(245, 158, 11, 0.14);
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
   --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.12);
-  --radius: 8px;
+
+  /* ---------- P1-7：尺度令牌 ----------
+     修复前全站取值范围失控：padding 12 档（3/4/6/8/9/10/12/14/18/20/22/24）、
+     gap 6 档、border-radius 4 档（4/6/7/8）、三个页面根留白 20/24/16 三套。
+     收敛为 6 档间距 + 3 档圆角 + 统一页面留白，后续新增样式一律走令牌。 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  /* 三个页面统一 24px 左右留白 —— 原结果页是 16px 例外，切换页面时内容会横向跳动 8px */
+  --page-gutter: var(--sp-5);
+  --r-sm: 4px; /* 标签、徽章、进度条 */
+  --r-md: 8px; /* 面板、卡片、按钮、输入框、列表行（合并原 6 / 7 / 8） */
+  --r-lg: 12px; /* 模态与浮层，与页内控件拉开层级 */
+
+  /* ---------- P2-2：字号阶梯 ----------
+     修复前全站出现 10 个不同字号（9 / 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 14 / 15），
+     其中 9px 与 10px 出现在可读内容上、11.5px 与 12.5px 是只此一处的孤立取值。
+     字号档位越多，"次级信息"就越难保持一致性——同一个层级在不同页面会落到不同档。
+     收敛为 5 档，并让每一档对应明确的语义角色：
+
+       xs   11px  仅角标/徽章（导航未读徽章、图片组标记、保留/冗余标签、统计格小标题）
+       sm   12px  次级文字（路径、时间、提示、表单标签、统计条文字、提示条正文）
+       base 13px  正文、按钮、列表主文本（body 默认值）
+       lg   15px  面板/浮层标题、统计数值、空态标题、品牌字
+       xl   20px  页面标题（当前 UI 尚无此角色，预留，避免将来又冒出临时取值）
+
+     注意：图标尺寸**不跟随**字号（P2-1 已把图标改为 SVG，尺寸由 width/height 决定），
+     因此调整字号不会牵动图标排版。 */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 20px;
+
   --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
     "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
 [data-theme='dark'] {
+  color-scheme: dark; /* P0-2：同上，暗色主题下原生控件走暗色 UA 样式 */
   --bg: #0f1420;
   --bg-panel: #171e2e;
   --bg-hover: #1f2738;
@@ -30,11 +96,26 @@
   --border: #28324a;
   --text: #e7ebf3;
   --text-2: #9aa6bd;
-  --text-3: #5f6b83;
+  --text-3: #828ea6; /* P0-3：由 #5f6b83 提亮（3.11:1 → 5.05:1 on 面板底） */
   --primary: #5b9dff;
   --primary-weak: rgba(91, 157, 255, 0.15);
   --danger: #f87171;
   --danger-weak: rgba(248, 113, 113, 0.12);
+  /* 补齐亮色主题未覆盖的暗色语义色（原样沿用亮色值）。
+     实测暗色下沿用亮色值本身仍达标（--success 6.56:1），但偏浊，
+     这里按设计令牌提案提亮一档以贴合暗色背景。 */
+  --success: #34d399;
+  --warn: #fbbf24;
+  /* P1-1：暗色主题的主色/危险色是亮色系（更适合深底），配白字只有 2.72 / 2.77:1，
+     因此填充面改用深色文字（实测 6.90 / 6.79:1）—— 这也是暗色 UI 的通行做法。 */
+  --on-primary: #0b1020;
+  --on-danger: #0b1020;
+  --primary-ink: #5b9dff;
+  --success-ink: #34d399;
+  --warn-ink: #fbbf24;
+  --danger-ink: #f87171;
+  --success-weak: rgba(52, 211, 153, 0.14);
+  --warn-weak: rgba(251, 191, 36, 0.14);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
@@ -45,7 +126,7 @@ html, body, #app { height: 100%; }
 
 body {
   font-family: var(--font);
-  font-size: 13px;
+  font-size: var(--fs-base);
   color: var(--text);
   background: var(--bg);
   overflow: hidden;
@@ -54,16 +135,16 @@ body {
 
 button {
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-base);
   border: none;
-  border-radius: 6px;
+  border-radius: var(--r-md);
   cursor: pointer;
   transition: background 0.15s, opacity 0.15s;
 }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .btn-primary {
-  background: var(--primary); color: #fff; padding: 8px 18px;
+  background: var(--primary); color: var(--on-primary); padding: 8px 18px;
   font-weight: 500;
 }
 .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
@@ -75,23 +156,53 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 
 .btn-danger {
-  background: var(--danger); color: #fff; padding: 8px 18px;
+  background: var(--danger); color: var(--on-danger); padding: 8px 18px;
 }
 
 input[type='text'], input[type='number'], select {
-  font-family: inherit; font-size: 13px;
+  font-family: inherit; font-size: var(--fs-base);
   color: var(--text);
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--r-md);
   padding: 6px 10px;
-  outline: none;
+  outline: none; /* 基态去掉 UA 环，键盘焦点由下方统一的 :focus-visible 规则下发（P1-6） */
   user-select: text;
 }
 input:focus, select:focus { border-color: var(--primary); }
 
+/* P1-6：统一焦点可见性。
+   修复前只有 UA 默认环（`auto 1px rgb(0,95,204)`、offset 0），对 --primary 填充的
+   对比度仅 1.16:1（对 --danger 填充 1.24:1），等于看不见；而输入框/下拉更是直接
+   `outline: none`，只靠边框 #e3e6ee→--primary 的变色充当焦点提示（反模式，
+   亮色下边框对白底也只有 1.25:1）。实测 84 个 Tab 落点里有 15 个（17.9%）零焦点指示，
+   且全部是 input/select。
+   现在统一下发 2px 主色描边 + 2px 偏移：偏移让描边落在背景而非填充之上，
+   因此对面板底 5.17:1（亮）/ 6.95:1（暗），对任何填充色都成立。
+   选择器与 input[type='text'] 同为 (0,1,1) 且写在后面，可靠压过基态的 outline: none。 */
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* 暗色下主色为 #5b9dff，对深色面板底对比度 6.95:1，无需额外内衬，规则沿用同一套。 */
+
+/* P0-2：统一原生勾选控件的强调色（此前只有组卡片声明，扫描页用的是 UA 默认蓝）。
+   --primary 随主题切换，因此亮/暗两套主题各自拿到合适的勾选色。 */
+input[type='checkbox'], input[type='radio'] {
+  accent-color: var(--primary);
+  /* P1-5：UA 默认勾选框只有 13×13，低于 WCAG 2.5.8 的 16px 视觉下限。
+     统一提到 16×16；命中区域由包裹它的 <label>（扫描页过滤器）或
+     .check-wrap（组卡片文件行）承载，实际可点面积 ≥26×26。 */
+  width: 16px; height: 16px; flex: 0 0 auto;
+}
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--r-sm); }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
 ::-webkit-scrollbar-track { background: transparent; }
 
@@ -99,17 +210,32 @@ input:focus, select:focus { border-color: var(--primary); }
 .panel {
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--r-md);
   box-shadow: var(--shadow);
 }
 
 .tag {
-  display: inline-block; padding: 1px 8px; border-radius: 4px;
-  font-size: 11px; line-height: 18px;
+  display: inline-block; padding: 1px 8px; border-radius: var(--r-sm);
+  font-size: var(--fs-xs); line-height: 18px;
   background: var(--bg-hover); color: var(--text-2);
 }
-.tag-keep { background: rgba(16, 185, 129, 0.12); color: var(--success); }
-.tag-warn { background: var(--danger-weak); color: var(--danger); }
+.tag-keep { background: var(--success-weak); color: var(--success-ink); }
+.tag-warn { background: var(--danger-weak); color: var(--danger-ink); }
 
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* P2-4：尊重系统的「减弱动态效果」。此前全站 6 处 transition 与 1 处 pulse 动画
+   （扫描中的状态点 1.2s 无限脉冲）都无条件执行，前庭功能敏感的用户无法关闭。
+   这里统一压到 0.01ms 并只播一次——保留终态、去掉动效，与 WCAG 2.3.3 一致。
+   放在全局样式表里，因此对 scoped 组件内的 <transition> 同样生效。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}

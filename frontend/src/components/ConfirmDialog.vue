@@ -5,6 +5,7 @@ import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import { humanBytes } from '../utils/format'
+import { useModal } from '../composables/useModal'
 
 const props = defineProps<{
   kind: 'trash' | 'delete' | 'move' | 'hardlink'
@@ -57,12 +58,24 @@ function onKeydown(e: KeyboardEvent) {
 }
 onMounted(() => window.addEventListener('keydown', onKeydown, true))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown, true))
+
+// P2-3：浮层语义 + 焦点管理。首焦点落在 DOM 序第一个可聚焦元素上 ——
+// delete 场景是「我已知晓」勾选框，其余场景是「取消」，都不会默认停在破坏性按钮上。
+const dlgRef = ref<HTMLElement | null>(null)
+useModal(dlgRef)
 </script>
 
 <template>
   <div class="mask" @click.self="emit('close')">
-    <div class="panel dlg">
-      <div class="t" :class="{ danger: meta.danger }">{{ meta.title }}</div>
+    <div
+      ref="dlgRef"
+      class="panel dlg"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      tabindex="-1"
+    >
+      <div id="confirm-dialog-title" class="t" :class="{ danger: meta.danger }">{{ meta.title }}</div>
       <p class="d">{{ meta.desc }}</p>
       <div class="box">
         <div>将处理 <b>{{ store.selectedFiles.length }}</b> 个文件</div>
@@ -88,14 +101,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown, true))
 
 <style scoped>
 .mask { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 120; }
-.dlg { width: 420px; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
-.t { font-size: 15px; font-weight: 600; }
-.t.danger { color: var(--danger); }
+.dlg { width: 420px; padding: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); border-radius: var(--r-lg); }
+.t { font-size: var(--fs-lg); font-weight: 600; }
+.t.danger { color: var(--danger-ink); }
 .d { color: var(--text-2); }
-.box { background: var(--bg-hover); border-radius: var(--radius); padding: 10px 14px; display: flex; gap: 24px; font-size: 12px; color: var(--text-2); }
+.box { background: var(--bg-hover); border-radius: var(--r-sm); padding: 10px 14px; display: flex; gap: var(--sp-5); font-size: var(--fs-sm); color: var(--text-2); }
 .box b { color: var(--text); font-variant-numeric: tabular-nums; }
-.moverow { display: flex; gap: 8px; }
+.moverow { display: flex; gap: var(--sp-2); }
 .moverow input { flex: 1; }
-.ack { display: flex; gap: 6px; align-items: center; color: var(--danger); font-size: 12px; }
-.btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.ack { display: flex; gap: var(--sp-1); align-items: center; color: var(--danger-ink); font-size: var(--fs-sm); }
+.btns { display: flex; justify-content: flex-end; gap: var(--sp-3); margin-top: var(--sp-1); }
 </style>

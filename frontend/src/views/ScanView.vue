@@ -3,7 +3,8 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useScanStore, emptyFilters } from '../stores/scan'
 import { api } from '../wails'
-import { humanBytes, humanSpeed, humanTime, statusLabel, stageLabel } from '../utils/format'
+import { humanBytes, humanSpeed, humanTime, statusLabel, stageLabel, formatCount } from '../utils/format'
+import Icon from '../components/Icon.vue'
 
 const store = useScanStore()
 const pastePath = ref('')
@@ -12,6 +13,25 @@ const advancedOpen = ref(false)
 const stageText = computed(() => {
   const st = store.progress?.Stage
   return st ? (stageLabel[st] ?? st) : store.stageDesc
+})
+
+// P2-8①：运行态下 Status 与 Stage 是**同一个维度**，并排展示就成了同义重复
+// （实测截图里出现「全量哈希」+「哈希中」两行近义文案）。
+// 后端在运行时对每个阶段都有唯一对应的状态：
+//   scan ↔ Scanning、prefilter ↔ Prefiltering、hash ↔ Hashing
+// 因此当 Status 恰好是当前 Stage 的"进行时"表述时不再单独渲染状态标签；
+// 只有 Status 携带阶段之外的信息（已暂停 / 空闲 / 已完成 / 已取消 / 失败，
+// 或阶段与状态不同步）时才显示，避免丢掉真正的新信息。
+const STAGE_OF_STATUS: Record<string, string> = {
+  Scanning: 'scan',
+  Prefiltering: 'prefilter',
+  Hashing: 'hash',
+}
+const statusTag = computed(() => {
+  const st = store.status
+  const implied = STAGE_OF_STATUS[st]
+  if (implied && implied === (store.progress?.Stage ?? '')) return ''
+  return statusLabel[st] ?? st
 })
 
 async function addByPicker() {
@@ -69,12 +89,12 @@ const progressPercent = computed(() => {
       <div class="run-head">
         <span class="dot" :class="{ paused: store.status === 'Paused' }"></span>
         <span class="stage">{{ stageText }}</span>
-        <span class="status-tag">{{ statusLabel[store.status] ?? store.status }}</span>
+        <span v-if="statusTag" class="status-tag">{{ statusTag }}</span>
       </div>
       <div class="bar"><div class="fill" :style="{ width: progressPercent + '%' }"></div></div>
       <div class="stats">
         <div class="stat">
-          <div class="v">{{ store.progress?.FilesDone ?? 0 }}</div>
+          <div class="v">{{ formatCount(store.progress?.FilesDone ?? 0) }}</div>
           <div class="k">已处理文件</div>
         </div>
         <div class="stat">
@@ -105,12 +125,21 @@ const progressPercent = computed(() => {
           <div v-if="store.roots.length === 0" class="empty">将文件夹拖到这里，或点击下方添加</div>
           <div v-for="(r, i) in store.roots" :key="r" class="root-item">
             <span class="path" :title="r">{{ r }}</span>
-            <button class="x" @click="removeRoot(i)">✕</button>
+            <button class="x" aria-label="移除该目录" :title="`移除目录 ${r}`" @click="removeRoot(i)">
+              <Icon name="close" :size="14" />
+            </button>
           </div>
           <div class="add-row">
             <button class="btn-primary" @click="addByPicker">选择目录</button>
-            <input v-model="pastePath" type="text" placeholder="或粘贴路径后回车"
-              @keydown.enter="addRoot(pastePath)" />
+            <!-- P2-3：本输入框原先只有 placeholder，没有可访问名称（占位符不能当标签用，
+                 聚焦后即消失，且屏幕阅读器不会把它当名称播报）。补 aria-label。 -->
+            <input
+              v-model="pastePath"
+              type="text"
+              aria-label="粘贴要扫描的目录路径"
+              placeholder="或粘贴路径后回车"
+              @keydown.enter="addRoot(pastePath)"
+            />
           </div>
         </div>
       </div>
@@ -131,8 +160,9 @@ const progressPercent = computed(() => {
         </div>
 
         <!-- 渐进披露：高级选项折叠区（02 §5.2） -->
-        <button class="toggle" @click="advancedOpen = !advancedOpen">
-          {{ advancedOpen ? '收起' : '展开' }}高级选项 ▾
+        <button class="toggle" :aria-expanded="advancedOpen" @click="advancedOpen = !advancedOpen">
+          {{ advancedOpen ? '收起' : '展开' }}高级选项
+          <Icon name="chevron-down" :size="14" :class="['chev', { open: advancedOpen }]" />
         </button>
         <div v-show="advancedOpen" class="grid adv">
           <label>包含扩展名<input v-model="extInclude" type="text" placeholder=".jpg,.png（空 = 全部）" /></label>
@@ -155,55 +185,78 @@ const progressPercent = computed(() => {
 .scan-view {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 24px;
+  padding: var(--sp-5) var(--page-gutter);
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--sp-4);
 }
-.sec-title { font-weight: 600; margin-bottom: 10px; }
+.sec-title { font-weight: 600; margin-bottom: var(--sp-3); }
 
 /* 运行态 */
-.running { padding: 26px; display: flex; flex-direction: column; gap: 16px; }
-.run-head { display: flex; align-items: center; gap: 10px; }
+.running { padding: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-4); }
+.run-head { display: flex; align-items: center; gap: var(--sp-3); }
 .dot {
   width: 10px; height: 10px; border-radius: 50%;
   background: var(--primary);
   animation: pulse 1.2s ease-in-out infinite;
 }
-.dot.paused { background: var(--warn); animation: none; }
+/* 暂停态圆点属状态指示图形，需 ≥3:1（--warn 亮色仅 2.15:1） */
+.dot.paused { background: var(--warn-ink); animation: none; }
 @keyframes pulse { 50% { opacity: 0.3; } }
-.stage { font-weight: 600; font-size: 14px; }
+.stage { font-weight: 600; font-size: var(--fs-lg); }
 .status-tag { color: var(--text-3); }
-.bar { height: 8px; border-radius: 4px; background: var(--bg-hover); overflow: hidden; }
-.fill { height: 100%; background: var(--primary); border-radius: 4px; transition: width 0.3s; }
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-.stat { text-align: center; padding: 10px 0; border-radius: var(--radius); background: var(--bg-hover); }
-.stat .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat .k { font-size: 11px; color: var(--text-3); margin-top: 2px; }
-.actions { display: flex; gap: 10px; justify-content: center; }
+.bar { height: 8px; border-radius: var(--r-sm); background: var(--bg-hover); overflow: hidden; }
+.fill { height: 100%; background: var(--primary); border-radius: var(--r-sm); transition: width 0.3s; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--sp-3); }
+.stat { text-align: center; padding: 10px 0; border-radius: var(--r-md); background: var(--bg-hover); }
+.stat .v { font-size: var(--fs-lg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat .k { font-size: var(--fs-sm); color: var(--text-3); margin-top: 2px; }
+.actions { display: flex; gap: var(--sp-3); justify-content: center; }
 
 /* 目录 */
-.drop-zone { border: 1.5px dashed var(--border); border-radius: var(--radius); padding: 14px; }
-.empty { text-align: center; color: var(--text-3); padding: 22px 0; }
+.drop-zone { border: 1.5px dashed var(--border); border-radius: var(--r-md); padding: var(--sp-4); }
+.empty { text-align: center; color: var(--text-3); padding: var(--sp-5) 0; }
 .root-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; border-radius: 6px; margin-bottom: 6px;
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 7px 10px; border-radius: var(--r-md); margin-bottom: 6px;
   background: var(--bg-hover); user-select: text;
 }
-.path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12px; }
-.x { background: none; color: var(--text-3); padding: 2px 6px; }
-.x:hover { color: var(--danger); }
-.add-row { display: flex; gap: 10px; margin-top: 8px; }
+.path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-sm); }
+/* P1-5：原 21.9×20，低于 28×28 的图标按钮下限。撑到 28×28 后负纵向 margin 抵消，
+   目录行高保持 34px。 */
+.x {
+  background: none; color: var(--text-3);
+  display: flex; align-items: center; justify-content: center;
+  min-width: 28px; min-height: 28px; margin: -4px 0;
+  padding: 0; border-radius: var(--r-md); line-height: 1;
+}
+.x:hover { color: var(--danger-ink); background: var(--danger-weak); }
+.add-row { display: flex; gap: var(--sp-3); margin-top: 8px; }
 .add-row input { flex: 1; }
 
 /* 过滤器 */
-.filters { padding: 18px; }
-.grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
-.grid label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-2); }
+.filters { padding: var(--sp-4); }
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: var(--sp-3); }
+.grid label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
 .grid label.wide { grid-column: span 2; }
-.check { flex-direction: row; align-items: center; gap: 6px; }
-.toggle { background: none; color: var(--primary); padding: 8px 0 4px; text-align: left; }
+/* P0-1：`.check` 的 (0,1,0) 特异性压不过 `.grid label` 的 (0,1,1)，
+   导致 flex-direction: row 从未生效、复选框与自己的标签错行 19px。
+   用 `.grid label.check` 提高权重，并让「复选框 + 文案」与同格数字输入框落在同一水平带。
+   偏移量推导：数字格控件顶部 = 标签行高 + gap；复选框比输入框矮 14px（16 vs 30），
+   居中后需再下移 7px，故 padding-top = 标签行高 + gap。
+   P1-7：把 gap 写进 calc，间隔令牌一改这里自动跟随，不再是一个孤立的魔数。
+   标签行高为 12px 字体在 normal 行高下的实测值 17.5px。 */
+.grid label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-1);
+  padding-top: calc(17.5px + var(--sp-1));
+}
+.toggle { background: none; color: var(--primary-ink); padding: 8px 0 4px; text-align: left; }
+/* P2-1：折叠指示由文字字符 ▾ 改为线性图标，展开态用旋转表达（原先只靠 ▾/▸ 两种字形） */
+.toggle .chev { margin-left: 4px; transition: transform 0.18s ease; }
+.toggle .chev.open { transform: rotate(180deg); }
 .adv { border-top: 1px dashed var(--border); padding-top: 10px; }
-.filter-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
-.start { font-size: 14px; padding: 9px 22px; }
+.filter-foot { display: flex; justify-content: flex-end; gap: var(--sp-3); margin-top: 14px; }
+.start { font-size: var(--fs-lg); padding: 9px 22px; }
 </style>

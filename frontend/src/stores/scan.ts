@@ -50,7 +50,19 @@ export const useScanStore = defineStore('scan', () => {
   const failed = ref<FailedItem[]>([])
   const failedOpen = ref(false)
   // 预览
-  const preview = ref<{ kind: string; content: string; mime?: string; path: string } | null>(null)
+  // P2-7：预览面板原先只带 path，头部无法回答"这是什么类型/多大/什么时候改的"，
+  // 也没有回到磁盘定位的入口。这里把 FileView 已有的元信息一并带上
+  // （fileID 用于 RevealInFolder，其余供头部元信息行展示）。
+  const preview = ref<{
+    fileID: number
+    kind: string
+    content: string
+    mime?: string
+    path: string
+    name: string
+    size: number
+    mtime: number
+  } | null>(null)
   const currentFileID = ref<number | null>(null) // Space 快捷键预览目标
   // 勾选与操作（M3）
   const selection = ref<Set<number>>(new Set())
@@ -304,9 +316,29 @@ export const useScanStore = defineStore('scan', () => {
     try {
       const p = await api.previewFile(fileID)
       const f = findFile(fileID)
-      preview.value = { kind: p.kind, content: p.content, mime: p.mimeType, path: f?.path ?? '' }
+      preview.value = {
+        fileID,
+        kind: p.kind,
+        content: p.content,
+        mime: p.mimeType,
+        path: f?.path ?? '',
+        name: f?.name ?? '',
+        size: f?.size ?? 0,
+        mtime: f?.mtime ?? 0,
+      }
     } catch (e: any) {
       toast().notifyError('预览失败', e)
+    }
+  }
+
+  // P2-7：从预览面板直接定位到所在文件夹（复用结果行上的同一后端能力）
+  async function revealPreview() {
+    const id = preview.value?.fileID
+    if (id == null) return
+    try {
+      await api.revealInFolder(id)
+    } catch (e: any) {
+      toast().notifyError('打开所在文件夹失败', e)
     }
   }
 
@@ -330,6 +362,7 @@ export const useScanStore = defineStore('scan', () => {
     applyKeep, clearKeep, executeOp, openTrash,
     running, startScan, pauseScan, resumeScan, cancelScan,
     loadResultPage, loadMore, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,
+    revealPreview,
     refreshStatus,
   }
 })

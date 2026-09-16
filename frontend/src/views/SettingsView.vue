@@ -5,7 +5,8 @@ import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import type { Settings, CacheStats } from '../wails'
-import { humanBytes } from '../utils/format'
+import { humanBytes, formatCount } from '../utils/format'
+import Icon from '../components/Icon.vue'
 
 const store = useScanStore()
 const toast = useToastStore()
@@ -52,9 +53,11 @@ async function save() {
   <div class="settings-view">
     <div class="panel box">
       <div class="sec">外观</div>
+      <!-- P2-3：`.row label` 是裸 label（既未包裹控件也无 for），与控件没有关联，
+           控件因此没有可访问名称。给控件补 aria-label。 -->
       <div class="row">
         <label>主题</label>
-        <select v-if="draft" v-model="draft.theme">
+        <select v-if="draft" v-model="draft.theme" aria-label="主题">
           <option value="system">跟随系统</option>
           <option value="light">亮色</option>
           <option value="dark">暗色</option>
@@ -62,7 +65,7 @@ async function save() {
       </div>
       <div class="row">
         <label>语言</label>
-        <select v-if="draft" v-model="draft.language">
+        <select v-if="draft" v-model="draft.language" aria-label="语言">
           <option value="zh">中文</option>
           <option value="en">English（M5）</option>
         </select>
@@ -71,7 +74,7 @@ async function save() {
       <div class="sec">扫描</div>
       <div class="row">
         <label>默认线程数</label>
-        <input v-if="draft" v-model.number="draft.threads" type="number" min="0" />
+        <input v-if="draft" v-model.number="draft.threads" type="number" min="0" aria-label="默认线程数" />
         <span class="hint">0 = 自动（逻辑核心数 - 1）</span>
       </div>
 
@@ -79,9 +82,9 @@ async function save() {
       <div class="row">
         <label>缓存统计</label>
         <span v-if="cacheStats" class="hint">
-          {{ cacheStats.entries }} 条目（含全量 {{ cacheStats.withFull }}）·
+          {{ formatCount(cacheStats.entries) }} 条目（含全量 {{ formatCount(cacheStats.withFull) }}）·
           {{ humanBytes(cacheStats.dbSizeBytes) }}
-          <template v-if="cacheStats.lastEvicted"> · 累计淘汰 {{ cacheStats.lastEvicted }}</template>
+          <template v-if="cacheStats.lastEvicted"> · 累计淘汰 {{ formatCount(cacheStats.lastEvicted) }}</template>
         </span>
         <span v-else class="hint">不可用</span>
       </div>
@@ -98,7 +101,7 @@ async function save() {
       </div>
 
       <div class="foot">
-        <span v-if="saved" class="ok">已保存 ✓</span>
+        <span v-if="saved" class="ok"><Icon name="check" :size="13" /> 已保存</span>
         <button class="btn-primary" :disabled="!draft" @click="save">保存设置</button>
       </div>
     </div>
@@ -106,15 +109,15 @@ async function save() {
 </template>
 
 <style scoped>
-.settings-view { flex: 1; overflow-y: auto; padding: 20px 24px; }
-.box { max-width: 640px; padding: 20px 24px; }
-.sec { font-weight: 600; margin: 16px 0 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+.settings-view { flex: 1; overflow-y: auto; padding: var(--sp-5) var(--page-gutter); }
+.box { max-width: 640px; margin-inline: auto; padding: var(--sp-5) var(--page-gutter); }
+.sec { font-weight: 600; margin: var(--sp-4) 0 var(--sp-3); padding-top: 12px; border-top: 1px solid var(--border); }
 .sec:first-child { margin-top: 0; padding-top: 0; border-top: none; }
-.row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.row { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-3); }
 .row label { width: 110px; color: var(--text-2); }
-.hint { color: var(--text-3); font-size: 12px; }
+.hint { color: var(--text-3); font-size: var(--fs-sm); }
 .row.disabled { opacity: 0.55; }
 .about div { color: var(--text-2); }
-.foot { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 18px; }
-.ok { color: var(--success); }
+.foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4); }
+.ok { color: var(--success-ink); display: inline-flex; align-items: center; gap: 4px; }
 </style>
