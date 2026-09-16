@@ -161,9 +161,14 @@ func (a *App) startup(ctx context.Context) {
 	}
 	// M4：哈希缓存（损坏自愈；失败不阻塞应用）
 	if a.cfgDir != "" {
-		if cch, err := cache.Open(filepath.Join(a.cfgDir, "cache.db")); err == nil {
+		dbPath := filepath.Join(a.cfgDir, "cache.db")
+		if cch, err := cache.Open(dbPath); err == nil {
 			a.cch = cch
 			a.pipe = a.pipe.WithCache(cch)
+		} else {
+			// 缓存不可用只影响二次扫描速度（功能不受损），但静默吞掉会让"为何每次都要重新
+			// 哈希"无从排查——这里显式留痕。不去重、不降级退出，只在启动时说一次。
+			fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
 		}
 	}
 	wruntime.EventsEmit(a.ctx, "app:ready", AppVersion)
