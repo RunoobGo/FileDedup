@@ -129,18 +129,20 @@ const progressPercent = computed(() => {
               <Icon name="close" :size="14" />
             </button>
           </div>
-          <div class="add-row">
-            <button class="btn-primary" @click="addByPicker">选择目录</button>
-            <!-- P2-3：本输入框原先只有 placeholder，没有可访问名称（占位符不能当标签用，
-                 聚焦后即消失，且屏幕阅读器不会把它当名称播报）。补 aria-label。 -->
-            <input
-              v-model="pastePath"
-              type="text"
-              aria-label="粘贴要扫描的目录路径"
-              placeholder="或粘贴路径后回车"
-              @keydown.enter="addRoot(pastePath)"
-            />
-          </div>
+        </div>
+        <!-- 虚线框只该圈住"拖放目标"。按钮与输入框是点击类控件，圈进去会让人误以为
+             它们也属于可拖入区域（视觉上也把一处虚线框变成了整块内容的容器）。 -->
+        <div class="add-row">
+          <button class="btn-primary" @click="addByPicker">选择目录</button>
+          <!-- P2-3：本输入框原先只有 placeholder，没有可访问名称（占位符不能当标签用，
+               聚焦后即消失，且屏幕阅读器不会把它当名称播报）。补 aria-label。 -->
+          <input
+            v-model="pastePath"
+            type="text"
+            aria-label="粘贴要扫描的目录路径"
+            placeholder="或粘贴路径后回车"
+            @keydown.enter="addRoot(pastePath)"
+          />
         </div>
       </div>
 
@@ -214,6 +216,11 @@ const progressPercent = computed(() => {
 .actions { display: flex; gap: var(--sp-3); justify-content: center; }
 
 /* 目录 */
+/* 面板内边距与下方「过滤器」面板对齐。原先 .roots 没有 padding，
+   「扫描目录」标题与虚线框都紧贴面板边框（实测各仅 1px），
+   而同一页的过滤器面板是 16px —— 两块面板的节奏对不上，
+   虚线框看起来像溢出了面板。 */
+.roots { padding: var(--sp-4); }
 .drop-zone { border: 1.5px dashed var(--border); border-radius: var(--r-md); padding: var(--sp-4); }
 .empty { text-align: center; color: var(--text-3); padding: var(--sp-5) 0; }
 .root-item {
@@ -221,6 +228,8 @@ const progressPercent = computed(() => {
   padding: 7px 10px; border-radius: var(--r-md); margin-bottom: 6px;
   background: var(--bg-hover); user-select: text;
 }
+/* 末项的 margin-bottom 会叠在虚线框的 padding 上，使框的下沿比上沿多 6px（不等距） */
+.root-item:last-child { margin-bottom: 0; }
 .path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-sm); }
 /* P1-5：原 21.9×20，低于 28×28 的图标按钮下限。撑到 28×28 后负纵向 margin 抵消，
    目录行高保持 34px。 */
@@ -231,7 +240,8 @@ const progressPercent = computed(() => {
   padding: 0; border-radius: var(--r-md); line-height: 1;
 }
 .x:hover { color: var(--danger-ink); background: var(--danger-weak); }
-.add-row { display: flex; gap: var(--sp-3); margin-top: 8px; }
+/* 按钮与输入框已移出虚线框：与上方拖放区保持 12px，和「标题 → 拖放区」同一节奏 */
+.add-row { display: flex; gap: var(--sp-3); margin-top: var(--sp-3); }
 .add-row input { flex: 1; }
 
 /* 过滤器 */
