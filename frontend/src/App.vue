@@ -9,6 +9,7 @@ import FailedDrawer from './components/FailedDrawer.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import ToastHost from './components/ToastHost.vue'
 import Icon from './components/Icon.vue'
+import Logo from './components/Logo.vue'
 import type { IconName } from './components/icons'
 
 const store = useScanStore()
@@ -50,7 +51,7 @@ const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName
 <template>
   <div class="layout">
     <aside class="sidebar">
-      <div class="logo">FD</div>
+      <Logo class="logo" :size="44" />
       <nav>
         <button
           v-for="n in navs"
@@ -97,12 +98,12 @@ const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
 }
+/* 品牌标记：由 Logo.vue 内联 SVG 渲染（原来只是一个 "FD" 文字占位）。
+   44px 是实测下限之上的取值 —— 见 Logo.vue 注释第 3 条。
+   颜色走 currentColor，这里给令牌即可，不要在组件里写死。 */
 .logo {
-  font-weight: 700;
-  font-size: var(--fs-lg);
   color: var(--primary-ink);
-  margin-bottom: 10px;
-  letter-spacing: 1px;
+  margin-bottom: var(--sp-2);
 }
 nav {
   display: flex;
