@@ -1,51 +1,56 @@
-name: Build & Package FileDedup
+name: Build Wails App
 
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - 'v*'           # 推送 v1.0.0 等标签时自动构建并发布 Release
+  workflow_dispatch:   # 允许在 GitHub 网页端手动点击触发
 
 jobs:
   build:
     name: Build - ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: false # 某个平台失败不影响其他平台
       matrix:
         include:
-          - os: macos-latest       # Apple Silicon (M1/M2/M3)
-            goos: darwin
-            goarch: arm64
-            asset_name: FileDedup-macos-arm64
-            archive_ext: .zip
-          - os: macos-13           # Intel Mac
-            goos: darwin
-            goarch: amd64
-            asset_name: FileDedup-macos-amd64
-            archive_ext: .zip
-          - os: ubuntu-latest      # Linux AMD64
-            goos: linux
-            goarch: amd64
+          # 1. Linux AMD64
+          - os: ubuntu-latest
+            platform: linux
+            arch: amd64
             asset_name: FileDedup-linux-amd64
-            archive_ext: .tar.gz
-          - os: windows-latest     # Windows AMD64
-            goos: windows
-            goarch: amd64
+            archive_name: FileDedup-linux-amd64.tar.gz
+          # 2. Windows AMD64
+          - os: windows-latest
+            platform: windows
+            arch: amd64
             asset_name: FileDedup-windows-amd64
-            archive_ext: .zip
-            is_windows: true
+            archive_name: FileDedup-windows-amd64.zip
+          # 3. macOS ARM64 (Apple Silicon M1/M2/M3)
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            asset_name: FileDedup-macos-arm64
+            archive_name: FileDedup-macos-arm64.zip
+          # 4. macOS AMD64 (Intel)
+          - os: macos-13
+            platform: darwin
+            arch: amd64
+            asset_name: FileDedup-macos-amd64
+            archive_name: FileDedup-macos-amd64.zip
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ========== 1. 系统依赖 (Wails 需要) ==========
-      - name: Install Linux Dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+      # ================= 1. 安装系统级依赖 =================
+      - name: Install Linux Dependencies (GTK/WebKit)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
 
-      # ========== 2. 构建前端 ==========
+      # ================= 2. 构建前端资源 =================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,14 +58,14 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Build Frontend
+      - name: Install & Build Frontend
         working-directory: ./frontend
+        shell: bash
         run: |
           if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
           npm run build
-        shell: bash
 
-      # ========== 3. 构建 Wails 应用 ==========
+      # ================= 3. 配置 Go 与 Wails 环境 =================
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -70,49 +75,57 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
+      # ================= 4. 编译 Wails 应用 =================
       - name: Build Wails Binary
+        shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1   # ⚠️ Wails 桌面应用必须开启 CGO
+          GOOS: ${{ matrix.platform }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 1  # ⚠️ Wails 桌面端强依赖 CGO
         run: |
-          # -s: 跳过前端构建(已在上面完成)
+          # -s: 跳过前端构建(已在步骤2完成)
           # -clean: 清理旧产物
-          # -skipbindings: 跳过绑定生成(CI中不需要)
+          # -skipbindings: 跳过绑定生成(CI中无需)
           wails build -clean -s -skipbindings -ldflags "-s -w"
 
-          # Wails 输出到 build/bin/，提取二进制文件
+          # 检查 build/bin 目录下是否生成了文件
+          echo "✅ Build completed. Files in build/bin:"
+          ls -la build/bin/
+
+      # ================= 5. 打包产物 =================
+      - name: Package Artifact
+        shell: bash
+        run: |
+          # 查找 build/bin 下的可执行文件 (兼容 Windows 的 .exe 和 Linux/macOS 的无后缀)
           BINARY=$(find build/bin -type f -name "FileDedup*" -o -name "filededup*" | head -1)
+          
           if [ -z "$BINARY" ]; then
             echo "❌ Error: Built binary not found in build/bin/"
-            ls -la build/bin/
             exit 1
           fi
-          cp "$BINARY" FileDedup_bin
-          echo "✅ Built: $BINARY"
-        shell: bash
-
-      # ========== 4. 打包 ==========
-      - name: Package Artifact
-        run: |
-          ARCHIVE="${{ matrix.asset_name }}${{ matrix.archive_ext }}"
-          if [ "${{ matrix.is_windows }}" == "true" ]; then
-            powershell -Command "Compress-Archive -Path 'FileDedup_bin' -DestinationPath '$ARCHIVE'"
-          elif [ "${{ matrix.archive_ext }}" == ".tar.gz" ]; then
-            tar -czf "$ARCHIVE" "FileDedup_bin"
+          
+          echo "📦 Packaging $BINARY into ${{ matrix.archive_name }}..."
+          
+          if [ "${{ matrix.platform }}" == "windows" ]; then
+            # Windows 使用 PowerShell 压缩
+            powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '${{ matrix.archive_name }}'"
+          elif [ "${{ matrix.archive_name }}" == *.tar.gz ]; then
+            # Linux 使用 tar 压缩
+            tar -czf "${{ matrix.archive_name }}" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
           else
-            zip -r "$ARCHIVE" "FileDedup_bin"
+            # macOS 使用 zip 压缩
+            zip -j "${{ matrix.archive_name }}" "$BINARY"
           fi
-        shell: bash
 
+      # ================= 6. 上传产物到 Actions =================
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}${{ matrix.archive_ext }}
+          path: ${{ matrix.archive_name }}
           retention-days: 7
 
-  # ========== 5. 自动发布 Release ==========
+  # ================= 7. 自动发布 GitHub Release =================
   release:
     name: Create GitHub Release
     needs: build
@@ -127,8 +140,10 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create Release
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
+          draft: false
+          prerelease: false
