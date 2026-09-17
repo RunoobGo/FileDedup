@@ -307,3 +307,74 @@ func TestVerifyFastPathAndTouch(t *testing.T) {
 		t.Fatalf("仅 touch 应通过（内容未变）, got %d", v)
 	}
 }
+
+// ---------- P0-3：时间戳无法证明内容未变 ----------
+
+// 原地改写但 mtime/ctime 逐纳秒不变（同一次时钟刻度内、或 cp -p 等保留时间戳的
+// 程序化改写、或 FAT32/exFAT/HFS+ 等粗粒度卷）。修正前快速路径直接放行。
+func TestS1TamperWithUnchangedMtime(t *testing.T) {
+	fx := newFixture(t)
+	pool := hasher.NewPool()
+
+	// 记录并强制还原时间戳，模拟"内容变了、时间戳没变"
+	st, _ := os.Stat(fx.dup1.Path)
+	raw, _ := os.ReadFile(fx.dup1.Path)
+	raw[len(raw)/2] ^= 0xFF
+	raw[len(raw)/2+1] ^= 0xAA
+	if err := os.WriteFile(fx.dup1.Path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fx.dup1.Path, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	// 前提确认：size 与 mtime 与扫描记录完全一致
+	now, _ := os.Stat(fx.dup1.Path)
+	if now.Size() != int64(fx.dup1.Size) || now.ModTime().UnixNano() != fx.dup1.ModTime {
+		t.Fatalf("测试前提失效：元数据已变化")
+	}
+
+	// 内容级校验必须拦截（修正前：size+mtime 双一致 → 快速路径直接放行）
+	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
+		t.Fatalf("元数据未变但内容已篡改，VerifyFile 应 Failed，got %d", v)
+	}
+
+	// 端到端：hardlink 合并的 keep 源被如此篡改时必须拦截
+	keep := fx.orig
+	ks, _ := os.Stat(keep.Path)
+	kraw, _ := os.ReadFile(keep.Path)
+	kraw[len(kraw)/2] ^= 0x55
+	os.WriteFile(keep.Path, kraw, 0o644)
+	os.Chtimes(keep.Path, ks.ModTime(), ks.ModTime())
+
+	res := Execute(Options{
+		Groups:  []*model.DuplicateGroup{fx.group},
+		KeepIDs: map[uint64]bool{keep.ID: true},
+	}, model.OpRequest{Kind: "hardlink", FileIDs: []uint64{fx.dup1.ID}})
+	if len(res.OK) != 0 {
+		t.Fatalf("keep 源被原地改写（时间戳未变）时不得执行合并: %+v", res)
+	}
+	// dup 原内容必须仍在
+	after, _ := os.ReadFile(fx.dup1.Path)
+	if string(after) != string(raw) {
+		t.Fatal("dup 原内容被覆盖：数据丢失")
+	}
+}
+
+// size 变化是少数仍能凭元数据断定的情形：重复组成员尺寸恒等，尺寸变了即非原物。
+func TestVerifySizeMismatchFails(t *testing.T) {
+	fx := newFixture(t)
+	pool := hasher.NewPool()
+	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
+		t.Fatalf("未修改应通过, got %d", v)
+	}
+	raw, _ := os.ReadFile(fx.dup1.Path)
+	os.WriteFile(fx.dup1.Path, append(raw, 'x'), 0o644)
+	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
+		t.Fatalf("size 变化应 Failed, got %d", v)
+	}
+	// ENOENT 仍为 Skipped（S8）
+	os.Remove(fx.dup2.Path)
+	if v := VerifyFile(fx.dup2, fx.group.Hash, pool); v != VerdictSkipped {
+		t.Fatalf("已消失应 Skipped, got %d", v)
+	}
+}

@@ -135,6 +135,13 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 						if !f.IncludeHidden && strings.HasPrefix(de.Name(), ".") {
 							continue
 						}
+						// P2：目录级剪枝。修正前 ExcludePaths 只作用于文件，
+						// 排除 node_modules/.git 时仍会把整棵树走完再逐个过滤，
+						// 大目录场景下"排除"只省结果不省时间（实测遍历量不变）。
+						// 目录不参与扩展名/大小判定，故走 matchPath-only 的裁剪入口。
+						if matcher.ExcludeDir(relativeTo(prefixes, full), de.Name()) {
+							continue
+						}
 						key := foldPath(full)
 						mu.Lock()
 						_, seen := visited[key]

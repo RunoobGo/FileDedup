@@ -8,18 +8,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	_ "image/gif"
 	"image/jpeg"
-	_ "image/png"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/webp"
+	_ "image/gif"
+	_ "image/png"
 
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -120,11 +125,20 @@ type App struct {
 	// Y3：结果视图按 (sort, ext) 缓存有序组列表，避免每次翻页全量重排
 	viewCache map[sortKey]viewCacheEntry
 
-	opsRunning   bool // 清理操作执行中（互斥：拒绝并发操作/保留策略，与 goroutine 写结果集互斥）
-	scanInFlight bool // 扫描 goroutine 在途（互斥新扫描：防旧任务收尾写结果集覆盖新任务）
+	opsRunning   bool               // 清理操作执行中（互斥：拒绝并发操作/保留策略，与 goroutine 写结果集互斥）
+	scanInFlight bool               // 扫描 goroutine 在途（互斥新扫描：防旧任务收尾写结果集覆盖新任务）
+	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
+	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
 	cfgDir string
 	cch    *cache.Cache
+
+	// emit 事件出口（默认 wruntime.EventsEmit）。
+	// 可测性：包级 EventsEmit 要求 Wails 前端注入的内部 context，
+	// 单元测试里会直接 log.Fatalf 退出进程——StartScan / ExecuteOperation
+	// 的 goroutine 收尾路径因此完全无法覆盖，P0-1、P1-1 正是这样漏网的。
+	// 这里留一个窄接缝，测试替换后即可断言终止事件。
+	emit func(ctx context.Context, event string, data ...interface{})
 }
 
 // NewApp 创建绑定服务。
@@ -133,16 +147,17 @@ func NewApp() *App {
 		pipe:      dedup.New(),
 		byID:      make(map[uint64]*model.FileEntry),
 		viewCache: make(map[sortKey]viewCacheEntry),
+		emit:      wruntime.EventsEmit,
 	}
 	// 引擎回调 → 事件桥（M2-T03）
 	a.pipe.OnProgress = func(ev model.ProgressEvent) {
 		a.mu.Lock()
 		a.lastEvs = ev
 		a.mu.Unlock()
-		wruntime.EventsEmit(a.ctx, "scan:progress", ev)
+		a.emit(a.ctx, "scan:progress", ev)
 	}
 	a.pipe.OnStage = func(ev model.StageEvent) {
-		wruntime.EventsEmit(a.ctx, "scan:stage", ev)
+		a.emit(a.ctx, "scan:stage", ev)
 	}
 	return a
 }
@@ -171,7 +186,7 @@ func (a *App) startup(ctx context.Context) {
 			fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
 		}
 	}
-	wruntime.EventsEmit(a.ctx, "app:ready", AppVersion)
+	a.emit(a.ctx, "app:ready", AppVersion)
 }
 
 // shutdown Wails 生命周期：释放缓存句柄。
@@ -208,6 +223,14 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("上一个扫描任务尚未收尾，请稍候")
 	}
+	// P1-1：清理操作 goroutine 在途时禁止开新扫描。ExecuteOperation 在锁外捕获
+	// groups 快照、执行完在锁内回写 a.groups；若此间开新扫描并清空结果集，
+	// 旧操作的收尾会用「基于旧结果集清理后的列表」整个覆盖新扫描结果，
+	// 新结果静默丢失且无任何提示。
+	if a.opsRunning {
+		a.mu.Unlock()
+		return "", fmt.Errorf("清理操作执行中，请等待完成后再扫描")
+	}
 	a.scanInFlight = true
 	a.groups = nil
 	a.byID = make(map[uint64]*model.FileEntry)
@@ -216,21 +239,22 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	a.invalidateViewCacheLocked() // Y3：新任务清空旧视图
 	a.mu.Unlock()
 
-	taskID := time.Now().Format("20060102-150405")
-	go func() {
-		defer func() {
-			a.mu.Lock()
-			a.scanInFlight = false
-			a.mu.Unlock()
-		}()
+	// P3：时间戳秒级精度不是唯一 ID——同一秒内重扫（取消后立刻重试很常见）会
+	// 产生重复 taskID，前端若据此关联事件就会串台。追加原子序号保证单调唯一。
+	taskID := fmt.Sprintf("scan-%s-%d", time.Now().Format("20060102-150405"), a.taskSeq.Add(1))
+	a.goTask("scan", func() {
+		a.mu.Lock()
+		a.scanInFlight = false
+		a.mu.Unlock()
+	}, func() {
 		start := time.Now()
 		groups, failed, err := a.pipe.Run(a.ctx, cfg)
 		elapsed := time.Since(start)
 		if err != nil {
 			if a.pipe.Status() == model.StatusCancelled {
-				wruntime.EventsEmit(a.ctx, "scan:cancelled", ScanSummary{Elapsed: elapsed.String()})
+				a.emit(a.ctx, "scan:cancelled", ScanSummary{Elapsed: elapsed.String()})
 			} else {
-				wruntime.EventsEmit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
+				a.emit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
 			}
 			return
 		}
@@ -248,24 +272,76 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			reclaim += g.Reclaimable
 		}
 		a.mu.Unlock()
-		wruntime.EventsEmit(a.ctx, "scan:done", ScanSummary{
+		a.emit(a.ctx, "scan:done", ScanSummary{
 			Groups:      len(groups),
 			Reclaimable: reclaim,
 			FilesFailed: len(failed),
 			Elapsed:     elapsed.String(),
 		})
-	}()
+	})
 	return taskID, nil
 }
 
-// PauseScan 暂停（运行态生效）。
-func (a *App) PauseScan() error { a.pipe.Pause(); return nil }
+// PauseScan 暂停（运行态生效）。P3：无任务时返回错误，前端据此提示而非误显示"已暂停"。
+func (a *App) PauseScan() error { return a.pipe.Pause() }
 
 // ResumeScan 恢复。
-func (a *App) ResumeScan() error { a.pipe.Resume(); return nil }
+func (a *App) ResumeScan() error { return a.pipe.Resume() }
+
+// CancelOperation 取消进行中的清理操作（P2）。
+// 语义：停止派发后续条目，已完成的部分保持完成（不可回滚），
+// 未派发的条目计入 OpsResult.Cancelled 且不会从结果集中移除。
+// 没有这个出口时，一次卡住的网络卷/回收站调用会让 opsRunning 永不复位，
+// 之后所有清理与保留策略都返回「操作执行中」，只能重启应用。
+func (a *App) CancelOperation() error {
+	a.mu.Lock()
+	cancel := a.opsCancel
+	a.mu.Unlock()
+	if cancel == nil {
+		return fmt.Errorf("当前没有进行中的清理操作")
+	}
+	cancel()
+	return nil
+}
 
 // CancelScan 取消。
-func (a *App) CancelScan() error { a.pipe.Cancel(); return nil }
+func (a *App) CancelScan() error { return a.pipe.Cancel() }
+
+// goTask 启动绑定层后台任务（P3）：统一挂上 panic 兜底与在途标志复位。
+// defer 为 LIFO：先注册 recover（最外层兜底）、后注册 reset，
+// 因此 panic 展开时先复位在途标志、再吞掉 panic 发错误事件——
+// 前端收到 error 时应用已确定处于"空闲"，不会再看到"扫描中"的残影。
+func (a *App) goTask(kind string, reset, body func()) {
+	go func() {
+		defer a.recoverGoroutine(kind)
+		defer reset()
+		body()
+	}()
+}
+
+// recoverGoroutine P3：绑定层 goroutine 的兜底 panic 守卫。
+//
+// 扫描/清理跑在独立 goroutine 里，任何 panic（越界、nil map、第三方解码器
+// 遇到畸形文件）都会直接带走整个进程——用户看到的现象是"点了扫描，软件消失"，
+// 而且未清理的在途标志会让重启前的会话一直显示"扫描中"。
+// 这里吞掉 panic 但把堆栈写到 stderr 留痕，并向前端发一条错误事件；
+// 状态复位交由 goTask 中先前注册的 reset 完成。
+func (a *App) recoverGoroutine(kind string) {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "[panic] %s goroutine 已恢复: %v\n%s\n", kind, r, debug.Stack())
+		if kind != "ops" {
+			a.pipe.Abort() // 状态机停在运行态 → 之后所有扫描都会被"任务进行中"拒绝
+		}
+		msg := map[string]string{"error": fmt.Sprintf("%s goroutine panic: %v", kind, r)}
+		if a.emit != nil && a.ctx != nil {
+			if kind == "ops" {
+				a.emit(a.ctx, "ops:error", msg)
+			} else {
+				a.emit(a.ctx, "scan:error", msg)
+			}
+		}
+	}
+}
 
 // GetScanProgress 主动拉取当前进度（断线重连语义）。
 func (a *App) GetScanProgress() model.ProgressEvent {
@@ -445,9 +521,15 @@ func (a *App) GetFailedItems() []model.FailedItem {
 
 // ---------- 预览与定位 ----------
 
+// imageMime 可缩略图预览的位图扩展名。
+// P3：表内每一项都必须在下方有对应解码器，否则 PreviewFile 会走"图片解码失败"
+// 分支——修正前 .webp/.bmp/.svg 都在表里却未注册解码器（标准库只有 jpeg/png/gif），
+// 用户看到的是无信息量的失败提示。
+//   - .svg 是文本矢量格式，不该进位图预览表：移除后自然落到文本分支显示源码。
+//   - .webp/.bmp 通过 golang.org/x/image 注册真正的解码器。
 var imageMime = map[string]string{
 	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-	".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+	".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
 }
 
 // PreviewFile 预览：图片（≤256KB base64）/ 文本（前 4KB）/ HEX（前 256B）。
@@ -551,16 +633,45 @@ func (a *App) RevealInFolder(id uint64) error {
 	if !ok {
 		return fmt.Errorf("文件不存在或已过期（id=%d）", id)
 	}
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", "-R", e.Path)
-	case "windows":
-		cmd = exec.Command("explorer", "/select,", e.Path)
-	default:
-		cmd = exec.Command("xdg-open", filepath.Dir(e.Path))
+	cmd, err := revealCmd(e.Path)
+	if err != nil {
+		return err
 	}
 	return startCmd(cmd)
+}
+
+// revealCmd 组装"定位并选中"命令。
+//
+// P3：Linux 分支此前只有 xdg-open 目录 = 只打开父目录不选中，用户在几千个
+// 同名/相似文件里仍要自己找；而且 xdg-open 不存在时 exec 才报错，用户看不出
+// 是"没装支持的工具"还是"操作失败"。这里按 DE 探测带 --select 的命令，
+// 全部缺失时明确报错。darwin/windows 行为不变。
+func revealCmd(path string) (*exec.Cmd, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", "-R", path), nil
+	case "windows":
+		return exec.Command("explorer", "/select,", path), nil
+	}
+	dir := filepath.Dir(path)
+	// 顺序即优先级：能选中文件 > 只能打开目录
+	for _, c := range []struct {
+		exe  string
+		args []string
+	}{
+		{"nautilus", []string{"--select", path}},
+		{"dolphin", []string{"--select", path}},
+		{"thunar", []string{path}},
+		{"nemo", []string{"--select", path}},
+		{"pcmanfm", []string{"--select", dir}},
+		{"gio", []string{"open", filepath.Dir(path)}},
+		{"xdg-open", []string{dir}},
+	} {
+		if _, err := exec.LookPath(c.exe); err == nil {
+			return exec.Command(c.exe, c.args...), nil
+		}
+	}
+	return nil, fmt.Errorf("未找到可用的文件管理器命令（nautilus/dolphin/thunar/xdg-open），无法定位文件")
 }
 
 // startCmd 启动外部定位命令并异步回收：
@@ -588,8 +699,12 @@ func (a *App) GetSettings() Settings {
 
 // SaveSettings 保存设置到 settings.json。
 func (a *App) SaveSettings(s Settings) (Settings, error) {
+	// P2：与引擎同一口径钳制（0 = 自动，1..dedup.MaxThreads = 显式指定）。
+	// 引擎侧也会钳制，这里钳是为了落盘值与实际生效值一致，界面上不自相矛盾。
 	if s.Threads < 0 {
 		s.Threads = 0
+	} else if s.Threads > dedup.MaxThreads {
+		s.Threads = dedup.MaxThreads
 	}
 	if s.Theme != "light" && s.Theme != "dark" && s.Theme != "system" {
 		s.Theme = "system"
@@ -641,45 +756,60 @@ func (a *App) ClearKeepDecisions() {
 
 // ExecuteOperation 操作执行器（M3-T02~T06）：
 // 校验 → 执行（回收站/永久删除/移动/硬链接）→ 事件反馈 → 结果集清理。
-// 互斥：执行期间拒绝再次操作（两组 goroutine 并发写结果集会互相覆盖）。
+// 互斥：执行期间拒绝再次操作与再次扫描（两组 goroutine 并发写结果集会互相覆盖）。
 func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
+	// P1-1：快照读取与 opsRunning 置位在同一个临界区内完成。
+	// 修正前分了两段（读快照 → 释放锁 → 查状态 → 再取锁双检置位），
+	// 中间窗口里新扫描可以启动并清空结果集，本操作的 goroutine 随后
+	// 会用「基于陈旧结果集清理后的列表」覆盖新扫描结果 → 新结果静默丢失。
+	// StartScan 同样在锁内检查 opsRunning，二者互斥因此是双向闭合的。
 	a.mu.Lock()
 	if a.opsRunning {
 		a.mu.Unlock()
 		return "", fmt.Errorf("上一个清理操作仍在执行中")
 	}
+	if a.scanInFlight {
+		a.mu.Unlock()
+		return "", fmt.Errorf("扫描进行中，请等待结束后再执行清理")
+	}
+	if s := a.pipe.Status(); s != model.StatusDone {
+		a.mu.Unlock()
+		return "", fmt.Errorf("任务未完成（当前 %s）", s)
+	}
+	if len(a.groups) == 0 {
+		a.mu.Unlock()
+		return "", fmt.Errorf("暂无结果集")
+	}
 	groups := a.groups
 	keepIDs := a.keepIDs
 	failed := a.failed
+	a.opsRunning = true // 置位后新扫描会被拒（StartScan 检 opsRunning）
+	opCtx, cancelOp := context.WithCancel(context.Background())
+	a.opsCancel = cancelOp
 	a.mu.Unlock()
-	if len(groups) == 0 {
-		return "", fmt.Errorf("暂无结果集")
-	}
-	if s := a.pipe.Status(); s != model.StatusDone {
-		return "", fmt.Errorf("任务未完成（当前 %s）", s)
-	}
-	// 状态与快照校验通过后置位（goroutine 结束时复位）
-	a.mu.Lock()
-	if a.opsRunning { // 双检：并发窗口内另一调用已置位
+
+	opID := fmt.Sprintf("ops-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
+
+	a.goTask("ops", func() {
+		a.mu.Lock()
+		a.opsRunning = false
+		a.opsCancel = nil
 		a.mu.Unlock()
-		return "", fmt.Errorf("上一个清理操作仍在执行中")
-	}
-	a.opsRunning = true
-	a.mu.Unlock()
-
-	opID := time.Now().Format("ops-150405")
-
-	go func() {
-		defer func() {
-			a.mu.Lock()
-			a.opsRunning = false
-			a.mu.Unlock()
-		}()
+		cancelOp()
+	}, func() {
 		res := ops.Execute(ops.Options{
+			Ctx:     opCtx,
 			Groups:  groups,
 			KeepIDs: keepIDs,
 			OnProgress: func(done, total int, current string) {
-				wruntime.EventsEmit(a.ctx, "ops:progress", model.OpsProgress{Done: done, Total: total, Current: current})
+				a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: done, Total: total, Current: current})
+			},
+			// C7：worker 内 panic 兜底。runIndexed 已捕获 panic 并标记失败，
+			// 此处把异常转成 ops:error 事件，使前端能复位 opsRunning（P2 死锁终防）。
+			OnPanic: func(err error) {
+				if a.emit != nil && a.ctx != nil {
+					a.emit(a.ctx, "ops:error", map[string]string{"error": err.Error()})
+				}
 			},
 		}, op)
 		// 失败/跳过并入统一失败清单
@@ -710,8 +840,8 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.groups = kept
 		a.invalidateViewCacheLocked() // Y3：清理后组结构变化，排序缓存失效
 		a.mu.Unlock()
-		wruntime.EventsEmit(a.ctx, "ops:done", res)
-	}()
+		a.emit(a.ctx, "ops:done", res)
+	})
 	return opID, nil
 }
 
@@ -786,6 +916,15 @@ func thumbnail(data []byte, maxDim int) ([]byte, error) {
 		}
 	} else if h > maxDim {
 		nw, nh = w*maxDim/h, maxDim
+	}
+	// 极端长宽比（1×100000 之类）整数除法会把短边归零，
+	// 产出 0 尺寸的"合法" JPEG——前端只显示空白，用户以为文件坏了。
+	// 缩略图短边至少 1px。
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
 	for y := 0; y < nh; y++ {

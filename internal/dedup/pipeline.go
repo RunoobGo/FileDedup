@@ -54,45 +54,84 @@ func (p *Pipeline) Status() model.TaskStatus {
 	return p.status
 }
 
-// Pause 暂停：停止派发新哈希任务，in-flight 完成后挂起（01 §5.5）。
-// 仅运行态生效（Idle/Done/Cancelled/Failed 无操作）。
-func (p *Pipeline) Pause() {
+// Pause 暂停（仅运行态生效）。
+// P3：与 Resume/Cancel 一致返回 error——此前空转调用静默成功，前端按
+// "调用成功" 把按钮切成"已暂停"，用户以为生效实际没暂停，只能事后重读状态。
+func (p *Pipeline) Pause() error {
 	p.mu.Lock()
 	switch p.status {
 	case model.StatusIdle, model.StatusDone, model.StatusCancelled, model.StatusFailed:
+		from := p.status
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("当前不在扫描中（%s），无法暂停", from)
+	case model.StatusPaused:
+		p.mu.Unlock()
+		return fmt.Errorf("任务已处于暂停状态")
 	}
+	// 记住被打断的阶段：若阶段内后续不再调用 setStatus，Resume 否则会显示成 Scanning
+	p.afterResume = p.status
 	p.status = model.StatusPaused
 	p.mu.Unlock()
 	p.gate.Pause()
+	return nil
 }
 
 // Resume 恢复：回到暂停期间到达的阶段。
-func (p *Pipeline) Resume() {
+func (p *Pipeline) Resume() error {
 	p.mu.Lock()
-	if p.status == model.StatusPaused {
-		if p.afterResume != "" {
-			p.status = p.afterResume
-			p.afterResume = ""
-		} else {
-			p.status = model.StatusScanning
-		}
+	if p.status != model.StatusPaused {
+		from := p.status
+		p.mu.Unlock()
+		return fmt.Errorf("当前未暂停（%s），无需恢复", from)
+	}
+	if p.afterResume != "" {
+		p.status = p.afterResume
+		p.afterResume = ""
+	} else {
+		p.status = model.StatusScanning
 	}
 	p.mu.Unlock()
 	p.gate.Resume()
+	return nil
 }
 
 // Cancel 取消：全部 worker 退出，部分结果丢弃。
 // Y1：p.cancel 由 Run 持锁写入，此处必须同样持锁读取，避免数据竞争。
-func (p *Pipeline) Cancel() {
+func (p *Pipeline) Cancel() error {
 	p.mu.Lock()
 	cancel := p.cancel
+	running := !p.isTerminalLocked() && p.status != model.StatusIdle
 	p.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if !running || cancel == nil {
+		return fmt.Errorf("当前没有进行中的扫描任务")
 	}
+	cancel()
 	p.gate.Resume() // 唤醒暂停中的 worker 使其感知取消
+	return nil
+}
+
+// Abort 强制把非终态置为 Failed（仅 panic 兜底路径使用）。
+//
+// Run 中途 panic 时，其内部 setStatus 分支不会执行，状态会永久停在运行态；
+// 而 StartScan 只接受 Idle/终态 → 用户此后无法再扫描，只能重启应用。
+// 因此绑定层 recover 之后必须显式收敛状态机，让"再次扫描"重新可用。
+func (p *Pipeline) Abort() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.isTerminalLocked() || p.status == model.StatusIdle {
+		return
+	}
+	p.status = model.StatusFailed
+	p.afterResume = ""
+}
+
+// isTerminalLocked 是否处于终态（调用方须持 p.mu）。P0-1：终态可被下一次 Run 复位。
+func (p *Pipeline) isTerminalLocked() bool {
+	switch p.status {
+	case model.StatusDone, model.StatusCancelled, model.StatusFailed:
+		return true
+	}
+	return false
 }
 
 // setStatus 运行态阶段切换；暂停中则记忆待恢复阶段（不覆盖 Paused 显示）。
@@ -116,13 +155,28 @@ func (p *Pipeline) setStatus(s model.TaskStatus) {
 // Run 执行完整流水线。返回重复组与失败清单；ctx 取消返回 context 错误。
 // 命名返回值：defer 中的缓存写回（含 Cancelled 路径，01 §5.5）需修改返回值。
 func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*model.DuplicateGroup, failed []model.FailedItem, err error) {
-	if !model.ValidateTransition(p.Status(), model.StatusScanning) {
-		return nil, nil, fmt.Errorf("非法状态转换: %s → Scanning", p.Status())
-	}
 	ctx, cancel := context.WithCancel(parent)
 	p.mu.Lock()
+	// P0-1：终态（Done/Cancelled/Failed）自动经 Idle 复位，使「再次扫描」成为
+	// 受支持的路径。状态机表本身不动（仍只允许 Idle→Scanning 进入运行态），
+	// 因此 Done→Scanning 依旧非法——复位是一次显式的 Done→Idle→Scanning。
+	// 不这样做的话：Run 结束只会置终态、无人置 Idle，第二次 Run 永久被拒，
+	// 而 app 层已清空旧结果集 → 界面永久卡在「扫描中」（增量缓存特性完全不可达）。
+	if p.isTerminalLocked() {
+		p.status = model.StatusIdle
+	}
+	if !model.ValidateTransition(p.status, model.StatusScanning) {
+		from := p.status
+		p.mu.Unlock()
+		cancel()
+		return nil, nil, fmt.Errorf("非法状态转换: %s → Scanning", from)
+	}
 	p.cancel = cancel
+	p.afterResume = ""
 	p.mu.Unlock()
+	// 闸门复位：上一轮若在 Paused 下被取消（父 ctx 直接取消、未走 CancelScan），
+	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
+	p.gate.Resume()
 	defer cancel()
 	p.setStatus(model.StatusScanning)
 
@@ -141,6 +195,11 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	threads := cfg.Threads
 	if threads < 1 {
 		threads = autoThreads(cfg.Roots)
+	} else if threads > MaxThreads {
+		// P2：并发度必须有上限。修正前只兜 <1，threads=100000 会真的开 10 万
+		// worker，每个大文件 worker 另占 (depth+1)×16MiB 环形段缓冲 → 直接 OOM。
+		// 按「后端是最后防线」的原则，钳制而非报错：设置界面不该能拖垮进程。
+		threads = MaxThreads
 	}
 	workers := threads
 	pool := hasher.NewPool()
@@ -179,7 +238,12 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			if prev, dup := seen[k]; dup {
 				// 硬链接多路径：保留路径较短者
 				if len(e.Path) < len(prev.Path) {
-					*prev = *e // 原地替换（ID 保持引用稳定，避免结果集悬挂）
+					// C3：仅替换路径派生字段（Path/Ext）。指针原地替换保证引用
+					// 稳定（无悬垂），但 ID/Key 不得被丢弃项覆盖——下游按 ID
+					// 关联选中态/保留决策/预览，覆盖会让 ID 与结果集错位；
+					// Key 同 inode 必然相同，Size/Mtime 同 inode 必然一致，均无需复制。
+					prev.Path = e.Path
+					prev.Ext = e.Ext
 					continue
 				}
 				continue
@@ -198,16 +262,28 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	// R2：本阶段只处理候选文件、且每文件最多读 SmallFileMax 字节，
 	// 总量口径必须与 AddFile/AddBytes 一致，否则进度会虚满、ETA 提前归零
 	tracker.SetTotal(uint64(len(candidates)), prefilterBytes(candidates))
-	type preKey struct {
-		size      uint64
-		head      uint64
-		tail      uint64
-		small     bool
+	// sampleKey 预筛分桶键；preEntry 记录该文件的采样与（若有）全量哈希。
+	// P0-2：分桶键只能由"采样"构成。此前缓存命中带全量的文件被绕过预筛分组
+	// 直接送进最终分组，使它与本轮实算的同内容文件不在同一桶内，导致静默漏报。
+	type sampleKey struct {
+		size uint64
+		head uint64
+		tail uint64
+	}
+	type preEntry struct {
+		sample    sampleKey
 		full      [32]byte
-		fullValid bool // 缓存命中带全量 / 小文件必然
+		fullValid bool // 小文件一趟完成，或缓存带全量
 		skip      bool // 预筛失败：已入失败清单，不参与任何分组（防零哈希假组）
 	}
-	pre := make([]preKey, len(candidates))
+	pre := make([]preEntry, len(candidates))
+	// 阶段 3 全量哈希产物，与 candidates 下标平行（独立槽位，避免与采样字段互相污染）
+	fulls := make([][32]byte, len(candidates))
+	fullsValid := make([]bool, len(candidates))
+	pendIdx := make([]int, len(candidates)) // candidates → pending 下标（-1 = 未入队）
+	for i := range pendIdx {
+		pendIdx[i] = -1
+	}
 	var preMu sync.Mutex      // failed/pending 共享写锁
 	var pending []cache.Entry // M4：任务结束批量写回
 	idx := atomic.Int64{}
@@ -249,28 +325,11 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				return err
 			}
 			e := candidates[i]
-			// M4 缓存命中：零读盘直接组装（partial 必有；full 视缓存）
-			if cacheOn {
-				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime); hit {
-					localHits = append(localHits, e.Path)
-					var full [32]byte
-					if fullValid {
-						copy(full[:], ent.Full)
-					}
-					pre[i] = preKey{
-						size: e.Size, head: ent.Head, tail: ent.Tail,
-						// 无全量缓存的小文件不直接入最终分组（full 为零值会造出
-						// 假重复组），改走 preGroups → 阶段 3 补全
-						small: fullValid && e.Size <= hasher.SmallFileMax,
-						full:  full, fullValid: fullValid,
-					}
-					tracker.AddFile()
-					// R2：命中视作该文件的预筛工作量已完成，字节数同样计入，
-					// 否则命中越多进度越滞后（总量口径已按预筛读量设定）
-					tracker.AddBytes(minU64(e.Size, hasher.SmallFileMax))
-					continue
-				}
-			}
+			// 计算实际文件的抽样哈希（head/tail）。即便命中缓存也要重算：size/mtime
+			// 可信，但内容可能因 cp -p/COW/FAT 2s 粒度/原地改写保 mtime 等而变更且
+			// mtime 不变（C1）。命中时以实际抽样与缓存抽样比对，一致才信任缓存 full，
+			// 否则内容已变、full 须在阶段 3 重算，避免把"内容已变但缓存哈希仍是旧内容"
+			// 的文件误判进重复组（进而误删）。
 			f, err := os.Open(e.Path)
 			if err != nil {
 				preMu.Lock()
@@ -290,6 +349,31 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				pre[i].skip = true
 				continue
 			}
+			if cacheOn {
+				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime); hit {
+					localHits = append(localHits, e.Path)
+					var full [32]byte
+					fullValidNow := false
+					// 抽样一致 → 内容极可能未变，信任缓存 full；否则内容已变，full 须重算。
+					if r.Partial.Head == ent.Head && r.Partial.Tail == ent.Tail {
+						if fullValid {
+							copy(full[:], ent.Full)
+						}
+						fullValidNow = fullValid
+					}
+					pre[i] = preEntry{
+						sample:    sampleKey{size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail},
+						full:      full,
+						fullValid: fullValidNow,
+					}
+					tracker.AddFile()
+					// R2：命中视作该文件的预筛工作量已完成，字节数同样计入，
+					// 否则命中越多进度越滞后（总量口径已按预筛读量设定）
+					tracker.AddBytes(minU64(e.Size, hasher.SmallFileMax))
+					continue
+				}
+			}
+			// 未命中：用实际抽样分桶，full 视小文件与否（小文件一趟即得全量）
 			var ent cache.Entry
 			if r.Small { // 小文件一趟双哈希：full 一并缓存
 				ent = cache.Entry{Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
@@ -299,10 +383,14 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 					Head: r.Partial.Head, Tail: r.Partial.Tail}
 			}
 			preMu.Lock()
+			pendIdx[i] = len(pending) // P0-2：阶段 3 补算后原位更新，不再追加第二条
 			pending = append(pending, ent)
 			preMu.Unlock()
-			pre[i] = preKey{size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail,
-				small: r.Small, full: r.Full, fullValid: r.Small}
+			pre[i] = preEntry{
+				sample:    sampleKey{size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail},
+				full:      r.Full,
+				fullValid: r.Small, // 小文件一趟即得全量
+			}
 			tracker.AddFile()
 			tracker.AddBytes(minU64(e.Size, hasher.SmallFileMax))
 		}
@@ -312,38 +400,41 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		return nil, failed, ctx.Err()
 	}
 
-	// 按 (size, head, tail) 分组；小文件直接进入最终分组（已有全量哈希）
+	// ---------- 分桶：一律按 (size, head, tail) 采样聚合 ----------
+	// P0-2：修正前带全量哈希的缓存命中文件会绕过采样分桶、直接进最终分组，
+	// 于是同内容的新文件只能在"本轮实算采样的文件"里找同伴，永远碰不到
+	// 已缓存的那份 → 自己孤身一桶 → 进不了阶段 3 → 被静默丢弃（漏报）。
+	// 实测：三个内容相同的大文件，二次扫描只报出 2 个。
+	// 现在命中缓存仅免除阶段 3 的重算，不再改变分组资格。
 	type finalKey struct {
 		size uint64
 		full [32]byte
 	}
 	finalGroups := make(map[finalKey][]*model.FileEntry)
-	preGroups := make(map[preKey][]*model.FileEntry)
-	for i, e := range candidates {
+	sampleGroups := make(map[sampleKey][]int) // 采样 → candidates 下标
+	for i := range candidates {
 		if pre[i].skip {
 			continue // 预筛失败：已入失败清单，不得进入分组（防零值键假组）
 		}
-		if pre[i].small || pre[i].fullValid {
-			// 小文件（一趟完成）或缓存命中带全量：直接进入最终分组
-			finalGroups[finalKey{size: e.Size, full: pre[i].full}] = append(
-				finalGroups[finalKey{size: e.Size, full: pre[i].full}], e)
-		} else {
-			k := pre[i]
-			preGroups[k] = append(preGroups[k], e)
-		}
+		k := pre[i].sample
+		sampleGroups[k] = append(sampleGroups[k], i)
 	}
 
-	// ---------- 阶段 3：大文件全量 BLAKE3 ----------
+	// ---------- 阶段 3：大文件全量 BLAKE3（仅补算缺失者）----------
 	p.setStatus(model.StatusHashing)
 	stage("hash", "全量哈希")
 	var hashTargets []*model.FileEntry
-	var hashPreKeys []preKey
-	for k, g := range preGroups {
-		if len(g) >= 2 {
-			hashTargets = append(hashTargets, g...)
-			for range g {
-				hashPreKeys = append(hashPreKeys, k)
+	var hashSlot []int // 与 hashTargets 平行：candidates 下标
+	for _, idxs := range sampleGroups {
+		if len(idxs) < 2 {
+			continue // 采样唯一 → 无同伴，不可能成组
+		}
+		for _, ci := range idxs {
+			if pre[ci].fullValid {
+				continue // 已有全量哈希（缓存命中或小文件一趟），不重算
 			}
+			hashTargets = append(hashTargets, candidates[ci])
+			hashSlot = append(hashSlot, ci)
 		}
 	}
 	idx.Store(0)
@@ -388,9 +479,27 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				hashTargets[i] = nil
 				continue
 			}
-			hashPreKeys[i] = preKey{size: e.Size, full: full} // 复用槽位存最终哈希
+			ci := hashSlot[i]
+			// 全量哈希只写进独立的 fulls 槽位：pre[ci].sample 不得改动，
+			// 它仍是本阶段分桶与写回缓存的依据。
 			preMu.Lock()
-			pending = append(pending, cache.Entry{Path: e.Path, Size: e.Size, MtimeNs: e.ModTime, Full: full[:]})
+			fulls[ci] = full
+			fullsValid[ci] = true
+			// P0-2：原位补上 full，保留阶段 2 已写入的采样。
+			// 修正前这里 append 一条不含 Head/Tail 的新行，UPSERT 整行覆盖
+			// 把缓存里的 partial 清零 → 该文件后续扫描再也无法与新文件同桶。
+			if pi := pendIdx[ci]; pi >= 0 && pi < len(pending) {
+				cp := make([]byte, len(full))
+				copy(cp, full[:])
+				pending[pi].Full = cp
+			} else {
+				cp := make([]byte, len(full))
+				copy(cp, full[:])
+				pending = append(pending, cache.Entry{
+					Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
+					Head: pre[ci].sample.head, Tail: pre[ci].sample.tail, Full: cp,
+				})
+			}
 			preMu.Unlock()
 			tracker.AddFile()
 			tracker.AddBytes(e.Size)
@@ -400,13 +509,26 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		p.setStatus(model.StatusCancelled)
 		return nil, failed, ctx.Err()
 	}
-	for i := range hashTargets {
-		if hashTargets[i] == nil {
-			continue // 哈希失败条目：已入失败清单，剔除分组（防零哈希假组）
+
+	// ---------- 最终分组：按全量哈希聚合 ----------
+	// fulls[] 是阶段 3 的产物，与 candidates 下标平行；pre[ci].full 覆盖缓存/小文件来源。
+	for _, idxs := range sampleGroups {
+		if len(idxs) < 2 {
+			continue
 		}
-		k := finalKey{size: hashTargets[i].Size, full: hashPreKeys[i].full}
-		finalGroups[k] = append(finalGroups[k], hashTargets[i])
+		for _, i := range idxs {
+			full := pre[i].full
+			if !pre[i].fullValid {
+				if !fullsValid[i] {
+					continue // 全量哈希失败：已入失败清单，剔除分组（防零哈希假组）
+				}
+				full = fulls[i]
+			}
+			k := finalKey{size: candidates[i].Size, full: full}
+			finalGroups[k] = append(finalGroups[k], candidates[i])
+		}
 	}
+	// 采样唯一（桶内仅 1 个）的文件不可能与任何文件重复，无需进入最终分组。
 
 	// ---------- 阶段 4（可选）：paranoid 逐字节确认 ----------
 	// G1：比对缓冲在整趟 paranoid 中只分配一对，组间与文件间复用。
@@ -531,6 +653,11 @@ func (v *verifier) equal(a, b *os.File, size int64) (bool, error) {
 }
 
 // ---------- 工具 ----------
+
+// MaxThreads 显式并发度上限（P2）：固定值而非 NumCPU 的倍数，
+// 使同一配置在不同机器上的资源占用可预期。上限内已足够打满常规 SSD。
+// 导出以便设置界面（app.go）用同一口径钳制，避免"界面能存下引擎不认的值"。
+const MaxThreads = 64
 
 func defaultThreads() int {
 	n := runtime.NumCPU()

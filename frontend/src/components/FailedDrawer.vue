@@ -3,10 +3,12 @@
 // failed 数据由 store 统一维护（scan:done / ops:done 均在 store 处理），此处仅展示。
 import { ref } from 'vue'
 import { useScanStore } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 import { formatCount } from '../utils/format'
 import { useModal } from '../composables/useModal'
 
 const store = useScanStore()
+const toast = useToastStore()
 
 // P2-3：浮层语义 + 焦点管理（打开聚焦、Tab 循环、关闭归还焦点）。
 // 本组件由 App.vue 常驻挂载、靠 store.failedOpen 控制显隐，因此必须把「是否打开」传进去。
@@ -15,7 +17,10 @@ useModal(dlgRef, () => store.failedOpen)
 
 function copyAll() {
   const text = store.failed.map(f => `${f.Stage}\t${f.Path}\t${f.Err}`).join('\n')
-  navigator.clipboard?.writeText(text)
+  // C10：剪贴板写入可能被拒绝（无授权/非安全上下文），rejection 须接住
+  navigator.clipboard?.writeText(text).catch((e: any) => {
+    toast.notifyError('复制失败', e)
+  })
 }
 </script>
 

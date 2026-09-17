@@ -3,6 +3,7 @@ package cache
 // M4-T01 单测：命中判定 / 元数据失效 / 批量 UPSERT / 淘汰 / 统计 / 清空 / 损坏自愈。
 
 import (
+	"bytes"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -53,8 +54,7 @@ func TestStorePartialOnlyUpsertFull(t *testing.T) {
 	if err := c.Store([]Entry{{Path: "/b", Size: 10, MtimeNs: 1, Head: 9, Tail: 9}}); err != nil {
 		t.Fatal(err)
 	}
-	_, hit, fullValid := c.Lookup("/b", 10, 1)
-	if !hit || fullValid {
+	if _, hit, fullValid := c.Lookup("/b", 10, 1); !hit || fullValid {
 		t.Fatalf("partial-only: hit=%v fullValid=%v", hit, fullValid)
 	}
 	// 后补 full（UPSERT 覆盖）
@@ -63,9 +63,13 @@ func TestStorePartialOnlyUpsertFull(t *testing.T) {
 	if err := c.Store([]Entry{{Path: "/b", Size: 10, MtimeNs: 1, Full: full}}); err != nil {
 		t.Fatal(err)
 	}
-	_, hit, fullValid = c.Lookup("/b", 10, 1)
+	got, hit, fullValid := c.Lookup("/b", 10, 1)
 	if !hit || !fullValid {
 		t.Fatalf("补 full 后: hit=%v fullValid=%v", hit, fullValid)
+	}
+	// P0-2：补 full 不得抹掉已有采样（旧实现整行覆盖使 partial 清零 → 后续漏报）
+	if got.Head != 9 || got.Tail != 9 {
+		t.Fatalf("写回 full 时采样被覆盖: head=%d tail=%d", got.Head, got.Tail)
 	}
 }
 
@@ -209,12 +213,14 @@ func (c *Cache) evictOverForTest(limit int) error {
 		SELECT path FROM hash_cache ORDER BY last_hit ASC, path ASC LIMIT ?)`, limit); err != nil {
 		return err
 	}
+	c.cntValid = false // C5：绕过 Cache 写路径的测试钩子同样须使计数失效
 	c.lastEvicted = limit
 	return nil
 }
 
-// G4 回归：旧库遗留的 idx_cache_size（死索引）必须在 Open 时被清除，
-// 且迁移不得损坏既有数据或 last_hit 索引。
+// G4 回归：旧库遗留的 idx_cache_size（死索引）必须在 Open 时被清除。
+// P0-2 补充：无版本标记的旧库同时被整表作废——旧语义（含 partial 被清零的脏行）
+// 继续命中会导致漏报，因此"迁移保留既有数据"不再是期望行为。
 func TestOpenDropsLegacyUnusedIndex(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 
@@ -257,17 +263,67 @@ func TestOpenDropsLegacyUnusedIndex(t *testing.T) {
 	if !hasStr(names, "idx_cache_last_hit") {
 		t.Fatalf("last_hit 索引缺失（淘汰依赖它）: %v", names)
 	}
-	// 3) 既有数据不受迁移影响
-	if _, hit, _ := c.Lookup("/legacy", 7, 8); !hit {
-		t.Fatal("迁移后旧记录应仍可命中")
+	// 3) 旧版本记录被整体作废（P0-2），且版本已写入
+	if _, hit, _ := c.Lookup("/legacy", 7, 8); hit {
+		t.Fatal("无版本标记的旧库记录不应继续命中")
 	}
-	if ts, ok := c.LastHit("/legacy"); !ok || ts != 123 {
-		t.Fatalf("last_hit 被篡改: ts=%d ok=%v", ts, ok)
+	st, err := c.GetStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Entries != 0 {
+		t.Fatalf("旧库应被作废, entries=%d", st.Entries)
 	}
 	// 4) 新库不应再建出该索引
 	fresh := openTest(t)
 	if n := indexNamesForTest(t, fresh); hasStr(n, "idx_cache_size") {
 		t.Fatalf("新库不应创建 idx_cache_size: %v", n)
+	}
+}
+
+// P0-2：同版本重开必须保留缓存（作废只发生在版本变更时），否则增量缓存无意义。
+func TestAlgoVersionStableAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "stable.db")
+	c, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := Entry{Path: "/keep", Size: 4096, MtimeNs: 42, Head: 7, Tail: 8, Full: bytes.Repeat([]byte{0x9}, 32)}
+	if err := c.Store([]Entry{e}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	got, hit, fullValid := c2.Lookup("/keep", 4096, 42)
+	if !hit || !fullValid {
+		t.Fatalf("同版本重开后应命中且带全量: hit=%v fullValid=%v", hit, fullValid)
+	}
+	if got.Head != 7 || got.Tail != 8 {
+		t.Fatalf("采样被破坏: head=%d tail=%d", got.Head, got.Tail)
+	}
+}
+
+// P0-2：全零采样的行不可信，必须视为未命中（否则会与新文件永远不同桶 → 漏报）。
+func TestLookupRejectsZeroSampleRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "zero.db")
+	c, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// 绕开 Store 的 UPSERT 保留逻辑，直接造一行"采样为零但带 full"的脏数据
+	if _, err := c.db.Exec(`INSERT INTO hash_cache (path,size,mtime_ns,partial,full,last_hit)
+		VALUES ('/z', 5, 6, x'00000000000000000000000000000000', ?, 1)`, bytes.Repeat([]byte{0x1}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, _ := c.Lookup("/z", 5, 6); hit {
+		t.Fatal("全零采样行应视为未命中")
 	}
 }
 

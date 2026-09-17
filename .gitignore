@@ -1,8 +1,13 @@
 # ---------- 构建产物（Wails 官方模板约定）----------
-# 注意：//go:embed all:frontend/dist 需要 frontend/dist 存在，
-# 因此全新克隆后须先构建前端（wails build 会自动执行）再跑 go build/test。
+# 注意：main.go 的 //go:embed frontend/dist 需要 frontend/dist 存在，
+# 因此全新克隆后须先构建前端（npm run build，或 wails build 自动执行）再跑 go build/test。
 build/bin
 frontend/dist
+
+# 本地 `go build .` 会在仓库根产出与模块同名的可执行文件（filededup），
+# 极易被误提交（本次审查过程中就实际生成过一次）。
+/filededup
+/filededup.exe
 
 # ---------- 前端依赖 ----------
 node_modules

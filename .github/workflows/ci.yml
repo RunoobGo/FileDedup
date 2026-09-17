@@ -2,7 +2,7 @@
 #
 # 覆盖 04 §4 CI 表中 PR 阶段可实现项：gofmt + go vet + go test -race + 前端 build。
 #
-# 顺序约束（勿调换）：main.go 使用 `//go:embed all:frontend/dist`，
+# 顺序约束（勿调换）：main.go 使用 `//go:embed frontend/dist`，
 # 而 frontend/dist 属构建产物（.gitignore 排除），因此必须先构建前端，
 # 否则 go vet / go test 会因 embed 找不到目录而失败。
 #

@@ -25,7 +25,7 @@ function reveal(id: number) {
     <div class="head" @click="expanded = !expanded">
       <Icon name="chevron-down" :size="14" :class="['chev', { closed: !expanded }]" />
       <span class="size">{{ humanBytes(group.size) }}</span>
-      <span class="sep">×</span>
+      <span class="sep" aria-hidden="true"></span>
       <span class="count">{{ group.files.length }} 个文件</span>
       <span class="reclaim">可释放 {{ humanBytes(group.reclaimable) }}</span>
       <span v-if="group.files.some(f => /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(f.path))" class="tag">图片组</span>
@@ -82,7 +82,9 @@ function reveal(id: number) {
 .chev { color: var(--text-3); width: 14px; height: 14px; transition: transform 0.18s ease; }
 .chev.closed { transform: rotate(-90deg); }
 .size { font-weight: 600; font-variant-numeric: tabular-nums; }
-.sep, .count { color: var(--text-3); }
+/* C13：分隔符由字符 × 改为 CSS 绘制的 1px 竖线（aria-hidden 纯装饰） */
+.sep { width: 1px; height: 10px; background: var(--border); }
+.count { color: var(--text-3); }
 .reclaim { margin-left: auto; color: var(--primary-ink); font-weight: 600; }
 .files { padding: 4px 8px 8px; }
 .file {

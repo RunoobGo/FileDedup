@@ -231,6 +231,65 @@ func TestPipelineHashFailureNoFalseGroup(t *testing.T) {
 	}
 }
 
+// TestPipelineHardlinkRepIDStable C3 回归：硬链接多路径去重保留短路径时，
+// 只允许替换路径派生字段（Path/Ext），不得把被丢弃项的 ID 覆盖到代表体上——
+// 下游按 ID 关联选中态/保留决策/预览，覆盖会让 ID 与结果集错位。
+//
+// 确定性来源：Threads=1 + 单目录 → scanner 按目录项（字典序）顺序分配 ID：
+// aaa-longer-name.bin=1, mid.bin=2, zz.bin=3。
+// 阶段 1.5 中 zz 与 aaa 同 inode（key 相同）且路径更短 → 替换代表体字段。
+//
+//	修复前：*prev = *e → 代表体 ID 被覆盖为 3（zz 的）。
+//	修复后：仅换 Path/Ext → 代表体保持 ID=1（aaa 的），Path=zz.bin。
+func TestPipelineHardlinkRepIDStable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows FileKey 需开句柄，ID 顺序同样依赖单 worker，跳过")
+	}
+	root := t.TempDir()
+	content := make([]byte, 4096)
+	for i := range content {
+		content[i] = byte(i)
+	}
+	long := filepath.Join(root, "aaa-longer-name.bin")
+	if err := os.WriteFile(long, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "zz.bin") // 短路径硬链接（同 inode）
+	if err := os.Link(long, link); err != nil {
+		t.Skipf("硬链接创建失败: %v", err)
+	}
+	mid := filepath.Join(root, "mid.bin") // 同内容独立副本（不同 inode）
+	if err := os.WriteFile(mid, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New()
+	groups, _, err := p.Run(context.Background(), model.ScanConfig{
+		Roots: []string{root}, Threads: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("组数 = %d, want 1（硬链接对计一次 + 独立副本）", len(groups))
+	}
+	g := groups[0]
+	if len(g.Files) != 2 {
+		t.Fatalf("组内文件数 = %d, want 2: %+v", len(g.Files), g.Files)
+	}
+	for _, f := range g.Files {
+		if strings.HasSuffix(f.Path, "zz.bin") {
+			// 修复前此处为 3（被 zz 自身 ID 覆盖）；修复后应保持 aaa 的 ID=1
+			if f.ID != 1 {
+				t.Fatalf("C3 回归：短路径代表体 ID = %d, want 1（长路径项 ID）；Path=%s",
+					f.ID, f.Path)
+			}
+			return
+		}
+	}
+	t.Fatalf("结果组中未找到短路径硬链接 zz.bin: %+v", g.Files)
+}
+
 func TestPipelineHardlinkNotDuplicate(t *testing.T) {
 	// 硬链接（同物理文件多路径）：不计为重复、不占可释放空间
 	if runtime.GOOS == "windows" {
@@ -382,17 +441,91 @@ func TestPipelinePauseResume(t *testing.T) {
 	}
 }
 
-func TestPipelineIllegalStart(t *testing.T) {
-	// Done → Scanning 非法转换应被拒绝
-	p := New()
+// P0-1 回归：终态不得永久锁死流水线。
+// 修正前 Done 状态下的第二次 Run 永远被拒（无人置回 Idle），
+// 而 app 层已清空旧结果集 → 界面永久卡在「扫描中」，增量缓存特性不可达。
+func TestPipelineRerunAfterTerminalStates(t *testing.T) {
 	root := t.TempDir()
 	genDataset(t, root)
-	if _, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}}); err == nil {
-		t.Fatal("Done 状态下重复 Run 应被状态机拒绝")
-	}
+
+	t.Run("Done后可再扫", func(t *testing.T) {
+		p := New()
+		g1, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Status() != model.StatusDone {
+			t.Fatalf("终态 = %s, want Done", p.Status())
+		}
+		g2, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}})
+		if err != nil {
+			t.Fatalf("第二次 Run 被拒: %v", err)
+		}
+		if len(g2) != len(g1) {
+			t.Fatalf("两次扫描组数应一致: %d vs %d", len(g1), len(g2))
+		}
+		if p.Status() != model.StatusDone {
+			t.Fatalf("第二次终态 = %s, want Done", p.Status())
+		}
+	})
+
+	t.Run("Cancelled后可再扫", func(t *testing.T) {
+		// 较大数据集 + 等待进入运行态再取消（同 TestPipelineCancelNoLeak 手法），
+		// 避免小数据集在取消前就跑完、终态落在 Done 的竞态。
+		croot := t.TempDir()
+		for i := 0; i < 4000; i++ {
+			p := filepath.Join(croot, "f"+strconv.Itoa(i)+".bin")
+			b := make([]byte, 64)
+			rand.Read(b)
+			if err := os.WriteFile(p, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p := New()
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for p.Status() == model.StatusIdle {
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+		}()
+		_, _, err := p.Run(ctx, model.ScanConfig{Roots: []string{croot}, Threads: 4})
+		if err == nil {
+			t.Skip("数据集过小，取消前已完成（不构成失败）")
+		}
+		if p.Status() != model.StatusCancelled {
+			t.Fatalf("终态 = %s, want Cancelled", p.Status())
+		}
+		if _, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{croot}}); err != nil {
+			t.Fatalf("取消后再次 Run 被拒: %v", err)
+		}
+	})
+
+	// 运行中重入仍须被拒——复位逻辑只能作用于终态，不得把「并发双开」也放行。
+	// app 层有 scanInFlight 互斥，此处是引擎自身的第二道防线。
+	// 白盒注入运行态，避免依赖时序（数据集大小/调度）造成竞态。
+	t.Run("运行中重入仍被拒", func(t *testing.T) {
+		for _, s := range []model.TaskStatus{model.StatusScanning, model.StatusPrefiltering, model.StatusHashing} {
+			p := New()
+			p.mu.Lock()
+			p.status = s
+			p.mu.Unlock()
+			if _, _, err := p.Run(context.Background(), model.ScanConfig{Roots: []string{root}}); err == nil {
+				t.Fatalf("%s 状态下的第二次 Run 必须被拒绝", s)
+			}
+			if p.Status() != s {
+				t.Fatalf("%s 被误复位为 %s（复位只允许发生在终态）", s, p.Status())
+			}
+		}
+		// Paused 按既有语义可恢复到 Scanning，此处仅锁定不被复位逻辑改变
+		p := New()
+		p.mu.Lock()
+		p.status = model.StatusPaused
+		p.mu.Unlock()
+		if p.isTerminalLocked() {
+			t.Fatal("Paused 不是终态，不得被复位")
+		}
+	})
 }
 
 func TestProgressCallbackFired(t *testing.T) {

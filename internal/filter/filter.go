@@ -127,9 +127,64 @@ func (m *Matcher) Apply(name, rel string, size uint64) bool {
 	return true
 }
 
-// matchPath 路径排除匹配：
+// ExcludeDir 判定目录是否可被安全剪枝（返回 true 表示不再深入遍历）。
+//
+// P2：修正前 ExcludePaths 只在文件级生效，排除 node_modules/.git 时仍会完整
+// 遍历其内部再逐个丢弃——"排除"省下了结果却没省下时间。
+//
+// 剪枝比文件级过滤更激进（整棵子树消失），因此只对「命中可向后代传播」的
+// 模式形态生效，见 prunable：含通配且含斜杠的模式（如 "*/build"）经 filepath.Match
+// 只匹配目录自身、不匹配其后代，按它剪枝会连带丢掉本该保留的文件（实测确认）。
+// 这类模式退回原有的文件级判定，遍历量不变但结果始终正确。
+func (m *Matcher) ExcludeDir(rel, name string) bool {
+	if m == nil {
+		return false
+	}
+	for _, pat := range m.f.ExcludePaths {
+		if !prunable(pat) {
+			continue
+		}
+		if matchPath(pat, rel, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// prunable 该排除模式能否安全地用于目录剪枝。
+//
+// 两类可以（关键是「命中可向后代传播」，与 matchPath 的既有文件级语义一致）：
+//  1. 不含 "/" 的段模式（"node_modules"、"*.tmp"）：匹配按路径段进行，
+//     目录名命中则该目录下所有文件的 rel 都含同名段。
+//  2. 字面前缀式（"a/b"、"a/b/"）与递归尾随式（"a/b/**"）：前者按目录前缀
+//     匹配全部后代，后者 ** 跨任意层，目录命中则后代必然命中。
+//
+// 其余不可（C2 收紧）：
+//   - 尾随单 *（"a/b/*"）：单层语义，只匹配 a/b 的直接子层；按它剪枝会连带
+//     丢掉 a/b/c/d 这类本该保留的更深后代（静默多删）。
+//   - 通配在中间（"*/build"、"a/**/b"、"a?/dist"、"x/[ab]/build"）：模式只匹配
+//     目录自身（或某一层关系），不保证命中目录的后代同样命中，按它剪枝会
+//     连带丢掉本该保留的文件。这类模式退回文件级判定。
+func prunable(pat string) bool {
+	if !strings.Contains(pat, "/") {
+		return true
+	}
+	if strings.Contains(pat, "**") {
+		// 递归式：仅当 ** 位于末尾（"a/b/**"）才可剪枝；中间 ** 不可
+		body := strings.TrimSuffix(pat, "**")
+		body = strings.TrimSuffix(body, "/")
+		return !strings.ContainsAny(body, "*?[")
+	}
+	// 不含 **：只有完全无通配的字面前缀（"a/b"、"a/b/"）才可剪枝
+	return !strings.ContainsAny(pat, "*?[")
+}
+
+// matchPath 路径排除匹配（C2：区分 *（单层，不跨分隔符）与 **（递归跨层））：
 //   - 模式不含 "/"：对 rel 的每个路径段（含文件名）做 filepath.Match
-//   - 模式含 "/"：去掉尾部 "**"/"*" 后作前缀匹配，或对 rel 做 filepath.Match
+//   - 模式含 "/" 且含 "**"：段级匹配，** 跨任意层（含零层），其余段不跨层
+//   - 模式含 "/" 且不含 "**"：字面前缀（"a/b"、"a/b/"）匹配全部后代；
+//     否则对整条 rel 做 filepath.Match（* 只匹配单层，不再剥尾作前缀——
+//     修正前 "a/b/*" 会被当作递归前缀误伤 a/b/c/d）
 func matchPath(pat, rel, name string) bool {
 	if pat == "" {
 		return false
@@ -148,17 +203,42 @@ func matchPath(pat, rel, name string) bool {
 		}
 		return false
 	}
-	// 前缀式：dir/** 或 dir/
-	prefix := strings.TrimSuffix(pat, "**")
-	prefix = strings.TrimSuffix(prefix, "*")
-	prefix = strings.TrimSuffix(prefix, "/")
-	if prefix != "" {
-		if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
+	if strings.Contains(pat, "**") {
+		return matchSegs(strings.Split(pat, "/"), strings.Split(rel, "/"))
+	}
+	// 字面前缀式（无通配）：dir 或 dir/ 递归命中后代
+	if !strings.ContainsAny(pat, "*?[") {
+		prefix := strings.TrimSuffix(pat, "/")
+		if prefix != "" && (rel == prefix || strings.HasPrefix(rel, prefix+"/")) {
 			return true
 		}
+		return false
 	}
 	if ok, _ := filepath.Match(pat, rel); ok {
 		return true
 	}
 	return false
+}
+
+// matchSegs 段级 glob 匹配：pat/rel 已按 "/" 切段。** 匹配 0..n 个段
+// （递归），其余段交由 filepath.Match（* 不跨段）。回溯实现，段数有限无性能顾虑。
+func matchSegs(pat, rel []string) bool {
+	if len(pat) == 0 {
+		return len(rel) == 0
+	}
+	if pat[0] == "**" {
+		for i := 0; i <= len(rel); i++ {
+			if matchSegs(pat[1:], rel[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(rel) == 0 {
+		return false
+	}
+	if ok, _ := filepath.Match(pat[0], rel[0]); !ok {
+		return false
+	}
+	return matchSegs(pat[1:], rel[1:])
 }

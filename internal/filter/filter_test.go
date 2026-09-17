@@ -170,3 +170,116 @@ func BenchmarkExtMatch(b *testing.B) {
 		})
 	}
 }
+
+// ---------- P2：目录剪枝安全性 ----------
+
+func TestPrunable(t *testing.T) {
+	cases := []struct {
+		pat    string
+		want   bool
+		reason string
+	}{
+		{"node_modules", true, "无斜杠段模式：命中可传播到全部后代"},
+		{"*.tmp", true, "无斜杠通配段模式：同上"},
+		{"a/b", true, "字面前缀"},
+		{"a/b/**", true, "尾部通配前缀式"},
+		{"a/b/", true, "尾部斜杠前缀式"},
+		{"*/build", false, "通配在中间：只匹配目录自身，剪枝会误删后代"},
+		{"a?/dist", false, "问号在中间：同上"},
+		{"x/[ab]/build", false, "字符类在中间：同上"},
+		{"", true, "空模式无匹配，交由 matchPath 早退"},
+	}
+	for _, c := range cases {
+		if got := prunable(c.pat); got != c.want {
+			t.Errorf("prunable(%q) = %v, want %v (%s)", c.pat, got, c.want, c.reason)
+		}
+	}
+}
+
+func TestExcludeDirSemantics(t *testing.T) {
+	m := Compile(&model.Filters{ExcludePaths: []string{"node_modules", "build/**", "*/keep"}})
+	if !m.ExcludeDir("x/node_modules", "node_modules") {
+		t.Error("段模式应剪枝")
+	}
+	// 既有 matchPath 语义：前缀式按「相对扫描根」的路径匹配，不含祖先段
+	if !m.ExcludeDir("build", "build") {
+		t.Error("前缀式 build/** 应剪枝根下的 build 目录")
+	}
+	if m.ExcludeDir("src/build", "build") {
+		t.Error("build/** 按既有语义不匹配 src/build（不得额外扩大范围）")
+	}
+	// "*/keep" 匹配目录 */keep 自身，但剪枝不安全 → 必须拒绝剪枝（退回文件级）
+	if m.ExcludeDir("a/keep", "keep") {
+		t.Error("通配在中间的模式不得用于目录剪枝")
+	}
+	if m.ExcludeDir("docs", "docs") {
+		t.Error("未命中的目录不应剪枝")
+	}
+	// nil matcher 恒不剪枝
+	var nilM *Matcher
+	if nilM.ExcludeDir("a", "a") {
+		t.Error("nil matcher 应不剪枝")
+	}
+}
+
+// ---------- C2：ExcludeDir/排除 glob 区分 *（单层）与 **（递归） ----------
+
+// TestPrunableC2Star 剪枝安全性：尾随单 * 与中间 ** 一律不可剪枝。
+func TestPrunableC2Star(t *testing.T) {
+	cases := []struct {
+		pat    string
+		want   bool
+		reason string
+	}{
+		{"a/b/*", false, "尾随单 * 只匹配直接子层，剪枝会误删 a/b/c/d（C2 静默多删）"},
+		{"a/**/b", false, "中间 ** 只表达层级关系，不保证后代命中"},
+		{"**/build", false, "头部 ** 同上"},
+		{"a/b/**", true, "尾部 ** 递归前缀：命中可传播"},
+		{"a/b", true, "字面前缀不变"},
+	}
+	for _, c := range cases {
+		if got := prunable(c.pat); got != c.want {
+			t.Errorf("prunable(%q) = %v, want %v (%s)", c.pat, got, c.want, c.reason)
+		}
+	}
+}
+
+// TestMatchPathStarVsDoubleStar 文件级：* 单层不跨段、** 递归跨层。
+func TestMatchPathStarVsDoubleStar(t *testing.T) {
+	cases := []struct {
+		name string
+		pat  string
+		rel  string
+		want bool
+	}{
+		{"尾随单 * 命中直接子层", "a/b/*", "a/b/c", true},
+		{"尾随单 * 不再误伤更深后代", "a/b/*", "a/b/c/d", false}, // C2：修正前 true（静默多删）
+		{"** 匹配零层", "a/**/b", "a/b", true},
+		{"** 匹配单层", "a/**/b", "a/x/b", true},
+		{"** 匹配多层", "a/**/b", "a/x/y/b", true}, // C2：修正前 false（漏删）
+		{"** 不误伤其他路径", "a/**/b", "a/x", false},
+		{"递归尾随 ** 覆盖深层", "build/**", "build/x/y/f.o", true},
+		{"字面前缀仍递归", "a/b", "a/b/c/d", true},
+		{"单层 * 不跨段", "a/*", "a/x", true},
+		{"单层 * 不跨段-深层", "a/*", "a/x/y", false},
+	}
+	for _, c := range cases {
+		if got := matchPath(c.pat, c.rel, "f.o"); got != c.want {
+			t.Errorf("matchPath(%q, %q) = %v, want %v (%s)", c.pat, c.rel, got, c.want, c.name)
+		}
+	}
+}
+
+// TestExcludeDirC2 剪枝行为端到端：单 * 不剪枝（退回文件级），** 剪枝。
+func TestExcludeDirC2(t *testing.T) {
+	m := Compile(&model.Filters{ExcludePaths: []string{"a/b/*", "c/d/**", "a/**/b"}})
+	if m.ExcludeDir("a/b/c", "c") {
+		t.Error("尾随单 * 的命中目录不得剪枝（否则误删 a/b/c/d）")
+	}
+	if !m.ExcludeDir("c/d/x", "x") {
+		t.Error("尾部 ** 的命中目录应剪枝（后代必然命中）")
+	}
+	if m.ExcludeDir("a/x/b", "b") {
+		t.Error("中间 ** 的命中目录不得剪枝（后代不保证命中）")
+	}
+}

@@ -35,6 +35,22 @@ type Stats struct {
 // MaxEntries 条目上限（01 §7.3：默认 50 万）。
 const MaxEntries = 500_000
 
+// AlgoVersion 缓存语义版本（P0-2 / P2）。
+//
+// 命中判定只比 (path, size, mtime)，因此缓存行的含义一旦变化，旧行就可能
+// 给出错误的分组依据。需要 bump 本版本的改动包括但不限于：
+//   - 全量/采样哈希算法或长度（blake3-256 → 其他）
+//   - hasher.HeadTailChunk / SmallFileMax 等采样参数
+//   - Entry 字段语义（例如 partial 是否必须有效）
+//
+// 修正前无任何版本标记：升级或换算法后旧库继续命中，可能造出错误分组。
+// 旧库还存在「阶段 3 写回把 partial 清零」留下的脏行（head=tail=0），
+// 这些行与新算出的采样永远不同桶 → 漏报。bump 版本可一并清掉。
+const AlgoVersion = "blake3-256+xxh64-64k-v2"
+
+// metaKey 元信息表主键。
+const metaKey = "algo_version"
+
 // Cache 线程安全缓存（单写多读；WAL 支持并发读）。
 // Lookup 用 RLock 并行（阶段 2 多 worker 同时点查）；写操作独占。
 type Cache struct {
@@ -42,6 +58,11 @@ type Cache struct {
 	db          *sql.DB
 	path        string
 	lastEvicted int
+	// C5/G11 触发式计数：条目数只在写入后变化（本进程独占此库），
+	// 缓存计数并在任何写入后失效，避免每次统计/淘汰判定都全表 COUNT。
+	cnt      int  // 条目总数（≈ COUNT(*)）
+	cntFull  int  // 含全量哈希的条目数（≈ COUNT(full)）
+	cntValid bool // cnt/cntFull 是否有效
 }
 
 // Open 打开或创建缓存库；损坏（无法打开/迁移）时自动重建（最坏退化为首扫速度）。
@@ -60,7 +81,38 @@ func Open(path string) (*Cache, error) {
 			return nil, fmt.Errorf("缓存库重建失败: %w", err)
 		}
 	}
+	// P0-2 / P2：算法语义版本校验。版本不符（含旧库无版本标记）即整表作废，
+	// 否则旧语义的缓存行会继续命中，可能导致错误分组或漏报。
+	if err := enforceAlgoVersion(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Cache{db: db, path: path}, nil
+}
+
+// enforceAlgoVersion 比对并刷新缓存语义版本；不符则清空哈希表。
+func enforceAlgoVersion(db *sql.DB) error {
+	var got string
+	err := db.QueryRow(`SELECT value FROM cache_meta WHERE key = ?`, metaKey).Scan(&got)
+	if err == nil && got == AlgoVersion {
+		return nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("读取缓存版本失败: %w", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM hash_cache`); err != nil {
+		return fmt.Errorf("作废旧缓存失败: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO cache_meta (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaKey, AlgoVersion); err != nil {
+		return fmt.Errorf("写入缓存版本失败: %w", err)
+	}
+	return tx.Commit()
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -79,6 +131,10 @@ func openDB(path string) (*sql.DB, error) {
 			partial  BLOB    NOT NULL,
 			full     BLOB,
 			last_hit INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS cache_meta (
+			key   TEXT NOT NULL PRIMARY KEY,
+			value TEXT NOT NULL
 		)`,
 		// G4：idx_cache_size 为死索引——size 从不作为查询谓词或排序键
 		// （Lookup/Touch 走 path 主键，淘汰走 last_hit 索引），
@@ -111,6 +167,12 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64) (Entry, bool, bo
 		return Entry{}, false, false // 元数据变化 → 未命中（重算）
 	}
 	e.Head, e.Tail = decodePartial(partial)
+	// P0-2 防御：采样为全零的行不可信（历史写入路径曾把 partial 覆盖为零，
+	// 见 enforceAlgoVersion 的说明）。这类行若参与分桶会让文件与真正的同内容
+	// 文件永远不同桶，表现为漏报；宁可当作未命中重算一次。
+	if e.Head == 0 && e.Tail == 0 {
+		return Entry{}, false, false
+	}
 	fullValid := len(e.Full) == 32
 	// 异步更新 last_hit 会引入写竞争；此处随批量写回刷新（够用）
 	return e, true, fullValid
@@ -133,7 +195,9 @@ func (c *Cache) Store(entries []Entry) error {
 	stmt, err := tx.Prepare(`INSERT INTO hash_cache (path, size, mtime_ns, partial, full, last_hit)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
-			partial=excluded.partial, full=excluded.full, last_hit=excluded.last_hit`)
+			partial=CASE WHEN excluded.partial = x'00000000000000000000000000000000'
+				THEN hash_cache.partial ELSE excluded.partial END,
+			full=excluded.full, last_hit=excluded.last_hit`)
 	if err != nil {
 		return err
 	}
@@ -150,6 +214,7 @@ func (c *Cache) Store(entries []Entry) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	c.cntValid = false // C5：写入后计数失效，下次统计/淘汰判定重算一次
 	return c.evictLocked()
 }
 
@@ -192,31 +257,45 @@ func (c *Cache) LastHit(path string) (int64, bool) {
 	return ts, true
 }
 
-// evictLocked 超上限淘汰（last_hit 最旧优先）。
+// evictLocked 超上限淘汰（last_hit 最旧优先）。调用方须持写锁。
 func (c *Cache) evictLocked() error {
-	var n int
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM hash_cache`).Scan(&n); err != nil {
-		return err
+	// C5/G11：优先用缓存计数，仅在失效（最近有写入）时全表 COUNT 一次
+	if !c.cntValid {
+		if err := c.db.QueryRow(`SELECT COUNT(*), COUNT(full) FROM hash_cache`).
+			Scan(&c.cnt, &c.cntFull); err != nil {
+			return err
+		}
+		c.cntValid = true
 	}
-	if n <= MaxEntries {
+	if c.cnt <= MaxEntries {
 		return nil
 	}
-	over := n - MaxEntries
+	over := c.cnt - MaxEntries
 	if _, err := c.db.Exec(`DELETE FROM hash_cache WHERE path IN (
 		SELECT path FROM hash_cache ORDER BY last_hit ASC, path ASC LIMIT ?)`, over); err != nil {
 		return err
 	}
+	c.cnt -= over
 	c.lastEvicted = over
 	return nil
 }
 
-// GetStats 统计。
+// GetStats 统计。读锁即可（C5：修正前取写锁，会阻塞并发的 Lookup 读）；
+// 条目计数走触发式缓存（G11）：计数只在写锁内回写，写后由 evictLocked 即时
+// 重算，因此常态下零全表扫描；仅在 Clear 之后的首查走一次 COUNT（不回写，
+// 避免持读锁写共享字段与并发 GetStats 竞争）。
 func (c *Cache) GetStats() (Stats, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	var s Stats
-	if err := c.db.QueryRow(`SELECT COUNT(*), COUNT(full) FROM hash_cache`).Scan(&s.Entries, &s.WithFull); err != nil {
-		return s, err
+	if c.cntValid {
+		s.Entries = c.cnt
+		s.WithFull = c.cntFull
+	} else {
+		if err := c.db.QueryRow(`SELECT COUNT(*), COUNT(full) FROM hash_cache`).
+			Scan(&s.Entries, &s.WithFull); err != nil {
+			return s, err
+		}
 	}
 	s.LastEvicted = c.lastEvicted
 	if st, err := os.Stat(c.path); err == nil {
@@ -230,6 +309,8 @@ func (c *Cache) Clear() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.db.Exec(`DELETE FROM hash_cache`)
+	c.cntValid = false // C5：清空后计数失效
+	c.lastEvicted = 0
 	return err
 }
 

@@ -81,6 +81,103 @@ func TestCacheSecondScan(t *testing.T) {
 	}
 }
 
+// TestCacheMtimeContentChanged C1 回归：文件内容变更但 size+mtime 不变时，
+// 缓存命中绝不可让"旧 full 哈希"把内容已变文件误判进重复组（否则会误删）。
+//
+// 触发条件：首扫缓存 x/y（内容 A，互为重复）。二扫前把 x 内容改为 B（同长度），
+// 并把 mtime 拨回原值 → 缓存仍以 (path,size,mtime) 命中，但内容已变。
+//
+//	修复前：命中分支直接采用缓存的 Head/Tail/Full（内容 A）→ x 与 y 同桶 → 误报重复组。
+//	修复后：命中后再算实际抽样(head/tail)，与缓存抽样不一致 → 不信任缓存 full，
+//	        x 以实际抽样(contentB)分桶、阶段3重算 full → 与 y(contentA)不同 → 无重复组。
+func TestCacheMtimeContentChanged(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, b []byte) string {
+		p := filepath.Join(root, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, b, 0o644)
+		return p
+	}
+	// 大文件（>128KiB 走两阶段：预筛采样 + 阶段3全量），内容确定性。
+	n := 200 << 10
+	contentA := make([]byte, n)
+	contentB := make([]byte, n)
+	for i := range contentA {
+		contentA[i] = byte(i)
+		contentB[i] = byte(i * 3) // 同长度、不同内容 → head/tail 抽样必然不同
+	}
+	x := write("x.bin", contentA)
+	_ = write("y.bin", contentA) // 与 x 重复
+
+	cch, err := cache.Open(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cch.Close()
+
+	cfg := model.ScanConfig{Roots: []string{root}, UseCache: true}
+
+	// 首扫：建立缓存（x,y 应判为 1 个重复组）
+	p1 := New().WithCache(cch)
+	g1, failed1, err := p1.Run(context.Background(), cfg)
+	if err != nil || len(failed1) != 0 {
+		t.Fatalf("首扫: failed=%+v err=%v", failed1, err)
+	}
+	if len(g1) != 1 {
+		t.Fatalf("首扫组数 = %d, want 1", len(g1))
+	}
+
+	// 抓取 x 的原始 mtime（缓存键含 mtime）。首扫后未再写入，故与缓存一致。
+	fi, err := os.Stat(x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origMtime := fi.ModTime()
+
+	// 内容改为 B（同长度），再把 mtime 拨回原值 → 缓存命中但内容已变（C1 触发条件）
+	if err := os.WriteFile(x, contentB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(x, origMtime, origMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	// 二扫：若 C1 未修复，x 复用旧 full → 与 y 仍被判重复（误报）；
+	// 修复后 x 实际抽样与缓存不符 → full 重算 → 与 y 不同 → 无重复组。
+	p2 := New().WithCache(cch)
+	g2, failed2, err := p2.Run(context.Background(), cfg)
+	if err != nil || len(failed2) != 0 {
+		t.Fatalf("二扫: failed=%+v err=%v", failed2, err)
+	}
+	if len(g2) != 0 {
+		names := make([]string, 0, len(g2))
+		for _, gg := range g2 {
+			for _, f := range gg.Files {
+				names = append(names, f.Path)
+			}
+		}
+		t.Fatalf("C1 回归：内容已变却误判重复组（%d 组，文件 %v）；修复后应为 0 组（x/y 内容现已不同）",
+			len(g2), names)
+	}
+
+	// 反向再验证：把 x 真正改回内容 A（含 mtime 复位），二扫应能找回重复组
+	if err := os.WriteFile(x, contentA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(x, origMtime, origMtime); err != nil {
+		t.Fatal(err)
+	}
+	// 注意：y 此刻仍命中旧缓存（内容 A），x 内容恢复 A 但 mtime 与首扫一致 → 命中旧缓存 full
+	p3 := New().WithCache(cch)
+	g3, failed3, err := p3.Run(context.Background(), cfg)
+	if err != nil || len(failed3) != 0 {
+		t.Fatalf("三扫: failed=%+v err=%v", failed3, err)
+	}
+	if len(g3) != 1 {
+		t.Fatalf("恢复内容后组数 = %d, want 1（x/y 内容应再次相同）", len(g3))
+	}
+}
+
 // TestCacheSecondScanRefreshesLastHit R1 端到端：二扫全命中时，
 // 命中条目 last_hit 必须被续期（否则热文件会在淘汰时最先被逐出）。
 func TestCacheSecondScanRefreshesLastHit(t *testing.T) {

@@ -123,6 +123,7 @@ type OpsResult struct {
 	OK        []string
 	Failed    []FailedItem
 	Skipped   []string // 操作时文件已不存在（ENOENT）
+	Cancelled []string // 取消后未派发（P2：使操作可中止且结果可解释）
 	Reclaimed uint64
 }
 

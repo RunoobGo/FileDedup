@@ -13,7 +13,9 @@ import Logo from './components/Logo.vue'
 import type { IconName } from './components/icons'
 
 const store = useScanStore()
-onMounted(() => store.bindEvents())
+// C12：记录解绑函数，卸载时清理（HMR 重挂会重复绑定、toast 重复弹出）
+let unbindEvents: (() => void) | null = null
+onMounted(() => { unbindEvents = store.bindEvents() })
 
 // 快捷键：Space 预览当前项 / Cmd(Ctrl)+A 全选 / Del 清除选择 / Esc 关闭浮层
 function onKeydown(e: KeyboardEvent) {
@@ -24,7 +26,7 @@ function onKeydown(e: KeyboardEvent) {
     return
   }
   if (inInput) return
-  if (store.view === 'result' && !store.preview) {
+  if (store.view === 'result' && !store.preview && !store.confirmOpen) {
     if (e.code === 'Space') {
       e.preventDefault()
       store.previewCurrent()
@@ -38,7 +40,11 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+  unbindEvents?.()
+  unbindEvents = null
+})
 
 // P2-1：导航图标由文字符号（◎ ⧉ ⚙）改为统一线性图标集的图标名。
 const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName }[] = [

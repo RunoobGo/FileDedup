@@ -1,6 +1,6 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
-import { api, onEvent, isBackendAvailable } from '../wails'
+import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
 import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult } from '../wails'
 import { reactive, ref, computed } from 'vue'
 import { useToastStore } from './toast'
@@ -49,6 +49,8 @@ export const useScanStore = defineStore('scan', () => {
   // 失败清单
   const failed = ref<FailedItem[]>([])
   const failedOpen = ref(false)
+  // 是否处在「确认操作」对话框中（用于拦截全局快捷键，避免误改 selection 导致误删）
+  const confirmOpen = ref(false)
   // 预览
   // P2-7：预览面板原先只带 path，头部无法回答"这是什么类型/多大/什么时候改的"，
   // 也没有回到磁盘定位的入口。这里把 FileView 已有的元信息一并带上
@@ -103,9 +105,18 @@ export const useScanStore = defineStore('scan', () => {
       })
   }
 
-  function pauseScan() { api.pauseScan().then(refreshStatus) }
-  function resumeScan() { api.resumeScan().then(refreshStatus) }
-  function cancelScan() { api.cancelScan().then(refreshStatus) }
+  // P3：后端现在对"无任务时暂停/继续/取消"返回错误（此前静默成功，
+  // 按钮状态与真实状态不一致）。这里必须把失败显式提示出来，
+  // 同时仍刷新状态以回到真实值——不能用 .then 让 rejection 逃逸。
+  function controlScan(p: Promise<unknown>, what: string) {
+    p.then(refreshStatus).catch((e: any) => {
+      refreshStatus()
+      toast().notifyError(`${what}失败`, e)
+    })
+  }
+  function pauseScan() { controlScan(api.pauseScan(), '暂停') }
+  function resumeScan() { controlScan(api.resumeScan(), '恢复') }
+  function cancelScan() { controlScan(api.cancelScan(), '取消') }
 
   // 结果页加载串行化：滚动加载/排序/筛选并发触发时按序执行，
   // 避免同页重复请求（:key 冲突）与新旧响应交错覆盖
@@ -232,6 +243,12 @@ export const useScanStore = defineStore('scan', () => {
 
   function openTrash() { api.openTrash().catch((e: any) => toast().notifyError('打开回收站失败', e)) }
 
+  // P2：清理操作可中止。语义是「停止派发后续条目」——已完成的部分不可回滚，
+  // 未派发条目会出现在 OpsResult.Cancelled 中并保留在结果集里。
+  function cancelOp() {
+    api.cancelOperation().catch((e: any) => toast().notifyError('取消清理操作失败', e))
+  }
+
   async function previewCurrent() {
     if (currentFileID.value != null) await openPreview(currentFileID.value)
   }
@@ -246,23 +263,36 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
-  function bindEvents() {
-    if (!isBackendAvailable()) return
-    onEvent('ops:progress', (p: OpsProgress) => { opsProgress.value = p })
-    onEvent('ops:done', async (r: OpsResult) => {
+  function bindEvents(): () => void {
+    if (!isBackendAvailable()) return () => {}
+    const bound: string[] = []
+    const bind = (name: string, cb: (data: any) => void) => {
+      onEvent(name, cb)
+      bound.push(name)
+    }
+    bind('ops:progress', (p: OpsProgress) => { opsProgress.value = p })
+    bind('ops:done', async (r: OpsResult) => {
       opsRunning.value = false
       opsResult.value = r
       await refreshFailed()
       await loadResultPage(false) // 重载视图并清空勾选（结果集已变化）
     })
-    onEvent('scan:progress', (ev: ProgressEvent) => {
+    // C9：后端 worker panic / 内部异常时发 ops:error（C7 守卫已捕获，不崩进程）。
+    // 必须复位 opsRunning，否则操作互斥标记卡在 true → 重演 P2「操作执行中」死锁，
+    // 此后所有清理/保留策略永久返回「操作执行中」，只能重启应用。
+    bind('ops:error', (e: any) => {
+      opsRunning.value = false
+      const msg = (e && typeof e === 'object' && e.error) ? e.error : String(e ?? '未知错误')
+      toast().notifyError('清理操作异常中断', msg)
+    })
+    bind('scan:progress', (ev: ProgressEvent) => {
       progress.value = ev
     })
-    onEvent('scan:stage', (ev: { Stage: string; Desc: string }) => {
+    bind('scan:stage', (ev: { Stage: string; Desc: string }) => {
       stageDesc.value = ev.Desc || ev.Stage
       refreshStatus()
     })
-    onEvent('scan:done', async (s: ScanSummary) => {
+    bind('scan:done', async (s: ScanSummary) => {
       scanning.value = false
       status.value = 'Done'
       reclaimableTotal.value = s.reclaimable // 初始值，随即被 loadResultPage 全量口径覆盖
@@ -271,17 +301,17 @@ export const useScanStore = defineStore('scan', () => {
       await loadResultPage(false)
       view.value = 'result' // 完成后自动切结果页（M2-T05）
     })
-    onEvent('scan:cancelled', async () => {
+    bind('scan:cancelled', async () => {
       scanning.value = false
       status.value = 'Cancelled'
       await refreshFailed()
     })
-    onEvent('scan:error', (e: any) => {
+    bind('scan:error', (e: any) => {
       scanning.value = false
       status.value = 'Failed'
       toast().notifyError('扫描失败', e)
     })
-    onEvent('app:ready', (v: string) => {
+    bind('app:ready', (v: string) => {
       appVersion.value = v
       refreshStatus()
     })
@@ -293,6 +323,8 @@ export const useScanStore = defineStore('scan', () => {
       applyTheme(s.theme)
     }).catch(() => {})
     refreshStatus()
+    // C12：返回解绑函数——HMR/卸载时清掉全部订阅，防重复绑定
+    return () => { for (const n of bound) offEvent(n) }
   }
 
   function applyTheme(theme: string) {
@@ -355,11 +387,11 @@ export const useScanStore = defineStore('scan', () => {
     status, progress, stageDesc, scanning,
     groups, totalGroups, reclaimableTotal, resultSort, resultExt, hasResult, pageSize,
     loadCap, loadingPage, resultPage,
-    failed, failedOpen, preview, settings, appVersion,
+    failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
-    applyKeep, clearKeep, executeOp, openTrash,
+    applyKeep, clearKeep, executeOp, openTrash, cancelOp,
     running, startScan, pauseScan, resumeScan, cancelScan,
     loadResultPage, loadMore, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,
     revealPreview,

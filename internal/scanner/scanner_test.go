@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -212,4 +213,40 @@ func BenchmarkRelativeTo(b *testing.B) {
 			_ = naiveRelativeTo(roots, full)
 		}
 	})
+}
+
+// P2：ExcludePaths 目录级剪枝——既要不进结果，也要真的不去遍历。
+func TestExcludePathsPrunesDirectories(t *testing.T) {
+	root := t.TempDir()
+	payload := []byte("PRUNE-CHECK-CONTENT")
+	// nm 下塞大量文件，用于衡量遍历量
+	for _, dir := range []string{"node_modules/pkg", "src"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 300; i++ {
+			p := filepath.Join(root, dir, "f"+strconv.Itoa(i)+".bin")
+			if err := os.WriteFile(p, payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	countFiles := func(exclude []string) (int, int) {
+		r := Walk(context.Background(), []string{root}, &model.Filters{ExcludePaths: exclude}, 4)
+		return len(r.Files), r.Visited
+	}
+	withPrune, visitedWith := countFiles([]string{"node_modules"})
+	_, visitedNone := countFiles(nil)
+
+	if withPrune != 300 {
+		t.Fatalf("结果数应只剩 src 的 300 个, got %d", withPrune)
+	}
+	if visitedWith >= visitedNone {
+		t.Fatalf("P2: 剪枝未减少遍历量 visited=%d (未排除时 %d)", visitedWith, visitedNone)
+	}
+	// 剪枝必须与"不剪枝只过滤"结果一致
+	rNoPrune := Walk(context.Background(), []string{root}, &model.Filters{ExcludePaths: []string{"*/nope", "node_modules"}}, 4)
+	if len(rNoPrune.Files) != withPrune {
+		t.Fatalf("加入不可剪枝模式后结果数变化: %d vs %d", len(rNoPrune.Files), withPrune)
+	}
 }

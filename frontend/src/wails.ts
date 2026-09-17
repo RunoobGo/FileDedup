@@ -99,6 +99,7 @@ export interface OpsResult {
   OK: string[]
   Failed: { Path: string; Stage: string; Err: string }[]
   Skipped: string[]
+  Cancelled: string[] // P2：取消后未派发的条目（未处理，仍在结果集中）
   Reclaimed: number
 }
 
@@ -141,6 +142,7 @@ export interface BackendAPI {
   ApplyKeepPolicy(policy: { Kind: string; Directory: string }): Promise<KeepDecision[]>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
+  CancelOperation(): Promise<void>
   OpenTrash(): Promise<void>
   CacheStats(): Promise<CacheStats>
   CacheClear(): Promise<void>
@@ -148,7 +150,9 @@ export interface BackendAPI {
 
 declare global {
   interface Window {
-    go: { main: { app: { App: BackendAPI } } }
+    // Wails v2 注入路径为 window.go.main.App（结构体名大写，见 wailsjs/go/main/App.js
+    // 生成的 window['go']['main']['App']）；app 小写为历史错误写法，保留兜底。
+    go: { main: { App?: BackendAPI; app?: { App: BackendAPI } } }
     runtime?: {
       EventsOn: (name: string, cb: (data: any) => void) => void
       OnFileDrop?: (cb: (x: number, y: number, paths: string[]) => void, useDropTarget?: boolean) => void
@@ -157,10 +161,15 @@ declare global {
   }
 }
 
-// 后端可用性探测：纯浏览器（vite dev）时 window.go 不存在
+// 后端可用性探测：纯浏览器（vite dev）时 window.go 不存在。
+// 路径修复（2026-09-17）：Wails v2 实际注入 window.go.main.App（结构体名大写），
+// 旧代码探测 window.go.main.app.App 永远为 undefined，导致原生窗口内
+// 所有后端调用抛「后端不可用」。
 const backendOrNull = (): BackendAPI | null => {
-  if (typeof window !== 'undefined' && window.go?.main?.app?.App) return window.go.main.app.App
-  return null
+  if (typeof window === 'undefined') return null
+  const main = window.go?.main as { App?: BackendAPI; app?: { App: BackendAPI } } | undefined
+  if (!main) return null
+  return main.App ?? main.app?.App ?? null
 }
 
 // 调用入口：后端缺失时抛出明确错误（替代此前 null 解引用的 TypeError）
@@ -189,6 +198,7 @@ export const api = {
     backend().ApplyKeepPolicy({ Kind: kind, Directory: directory ?? '' }),
   clearKeepDecisions: (): Promise<void> => backend().ClearKeepDecisions(),
   executeOperation: (op: OpRequest): Promise<string> => backend().ExecuteOperation(op),
+  cancelOperation: (): Promise<void> => backend().CancelOperation(),
   openTrash: (): Promise<void> => backend().OpenTrash(),
   cacheStats: (): Promise<CacheStats> => backend().CacheStats(),
   cacheClear: (): Promise<void> => backend().CacheClear(),
@@ -198,6 +208,14 @@ export const api = {
 export function onEvent(name: string, cb: (data: any) => void): void {
   if (typeof window !== 'undefined' && window.runtime?.EventsOn) {
     window.runtime.EventsOn(name, cb)
+  }
+}
+
+// 事件解绑（C12）：onUnmounted 清理，防 Vite HMR 重挂时重复绑定、toast 重复弹出
+export function offEvent(name: string): void {
+  const rt = typeof window !== 'undefined' ? window.runtime : undefined
+  if (rt && typeof (rt as any).EventsOff === 'function') {
+    ;(rt as any).EventsOff(name)
   }
 }
 

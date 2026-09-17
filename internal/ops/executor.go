@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -17,7 +18,12 @@ const opWorkers = 4
 
 // runIndexed 有界并发执行 n 个相互独立的任务；结果按下标写入，
 // 由调用方按序汇总，从而在并发的同时保证输出顺序确定。
-func runIndexed(n, workers int, fn func(i int)) {
+// ctx 取消后不再派发新任务（已在途的单次 syscall 不可抢占），剩余下标保持
+// 未置位，由调用方汇总为「已取消」。
+// onPanic 为可选兜底（C7）：fn 内的 panic（如 trash/VerifyFile/HardlinkMerge
+// 遇畸形输入）会被对应 worker 捕获并回调，避免进程崩溃、操作互斥标记卡死
+// （P2 死锁的终防）。未提供时等价于不拦截——panic 仍穿透进程，便于测试暴露意外。
+func runIndexed(ctx context.Context, n, workers int, fn func(i int), onPanic ...func(i int, r any)) {
 	if n <= 0 {
 		return
 	}
@@ -29,16 +35,30 @@ func runIndexed(n, workers int, fn func(i int)) {
 	}
 	var wg sync.WaitGroup
 	var next atomic.Int64
+	guard := func(i int) {
+		if len(onPanic) == 0 || onPanic[0] == nil {
+			return
+		}
+		if r := recover(); r != nil {
+			onPanic[0](i, r)
+		}
+	}
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
+				if ctx.Err() != nil {
+					return
+				}
 				i := int(next.Add(1) - 1)
 				if i >= n {
 					return
 				}
-				fn(i)
+				func() {
+					defer guard(i)
+					fn(i)
+				}()
 			}
 		}()
 	}
@@ -52,6 +72,17 @@ type Options struct {
 	Pool       *hasher.Pool
 	TrashFn    func(paths []string) error // 回收站（可注入，默认平台实现）
 	OnProgress func(done, total int, current string)
+
+	// OnPanic C7 兜底：worker 内 panic 时回调（由调用方发 ops:error 并复位在途标志）。
+	// 不提供则 runIndexed 的 panic 守卫退化为不拦截（保留默认崩溃行为，便于测试暴露缺陷）。
+	OnPanic func(err error)
+
+	// Ctx 取消信号（P2）：修正前 Execute 无法中止——任何一次卡住
+	// （回收站服务无响应、网络卷挂起）都会让 app 层的操作互斥标记永不复位，
+	// 此后可清理与保留策略永久返回「操作执行中」，只能重启应用。
+	// 注意：已在途的单个 syscall 无法抢占，取消保证的是「不再派发新条目」，
+	// 配合 app 层的代际校验共同消除永久锁死。
+	Ctx context.Context
 }
 
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
@@ -61,7 +92,13 @@ type Options struct {
 //   - 单文件失败不中断整体（S7），逐项计入清单
 //   - Execute 须由上层串行调用（app 层单任务约束）
 func Execute(opts Options, op model.OpRequest) model.OpsResult {
-	res := model.OpsResult{OK: []string{}, Failed: []model.FailedItem{}, Skipped: []string{}}
+	ctx := opts.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	res := model.OpsResult{
+		OK: []string{}, Failed: []model.FailedItem{}, Skipped: []string{}, Cancelled: []string{},
+	}
 	if len(op.FileIDs) == 0 {
 		return res
 	}
@@ -152,6 +189,26 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		err   string
 	}
 	outcomes := make([]outcome, len(toProcess))
+
+	// C7：worker 内 panic 守卫落地。fn（trash/VerifyFile/HardlinkMerge）panic 会
+	// 穿透 goTask 的 recover（仅包主 goroutine）直接崩进程；此处捕获后把该下标
+	// 标记为失败，并回调 OnPanic（由调用方发 ops:error）。进程不死、操作互斥标记
+	// 仍由最终的 ops:done 正常复位（P2 死锁的最终防线）。
+	onPanic := func(i int, r any) {
+		if i < 0 || i >= len(toProcess) {
+			if opts.OnPanic != nil {
+				opts.OnPanic(fmt.Errorf("worker panic（下标越界 %d）: %v", i, r))
+			}
+			return
+		}
+		e := toProcess[i]
+		outcomes[i] = outcome{code: ocFailed, stage: "ops",
+			err: fmt.Sprintf("内部错误（panic 已被捕获，未崩溃）: %v", r)}
+		report(e.Path)
+		if opts.OnPanic != nil {
+			opts.OnPanic(fmt.Errorf("文件 %s 操作 panic: %v", e.Path, r))
+		}
+	}
 	aggregate := func() {
 		for i, e := range toProcess {
 			switch outcomes[i].code {
@@ -161,7 +218,13 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
 			case ocNone:
-				res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ops", Err: "未执行（内部状态缺失）"})
+				// 未派发：取消时是常态（P2），须与真正的内部状态缺失区分开，
+				// 否则用户取消一次会得到一堆"内部状态缺失"的误导信息。
+				if ctx.Err() != nil {
+					res.Cancelled = append(res.Cancelled, e.Path)
+				} else {
+					res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ops", Err: "未执行（内部状态缺失）"})
+				}
 			default:
 				stage := outcomes[i].stage
 				if stage == "" {
@@ -186,7 +249,8 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		for _, e := range toProcess {
 			paths = append(paths, e.Path)
 		}
-		if len(paths) > 0 {
+		// 已取消则整批不派发（outcome 保持 ocNone → aggregate 归入 Cancelled）
+		if len(paths) > 0 && ctx.Err() == nil {
 			if err := trash(paths); err == nil {
 				for i := range toProcess {
 					outcomes[i].code = ocOK
@@ -194,20 +258,30 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				}
 			} else {
 				// 批量失败退化为逐文件执行以隔离错误项（S5/S7）；
-				// 各文件相互独立 → 有界并发
-				runIndexed(len(toProcess), opWorkers, func(i int) {
-					if err := trash([]string{toProcess[i].Path}); err != nil {
+				// 各文件相互独立 → 有界并发。
+				// C6：批量 trash 可能已部分成功（整批返回一个 error，无从得知
+				// 哪些已移走）。回退前逐个检查源是否还在——已不在的按 S8 语义
+				// 记 Skipped（目标已达成），否则会被记 Failed，但文件实际已在
+				// 回收站，结果集却仍显示「存在」，状态不一致。
+				runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
+					p := toProcess[i].Path
+					if _, err := os.Stat(p); os.IsNotExist(err) {
+						outcomes[i].code = ocSkipped
+						report(p)
+						return
+					}
+					if err := trash([]string{p}); err != nil {
 						outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 					} else {
 						outcomes[i].code = ocOK
 					}
-					report(toProcess[i].Path)
-				})
+					report(p)
+				}, onPanic)
 			}
 		}
 
 	case "delete":
-		runIndexed(len(toProcess), opWorkers, func(i int) {
+		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
 			e := toProcess[i]
 			if err := os.Remove(e.Path); err != nil {
 				if os.IsNotExist(err) {
@@ -219,13 +293,16 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				outcomes[i].code = ocOK
 			}
 			report(e.Path)
-		})
+		}, onPanic)
 
 	case "move":
 		// 串行（安全优先）：MoveFile 的目标重名递增（uniqueDst）是「先查后用」，
 		// 并发处理同目录同基名文件时两个 worker 会选中同一目标名，后写者覆盖前者
 		// → 静默数据丢失。该风险高于并发收益，故此处不做并发（01 §9 安全语义）。
 		for i, e := range toProcess {
+			if ctx.Err() != nil {
+				break // move 串行执行，取消后立即停止派发（P2）
+			}
 			if _, err := MoveFile(e.Path, op.TargetDir); err != nil {
 				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 			} else {
@@ -235,7 +312,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		}
 
 	case "hardlink":
-		runIndexed(len(toProcess), opWorkers, func(i int) {
+		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
 			e := toProcess[i]
 			src := keepSrcByID[e.ID]
 			if src == nil || src.ID == e.ID {
@@ -245,7 +322,8 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
 			// 覆盖 dup 的原内容（不可逆），必须拦截。
-			// 注：同组多个 dup 共享同一 keep 源，VerifyFile 为只读操作，并发安全。
+			// P0-3：校验为内容级（见 VerifyFile），时间戳未变不再放行。
+			// 注：同组多个 dup 共享同一 keep 源，校验为只读操作，并发安全。
 			switch VerifyFile(src, hashByID[src.ID], pool) {
 			case VerdictSkipped:
 				outcomes[i] = outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"}
@@ -263,7 +341,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				outcomes[i].code = ocOK
 			}
 			report(e.Path)
-		})
+		}, onPanic)
 
 	default:
 		// 已在入口拦截未知类型，此处不可达（防御性保留）

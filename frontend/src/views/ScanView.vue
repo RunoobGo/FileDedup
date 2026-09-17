@@ -2,11 +2,13 @@
 // 扫描页：目录管理（拖拽/选择器/粘贴）+ 过滤器（渐进披露）+ 扫描进行态（M2-T04/T05）。
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useScanStore, emptyFilters } from '../stores/scan'
+import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import { humanBytes, humanSpeed, humanTime, statusLabel, stageLabel, formatCount } from '../utils/format'
 import Icon from '../components/Icon.vue'
 
 const store = useScanStore()
+const toast = useToastStore()
 const pastePath = ref('')
 const advancedOpen = ref(false)
 
@@ -35,8 +37,13 @@ const statusTag = computed(() => {
 })
 
 async function addByPicker() {
-  const dir = await api.selectDirectory()
-  if (dir) addRoot(dir)
+  // C10：dev 模式（window.go 缺失）backend() 同步抛错，await 后须接住，否则 unhandled rejection
+  try {
+    const dir = await api.selectDirectory()
+    if (dir) addRoot(dir)
+  } catch (e: any) {
+    toast.notifyError('选择目录失败', e)
+  }
 }
 function addRoot(p: string) {
   p = p.trim()
@@ -174,7 +181,10 @@ const progressPercent = computed(() => {
         </div>
         <div class="filter-foot">
           <button class="btn-ghost" @click="resetFilters">重置过滤</button>
-          <button class="btn-primary start" :disabled="store.roots.length === 0" @click="store.startScan()">
+          <button class="btn-primary start"
+            :disabled="store.roots.length === 0 || store.opsRunning"
+            :title="store.opsRunning ? '清理操作执行中，请等待完成' : undefined"
+            @click="store.startScan()">
             开始扫描（{{ store.roots.length }} 个目录）
           </button>
         </div>

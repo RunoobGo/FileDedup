@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- 多根目录扫描，按内容哈希（默认 SHA-256）识别重复文件
+- 多根目录扫描，按内容哈希（默认 BLAKE3-256）识别重复文件
 - 分组展示重复项，支持按扩展名 / 大小 / 修改时间筛选与排序
 - 可预览文件元信息与内容（Markdown 等），一键在文件管理器中定位
 - 增量缓存：已扫描文件的哈希结果落盘，二次扫描大幅提速
@@ -22,7 +22,7 @@
 ## 构建与运行
 
 ```bash
-# 依赖：Go 1.22+、Node 18+、Wails v2 CLI
+# 依赖：Go 1.27.1+（见 go.mod 的 go 指令）、Node 18+、Wails v2 CLI
 wails dev      # 开发模式（热更新）
 wails build    # 产出各平台安装包
 ```
@@ -33,12 +33,20 @@ wails build    # 产出各平台安装包
 .
 ├── main.go                 # 应用入口与窗口配置
 ├── app.go                  # Wails 应用生命周期与绑定
-├── internal/               # Go 后端（cache / dedup / scan）
+├── internal/               # Go 后端（scanner / dedup / hasher / cache / ops / filter / media / progress / model）
 ├── frontend/               # Vue 3 前端
 ├── build/                  # 图标与构建资源
 └── docs/                   # 设计 / 开发 / 测试文档
 ```
 
+## 开发前置：先构建前端
+
+`main.go` 用 `//go:embed frontend/dist` 内嵌前端产物，而 `frontend/dist` 属构建产物
+（被 .gitignore 排除）。因此全新克隆后须先 `cd frontend && npm ci && npm run build`，
+否则 `go build` / `go vet` / `go test` 会因 embed 找不到目录而失败（CI 已按此顺序编排）。
+
 ## 许可证
 
-本项目源码按相应许可证发布，详见仓库内 LICENSE 文件（如有）。
+仓库当前**未包含 LICENSE 文件**，按著作权默认条款即「保留所有权利」，
+未授权任何人复制、修改或再分发。若需开源发布，请先在仓库根目录补一份
+LICENSE 并同步本节说明。

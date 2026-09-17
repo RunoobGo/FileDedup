@@ -83,7 +83,7 @@ useModal(dlgRef)
       </div>
       <div v-if="kind === 'move'" class="moverow">
         <button class="btn-ghost" :disabled="picking" @click="pickDir">选择目录</button>
-        <input v-model="moveTarget" type="text" placeholder="目标目录" />
+        <input v-model="moveTarget" type="text" placeholder="目标目录" aria-label="移动目标目录" />
       </div>
       <label v-if="kind === 'delete'" class="ack">
         <input v-model="acknowledged" type="checkbox" />

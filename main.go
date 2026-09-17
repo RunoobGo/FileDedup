@@ -3,6 +3,8 @@ package main
 
 import (
 	"embed"
+	"fmt"
+	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -40,6 +42,9 @@ func main() {
 		Bind:       []interface{}{app},
 	})
 	if err != nil {
-		println("Error:", err.Error())
+		// P3：println 在无控制台附加的发布版（Windows GUI 子系统）里等于丢弃错误，
+		// 用户只会看到"双击没反应"。写 stderr + 非零退出码，供快捷方式/日志排查。
+		fmt.Fprintf(os.Stderr, "FileDedup 启动失败: %v\n", err)
+		os.Exit(1)
 	}
 }

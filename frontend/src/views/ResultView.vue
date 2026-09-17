@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 结果页（M3 版）：统计条 + 保留策略工具栏 + 操作按钮 + 执行反馈 + 组列表。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import GroupCard from '../components/GroupCard.vue'
@@ -13,6 +13,13 @@ const toast = useToastStore()
 const confirmKind = ref<'trash' | 'delete' | 'move' | 'hardlink' | null>(null)
 const keepKind = ref('shortest')
 const keepDir = ref('')
+
+// C12：切页时本组件卸载，但局部 confirmKind 不会自动复位——切回结果页会
+// 自动重开确认弹窗（且与 store.confirmOpen 脱钩，快捷键拦截失真）。卸载时复位。
+onUnmounted(() => {
+  confirmKind.value = null
+  store.confirmOpen = false
+})
 
 onMounted(() => {
   if (store.hasResult && store.groups.length === 0) store.loadResultPage(false)
@@ -80,12 +87,12 @@ function onConfirm(targetDir?: string) {
       </button>
       <div class="spacer"></div>
       <template v-if="store.totalGroups > 0">
-        <select :value="store.resultSort" @change="changeSort" aria-label="结果排序方式">
+        <select v-model="store.resultSort" @change="changeSort" aria-label="结果排序方式">
           <option value="reclaimable">按可释放空间</option>
           <option value="size">按文件大小</option>
           <option value="count">按文件数</option>
         </select>
-        <input :value="store.resultExt" @change="changeExt" type="text" aria-label="按扩展名过滤"
+        <input v-model="store.resultExt" @change="changeExt" type="text" aria-label="按扩展名过滤"
           placeholder="扩展名，如 .jpg" style="width: 120px" />
         <button v-if="store.totalGroups > store.groups.length" class="btn-ghost"
           :class="{ capped }" @click="store.loadMore()">
@@ -129,12 +136,12 @@ function onConfirm(targetDir?: string) {
         <button class="btn-primary" :disabled="store.selectedFiles.length === 0"
           @click="confirmKind = 'trash'">移入回收站</button>
         <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'move'">移动到…</button>
+          @click="confirmKind = 'move'; store.confirmOpen = true">移动到…</button>
         <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
           title="替换为指向保留文件的硬链接（同卷）"
           @click="confirmKind = 'hardlink'">硬链接合并</button>
         <button class="btn-danger" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'delete'">永久删除</button>
+          @click="confirmKind = 'delete'; store.confirmOpen = true">永久删除</button>
       </div>
     </div>
 
@@ -143,6 +150,9 @@ function onConfirm(targetDir?: string) {
       正在处理 <b>{{ store.opsProgress?.Done ?? 0 }}</b> / {{ store.opsProgress?.Total }} …
       <div class="bar"><div class="fill"
         :style="{ width: ((store.opsProgress?.Done ?? 0) / Math.max(1, store.opsProgress?.Total ?? 1)) * 100 + '%' }"></div></div>
+      <!-- P2：大批量清理（网络盘、回收站卡住）必须能中止，否则界面永久锁在"执行中" -->
+      <button class="btn-ghost" title="停止派发剩余条目；已完成的部分不会回滚"
+        @click="store.cancelOp()">中止</button>
     </div>
     <div v-else-if="store.opsResult" class="opsbar panel done">
       <template v-if="store.opsResult.OK.length">
@@ -150,6 +160,8 @@ function onConfirm(targetDir?: string) {
         <button class="btn-ghost" @click="store.openTrash()">打开回收站</button>
       </template>
       <span v-if="store.opsResult.Skipped.length" class="skip"><Icon name="skip" :size="13" /> 已跳过 {{ formatCount(store.opsResult.Skipped.length) }}（文件已消失）</span>
+      <!-- P2：中止后必须说清"还有多少没处理"，否则用户无法判断是否需要重跑 -->
+      <span v-if="store.opsResult.Cancelled?.length" class="skip"><Icon name="skip" :size="13" /> 未处理 {{ formatCount(store.opsResult.Cancelled.length) }}（已中止，仍在列表中）</span>
       <button v-if="store.opsResult.Failed.length" type="button" class="fail"
         @click="store.failedOpen = true"><Icon name="alert" :size="13" /> 失败 {{ formatCount(store.opsResult.Failed.length) }}（查看）</button>
       <button class="x" title="关闭结果提示" aria-label="关闭结果提示"
@@ -180,7 +192,7 @@ function onConfirm(targetDir?: string) {
       <GroupCard v-for="g in store.groups" :key="g.groupID" :group="g" />
     </div>
 
-    <ConfirmDialog v-if="confirmKind" :kind="confirmKind" @close="confirmKind = null" @confirm="onConfirm" />
+    <ConfirmDialog v-if="confirmKind" :kind="confirmKind" @close="confirmKind = null; store.confirmOpen = false" @confirm="onConfirm" />
   </div>
 </template>
 
