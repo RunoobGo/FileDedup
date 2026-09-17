@@ -1,62 +1,150 @@
-name: Build & Package
+name: Build & Package FileDedup
 
 on:
   push:
-    tags: ['v*']        # 打 tag 时触发发布
-  workflow_dispatch:     # 允许手动触发
+    tags:
+      - 'v*'           # 当推送 v1.0.0 这样的 tag 时触发
+  workflow_dispatch:   # 允许在 GitHub 网页上手动点击触发
 
 jobs:
   build:
+    name: Build - ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false # 某个平台失败不影响其他平台继续构建
       matrix:
         include:
+          # macOS ARM64 (Apple Silicon M1/M2/M3)
           - os: macos-latest
-            artifact: FileDedup-macos.zip
+            goos: darwin
+            goarch: arm64
+            asset_name: FileDedup-macos-arm64
+            archive_cmd: zip -r
+            archive_ext: .zip
+          # macOS AMD64 (Intel)
+          - os: macos-13 
+            goos: darwin
+            goarch: amd64
+            asset_name: FileDedup-macos-amd64
+            archive_cmd: zip -r
+            archive_ext: .zip
+          # Linux AMD64
           - os: ubuntu-latest
-            artifact: FileDedup-linux.tar.gz
+            goos: linux
+            goarch: amd64
+            asset_name: FileDedup-linux-amd64
+            archive_cmd: tar -czf
+            archive_ext: .tar.gz
+          # Windows AMD64
           - os: windows-latest
-            artifact: FileDedup-windows.zip
-
-    runs-on: ${{ matrix.os }}
+            goos: windows
+            goarch: amd64
+            asset_name: FileDedup-windows-amd64
+            archive_cmd: Compress-Archive -Path
+            archive_ext: .zip
+            is_windows: true
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      # 👇 根据你的技术栈选择对应的构建步骤
-      # --- Go 项目示例 ---
-      - uses: actions/setup-go@v5
+      # ================= 1. 构建前端 =================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          go-version: '1.22'
-      - run: |
-            CGO_ENABLED=0 go build -o FileDedup .
-            # 根据平台打包
-            if [[ "$RUNNER_OS" == "macOS" ]]; then
-              zip ${{ matrix.artifact }} FileDedup
-            elif [[ "$RUNNER_OS" == "Linux" ]]; then
-              tar czf ${{ matrix.artifact }} FileDedup
-            else
-              powershell Compress-Archive FileDedup.exe ${{ matrix.artifact }}
-            fi
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build Frontend
+        working-directory: ./frontend
+        run: |
+          # 如果有 lock 文件用 ci，没有则用 install
+          if [ -f "package-lock.json" ]; then
+            npm ci
+          else
+            npm install
+          fi
+          npm run build
         shell: bash
 
-      # 上传构建产物
-      - uses: actions/upload-artifact@v4
+      # ================= 2. 构建 Go 后端 =================
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          go-version: '1.22'
+          cache: true
 
-  # 打 tag 时自动创建 Release
+      - name: Build Go Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          # 动态生成可执行文件名 (Windows 需要 .exe)
+          EXT=""
+          if [ "${{ matrix.is_windows }}" == "true" ]; then
+            EXT=".exe"
+          fi
+          BINARY_NAME="FileDedup${EXT}"
+          
+          echo "Building $BINARY_NAME for $GOOS/$GOARCH..."
+          go build -ldflags="-s -w" -o "$BINARY_NAME" .
+          
+          # 将生成的二进制文件重命名为标准名称，方便后续打包
+          mv "$BINARY_NAME" "FileDedup_bin"
+        shell: bash
+
+      # ================= 3. 打包产物 =================
+      - name: Package Artifact
+        run: |
+          ARCHIVE_NAME="${{ matrix.asset_name }}${{ matrix.archive_ext }}"
+          echo "Packaging into $ARCHIVE_NAME..."
+          
+          if [ "${{ matrix.is_windows }}" == "true" ]; then
+            # Windows PowerShell 打包
+            powershell -Command "Compress-Archive -Path 'FileDedup_bin' -DestinationPath '$ARCHIVE_NAME'"
+          elif [ "${{ matrix.archive_ext }}" == ".tar.gz" ]; then
+            # Linux tar 打包
+            tar -czf "$ARCHIVE_NAME" "FileDedup_bin"
+          else
+            # macOS zip 打包
+            zip -r "$ARCHIVE_NAME" "FileDedup_bin"
+          fi
+        shell: bash
+
+      # ================= 4. 上传产物 =================
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}${{ matrix.archive_ext }}
+          retention-days: 7 # 仅保留7天，节省空间
+
+  # ================= 5. 自动发布 Release =================
   release:
+    name: Create GitHub Release
     needs: build
+    # 仅在推送 Tag (如 v1.0.0) 时执行此 Job
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # 赋予创建 Release 的权限
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
         with:
+          path: artifacts
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      - name: List Artifacts
+        run: ls -R artifacts
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
         with:
-          files: '*'
-          generate_release_notes: true
+          files: artifacts/*
+          generate_release_notes: true # 自动生成更新日志
+          draft: false
+          prerelease: false
