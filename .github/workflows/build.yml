@@ -1,0 +1,62 @@
+name: Build & Package
+
+on:
+  push:
+    tags: ['v*']        # 打 tag 时触发发布
+  workflow_dispatch:     # 允许手动触发
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: FileDedup-macos.zip
+          - os: ubuntu-latest
+            artifact: FileDedup-linux.tar.gz
+          - os: windows-latest
+            artifact: FileDedup-windows.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 👇 根据你的技术栈选择对应的构建步骤
+      # --- Go 项目示例 ---
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: |
+            CGO_ENABLED=0 go build -o FileDedup .
+            # 根据平台打包
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              zip ${{ matrix.artifact }} FileDedup
+            elif [[ "$RUNNER_OS" == "Linux" ]]; then
+              tar czf ${{ matrix.artifact }} FileDedup
+            else
+              powershell Compress-Archive FileDedup.exe ${{ matrix.artifact }}
+            fi
+        shell: bash
+
+      # 上传构建产物
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # 打 tag 时自动创建 Release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '*'
+          generate_release_notes: true
