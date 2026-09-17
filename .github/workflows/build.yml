@@ -3,44 +3,36 @@ name: Build & Package FileDedup
 on:
   push:
     tags:
-      - 'v*'           # 当推送 v1.0.0 这样的 tag 时触发
-  workflow_dispatch:   # 允许在 GitHub 网页上手动点击触发
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build - ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # 某个平台失败不影响其他平台继续构建
+      fail-fast: false
       matrix:
         include:
-          # macOS ARM64 (Apple Silicon M1/M2/M3)
-          - os: macos-latest
+          - os: macos-latest       # Apple Silicon (M1/M2/M3)
             goos: darwin
             goarch: arm64
             asset_name: FileDedup-macos-arm64
-            archive_cmd: zip -r
             archive_ext: .zip
-          # macOS AMD64 (Intel)
-          - os: macos-13 
+          - os: macos-13           # Intel Mac
             goos: darwin
             goarch: amd64
             asset_name: FileDedup-macos-amd64
-            archive_cmd: zip -r
             archive_ext: .zip
-          # Linux AMD64
-          - os: ubuntu-latest
+          - os: ubuntu-latest      # Linux AMD64
             goos: linux
             goarch: amd64
             asset_name: FileDedup-linux-amd64
-            archive_cmd: tar -czf
             archive_ext: .tar.gz
-          # Windows AMD64
-          - os: windows-latest
+          - os: windows-latest     # Windows AMD64
             goos: windows
             goarch: amd64
             asset_name: FileDedup-windows-amd64
-            archive_cmd: Compress-Archive -Path
             archive_ext: .zip
             is_windows: true
 
@@ -48,7 +40,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ================= 1. 构建前端 =================
+      # ========== 1. 系统依赖 (Wails 需要) ==========
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+
+      # ========== 2. 构建前端 ==========
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -56,81 +53,73 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install & Build Frontend
+      - name: Build Frontend
         working-directory: ./frontend
         run: |
-          # 如果有 lock 文件用 ci，没有则用 install
-          if [ -f "package-lock.json" ]; then
-            npm ci
-          else
-            npm install
-          fi
+          if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
           npm run build
         shell: bash
 
-      # ================= 2. 构建 Go 后端 =================
+      # ========== 3. 构建 Wails 应用 ==========
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           cache: true
 
-      - name: Build Go Binary
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build Wails Binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1   # ⚠️ Wails 桌面应用必须开启 CGO
         run: |
-          # 动态生成可执行文件名 (Windows 需要 .exe)
-          EXT=""
-          if [ "${{ matrix.is_windows }}" == "true" ]; then
-            EXT=".exe"
+          # -s: 跳过前端构建(已在上面完成)
+          # -clean: 清理旧产物
+          # -skipbindings: 跳过绑定生成(CI中不需要)
+          wails build -clean -s -skipbindings -ldflags "-s -w"
+
+          # Wails 输出到 build/bin/，提取二进制文件
+          BINARY=$(find build/bin -type f -name "FileDedup*" -o -name "filededup*" | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "❌ Error: Built binary not found in build/bin/"
+            ls -la build/bin/
+            exit 1
           fi
-          BINARY_NAME="FileDedup${EXT}"
-          
-          echo "Building $BINARY_NAME for $GOOS/$GOARCH..."
-          go build -ldflags="-s -w" -o "$BINARY_NAME" .
-          
-          # 将生成的二进制文件重命名为标准名称，方便后续打包
-          mv "$BINARY_NAME" "FileDedup_bin"
+          cp "$BINARY" FileDedup_bin
+          echo "✅ Built: $BINARY"
         shell: bash
 
-      # ================= 3. 打包产物 =================
+      # ========== 4. 打包 ==========
       - name: Package Artifact
         run: |
-          ARCHIVE_NAME="${{ matrix.asset_name }}${{ matrix.archive_ext }}"
-          echo "Packaging into $ARCHIVE_NAME..."
-          
+          ARCHIVE="${{ matrix.asset_name }}${{ matrix.archive_ext }}"
           if [ "${{ matrix.is_windows }}" == "true" ]; then
-            # Windows PowerShell 打包
-            powershell -Command "Compress-Archive -Path 'FileDedup_bin' -DestinationPath '$ARCHIVE_NAME'"
+            powershell -Command "Compress-Archive -Path 'FileDedup_bin' -DestinationPath '$ARCHIVE'"
           elif [ "${{ matrix.archive_ext }}" == ".tar.gz" ]; then
-            # Linux tar 打包
-            tar -czf "$ARCHIVE_NAME" "FileDedup_bin"
+            tar -czf "$ARCHIVE" "FileDedup_bin"
           else
-            # macOS zip 打包
-            zip -r "$ARCHIVE_NAME" "FileDedup_bin"
+            zip -r "$ARCHIVE" "FileDedup_bin"
           fi
         shell: bash
 
-      # ================= 4. 上传产物 =================
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}${{ matrix.archive_ext }}
-          retention-days: 7 # 仅保留7天，节省空间
+          retention-days: 7
 
-  # ================= 5. 自动发布 Release =================
+  # ========== 5. 自动发布 Release ==========
   release:
     name: Create GitHub Release
     needs: build
-    # 仅在推送 Tag (如 v1.0.0) 时执行此 Job
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 赋予创建 Release 的权限
-
+      contents: write
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
@@ -138,13 +127,8 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List Artifacts
-        run: ls -R artifacts
-
-      - name: Create Release and Upload Assets
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true # 自动生成更新日志
-          draft: false
-          prerelease: false
+          generate_release_notes: true
