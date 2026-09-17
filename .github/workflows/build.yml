@@ -3,8 +3,12 @@ name: Build Wails App
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - 'v*'           # 推送 v1.0.0 等标签时自动构建并发布 Release
+  workflow_dispatch:   # 允许在 GitHub 网页端手动点击触发
+
+# 🌟 全局环境变量：强制 Runner 使用 Node 20，彻底消除所有 Node.js 废弃警告
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node20
 
 jobs:
   build:
@@ -14,21 +18,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 1. Linux AMD64
           - os: ubuntu-latest
             platform: linux
             arch: amd64
             asset_name: FileDedup-linux-amd64
             archive_name: FileDedup-linux-amd64.tar.gz
+          # 2. Windows AMD64
           - os: windows-latest
             platform: windows
             arch: amd64
             asset_name: FileDedup-windows-amd64
             archive_name: FileDedup-windows-amd64.zip
+          # 3. macOS ARM64 (Apple Silicon M1/M2/M3)
           - os: macos-14
             platform: darwin
             arch: arm64
             asset_name: FileDedup-macos-arm64
             archive_name: FileDedup-macos-arm64.zip
+          # 4. macOS AMD64 (Intel)
           - os: macos-13
             platform: darwin
             arch: amd64
@@ -36,24 +44,24 @@ jobs:
             archive_name: FileDedup-macos-amd64.zip
 
     steps:
-      # ✅ 升级到 v5 以消除 Node.js 20 废弃警告
       - name: Checkout Code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      # ================= 1. Linux 系统依赖 (修复 Exit Code 100) =================
+      # ================= 1. Linux 系统依赖 (修复 Exit Code 1) =================
       - name: Install Linux Dependencies
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          # 尝试安装 4.1，如果失败则回退到 4.0；安装完整编译工具链
-          sudo apt-get install -y build-essential pkg-config libgtk-3-dev || true
+          # 核心修复：Ubuntu 24.04 需要 libayatana-appindicator3-dev 和 WebKit 4.1
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev
+          # 尝试安装 4.1，如果系统源没有则回退到 4.0
           sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
 
       # ================= 2. 前端构建 =================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'  # ✅ 升级到 Node 22 LTS
+          node-version: '20'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -68,13 +76,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'  # ✅ 升级 Go 版本
-          cache: false        # ✅ 禁用缓存以修复 macOS gtar exit code 2 错误
+          go-version: '1.22'
+          cache: false  # 禁用缓存以修复 macOS gtar 报错
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      # ================= 4. Wails 编译 =================
+      # ================= 4. Wails 编译 (带详细诊断) =================
       - name: Build Wails Binary
         shell: bash
         env:
@@ -82,8 +90,12 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 1
         run: |
-          wails build -clean -s -skipbindings -ldflags "-s -w"
-          
+          # 打印环境诊断信息，方便排查
+          wails doctor || true
+
+          # 执行构建，-v 开启详细日志
+          wails build -clean -s -skipbindings -ldflags "-s -w" -v
+
           echo "✅ Build output:"
           ls -la build/bin/
 
@@ -91,13 +103,14 @@ jobs:
       - name: Package Artifact
         shell: bash
         run: |
+          # 自动查找 build/bin 下的可执行文件
           BINARY=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \) | head -1)
-          
+
           if [ -z "$BINARY" ]; then
             echo "❌ Binary not found in build/bin/"
             exit 1
           fi
-          
+
           if [ "${{ matrix.platform }}" == "windows" ]; then
             powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '${{ matrix.archive_name }}'"
           elif [[ "${{ matrix.archive_name }}" == *.tar.gz ]]; then
@@ -106,15 +119,15 @@ jobs:
             zip -j "${{ matrix.archive_name }}" "$BINARY"
           fi
 
-      # ✅ 升级到 v5 消除警告
+      # ================= 6. 上传产物 =================
       - name: Upload Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.archive_name }}
           retention-days: 7
 
-  # ================= Release =================
+  # ================= 7. 自动发布 Release =================
   release:
     name: Create GitHub Release
     needs: build
@@ -124,7 +137,7 @@ jobs:
       contents: write
     steps:
       - name: Download All Artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
