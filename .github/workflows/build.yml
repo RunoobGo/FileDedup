@@ -6,14 +6,12 @@ on:
       - 'v*'           # 推送 v1.0.0 等标签时自动构建并发布 Release
   workflow_dispatch:   # 允许在 GitHub 网页端手动点击触发
 
-# 🌟 全局环境变量：强制 Runner 使用 Node 20，彻底消除所有 Node.js 废弃警告
-env:
-  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node20
-
 jobs:
   build:
     name: Build - ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read   # 最小权限：仅 release job 需要 contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -36,8 +34,8 @@ jobs:
             arch: arm64
             asset_name: FileDedup-macos-arm64
             archive_name: FileDedup-macos-arm64.zip
-          # 4. macOS AMD64 (Intel)
-          - os: macos-13
+          # 4. macOS AMD64 (Intel)：macos-13 已退役，用 macos-15-intel
+          - os: macos-15-intel
             platform: darwin
             arch: amd64
             asset_name: FileDedup-macos-amd64
@@ -52,16 +50,14 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          # 核心修复：Ubuntu 24.04 需要 libayatana-appindicator3-dev 和 WebKit 4.1
-          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev
-          # 尝试安装 4.1，如果系统源没有则回退到 4.0
-          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+          # ubuntu-24.04：wails v2 要求 WebKit 4.1，无 4.0 包，不做回退（回退只会把错误推迟到 wails build）
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev
 
       # ================= 2. 前端构建 =================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -76,13 +72,18 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-          cache: false  # 禁用缓存以修复 macOS gtar 报错
+          go-version-file: go.mod   # 与 go.mod 保持一致，勿硬编码版本
+          cache: true
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        # 固定与 go.mod 相同的 wails 版本，避免 @latest 与项目版本漂移
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
 
-      # ================= 4. Wails 编译 (带详细诊断) =================
+      # ================= 4. Go 测试（发布门槛） =================
+      - name: Run Go Tests
+        run: go test -count=1 ./...
+
+      # ================= 5. Wails 编译 (带详细诊断) =================
       - name: Build Wails Binary
         shell: bash
         env:
@@ -99,27 +100,34 @@ jobs:
           echo "✅ Build output:"
           ls -la build/bin/
 
-      # ================= 5. 打包 =================
+      # ================= 6. 打包 =================
       - name: Package Artifact
         shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |
-          # 自动查找 build/bin 下的可执行文件
-          BINARY=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \) | head -1)
-
-          if [ -z "$BINARY" ]; then
-            echo "❌ Binary not found in build/bin/"
-            exit 1
-          fi
-
-          if [ "${{ matrix.platform }}" == "windows" ]; then
-            powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '${{ matrix.archive_name }}'"
-          elif [[ "${{ matrix.archive_name }}" == *.tar.gz ]]; then
-            tar -czf "${{ matrix.archive_name }}" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+          if [ "$PLATFORM" == "darwin" ]; then
+            # macOS：打包完整 .app bundle（保留 Info.plist/图标），不用 find 挑裸二进制
+            [ -d "build/bin/FileDedup.app" ] || { echo "❌ build/bin/FileDedup.app not found"; exit 1; }
+            zip -ry "$ARCHIVE_NAME" build/bin/FileDedup.app
           else
-            zip -j "${{ matrix.archive_name }}" "$BINARY"
+            # 自动查找 build/bin 下的可执行文件
+            BINARY=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \) | head -1)
+
+            if [ -z "$BINARY" ]; then
+              echo "❌ Binary not found in build/bin/"
+              exit 1
+            fi
+
+            if [ "$PLATFORM" == "windows" ]; then
+              powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '$ARCHIVE_NAME'"
+            else
+              tar -czf "$ARCHIVE_NAME" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+            fi
           fi
 
-      # ================= 6. 上传产物 =================
+      # ================= 7. 上传产物 =================
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -127,7 +135,7 @@ jobs:
           path: ${{ matrix.archive_name }}
           retention-days: 7
 
-  # ================= 7. 自动发布 Release =================
+  # ================= 8. 自动发布 Release =================
   release:
     name: Create GitHub Release
     needs: build
