@@ -454,3 +454,21 @@ func TestThumbnail(t *testing.T) {
 		t.Fatal("非图片应报错")
 	}
 }
+
+// TestApplyKeepPolicyDirectoryValidation directory 策略必须至少一个目录。
+func TestApplyKeepPolicyDirectoryValidation(t *testing.T) {
+	a := newTestApp(t)
+	a.groups = []*model.DuplicateGroup{mkGroup(1, 100, "/x/a.bin", "/y/b.bin")}
+	if _, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "directory"}); err == nil {
+		t.Fatal("空目录列表应报错")
+	}
+	if _, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "directory",
+		Directories: []string{"  "}}); err == nil {
+		t.Fatal("全空白目录列表应报错")
+	}
+	ds, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "directory",
+		Directories: []string{"/x"}})
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("有效目录应产生决策: %+v err=%v", ds, err)
+	}
+}
