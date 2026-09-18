@@ -1,5 +1,14 @@
 # 扫描历史 / 清理回撤 / 保留策略多目录 / 组内全选 实现计划
 
+> **历史实施计划（2026-09-19 标注）**：本计划的任务**已实现并已进入版本库**（对应提交见
+> `git log` 0.5.0 线），但正文的 55 个 `- [ ]` 步骤框**当时未回填勾选**——它是原始步骤清单，
+> 不是完成度台账，请勿据此判断功能未做，也不要拿它当待办。
+> 它与现行实现的偏差集中在同一批审查整改上（C3 账本 fail-closed、C6 逐项即时
+> 落账、darwin 回收站 `src␟dst` 成对输出、`UndoOperationItem` 单项回撤），
+> 逐条对照表见 `docs/superpowers/specs/2026-09-18-history-undo-keep-priority-design.md` 页首；
+> 真正的待办清单是 `docs/04-开发与测试计划.md` §6，门禁约束力见同文 §5。
+> 另：下方 Global Constraints 的"版本号三处同改"已扩为 **5 处声明位**并有机器门禁。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans（本计划已获用户预授权自动执行）。Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 FileDedup 增加四项功能：保留策略多目录优先级、重复组内全选、扫描历史持久化与恢复、清理记录与回撤。

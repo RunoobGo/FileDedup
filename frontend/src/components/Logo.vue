@@ -18,7 +18,8 @@ import { useId } from 'vue'
  *    实测 40px 起环间开始分得开、48px 完全清楚，故默认 44px。
  *    **不要把 size 调到 32 以下** —— 指纹会糊成一团；那种尺寸应改用无指纹的简化版。
  *
- * 几何由一个一次性生成器产出（Python，见 docs/ui-logo-2026-09-16.md 的复现步骤），
+ * 几何由一个一次性生成器产出（Python，复现步骤见
+ * docs/archive/UI-视觉与品牌编年史.md 第 3 篇 · Logo 重设计 第六节），
  * 参数是照着 1:1 实渲染对照图定的，不要凭手感调数值。
  */
 withDefaults(defineProps<{ size?: number }>(), { size: 44 })
