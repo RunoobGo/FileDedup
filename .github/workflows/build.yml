@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ================= 1. Linux 系统依赖 (修复 Exit Code 1) =================
       - name: Install Linux Dependencies
@@ -58,7 +58,7 @@ jobs:
 
       # ================= 2. 前端构建 =================
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -73,7 +73,7 @@ jobs:
 
       # ================= 3. Go & Wails 环境 =================
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod   # 与 go.mod 保持一致，勿硬编码版本
           cache: true
@@ -142,7 +142,7 @@ jobs:
 
       # ================= 7. 上传产物 =================
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.archive_name }}
@@ -158,13 +158,13 @@ jobs:
       contents: write
     steps:
       - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*
           generate_release_notes: true
