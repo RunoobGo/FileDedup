@@ -170,17 +170,18 @@ func TestPipelineParanoidNoFalsePositive(t *testing.T) {
 	expect := genDataset(t, root)
 
 	p1 := New()
-	g1, _, err := p1.Run(context.Background(), model.ScanConfig{Roots: []string{root}})
+	g1, f1, err := p1.Run(context.Background(), model.ScanConfig{Roots: []string{root}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	p2 := New()
-	g2, _, err := p2.Run(context.Background(), model.ScanConfig{Roots: []string{root}, Paranoid: true})
+	g2, f2, err := p2.Run(context.Background(), model.ScanConfig{Roots: []string{root}, Paranoid: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(g1) != len(g2) || len(g1) != len(expect) {
-		t.Fatalf("paranoid 组数 = %d, 普通 = %d, want %d", len(g2), len(g1), len(expect))
+		t.Fatalf("paranoid 组数 = %d, 普通 = %d, want %d；普通 failed=%+v；paranoid failed=%+v",
+			len(g2), len(g1), len(expect), f1, f2)
 	}
 	for i := range g1 {
 		if len(g1[i].Files) != len(g2[i].Files) {

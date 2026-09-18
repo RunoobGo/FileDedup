@@ -121,12 +121,12 @@ func TestIncrementalEqualsFullScan(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "solo.bin"), lgPayload(23, 100*1024), 0o644)
 
 	// 基线：无缓存一次全量
-	gBase, _, err := New().Run(context.Background(), model.ScanConfig{Roots: []string{root}})
+	gBase, fBase, err := New().Run(context.Background(), model.ScanConfig{Roots: []string{root}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(gBase) != 2 {
-		t.Fatalf("基线应 2 组, got %d", len(gBase))
+		t.Fatalf("基线应 2 组, got %d failed=%+v", len(gBase), fBase)
 	}
 
 	// 增量：逐文件添加 + 每轮带缓存（复用同一 Pipeline，验证 P0-1 复位）

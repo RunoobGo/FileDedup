@@ -87,18 +87,68 @@ func TestWalkPanicIsolatedAsFailed(t *testing.T) {
 	}
 }
 
-// TestWalkCaseSensitivityIsProbed 同一对「仅大小写不同的根」在敏感卷与不敏感卷
-// 上必须给出不同结论：不敏感卷并成一棵（收一次），敏感卷视为两棵（收两次）。
-// 修正前只有编译目标钦定的一条路：macOS 上敏感卷会静默漏扫一棵子树。
-func TestWalkCaseSensitivityIsProbed(t *testing.T) {
+// TestDedupeRootsFoldsByProbedVolume 折叠判定的平台无关版本：只用字符串推理，
+// 不碰盘，因此在任何分隔符、任何大小写语义的卷上都成立。
+// 断言的是 I2 的实质——折叠与否**只来自按卷探测**：
+// 同一对仅大小写不同的根，探测说不敏感就并成一棵，说敏感就留两棵。
+func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
-	root := t.TempDir()
-	a := filepath.Join(root, "a")
-	mkDirFiles(t, a, "x.txt", "y.txt")
-	variants := []string{a, strings.ToUpper(a)} // 不敏感卷上指向同一目录
+	base := t.TempDir() // 绝对路径，分隔符与卷名前缀交给平台
+	variants := []string{filepath.Join(base, "a"), filepath.Join(base, "A")}
 
 	var probed atomic.Int32
 	sens := func(v bool) {
+		probed.Store(0)
+		probeCaseSensitive = func(string) bool {
+			probed.Add(1)
+			return v
+		}
+	}
+
+	sens(false)
+	kept, ksens := dedupeRoots(variants)
+	if len(kept) != 1 {
+		t.Fatalf("探测说不敏感时保留根数 = %d, want 1（两根应被并成一棵）：%v", len(kept), kept)
+	}
+	if n := probed.Load(); n != 2 {
+		t.Fatalf("两根卷探测调用 = %d, want 2", n)
+	}
+
+	sens(true)
+	kept, ksens = dedupeRoots(variants)
+	if len(kept) != 2 {
+		t.Fatalf("探测说敏感时保留根数 = %d, want 2（两棵子树各自入列，修正前被折叠成一棵）：%v",
+			len(kept), kept)
+	}
+	if len(ksens) != 2 || !ksens[0] || !ksens[1] {
+		t.Fatalf("保留根的卷语义标注 = %v, want [true true]", ksens)
+	}
+	if n := probed.Load(); n == 0 {
+		t.Fatal("敏感卷未走按卷探测（折叠仍被硬编码）")
+	}
+}
+
+// TestWalkCaseSensitivityIsProbed 端到端版本：两种拼写各自建成真目录时，
+// 探测结果必须真的改变收文件的数量（不敏感并一棵收 2 个，敏感两棵收 4 个）。
+// 需要所在卷区分大小写，否则两根无法并存——那是卷的属性，不是被测代码的行为，
+// 此时跳过并由上面的字符串层用例覆盖。修正前只有编译目标钦定的一条路：
+// macOS 上敏感卷会静默漏扫一棵子树。
+func TestWalkCaseSensitivityIsProbed(t *testing.T) {
+	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	root := t.TempDir()
+	lower := filepath.Join(root, "a")
+	upper := filepath.Join(root, "A")
+	if !fscase.Sensitive(root) {
+		t.Skipf("临时目录所在卷不区分大小写（%s）：仅大小写不同的两根无法并存", root)
+	}
+	// 两棵子树内容同名同量，收几次只取决于根是否被判为同一棵。
+	mkDirFiles(t, lower, "x.txt", "y.txt")
+	mkDirFiles(t, upper, "x.txt", "y.txt")
+	variants := []string{lower, upper}
+
+	var probed atomic.Int32
+	sens := func(v bool) {
+		probed.Store(0)
 		probeCaseSensitive = func(string) bool {
 			probed.Add(1)
 			return v
@@ -108,21 +158,30 @@ func TestWalkCaseSensitivityIsProbed(t *testing.T) {
 	sens(false)
 	ins := Walk(context.Background(), variants, &model.Filters{}, 2)
 	if len(ins.Files) != 2 {
-		t.Fatalf("不敏感卷折叠后文件数 = %d, want 2（两根被并成一棵才有 2）", len(ins.Files))
+		t.Fatalf("不敏感卷折叠后文件数 = %d, want 2（两根被并成一棵才有 2）：%v",
+			len(ins.Files), filePaths(ins.Files))
 	}
 	if n := probed.Load(); n != 2 {
 		t.Fatalf("两根卷探测调用 = %d, want 2", n)
 	}
 
 	sens(true)
-	probed.Store(0)
 	sec := Walk(context.Background(), variants, &model.Filters{}, 2)
 	if len(sec.Files) != 4 {
-		t.Fatalf("敏感卷文件数 = %d, want 4（两棵子树各自入列，修正前被折叠成一棵）", len(sec.Files))
+		t.Fatalf("敏感卷文件数 = %d, want 4（两棵子树各自入列）：%v",
+			len(sec.Files), filePaths(sec.Files))
 	}
 	if n := probed.Load(); n == 0 {
 		t.Fatal("敏感卷未走按卷探测（折叠仍被硬编码）")
 	}
+}
+
+func filePaths(entries []*model.FileEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Path)
+	}
+	return out
 }
 
 // TestWalkSingleRootSkipsProbe 单根无从判重，不该往用户目录里写探测文件。
@@ -144,26 +203,36 @@ func TestWalkSingleRootSkipsProbe(t *testing.T) {
 }
 
 // TestFolderFoldPerRoot 混合卷语义：折叠按各根所在卷分别生效，不能一刀切。
+// 路径一律用 filepath.Join 现拼：fold 靠「root + 原生分隔符」认根，写死 "/" 的用例
+// 在 Windows 上会因认不出根而落到平台默认，测到的不是被测的那条分支。
+// 折叠键只在遍历内部判重用，不作为对外路径返回，故 fold 允许归一分隔符；
+// 断言盯的是「敏感卷不动大小写」这一条。
 func TestFolderFoldPerRoot(t *testing.T) {
-	roots := []string{"/sen", "/ins"}
-	f := newFolder(roots, []bool{true, false})
-	if got := f.fold("/sen/Dir/F.TXT"); got != "/sen/Dir/F.TXT" {
-		t.Errorf("敏感卷根下的路径被折叠了: %q", got)
+	sep := string(filepath.Separator)
+	toSlash := func(p string) string { return strings.ReplaceAll(p, sep, "/") }
+	senRoot := filepath.Join(sep, "sen")
+	insRoot := filepath.Join(sep, "ins")
+	f := newFolder([]string{senRoot, insRoot}, []bool{true, false})
+
+	senPath := filepath.Join(senRoot, "Dir", "F.TXT")
+	insPath := filepath.Join(insRoot, "Dir", "F.TXT")
+	if got, want := f.fold(senPath), toSlash(senPath); got != want {
+		t.Errorf("敏感卷根下的路径被改了大小写: %q, want %q（只允许分隔符归一）", got, want)
 	}
-	if got := f.fold("/ins/Dir/F.TXT"); got != "/ins/dir/f.txt" {
-		t.Errorf("不敏感卷根下的路径未折叠: %q", got)
+	if got, want := f.fold(insPath), strings.ToLower(toSlash(insPath)); got != want {
+		t.Errorf("不敏感卷根下的路径未折叠: %q, want %q", got, want)
 	}
-	if got := f.foldRoot(0); got != "/sen" {
-		t.Errorf("foldRoot(0) = %q", got)
+	if got, want := f.foldRoot(0), toSlash(senRoot); got != want {
+		t.Errorf("foldRoot(0) = %q, want %q", got, want)
 	}
-	if got := f.foldRoot(1); got != "/ins" {
-		t.Errorf("foldRoot(1) = %q", got)
+	if got, want := f.foldRoot(1), toSlash(insRoot); got != want {
+		t.Errorf("foldRoot(1) = %q, want %q", got, want)
 	}
 	// 兜底：不属于任何根的路径按平台默认语义
-	const stray = "/other/MIX.txt"
-	want := strings.ToLower(stray)
+	stray := filepath.Join(sep, "other", "MIX.txt")
+	want := strings.ToLower(toSlash(stray))
 	if fscase.Default() {
-		want = stray
+		want = toSlash(stray)
 	}
 	if got := f.fold(stray); got != want {
 		t.Errorf("fold(%q) = %q, want %q（默认语义=%v）", stray, got, want, fscase.Default())

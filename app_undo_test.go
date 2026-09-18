@@ -182,10 +182,12 @@ func (e *eventRecorder) contains(name string) bool {
 }
 
 // 历史库缺失时的清理行为（2026-09-18 审查 C3，用户裁定「仅可回撤类型拒绝」）：
-//   - 承诺可回撤的（回收站/移动/硬链接）必须拒绝执行——无账本即无法回撤，
+//   - 承诺可回撤的（非 Windows 的回收站/移动/硬链接）必须拒绝执行——无账本即无法回撤，
 //     原先只发一条事件便照常移动文件，用户按手册预期可撤而实际不能；
-//   - 本就不承诺回撤的（永久删除）照常执行，但必须显式留痕（app:error），
-//     绝不静默——一并拒绝会把用户逼向唯一可用的破坏性路径。
+//   - 本就不承诺回撤的（永久删除，以及 Windows 回收站）照常执行，但必须显式留痕
+//     （app:error），绝不静默——一并拒绝会把用户逼向唯一可用的破坏性路径。
+//
+// 两类划分与 app.go beginJournal 的 undoable 判定同源，含 runtime.GOOS 分支。
 func TestExecuteOperationWithoutHistory(t *testing.T) {
 	newLoadedApp := func(t *testing.T) (*App, *eventRecorder, []uint64) {
 		t.Helper()
@@ -207,7 +209,13 @@ func TestExecuteOperationWithoutHistory(t *testing.T) {
 	}
 
 	t.Run("可回撤类拒绝且不动文件", func(t *testing.T) {
-		for _, kind := range []string{"trash", "move", "hardlink"} {
+		kinds := []string{"trash", "move", "hardlink"}
+		if runtime.GOOS == "windows" {
+			// trash 在 Windows 属"本就不承诺回撤"类（回收站拿不到原路返回映射），
+			// 走下一个子测试的留痕放行断言。
+			kinds = []string{"move", "hardlink"}
+		}
+		for _, kind := range kinds {
 			a, rec, sel := newLoadedApp(t)
 			target := t.TempDir()
 			a.authorizeDir(target) // 排除 H5 目标未授权这一干扰原因
@@ -231,24 +239,39 @@ func TestExecuteOperationWithoutHistory(t *testing.T) {
 	})
 
 	t.Run("不可回撤类放行但显式留痕", func(t *testing.T) {
+		// delete 三平台都不可回撤；trash 只在 Windows 不可回撤（同一 undoable 判定）。
+		kinds := []string{"delete"}
 		if runtime.GOOS == "windows" {
-			t.Skip("Windows 回收站拿不到映射，undoable 判定不同")
+			kinds = append(kinds, "trash")
 		}
-		a, rec, sel := newLoadedApp(t)
-		if _, err := a.ExecuteOperation(model.OpRequest{
-			Kind: "delete", FileIDs: sel, ConfirmDanger: true,
-		}); err != nil {
-			t.Fatalf("永久删除本就不支持回撤，账本故障不应使其不可用: %v", err)
-		}
-		waitOpsDone(t, rec)
-		if !rec.contains("app:error") {
-			t.Fatal("未写入账本必须显式告警（app:error），不得静默放行")
-		}
-		a.mu.Lock()
-		n := len(a.groups)
-		a.mu.Unlock()
-		if n != 0 { // S8 语义下结果集照常裁剪
-			t.Fatalf("结果集应清空, got %d 组", n)
+		for _, kind := range kinds {
+			a, rec, sel := newLoadedApp(t)
+			op := model.OpRequest{Kind: kind, FileIDs: sel}
+			if kind == "delete" {
+				op.ConfirmDanger = true
+			} else {
+				op.TargetDir = t.TempDir()
+				a.authorizeDir(op.TargetDir)
+			}
+			if _, err := a.ExecuteOperation(op); err != nil {
+				t.Fatalf("%s：本就不支持回撤，账本故障不应使其不可用: %v", kind, err)
+			}
+			// app:error 由 beginJournal 在派生执行 goroutine 之前同步发出，
+			// 因此这里无需等待操作收尾即可断言（本机无 Windows runner，
+			// trash 的实际执行结果不作断言——留痕才是本用例的靶心）。
+			if !rec.contains("app:error") {
+				t.Fatalf("%s：未写入账本必须显式告警（app:error），不得静默放行", kind)
+			}
+			if kind != "delete" {
+				continue
+			}
+			waitOpsDone(t, rec)
+			a.mu.Lock()
+			n := len(a.groups)
+			a.mu.Unlock()
+			if n != 0 { // S8 语义下结果集照常裁剪
+				t.Fatalf("%s：结果集应清空, got %d 组", kind, n)
+			}
 		}
 	})
 }

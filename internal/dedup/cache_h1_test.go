@@ -43,9 +43,11 @@ func TestCacheMidOnlyChangeNoFalseGroup(t *testing.T) {
 	defer cch.Close()
 	cfg := model.ScanConfig{Roots: []string{root}, UseCache: true}
 
-	g1, _, err := New().WithCache(cch).Run(context.Background(), cfg)
+	// failed 一并打印：组数少掉时，是"文件被读失败剔除"还是"身份被判为同一个"，
+	// 只有失败清单能区分（windows CI 上曾只有 groups=0 这一条线索）。
+	g1, fail1, err := New().WithCache(cch).Run(context.Background(), cfg)
 	if err != nil || len(g1) != 1 {
-		t.Fatalf("首扫应 1 组: groups=%d err=%v", len(g1), err)
+		t.Fatalf("首扫应 1 组: groups=%d err=%v failed=%+v", len(g1), err, fail1)
 	}
 	origMtime := func() time.Time {
 		st, err := os.Stat(x)
