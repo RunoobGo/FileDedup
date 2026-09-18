@@ -48,6 +48,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v7
 
+      # B3-5 发布门禁第一道：5 处版本号声明位必须对齐，且 v* tag 必须等于 AppVersion。
+      # 不把事件字段插值进 shell——脚本自行读 GITHUB_REF_NAME，非 v* tag（如
+      # workflow_dispatch）自动跳过 tag 比对。
+      - name: Version Sync Check
+        shell: bash
+        run: bash scripts/check-version-sync.sh
+
       # ================= 1. Linux 系统依赖 (修复 Exit Code 1) =================
       - name: Install Linux Dependencies
         if: matrix.platform == 'linux'
@@ -87,13 +94,19 @@ jobs:
         if: matrix.platform != 'windows'
         run: go test -count=1 ./...
 
-      # Windows 测试仅告警不阻断：现有 5 个测试包在 Windows 失败
-      # （路径分隔符 / 与 \、chmod 语义、不可读目录行为差异），后续单独修复。
-      # （2026-09-17 run #6 实测：dedup/filter/ops/scanner 共 6 个用例失败）
-      - name: Run Go Tests (Windows, advisory)
+      # B3-4：Windows 测试改为阻断式白名单门禁。原先 continue-on-error 让整个
+      # 平台的测试不设防（任何回归都被"仅告警"吞掉）。现在只有清单内逐条列明
+      # 原因的用例被隔离，其余失败直接断掉发布构建。
+      - name: Run Go Tests (Windows, quarantined)
         if: matrix.platform == 'windows'
-        continue-on-error: true
-        run: go test -count=1 ./...
+        run: bash scripts/test-windows-quarantine.sh
+
+      # B3-4：发布构建补数据正确性冒烟（回归配方第 6 步，见 docs/archive/里程碑开发与测试报告.md 第 4 篇 §7.5）。只在 linux
+      # 一腿跑一次：冷扫 / 缓存首扫 / 缓存复扫三跑逐项一致，并与 benchgen
+      # manifest 对账（漏报无法靠互比发现，必须对期望值）。
+      - name: CLI Smoke (cold / cache / warm-cache)
+        if: matrix.platform == 'linux'
+        run: bash scripts/smoke-cli.sh
 
       # ================= 5. Wails 编译 (带详细诊断) =================
       - name: Build Wails Binary
@@ -162,6 +175,13 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # 04 附录 A「SHA-256 checksum 文件」：随 Release 一并发布，用户可比对下载完整性
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum FileDedup-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
