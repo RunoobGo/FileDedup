@@ -4,6 +4,7 @@ import { onMounted, onUnmounted } from 'vue'
 import { useScanStore } from './stores/scan'
 import ScanView from './views/ScanView.vue'
 import ResultView from './views/ResultView.vue'
+import RecordsView from './views/RecordsView.vue'
 import SettingsView from './views/SettingsView.vue'
 import FailedDrawer from './components/FailedDrawer.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
@@ -47,9 +48,10 @@ onUnmounted(() => {
 })
 
 // P2-1：导航图标由文字符号（◎ ⧉ ⚙）改为统一线性图标集的图标名。
-const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName }[] = [
+const navs: { key: 'scan' | 'result' | 'records' | 'settings'; label: string; icon: IconName }[] = [
   { key: 'scan', label: '扫描', icon: 'scan' },
   { key: 'result', label: '结果', icon: 'layers' },
+  { key: 'records', label: '记录', icon: 'history' },
   { key: 'settings', label: '设置', icon: 'gear' },
 ]
 </script>
@@ -80,6 +82,7 @@ const navs: { key: 'scan' | 'result' | 'settings'; label: string; icon: IconName
     <main class="main">
       <ScanView v-if="store.view === 'scan'" />
       <ResultView v-else-if="store.view === 'result'" />
+      <RecordsView v-else-if="store.view === 'records'" />
       <SettingsView v-else />
     </main>
 

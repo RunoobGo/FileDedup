@@ -1,7 +1,7 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta } from '../wails'
 import { reactive, ref, computed } from 'vue'
 import { useToastStore } from './toast'
 
@@ -22,9 +22,11 @@ export const emptyFilters = (): Filters => ({
 // 加载/保存设置（settings.filtersDefault）走的都是 KB 口径，因此不会重复换算。
 const kbToBytes = (kb: number) => (Number.isFinite(+kb) ? +kb * 1024 : 0)
 
+export type ViewName = 'scan' | 'result' | 'settings' | 'records'
+
 export const useScanStore = defineStore('scan', () => {
   // 导航
-  const view = ref<'scan' | 'result' | 'settings'>('scan')
+  const view = ref<ViewName>('scan')
   // 扫描配置
   const roots = ref<string[]>([])
   const filters = reactive<Filters>(emptyFilters())
@@ -51,6 +53,10 @@ export const useScanStore = defineStore('scan', () => {
   const resultSort = ref('reclaimable')
   const resultExt = ref('')
   const hasResult = ref(false)
+  // v0.5.0 功能 3：扫描历史
+  const histList = ref<HistoryMeta[]>([])
+  const histResult = ref<HistoryMeta | null>(null) // 非空 = 当前结果集来自历史恢复（横幅提示）
+  const histLoading = ref(false)
   // 失败清单
   const failed = ref<FailedItem[]>([])
   const failedOpen = ref(false)
@@ -103,6 +109,7 @@ export const useScanStore = defineStore('scan', () => {
     resultPage.value = 0
     loadCap.value = DEFAULT_LOAD_CAP // 放量上限回到初始档
     hasResult.value = false
+    histResult.value = null // 历史关联随结果集作废（新扫描会生成新历史行）
     failed.value = []
     preview.value = null
     currentFileID.value = null
@@ -198,8 +205,89 @@ export const useScanStore = defineStore('scan', () => {
     loadResultPage(false)
   }
 
-  function switchView(v: 'scan' | 'result' | 'settings') {
+  function switchView(v: ViewName) {
     view.value = v
+  }
+
+  // ---------- v0.5.0 功能 3：扫描历史 ----------
+
+  async function refreshHistory() {
+    if (!isBackendAvailable()) return
+    try {
+      histList.value = await api.listScanHistory()
+    } catch {
+      // 历史库不可用（如浏览器 dev 模式）：保持现有列表
+    }
+  }
+
+  // openHistory 把一条历史恢复为当前结果集并切到结果页。
+  // 陈旧文件安全由后端操作前逐文件校验兜底（S1/S8），载入不做文件系统遍历。
+  async function openHistory(id: number) {
+    if (opsRunning.value || scanning.value) {
+      toast().notifyError('打开历史失败', '扫描/清理进行中，请稍后再试')
+      return
+    }
+    histLoading.value = true
+    try {
+      const s = await api.loadScanHistory(id)
+      groups.value = []
+      resultPage.value = 0
+      loadCap.value = DEFAULT_LOAD_CAP
+      totalGroups.value = s.groups
+      reclaimableTotal.value = s.reclaimable
+      failed.value = []
+      preview.value = null
+      currentFileID.value = null
+      opsResult.value = null
+      resetSelection()
+      hasResult.value = true
+      histResult.value = histList.value.find((m) => m.id === id) ?? null
+      await loadResultPage(false)
+      view.value = 'result'
+    } catch (e: any) {
+      toast().notifyError('打开历史失败', e)
+    } finally {
+      histLoading.value = false
+    }
+  }
+
+  // rescanHistory 用历史配置重新发起一次扫描。
+  // 注意：history.filters 是后端原始口径（字节），store.filters 是 KB 口径
+  // （startScan 出口统一 ×1024），这里回填为 KB。
+  function rescanHistory(m: HistoryMeta) {
+    roots.value = [...m.roots]
+    Object.assign(filters, emptyFilters(), {
+      IncludeExts: m.filters?.IncludeExts ?? [],
+      ExcludeExts: m.filters?.ExcludeExts ?? [],
+      MinSize: Math.round((m.filters?.MinSize ?? 0) / 1024),
+      MaxSize: Math.round((m.filters?.MaxSize ?? 0) / 1024),
+      ExcludePaths: m.filters?.ExcludePaths ?? [],
+      IncludeHidden: !!m.filters?.IncludeHidden,
+    })
+    threads.value = m.threads
+    paranoid.value = m.paranoid
+    switchView('scan')
+    startScan()
+  }
+
+  async function deleteHistory(id: number) {
+    try {
+      await api.deleteScanHistory(id)
+      if (histResult.value?.id === id) histResult.value = null
+      await refreshHistory()
+    } catch (e: any) {
+      toast().notifyError('删除历史失败', e)
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await api.clearScanHistory()
+      histResult.value = null // 当前结果集仅断开历史联动，仍可继续使用
+      await refreshHistory()
+    } catch (e: any) {
+      toast().notifyError('清空历史失败', e)
+    }
   }
 
   // ---------- M3：勾选 / 保留策略 / 操作 ----------
@@ -459,6 +547,7 @@ export const useScanStore = defineStore('scan', () => {
     status, progress, stageDesc, scanning,
     groups, totalGroups, reclaimableTotal, resultSort, resultExt, hasResult, pageSize,
     loadCap, loadingPage, resultPage,
+    histList, histResult, histLoading, refreshHistory, openHistory, rescanHistory, deleteHistory, clearHistory,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,

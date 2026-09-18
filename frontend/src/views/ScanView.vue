@@ -12,6 +12,17 @@ const toast = useToastStore()
 const pastePath = ref('')
 const advancedOpen = ref(false)
 
+// v0.5.0 功能 3：最近一次扫描横幅（有历史时提供 恢复/查看历史 快捷入口）
+const lastScan = computed(() => store.histList[0] ?? null)
+function fmtHistTime(unixSec: number): string {
+  return new Date(unixSec * 1000).toLocaleString('zh-CN', { hour12: false })
+}
+function rootsBrief(roots: string[]): string {
+  if (!roots.length) return '—'
+  return roots.length === 1 ? roots[0] : `${roots[0]} 等 ${roots.length} 项`
+}
+onMounted(() => { store.refreshHistory() })
+
 const stageText = computed(() => {
   const st = store.progress?.Stage
   return st ? (stageLabel[st] ?? st) : store.stageDesc
@@ -126,6 +137,16 @@ const progressPercent = computed(() => {
 
     <!-- 配置态 -->
     <template v-else>
+      <!-- v0.5.0：最近一次扫描快捷入口 -->
+      <div v-if="lastScan" class="panel hist-banner">
+        <Icon name="history" :size="15" class="hb-ico" />
+        <span class="hb-text">上次扫描 {{ fmtHistTime(lastScan.savedAt) }} ·
+          <span class="hb-roots" :title="lastScan.roots.join('\n')">{{ rootsBrief(lastScan.roots) }}</span>
+          · {{ lastScan.groups }} 组可释放 {{ humanBytes(lastScan.reclaimable) }}</span>
+        <button class="btn-ghost" :disabled="store.opsRunning"
+          title="恢复该结果集并可继续清理" @click="store.openHistory(lastScan.id)">恢复</button>
+        <button class="btn-ghost" @click="store.switchView('records')">查看历史</button>
+      </div>
       <div class="panel roots">
         <div class="sec-title">扫描目录</div>
         <div class="drop-zone" title="拖入文件夹">
@@ -224,6 +245,12 @@ const progressPercent = computed(() => {
 .stat .v { font-size: var(--fs-lg); font-weight: 600; font-variant-numeric: tabular-nums; }
 .stat .k { font-size: var(--fs-sm); color: var(--text-3); margin-top: 2px; }
 .actions { display: flex; gap: var(--sp-3); justify-content: center; }
+
+/* 历史横幅（v0.5.0 功能 3） */
+.hist-banner { display: flex; align-items: center; gap: 8px; padding: 9px 14px; margin-bottom: var(--sp-4); font-size: var(--fs-sm); }
+.hb-ico { color: var(--text-3); flex: none; }
+.hb-text { flex: 1; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hb-roots { font-family: var(--mono); }
 
 /* 目录 */
 /* 面板内边距与下方「过滤器」面板对齐。原先 .roots 没有 padding，

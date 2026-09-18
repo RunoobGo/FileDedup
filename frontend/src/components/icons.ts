@@ -21,6 +21,8 @@ export type IconName =
   | 'info' // 提示
   | 'skip' // 已跳过
   | 'chevron-down' // 折叠指示
+  | 'history' // 记录（导航）—— 扫描历史 / 清理记录
+  | 'undo' // 回撤（清理记录）
 
 export interface IconDef {
   /** 一段或多段 path 的 d 属性 */
@@ -89,6 +91,17 @@ export const ICONS: Record<IconName, IconDef> = {
   info: { viewBox: ICON_SIZE, d: ['M12 16v-4', 'M12 8h.01'], circle: [12, 12, 10] },
   skip: { viewBox: ICON_SIZE, d: ['m15 14 5-5-5-5', 'M4 20v-7a4 4 0 0 1 4-4h12'] },
   'chevron-down': { viewBox: ICON_SIZE, d: ['m6 9 6 6 6-6'] },
+  // lucide clock：圆 + 指针（扫描/清理历史）
+  history: {
+    viewBox: ICON_SIZE,
+    d: ['M12 6v6l4 2'],
+    circle: [12, 12, 10],
+  },
+  // lucide rotate-ccw：回撤
+  undo: {
+    viewBox: ICON_SIZE,
+    d: ['M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8', 'M3 3v5h5'],
+  },
 }
 
 /** 角标/状态语义到图标的固定映射，避免各处自行挑图标导致语义漂移 */

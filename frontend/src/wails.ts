@@ -40,6 +40,21 @@ export interface ScanSummary {
   elapsed: string
 }
 
+// HistoryMeta 扫描历史列表项（与 app.go HistoryMeta json tag 一致）。
+// filters 为后端原始口径（字节），重扫时需 KB/字节换算（store.rescanHistory 负责）。
+export interface HistoryMeta {
+  id: number
+  savedAt: number // Unix 秒
+  roots: string[]
+  filters: Filters
+  threads: number
+  paranoid: boolean
+  groups: number
+  files: number
+  origFiles: number // 保存时文件数（与 files 差异 = 已清理量）
+  reclaimable: number
+}
+
 export interface FileView {
   id: number
   path: string
@@ -139,6 +154,10 @@ export interface BackendAPI {
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
+  ListScanHistory(): Promise<HistoryMeta[]>
+  LoadScanHistory(id: number): Promise<ScanSummary>
+  DeleteScanHistory(id: number): Promise<void>
+  ClearScanHistory(): Promise<void>
   ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepDecision[]>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
@@ -194,6 +213,10 @@ export const api = {
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),
+  listScanHistory: (): Promise<HistoryMeta[]> => backend().ListScanHistory(),
+  loadScanHistory: (id: number): Promise<ScanSummary> => backend().LoadScanHistory(id),
+  deleteScanHistory: (id: number): Promise<void> => backend().DeleteScanHistory(id),
+  clearScanHistory: (): Promise<void> => backend().ClearScanHistory(),
   applyKeepPolicy: (kind: string, dirs: string[] = []): Promise<KeepDecision[]> =>
     backend().ApplyKeepPolicy({ Kind: kind, Directories: dirs }),
   clearKeepDecisions: (): Promise<void> => backend().ClearKeepDecisions(),

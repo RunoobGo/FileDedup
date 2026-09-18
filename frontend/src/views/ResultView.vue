@@ -89,6 +89,10 @@ function onConfirm(targetDir?: string) {
 
 <template>
   <div class="result-view">
+    <!-- v0.5.0 功能 3：历史结果提示条 -->
+    <div v-if="store.histResult" class="panel hist-banner">
+      当前为历史结果（保存于 {{ new Date(store.histResult.savedAt * 1000).toLocaleString('zh-CN', { hour12: false }) }}），清理前会逐文件校验内容。
+    </div>
     <!-- 统计条（P1-2：无重复组且无失败项时整块隐藏，不再渲染全 0 统计与无效的排序/过滤控件） -->
     <div v-if="store.totalGroups > 0 || store.failed.length" class="statbar panel">
       <template v-if="store.totalGroups > 0">
@@ -233,6 +237,7 @@ function onConfirm(targetDir?: string) {
 <style scoped>
 .result-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .statbar, .toolbar { margin: var(--sp-3) var(--page-gutter) 0; padding: 10px 14px; display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.hist-banner { flex: none; margin: var(--sp-3) var(--page-gutter) 0; padding: 8px 14px; font-size: var(--fs-sm); color: var(--text-2); }
 .stat { font-size: var(--fs-sm); color: var(--text-2); white-space: nowrap; }
 .stat b { font-size: var(--fs-lg); color: var(--text); margin-right: 4px; font-variant-numeric: tabular-nums; }
 .stat.warn, .stat.warn b { color: var(--danger-ink); }
