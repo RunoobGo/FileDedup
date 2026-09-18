@@ -1078,6 +1078,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	groups := a.groups
 	keepIDs := a.keepIDs
 	failed := a.failed
+	hs := a.hist // 锁内快照：goroutine 内不得再解引用可变字段
 	histID := a.curHistID
 	a.opsRunning = true // 置位后新扫描会被拒（StartScan 检 opsRunning）
 	opCtx, cancelOp := context.WithCancel(context.Background())
@@ -1093,12 +1094,39 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		cancelOp()
 	}, func() {
+		// v0.5.0 功能 4：写前账本——任何文件系统动作之前落盘全部计划。
+		// undoable 判定：delete 不可撤；Windows 回收站拿不到 src→dst 映射，
+		// 回撤改由「打开系统回收站」引导；其余可撤。
+		undoable := op.Kind != "delete" && !(op.Kind == "trash" && runtime.GOOS == "windows")
+		var journalID int64
+		if hs != nil {
+			if plans := planOpItems(groups, keepIDs, op.FileIDs); len(plans) > 0 {
+				jid, jerr := hs.BeginOp(op.Kind, op.TargetDir, histID, undoable, plans)
+				if jerr != nil {
+					fmt.Fprintf(os.Stderr, "[history] 操作账本写入失败: %v\n", jerr)
+					a.emit(a.ctx, "app:error", map[string]string{
+						"error": "操作账本写入失败，本次清理将无法在「记录」页回撤：" + jerr.Error()})
+				} else {
+					journalID = jid
+				}
+			}
+		}
 		res := ops.Execute(ops.Options{
 			Ctx:     opCtx,
 			Groups:  groups,
 			KeepIDs: keepIDs,
 			OnProgress: func(done, total int, current string) {
 				a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: done, Total: total, Current: current})
+			},
+			// v0.5.0：逐条收口写前账本（OnItem 由执行器保证每个进入
+			// 校验/执行阶段的文件恰好一次；取消未派发项留给 Finalize 归位）。
+			OnItem: func(r ops.ItemResult) {
+				if journalID == 0 {
+					return
+				}
+				if err := hs.FinishItem(journalID, r.OrigPath, r.DestPath, r.LinkSrc, r.State, r.Err); err != nil {
+					fmt.Fprintf(os.Stderr, "[history] 条目收口失败 %s: %v\n", r.OrigPath, err)
+				}
 			},
 			// C7：worker 内 panic 兜底。runIndexed 已捕获 panic 并标记失败，
 			// 此处把异常转成 ops:error 事件，使前端能复位 opsRunning（P2 死锁终防）。
@@ -1108,6 +1136,12 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 				}
 			},
 		}, op)
+		if journalID != 0 {
+			// 残留 planned（取消未派发等）→ cancelled，并冻结 done 计数/回收字节
+			if err := hs.FinalizeOp(journalID); err != nil {
+				fmt.Fprintf(os.Stderr, "[history] 操作账本收尾失败: %v\n", err)
+			}
+		}
 		// 失败/跳过并入统一失败清单
 		a.mu.Lock()
 		a.failed = append(append([]model.FailedItem{}, failed...), res.Failed...)
@@ -1139,14 +1173,43 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		// v0.5.0：历史联动裁剪（锁外）。gone 为本 goroutine 私有 map，
 		// 解锁后无并发写；历史行被删（curHistID 已清零）时 Prune 报"不存在"，
 		// 属可忽略的陈旧关联，留痕即可。
-		if a.hist != nil && histID != 0 && len(gone) > 0 {
-			if perr := a.hist.PruneScanFiles(histID, gone); perr != nil {
+		if hs != nil && histID != 0 && len(gone) > 0 {
+			if perr := hs.PruneScanFiles(histID, gone); perr != nil {
 				fmt.Fprintf(os.Stderr, "[history] 历史裁剪失败: %v\n", perr)
 			}
 		}
 		a.emit(a.ctx, "ops:done", res)
 	})
 	return opID, nil
+}
+
+// planOpItems 从结果集快照构造写前计划：仅收录「在结果集内且未被标为保留」
+// 的文件（保留项会被 S2 拒绝、从不触及文件系统，不入账；结果集外 id 无哈希，
+// 由执行器直接记错）。按 op.FileIDs 顺序去重。
+func planOpItems(groups []*model.DuplicateGroup, keepIDs map[uint64]bool, ids []uint64) []history.OpItemPlan {
+	type ent struct {
+		e    *model.FileEntry
+		hash [32]byte
+	}
+	lookup := make(map[uint64]ent)
+	for _, g := range groups {
+		for _, f := range g.Files {
+			lookup[f.ID] = ent{f, g.Hash}
+		}
+	}
+	seen := make(map[uint64]bool, len(ids))
+	plans := make([]history.OpItemPlan, 0, len(ids))
+	for _, id := range ids {
+		en, ok := lookup[id]
+		if !ok || seen[id] || (keepIDs != nil && keepIDs[id]) {
+			continue
+		}
+		seen[id] = true
+		plans = append(plans, history.OpItemPlan{
+			OrigPath: en.e.Path, Hash: en.hash, Size: en.e.Size, MtimeNs: en.e.ModTime,
+		})
+	}
+	return plans
 }
 
 // OpenTrash 打开系统回收站（M3-T06：恢复引导）。
