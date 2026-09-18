@@ -30,6 +30,7 @@ import (
 
 	"filededup/internal/cache"
 	"filededup/internal/dedup"
+	"filededup/internal/history"
 	"filededup/internal/model"
 	"filededup/internal/ops"
 )
@@ -139,6 +140,12 @@ type App struct {
 	cfgDir string
 	cch    *cache.Cache
 
+	// v0.5.0 功能 3：扫描历史。hist 访问一律经 history.Store 自身锁，
+	// 绝不与 a.mu 嵌套（快照 → 放锁 → 调 hist）。
+	hist         *history.Store
+	curHistID    int64 // 当前结果集对应的历史行 ID（0=无/未保存）
+	resultsReady bool  // 结果集可用门槛：扫描完成或历史结果已恢复
+
 	// emit 事件出口（默认 wruntime.EventsEmit）。
 	// 可测性：包级 EventsEmit 要求 Wails 前端注入的内部 context，
 	// 单元测试里会直接 log.Fatalf 退出进程——StartScan / ExecuteOperation
@@ -193,14 +200,28 @@ func (a *App) startup(ctx context.Context) {
 			fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
 		}
 	}
+	// v0.5.0：扫描历史/清理账本（独立 history.db，损坏自愈；失败不阻塞应用）
+	if a.cfgDir != "" {
+		histPath := filepath.Join(a.cfgDir, "history.db")
+		if hs, err := history.Open(histPath); err == nil {
+			a.hist = hs
+		} else {
+			// 历史不可用只失去"历史恢复/回撤"能力，扫描与清理不受影响；同 cache 留痕风格。
+			fmt.Fprintf(os.Stderr, "[history] 历史库不可用，本次运行不保存历史与清理记录: %v (path=%s)\n", err, histPath)
+		}
+	}
 	a.emit(a.ctx, "app:ready", AppVersion)
 }
 
-// shutdown Wails 生命周期：释放缓存句柄。
+// shutdown Wails 生命周期：释放缓存与历史库句柄。
 func (a *App) shutdown(ctx context.Context) {
 	if a.cch != nil {
 		_ = a.cch.Close()
 		a.cch = nil
+	}
+	if a.hist != nil {
+		_ = a.hist.Close()
+		a.hist = nil
 	}
 }
 
@@ -302,6 +323,8 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	a.byID = make(map[uint64]*model.FileEntry)
 	a.keepIDs = nil
 	a.failed = nil
+	a.resultsReady = false // 旧结果集作废（历史恢复/上次扫描均不再可操作）
+	a.curHistID = 0
 	a.invalidateViewCacheLocked() // Y3：新任务清空旧视图
 	a.mu.Unlock()
 
@@ -348,6 +371,22 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			reclaim += g.Reclaimable
 		}
 		a.scanInFlight = false
+		a.mu.Unlock()
+		// v0.5.0 功能 3：扫描成功收尾自动写历史（锁外调用，见 App.hist 注释）。
+		// 保存失败不影响结果集可用，只失去本次记录的恢复/裁剪联动。
+		var histID int64
+		if a.hist != nil {
+			id, serr := a.hist.SaveScan(cfg, groups, failed)
+			if serr != nil {
+				fmt.Fprintf(os.Stderr, "[history] 扫描历史保存失败: %v\n", serr)
+				a.emit(a.ctx, "app:error", map[string]string{"error": "历史保存失败（不影响当前结果）：" + serr.Error()})
+			} else {
+				histID = id
+			}
+		}
+		a.mu.Lock()
+		a.resultsReady = true
+		a.curHistID = histID
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
 			Groups:      len(groups),
@@ -806,17 +845,20 @@ func defaultSettings() Settings {
 func (a *App) GetVersion() string { return AppVersion }
 
 // ApplyKeepPolicy 保留策略引擎（M3-T01）：返回决策并记录 keepIDs（S2 保护依据）。
-// 全程持锁：遍历 groups 须与操作 goroutine 的结果集清理写互斥。
+// 遍历阶段全程持锁（须与操作 goroutine 的结果集清理写互斥）；
+// 历史持久化放到放锁之后（hist 自有锁，禁止与 a.mu 嵌套）。
 func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.opsRunning {
+		a.mu.Unlock()
 		return nil, fmt.Errorf("清理操作执行中，请稍后再应用保留策略")
 	}
 	if len(a.groups) == 0 {
+		a.mu.Unlock()
 		return nil, fmt.Errorf("暂无结果集")
 	}
 	if policy.Kind == "directory" && !ops.HasUsableDir(policy.Directories) {
+		a.mu.Unlock()
 		return nil, fmt.Errorf("请至少添加一个保留目录")
 	}
 	decisions := ops.ApplyKeepPolicy(a.groups, policy)
@@ -824,6 +866,9 @@ func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, erro
 	for _, d := range decisions {
 		a.keepIDs[d.KeepID] = true
 	}
+	histID, paths := a.curHistID, a.keepPathsLocked()
+	a.mu.Unlock()
+	a.persistKeepPaths(histID, paths)
 	return decisions, nil
 }
 
@@ -831,7 +876,168 @@ func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, erro
 func (a *App) ClearKeepDecisions() {
 	a.mu.Lock()
 	a.keepIDs = nil
+	histID := a.curHistID
 	a.mu.Unlock()
+	a.persistKeepPaths(histID, nil)
+}
+
+// keepPathsLocked 当前保留决策对应的路径集合（须持 a.mu 调用）。
+// 跨会话只有路径稳定——历史恢复后按 path→rowid 重建 keepIDs。
+func (a *App) keepPathsLocked() []string {
+	var out []string
+	if len(a.keepIDs) == 0 {
+		return out
+	}
+	for _, g := range a.groups {
+		for _, f := range g.Files {
+			if a.keepIDs[f.ID] {
+				out = append(out, f.Path)
+			}
+		}
+	}
+	return out
+}
+
+// persistKeepPaths 把保留决策同步进当前历史行（锁外调用；无历史联动则跳过）。
+func (a *App) persistKeepPaths(histID int64, paths []string) {
+	if a.hist == nil || histID == 0 {
+		return
+	}
+	if err := a.hist.UpdateKeepPaths(histID, paths); err != nil {
+		fmt.Fprintf(os.Stderr, "[history] 保留决策保存失败: %v\n", err)
+	}
+}
+
+// ---------- v0.5.0 功能 3：扫描历史绑定 ----------
+
+// HistoryMeta 扫描历史列表项（字段为 history.ScanMeta 的对外投影，
+// 不含 failed/keepPaths——恢复时经 LoadScanHistory 全量读取）。
+type HistoryMeta struct {
+	ID          int64         `json:"id"`
+	SavedAt     int64         `json:"savedAt"` // Unix 秒
+	Roots       []string      `json:"roots"`
+	Filters     model.Filters `json:"filters"`
+	Threads     int           `json:"threads"`
+	Paranoid    bool          `json:"paranoid"`
+	Groups      int           `json:"groups"`
+	Files       int           `json:"files"`
+	OrigFiles   int           `json:"origFiles"` // 保存时文件数（files 与之差异=已清理量）
+	Reclaimable uint64        `json:"reclaimable"`
+}
+
+// ListScanHistory 历史列表（新→旧）。
+func (a *App) ListScanHistory() ([]HistoryMeta, error) {
+	if a.hist == nil {
+		return nil, fmt.Errorf("历史库不可用")
+	}
+	ms, err := a.hist.ListScans()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HistoryMeta, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, HistoryMeta{
+			ID: m.ID, SavedAt: m.SavedAt, Roots: m.Roots, Filters: m.Filters,
+			Threads: m.Threads, Paranoid: m.Paranoid,
+			Groups: m.Groups, Files: m.Files, OrigFiles: m.OrigFiles,
+			Reclaimable: m.Reclaimable,
+		})
+	}
+	return out, nil
+}
+
+// LoadScanHistory 恢复一条历史为当前结果集（可直接继续清理）。
+// 陈旧文件安全性由操作前的逐文件校验兜底（S1 篡改拦截 / S8 消失即跳过），
+// 载入时不做文件系统遍历。
+func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
+	if a.hist == nil {
+		return ScanSummary{}, fmt.Errorf("历史库不可用")
+	}
+	a.mu.Lock()
+	busy := a.opsRunning || a.scanInFlight
+	a.mu.Unlock()
+	if busy {
+		return ScanSummary{}, fmt.Errorf("扫描/清理进行中，请稍后再打开历史")
+	}
+
+	meta, groups, err := a.hist.LoadScan(id)
+	if err != nil {
+		return ScanSummary{}, err
+	}
+	byID := make(map[uint64]*model.FileEntry, meta.Files)
+	var reclaim uint64
+	for _, g := range groups {
+		reclaim += g.Reclaimable
+		for _, f := range g.Files {
+			byID[f.ID] = f
+		}
+	}
+	// 保留决策持久化的是路径（功能 1 语义），恢复时映射回本次载入的行 ID
+	keepSet := make(map[string]bool, len(meta.KeepPaths))
+	for _, p := range meta.KeepPaths {
+		keepSet[p] = true
+	}
+	var keepIDs map[uint64]bool
+	for _, g := range groups {
+		for _, f := range g.Files {
+			if keepSet[f.Path] {
+				if keepIDs == nil {
+					keepIDs = make(map[uint64]bool)
+				}
+				keepIDs[f.ID] = true
+			}
+		}
+	}
+
+	a.mu.Lock()
+	// 二次确认：读库期间可能有任务抢占（与 StartScan 的 check-and-set 同锁串行）
+	if a.opsRunning || a.scanInFlight {
+		a.mu.Unlock()
+		return ScanSummary{}, fmt.Errorf("任务已开始，历史未载入")
+	}
+	a.groups = groups
+	a.byID = byID
+	a.keepIDs = keepIDs
+	a.failed = meta.Failed
+	a.invalidateViewCacheLocked()
+	a.curHistID = id
+	a.resultsReady = true
+	a.mu.Unlock()
+
+	return ScanSummary{
+		Groups: len(groups), Reclaimable: reclaim, FilesFailed: len(meta.Failed),
+	}, nil
+}
+
+// DeleteScanHistory 删除一条历史；若正是当前结果集的来源，仅断开联动
+// （内存结果仍可看可清，只是后续裁剪不再回写）。
+func (a *App) DeleteScanHistory(id int64) error {
+	if a.hist == nil {
+		return fmt.Errorf("历史库不可用")
+	}
+	if err := a.hist.DeleteScan(id); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if a.curHistID == id {
+		a.curHistID = 0
+	}
+	a.mu.Unlock()
+	return nil
+}
+
+// ClearScanHistory 清空全部扫描历史（当前结果集仅断开联动）。
+func (a *App) ClearScanHistory() error {
+	if a.hist == nil {
+		return fmt.Errorf("历史库不可用")
+	}
+	if err := a.hist.ClearScans(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.curHistID = 0
+	a.mu.Unlock()
+	return nil
 }
 
 // ExecuteOperation 操作执行器（M3-T02~T06）：
@@ -852,9 +1058,12 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("扫描进行中，请等待结束后再执行清理")
 	}
-	if s := a.pipe.Status(); s != model.StatusDone {
+	// v0.5.0：门槛由「pipe 状态 Done」改为「结果集就绪」。历史恢复出的结果集
+	// 引擎处于 Idle，旧判定会永久拒绝清理；resultsReady 在扫描完成/历史载入
+	// 时置真，StartScan 入口置假，语义与旧判定在扫描路径上完全等价。
+	if !a.resultsReady {
 		a.mu.Unlock()
-		return "", fmt.Errorf("任务未完成（当前 %s）", s)
+		return "", fmt.Errorf("暂无可操作的结果集（请先完成扫描或打开历史记录）")
 	}
 	if len(a.groups) == 0 {
 		a.mu.Unlock()
@@ -869,6 +1078,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	groups := a.groups
 	keepIDs := a.keepIDs
 	failed := a.failed
+	histID := a.curHistID
 	a.opsRunning = true // 置位后新扫描会被拒（StartScan 检 opsRunning）
 	opCtx, cancelOp := context.WithCancel(context.Background())
 	a.opsCancel = cancelOp
@@ -926,6 +1136,14 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.groups = kept
 		a.invalidateViewCacheLocked() // Y3：清理后组结构变化，排序缓存失效
 		a.mu.Unlock()
+		// v0.5.0：历史联动裁剪（锁外）。gone 为本 goroutine 私有 map，
+		// 解锁后无并发写；历史行被删（curHistID 已清零）时 Prune 报"不存在"，
+		// 属可忽略的陈旧关联，留痕即可。
+		if a.hist != nil && histID != 0 && len(gone) > 0 {
+			if perr := a.hist.PruneScanFiles(histID, gone); perr != nil {
+				fmt.Fprintf(os.Stderr, "[history] 历史裁剪失败: %v\n", perr)
+			}
+		}
 		a.emit(a.ctx, "ops:done", res)
 	})
 	return opID, nil

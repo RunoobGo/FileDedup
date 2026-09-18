@@ -352,6 +352,11 @@ export const useScanStore = defineStore('scan', () => {
       const msg = (e && typeof e === 'object' && e.error) ? e.error : String(e ?? '未知错误')
       toast().notifyError('清理操作异常中断', msg)
     })
+    // v0.5.0：后端非致命异常（如历史保存失败）→ toast 留痕，不影响当前功能
+    bind('app:error', (e: any) => {
+      const msg = (e && typeof e === 'object' && e.error) ? e.error : String(e ?? '未知错误')
+      toast().notifyError('后台提示', msg)
+    })
     bind('scan:progress', (ev: ProgressEvent) => {
       progress.value = ev
     })

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"filededup/internal/model"
@@ -213,6 +215,7 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 			}
 			g.Files = append(g.Files, &model.FileEntry{
 				ID: uint64(fid), Path: path, Size: size, ModTime: mtime,
+				Ext: strings.ToLower(filepath.Ext(path)), // 结果页扩展名筛选依赖
 			})
 		}
 		if err := frows.Err(); err != nil {
@@ -253,8 +256,10 @@ func (s *Store) PruneScanFiles(histID int64, gone map[string]bool) error {
 			return err
 		}
 	}
+	// 不足 2 员的组失去意义（与 app 层结果集清理同语义），一并移除
 	if _, err := tx.Exec(`DELETE FROM hist_groups WHERE hist_id = ? AND id NOT IN (
-		SELECT DISTINCT group_id FROM hist_files WHERE hist_id = ?)`,
+		SELECT group_id FROM hist_files WHERE hist_id = ?
+		GROUP BY group_id HAVING COUNT(*) >= 2)`,
 		histID, histID); err != nil {
 		return err
 	}

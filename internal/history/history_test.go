@@ -242,6 +242,28 @@ func TestPruneScanFiles(t *testing.T) {
 	if len(meta.KeepPaths) != 1 || meta.KeepPaths[0] != groups[0].Files[0].Path {
 		t.Fatalf("keep_paths 未裁剪: %+v", meta.KeepPaths)
 	}
+	// 二次裁剪：组 a 去掉 1 员 → 剩 2 员保留，reclaimable 重算 (2-1)*1000
+	if err := s.PruneScanFiles(histID, map[string]bool{groups[0].Files[2].Path: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta, loaded, err = s.LoadScan(histID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Groups != 1 || meta.Files != 2 || meta.Reclaimable != 1000 {
+		t.Fatalf("二次裁剪计数失真: %+v", meta)
+	}
+	// 三次裁剪：再去 1 员 → 不足 2 员整组消失
+	if err := s.PruneScanFiles(histID, map[string]bool{groups[0].Files[1].Path: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta, loaded, err = s.LoadScan(histID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Groups != 0 || meta.Files != 0 || meta.Reclaimable != 0 || len(loaded) != 0 {
+		t.Fatalf("不足 2 员应整组移除: %+v", meta)
+	}
 }
 
 func TestDeleteAndClear(t *testing.T) {
