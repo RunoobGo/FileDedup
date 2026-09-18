@@ -99,13 +99,26 @@ func sizes(batches [][]string) []int {
 	return out
 }
 
-// v0.5.0 UI 验收回归：Finder 移动单条目时返回「奇异引用」（document file）
-// 而非列表——`repeat with o in <非列表>` 迭代 0 次，脚本输出空串，
-// parseTrashOutput 因数量不符放弃映射，账本 DestPath 为空 → 回收站回撤
-// 只剩「无法定位回收站位置」。脚本必须先把结果规范成列表再迭代。
-func TestTrashScriptNormalizesSingularResult(t *testing.T) {
-	if !strings.Contains(trashScript, "if class of movedItems is not list") {
-		t.Error("脚本必须把 Finder 单条目奇异返回规范为列表（否则单项回收的 DestPath 恒为空）")
+// v0.5.0 UI 验收回归（两连击）：
+//  1. Finder `move <单条目列表> to trash` 返回奇异引用（非列表），
+//     `repeat with o in <非列表>` 迭代 0 次 → 旧批量脚本输出空串。
+//  2. 入站重名（同名文件先后回收，Finder 改名为 "b 19.04.56.bin"）时
+//     按基名配对整体放弃（宁缺勿错配）→ 账本 DestPath 为空，回撤失效。
+//
+// 修正：脚本逐文件 move 并输出 "src␟dst" 成对行——配对由脚本内一一对应
+// 完成，与 Finder 改名无关；POSIX file 解析必须在 tell 块外（tell 内会
+// 被当作 Finder 对象引用报 -1728）。
+func TestTrashScriptEmitsPairedResults(t *testing.T) {
+	iPosix := strings.Index(trashScript, `set srcItem to POSIX file (contents of p)`)
+	iTell := strings.Index(trashScript, `tell application "Finder"`)
+	if iPosix < 0 || iTell < 0 || iPosix > iTell {
+		t.Error(`POSIX file 解析必须在 tell application "Finder" 之前（tell 内报 -1728）`)
+	}
+	if !strings.Contains(trashScript, "move srcItem to trash") {
+		t.Error("必须逐文件 move（批量列表返回奇异引用）")
+	}
+	if !strings.Contains(trashScript, "(character id 31)") {
+		t.Error("输出必须是 src␟dst 成对行（0x1F 分隔），不得按基名回推配对")
 	}
 }
 
@@ -127,38 +140,43 @@ func TestDefaultTrashUsesTimeoutAndChunks(t *testing.T) {
 	}
 }
 
-// v0.5.0 功能 4：Finder 输出解析为 src→dst 映射（回撤账本用）。
+// v0.5.0 功能 4：解析 Finder「src␟dst」成对输出为 src→dst 映射（回撤账本用）。
 // 真实 Finder 移动不入单测；parseTrashOutput 是纯函数。
 
-func TestParseTrashOutputPairsByBasename(t *testing.T) {
+const us = "\x1f" // 0x1F 字段分隔符
+
+func TestParseTrashOutputPairsBySrcField(t *testing.T) {
 	inputs := []string{"/vol/a/report.txt", "/vol/b/照片.png"}
-	stdout := "/Volumes/.Trash/report.txt\n/Volumes/.Trash/照片.png\n"
+	// 第二个文件入站被 Finder 重名改写——配对仍精确（不依赖基名）
+	stdout := "/vol/a/report.txt" + us + "/Volumes/.Trash/report.txt\n" +
+		"/vol/b/照片.png" + us + "/Volumes/.Trash/照片 19.04.56.png\n"
 	m := parseTrashOutput(stdout, inputs)
-	if m == nil {
-		t.Fatal("匹配批次不应返回 nil")
-	}
-	if m[inputs[0]] != "/Volumes/.Trash/report.txt" || m[inputs[1]] != "/Volumes/.Trash/照片.png" {
+	if m[inputs[0]] != "/Volumes/.Trash/report.txt" ||
+		m[inputs[1]] != "/Volumes/.Trash/照片 19.04.56.png" {
 		t.Fatalf("映射失真: %+v", m)
 	}
 }
 
-func TestParseTrashOutputRejectsMismatch(t *testing.T) {
-	// 数量不符
-	if m := parseTrashOutput("/T/a.txt\n", []string{"/x/a.txt", "/y/b.txt"}); m != nil {
-		t.Errorf("数量不符应放弃: %+v", m)
+func TestParseTrashOutputDropsBadLines(t *testing.T) {
+	inputs := []string{"/x/a.txt", "/y/b.txt"}
+	stdout := strings.Join([]string{
+		"/x/a.txt" + us + "/T/a.txt",             // 正常
+		"no-separator-line",                      // 破坏协议 → 丢行
+		"/z/unknown.txt" + us + "/T/unknown.txt", // src 不在本批输入 → 丢弃
+		"/y/b.txt",                               // 缺 dst 字段 → 丢行
+		"",
+	}, "\n")
+	m := parseTrashOutput(stdout, inputs)
+	if len(m) != 1 || m["/x/a.txt"] != "/T/a.txt" {
+		t.Fatalf("应仅保留可信配对: %+v", m)
 	}
-	// 基名多重集不符（Finder 重命名为 "a 2.txt" 时宁缺勿错配）
-	inputs := []string{"/x/a.txt", "/y/other.txt"}
-	stdout := "/T/a.txt\n/T/a 2.txt\n"
-	if m := parseTrashOutput(stdout, inputs); m != nil {
-		t.Errorf("基名对不上应放弃: %+v", m)
+	// 含换行的文件名破坏所在行 → 该输入无映射（其余不受影响）
+	m2 := parseTrashOutput("/x/a\nb.txt"+us+"/T/whatever\n/y/b.txt"+us+"/T/b.txt\n", inputs)
+	if _, ok := m2["/y/b.txt"]; !ok || len(m2) != 1 {
+		t.Errorf("坏行只应伤及自身: %+v", m2)
 	}
-	// 空 stdout + 空输入 → 空映射（非 nil）
-	if m := parseTrashOutput("", nil); m == nil || len(m) != 0 {
-		t.Errorf("双双为空应为空映射, got %+v", m)
-	}
-	// 含换行的文件名破坏行协议 → 数量对不上 → nil（安全降级）
-	if m := parseTrashOutput("/T/a\nb.txt\n", []string{"/x/a\nb.txt"}); m != nil {
-		t.Errorf("行协议被破坏时应放弃: %+v", m)
+	// 空输出 → 空映射（非 nil），调用方按「去向未知」逐项处理
+	if m3 := parseTrashOutput("", nil); m3 == nil || len(m3) != 0 {
+		t.Errorf("空输出应为空映射, got %+v", m3)
 	}
 }

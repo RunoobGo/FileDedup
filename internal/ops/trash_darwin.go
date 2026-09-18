@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,22 +19,22 @@ import (
 // 移回收站直接失败。改为 on run argv + POSIX file (contents of p) 后，
 // 任意路径（含引号/反斜杠/换行/unicode）都原样到达脚本，无转义面。
 //
-// v0.5.0 功能 4：Finder move 返回已入站条目的引用列表，逐条转 POSIX 路径
-// 输出（每行一个），供 parseTrashOutput 建立 src→dst 映射（回撤账本）。
+// v0.5.0 功能 4（UI 验收两处修正）：
+//   - Finder `move <列表> to trash` 在列表仅一项时返回奇异引用（非列表），
+//     repeat 迭代 0 次；批量输出行数也与输入无对应保证。
+//   - 入站重名时 Finder 会改写基名（"b 19.04.56.bin"），按基名回推配对
+//     会整体放弃 → 账本 DestPath 为空、回撤失效。
+//     现逐文件 move 并输出 "src␟dst"（0x1F 分隔）成对行，配对在脚本内
+//     一一对应完成，与改名无关。注意 POSIX file 解析必须在 tell 块外，
+//     tell 内会被当作 Finder 对象引用（-1728）。
 const trashScript = `on run argv
-set itemList to {}
-repeat with p in argv
-set end of itemList to POSIX file (contents of p)
-end repeat
-tell application "Finder"
-set movedItems to move itemList to trash
-end tell
--- Finder 单条目移动返回奇异引用（非列表），repeat 对其迭代 0 次
--- → 输出空串、账本去向丢失；先规范成列表再逐条转 POSIX 路径。
-if class of movedItems is not list then set movedItems to {movedItems}
 set out to ""
-repeat with o in movedItems
-set out to out & (POSIX path of (o as alias)) & linefeed
+repeat with p in argv
+set srcItem to POSIX file (contents of p)
+tell application "Finder"
+set moved to move srcItem to trash
+end tell
+set out to out & (contents of p) & (character id 31) & (POSIX path of (moved as alias)) & linefeed
 end repeat
 return out
 end run`
@@ -108,36 +107,26 @@ func defaultTrash(paths []string) (map[string]string, error) {
 	return dst, nil
 }
 
-// parseTrashOutput 把 Finder 输出的 moved POSIX 路径（每行一个）与输入路径
-// 按基名多重集配对，返回 src→dst。数量或基名对不上（如入站重命名
-// "a 2.txt"、含换行的文件名破坏行协议）时返回 nil——回撤依赖正确的
-// dst，宁缺勿错配；调用方按「去向未知」处理。
+// parseTrashOutput 解析 Finder 输出的 "src␟dst" 成对行（0x1F 分隔，
+// 每行一条），返回 src→dst 映射。src 必须命中本批输入才采信；
+// 无法解析的行（如含换行的文件名破坏行协议）只丢自身一条——
+// 该输入按「去向未知」处理（账本 DestPath 为空 → 回撤给出明确错误）。
 func parseTrashOutput(stdout string, inputs []string) map[string]string {
-	var lines []string
-	for _, l := range strings.Split(stdout, "\n") {
-		if l = strings.TrimSpace(l); l != "" {
-			lines = append(lines, l)
-		}
-	}
-	if len(lines) != len(inputs) {
-		return nil
-	}
-	used := make([]bool, len(lines))
-	out := make(map[string]string, len(inputs))
+	want := make(map[string]bool, len(inputs))
 	for _, in := range inputs {
-		base := filepath.Base(in)
-		match := -1
-		for j, l := range lines {
-			if !used[j] && filepath.Base(l) == base {
-				match = j
-				break
-			}
+		want[in] = true
+	}
+	out := make(map[string]string, len(inputs))
+	for _, l := range strings.Split(stdout, "\n") {
+		l = strings.TrimSuffix(l, "\r")
+		i := strings.IndexByte(l, 0x1f)
+		if i <= 0 || i == len(l)-1 {
+			continue
 		}
-		if match < 0 {
-			return nil
+		src, dst := l[:i], l[i+1:]
+		if want[src] {
+			out[src] = dst
 		}
-		used[match] = true
-		out[in] = lines[match]
 	}
 	return out
 }
