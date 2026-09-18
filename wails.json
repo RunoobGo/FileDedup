@@ -11,7 +11,7 @@
   },
   "info": {
     "productName": "FileDedup",
-    "productVersion": "0.4.0",
+    "productVersion": "0.5.0",
     "copyright": "MIT License",
     "comments": "高性能跨平台文件查重工具"
   }

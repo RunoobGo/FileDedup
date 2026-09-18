@@ -37,7 +37,7 @@ import (
 
 // AppVersion 当前版本（GetVersion 契约，04 附录 A）：与 wails.json productVersion、
 // frontend/package.json version 统一口径，发布时三处同改。
-const AppVersion = "0.4.0"
+const AppVersion = "0.5.0"
 
 // ---------- 契约视图类型（01 §7.2） ----------
 
