@@ -99,6 +99,16 @@ func sizes(batches [][]string) []int {
 	return out
 }
 
+// v0.5.0 UI 验收回归：Finder 移动单条目时返回「奇异引用」（document file）
+// 而非列表——`repeat with o in <非列表>` 迭代 0 次，脚本输出空串，
+// parseTrashOutput 因数量不符放弃映射，账本 DestPath 为空 → 回收站回撤
+// 只剩「无法定位回收站位置」。脚本必须先把结果规范成列表再迭代。
+func TestTrashScriptNormalizesSingularResult(t *testing.T) {
+	if !strings.Contains(trashScript, "if class of movedItems is not list") {
+		t.Error("脚本必须把 Finder 单条目奇异返回规范为列表（否则单项回收的 DestPath 恒为空）")
+	}
+}
+
 // defaultTrash 必须用带超时的 CommandContext 且按批执行（静态断言，
 // 避免真实调用 Finder 污染用户回收站）。
 func TestDefaultTrashUsesTimeoutAndChunks(t *testing.T) {

@@ -30,6 +30,9 @@ end repeat
 tell application "Finder"
 set movedItems to move itemList to trash
 end tell
+-- Finder 单条目移动返回奇异引用（非列表），repeat 对其迭代 0 次
+-- → 输出空串、账本去向丢失；先规范成列表再逐条转 POSIX 路径。
+if class of movedItems is not list then set movedItems to {movedItems}
 set out to ""
 repeat with o in movedItems
 set out to out & (POSIX path of (o as alias)) & linefeed
