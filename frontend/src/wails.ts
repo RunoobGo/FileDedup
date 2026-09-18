@@ -125,6 +125,47 @@ export interface OpRequest {
   ConfirmDanger?: boolean
 }
 
+// ---------- v0.5.0 功能 4：清理记录与回撤 ----------
+
+// OpRecord 清理操作摘要（与 app.go history.OpMeta json tag 一致）。
+// done 为「曾执行成功」口径（含其后被回撤的项），剩余可撤 = done - undone。
+export interface OpRecord {
+  id: number
+  kind: string // trash/delete/move/hardlink
+  createdAt: number // Unix 秒
+  targetDir: string
+  histId: number
+  undoable: boolean
+  items: number
+  done: number
+  undone: number
+  failed: number // 执行失败（不含回撤失败）
+  reclaimable: number
+}
+
+export interface OpRecordItem {
+  id: number
+  origPath: string
+  destPath: string
+  linkSrc: string
+  state: string // planned/done/failed/skipped/cancelled/interrupted/undone/undo_failed
+  err: string
+  size: number
+  mtimeNs: number
+}
+
+export interface OpRecordDetail {
+  meta: OpRecord
+  list: OpRecordItem[]
+}
+
+export interface UndoResult {
+  opId: number
+  ok: number
+  restored: string[]
+  failed: { Path: string; Stage: string; Err: string }[]
+}
+
 export interface CacheStats {
   entries: number
   withFull: number
@@ -163,6 +204,10 @@ export interface BackendAPI {
   ExecuteOperation(op: OpRequest): Promise<string>
   CancelOperation(): Promise<void>
   OpenTrash(): Promise<void>
+  ListOpRecords(): Promise<OpRecord[]>
+  GetOpRecord(id: number): Promise<OpRecordDetail>
+  UndoOperation(opLogId: number): Promise<string>
+  ClearOpRecords(): Promise<void>
   CacheStats(): Promise<CacheStats>
   CacheClear(): Promise<void>
 }
@@ -223,6 +268,10 @@ export const api = {
   executeOperation: (op: OpRequest): Promise<string> => backend().ExecuteOperation(op),
   cancelOperation: (): Promise<void> => backend().CancelOperation(),
   openTrash: (): Promise<void> => backend().OpenTrash(),
+  listOpRecords: (): Promise<OpRecord[]> => backend().ListOpRecords(),
+  getOpRecord: (id: number): Promise<OpRecordDetail> => backend().GetOpRecord(id),
+  undoOperation: (opLogId: number): Promise<string> => backend().UndoOperation(opLogId),
+  clearOpRecords: (): Promise<void> => backend().ClearOpRecords(),
   cacheStats: (): Promise<CacheStats> => backend().CacheStats(),
   cacheClear: (): Promise<void> => backend().CacheClear(),
 }

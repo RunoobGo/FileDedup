@@ -1,7 +1,7 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult } from '../wails'
 import { reactive, ref, computed } from 'vue'
 import { useToastStore } from './toast'
 
@@ -57,6 +57,8 @@ export const useScanStore = defineStore('scan', () => {
   const histList = ref<HistoryMeta[]>([])
   const histResult = ref<HistoryMeta | null>(null) // 非空 = 当前结果集来自历史恢复（横幅提示）
   const histLoading = ref(false)
+  // v0.5.0 功能 4：清理记录（回撤账本）
+  const opList = ref<OpRecord[]>([])
   // 失败清单
   const failed = ref<FailedItem[]>([])
   const failedOpen = ref(false)
@@ -290,6 +292,44 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
+  // ---------- v0.5.0 功能 4：清理记录与回撤 ----------
+
+  async function refreshOps() {
+    if (!isBackendAvailable()) return
+    try {
+      opList.value = await api.listOpRecords()
+    } catch {
+      // 历史库不可用：保持现有列表
+    }
+  }
+
+  // undoRecord 回撤一条清理记录。后端同步拒绝（不可撤/在途）时走 catch；
+  // 受理后的终止事件是 ops:undo:done（复用 opsRunning 互斥）。
+  async function undoRecord(opId: number) {
+    if (opsRunning.value) {
+      toast().notifyError('回撤失败', '清理/回撤操作执行中，请稍候')
+      return
+    }
+    opsRunning.value = true
+    opsProgress.value = { Done: 0, Total: 0, Current: '' }
+    try {
+      await api.undoOperation(opId)
+    } catch (e: any) {
+      opsRunning.value = false
+      opsProgress.value = null
+      toast().notifyError('回撤失败', e)
+    }
+  }
+
+  async function clearOps() {
+    try {
+      await api.clearOpRecords()
+      await refreshOps()
+    } catch (e: any) {
+      toast().notifyError('清空清理记录失败', e)
+    }
+  }
+
   // ---------- M3：勾选 / 保留策略 / 操作 ----------
 
   // resetSelection 清空勾选（Y8）。
@@ -431,6 +471,21 @@ export const useScanStore = defineStore('scan', () => {
       opsResult.value = r
       await refreshFailed()
       await loadResultPage(false) // 重载视图并清空勾选（结果集已变化）
+      refreshOps() // 清理账本已更新（FinalizeOp 在事件发出前完成）
+    })
+    // v0.5.0 功能 4：回撤收尾。结果集不动（恢复的文件需重扫确认），
+    // 只刷新清理记录列表并给出可读的成败汇总。
+    bind('ops:undo:done', async (r: UndoResult) => {
+      opsRunning.value = false
+      opsProgress.value = null
+      if (r.failed?.length) {
+        toast().notifyError('部分条目回撤失败', `成功恢复 ${r.ok} 项、失败 ${r.failed.length} 项，原因见记录明细`)
+      } else if (r.ok > 0) {
+        toast().notifySuccess(`回撤完成：恢复 ${r.ok} 项，建议重新扫描刷新结果`)
+      } else {
+        toast().push('该记录没有可回撤的条目（已回撤或未实际执行）', 'info')
+      }
+      await refreshOps()
     })
     // C9：后端 worker panic / 内部异常时发 ops:error（C7 守卫已捕获，不崩进程）。
     // 必须复位 opsRunning，否则操作互斥标记卡在 true → 重演 P2「操作执行中」死锁，
@@ -548,6 +603,7 @@ export const useScanStore = defineStore('scan', () => {
     groups, totalGroups, reclaimableTotal, resultSort, resultExt, hasResult, pageSize,
     loadCap, loadingPage, resultPage,
     histList, histResult, histLoading, refreshHistory, openHistory, rescanHistory, deleteHistory, clearHistory,
+    opList, refreshOps, undoRecord, clearOps,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
