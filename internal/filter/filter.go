@@ -2,6 +2,7 @@
 package filter
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -12,9 +13,10 @@ import (
 // 两组扩展名列表在扫描前一次性归一小写并按长度选择匹配策略，
 // 取代原先「每文件对列表做 O(列表长) 次 strings.EqualFold」的线性比较。
 type Matcher struct {
-	f      *model.Filters
-	incExt extSet
-	excExt extSet
+	f        *model.Filters
+	incExt   extSet
+	excExt   extSet
+	excPaths []string // 2026-09-18 审查 I1：已归一为 "/" 分隔的排除模式
 }
 
 // extSetMapMin 建 map 的列表长度阈值（含）。
@@ -84,11 +86,29 @@ func Compile(f *model.Filters) *Matcher {
 	if f == nil {
 		return nil
 	}
-	return &Matcher{
-		f:      f,
-		incExt: newExtSet(f.IncludeExts),
-		excExt: newExtSet(f.ExcludeExts),
+	var excPaths []string
+	if len(f.ExcludePaths) > 0 {
+		excPaths = make([]string, len(f.ExcludePaths))
+		for i, pat := range f.ExcludePaths {
+			excPaths[i] = toSlashPat(pat)
+		}
 	}
+	return &Matcher{
+		f:        f,
+		incExt:   newExtSet(f.IncludeExts),
+		excExt:   newExtSet(f.ExcludeExts),
+		excPaths: excPaths,
+	}
+}
+
+// toSlashPat 把模式统一为 "/" 分隔（2026-09-18 审查 I1）。
+// 修正前模式按原样参与匹配，Windows 上写的 "a\b" 与遍历产生的 rel 无法对上。
+// 无 "\" 时（unix 全部、Windows 常规输入）原样返回，不产生分配。
+func toSlashPat(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\\", "/")
 }
 
 // Apply 判断文件是否通过过滤器。
@@ -119,9 +139,12 @@ func (m *Matcher) Apply(name, rel string, size uint64) bool {
 		return false
 	}
 	// 路径排除 glob
-	for _, pat := range f.ExcludePaths {
-		if matchPath(pat, rel, name) {
-			return false
+	if len(m.excPaths) > 0 {
+		rel = toSlashPat(rel) // Windows 遍历给的是 "\" 分隔，统一后再比对
+		for _, pat := range m.excPaths {
+			if matchPath(pat, rel, name) {
+				return false
+			}
 		}
 	}
 	return true
@@ -140,7 +163,8 @@ func (m *Matcher) ExcludeDir(rel, name string) bool {
 	if m == nil {
 		return false
 	}
-	for _, pat := range m.f.ExcludePaths {
+	rel = toSlashPat(rel)
+	for _, pat := range m.excPaths {
 		if !prunable(pat) {
 			continue
 		}
@@ -180,24 +204,28 @@ func prunable(pat string) bool {
 }
 
 // matchPath 路径排除匹配（C2：区分 *（单层，不跨分隔符）与 **（递归跨层））：
-//   - 模式不含 "/"：对 rel 的每个路径段（含文件名）做 filepath.Match
+//   - 模式不含 "/"：对 rel 的每个路径段（含文件名）做 path.Match
 //   - 模式含 "/" 且含 "**"：段级匹配，** 跨任意层（含零层），其余段不跨层
 //   - 模式含 "/" 且不含 "**"：字面前缀（"a/b"、"a/b/"）匹配全部后代；
-//     否则对整条 rel 做 filepath.Match（* 只匹配单层，不再剥尾作前缀——
+//     否则对整条 rel 做 path.Match（* 只匹配单层，不再剥尾作前缀——
 //     修正前 "a/b/*" 会被当作递归前缀误伤 a/b/c/d）
+//
+// I1：一律用 path.Match 而非 filepath.Match——后者在 Windows 上以 "\" 为分隔符，
+// "*" 会跨越 "/" 段，"单层"语义在三平台上各不相同。pat 与 rel 已在调用点归一为
+// "/" 分隔，故匹配结果与宿主平台无关。
 func matchPath(pat, rel, name string) bool {
 	if pat == "" {
 		return false
 	}
 	if !strings.Contains(pat, "/") {
-		if ok, _ := filepath.Match(pat, name); ok {
+		if ok, _ := path.Match(pat, name); ok {
 			return true
 		}
 		for _, seg := range strings.Split(rel, "/") {
 			if seg == "" {
 				continue
 			}
-			if ok, _ := filepath.Match(pat, seg); ok {
+			if ok, _ := path.Match(pat, seg); ok {
 				return true
 			}
 		}
@@ -214,14 +242,14 @@ func matchPath(pat, rel, name string) bool {
 		}
 		return false
 	}
-	if ok, _ := filepath.Match(pat, rel); ok {
+	if ok, _ := path.Match(pat, rel); ok {
 		return true
 	}
 	return false
 }
 
 // matchSegs 段级 glob 匹配：pat/rel 已按 "/" 切段。** 匹配 0..n 个段
-// （递归），其余段交由 filepath.Match（* 不跨段）。回溯实现，段数有限无性能顾虑。
+// （递归），其余段交由 path.Match（* 不跨段）。回溯实现，段数有限无性能顾虑。
 func matchSegs(pat, rel []string) bool {
 	if len(pat) == 0 {
 		return len(rel) == 0
@@ -237,7 +265,7 @@ func matchSegs(pat, rel []string) bool {
 	if len(rel) == 0 {
 		return false
 	}
-	if ok, _ := filepath.Match(pat[0], rel[0]); !ok {
+	if ok, _ := path.Match(pat[0], rel[0]); !ok {
 		return false
 	}
 	return matchSegs(pat[1:], rel[1:])

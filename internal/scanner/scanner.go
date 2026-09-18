@@ -3,15 +3,18 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"filededup/internal/filter"
+	"filededup/internal/fscase"
 	"filededup/internal/model"
 )
 
@@ -73,6 +76,51 @@ type Waiter interface {
 	Wait(ctx context.Context) error
 }
 
+// probeCaseSensitive 按卷探测入口；抽成变量供测试扮演敏感/不敏感卷
+// （真实大小写敏感卷需要专门格式化的卷，本机与 CI 都无法现造）。
+var probeCaseSensitive = fscase.Sensitive
+
+// folder 路径折叠器：折叠与否由「该路径所属扫描根所在卷」决定（I2）。
+// 修正前是包级函数 + 编译目标硬编码，等于对全部卷做一次平台赌博。
+type folder struct {
+	roots    []string
+	prefixes []string // root + sep，与 sens 同序
+	sens     []bool   // 各根所在卷是否区分大小写
+	def      bool     // 平台默认（路径不属于任何根时）
+	needFold bool     // 存在需要折叠的根；全敏感时 fold 直接原样返回
+}
+
+func newFolder(roots []string, sens []bool) *folder {
+	f := &folder{roots: roots, prefixes: rootPrefixes(roots), sens: sens, def: fscase.Default()}
+	for _, s := range f.sens {
+		if !s {
+			f.needFold = true // 有不敏感卷 → 必须按其语义折叠
+			break
+		}
+	}
+	if !f.def {
+		f.needFold = true // 兜底分支（路径未命中任何根）落在不敏感平台默认上
+	}
+	return f
+}
+
+// fold 折叠遍历中产生的全路径：按其所属扫描根所在卷的语义。
+func (f *folder) fold(p string) string {
+	if !f.needFold {
+		return p
+	}
+	for i, rp := range f.prefixes {
+		if strings.HasPrefix(p, rp) {
+			return fscase.Fold(p, f.sens[i])
+		}
+	}
+	return fscase.Fold(p, f.def)
+}
+
+// foldRoot 折叠第 i 个根本身：根路径不带尾分隔符，命中不了自身的 root+sep 前缀，
+// 故单独按该根卷的语义折叠。
+func (f *folder) foldRoot(i int) string { return fscase.Fold(f.roots[i], f.sens[i]) }
+
 // Walk 并行遍历 roots（无暂停闸门）。
 func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *Result {
 	return WalkWithGate(ctx, roots, f, workers, nil)
@@ -81,7 +129,7 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 // WalkWithGate 并行遍历 roots：
 //   - 跳过符号链接与 0 字节文件（内置行为）
 //   - 应用过滤器
-//   - 重叠根目录与子目录去重（平台大小写折叠）
+//   - 重叠根目录与子目录去重（折叠与否按各根所在卷探测，I2）
 //   - unix 平台 FileKey 由 lstat 顺带填充；Windows 留待 ResolveKey 按需解析
 //   - ②-S：每目录处理前过 gate（暂停挂起、取消快速排空），取消后不再触盘
 func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers int, gate Waiter) *Result {
@@ -89,9 +137,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		workers = 4
 	}
 	res := &Result{}
-	cleaned := dedupeRoots(roots)
-	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
-	prefixes := rootPrefixes(cleaned)
+	cleaned, sens := dedupeRoots(roots)
+	// I2：折叠按各根所在卷探测；G2：根前缀预计算一次，供每个文件的 relativeTo 复用
+	fld := newFolder(cleaned, sens)
+	prefixes := fld.prefixes
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
 	matcher := filter.Compile(f)
 
@@ -103,8 +152,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		pend    sync.WaitGroup // 在途目录计数（队列中 + 处理中）
 	)
 
-	for _, r := range cleaned {
-		visited[foldPath(r)] = struct{}{}
+	for i := range cleaned {
+		visited[fld.foldRoot(i)] = struct{}{}
 	}
 
 	// submit 投递目录：先计数再入队（保证 closer 的 Wait 不早于 Add）。
@@ -122,11 +171,21 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		go func(idx int) {
 			defer workerWg.Done()
 			local := make([]*model.FileEntry, 0, 1024)
-			for {
-				dir, ok := q.pop()
-				if !ok {
-					break // 队列关闭且空：全部完成
-				}
+			// handle 处理单个目录。I3（2026-09-18 审查）：逐目录 recover——
+			// 修正前 worker 无任何兜底，阶段 0 一个 panic（异常 DirEntry 的 Info、
+			// 底层 FS 返回的畸形项等）就把整个进程带走，与手册 §7「panic 转 Failed、
+			// 不拖垮进程」不符；且进程被杀时正在写的清理任务会停在半路。
+			handle := func(dir string) {
+				defer pend.Done() // 正常/取消/panic 三条路径都只销一次在途计数
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Fprintf(os.Stderr, "[scan] 目录 %s 遍历 panic：%v\n%s\n", dir, r, debug.Stack())
+						fails[idx] = append(fails[idx], model.FailedItem{
+							Path: dir, Stage: "scan",
+							Err: fmt.Sprintf("遍历异常已隔离，该目录已跳过: %v", r),
+						})
+					}
+				}()
 				// ②-S：暂停挂起在目录处理前（in-flight 目录完成后停步，符合 01 §5.5）。
 				// gate.Wait 只在 ctx 结束时返回错误 → 走下方取消排空路径。
 				if gate != nil {
@@ -135,14 +194,12 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 				if ctx.Err() != nil {
 					// 取消排空：只销在途计数，绝不再 ReadDir——
 					// 修正前取消后仍会把队列里剩余全部目录逐个读一遍才退出。
-					pend.Done()
-					continue
+					return
 				}
 				entries, err := os.ReadDir(dir)
 				if err != nil {
 					fails[idx] = append(fails[idx], model.FailedItem{Path: dir, Stage: "scan", Err: err.Error()})
-					pend.Done()
-					continue
+					return
 				}
 				for j, de := range entries {
 					if j&1023 == 512 && ctx.Err() != nil {
@@ -164,7 +221,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						if matcher.ExcludeDir(relativeTo(prefixes, full), de.Name()) {
 							continue
 						}
-						key := foldPath(full)
+						key := fld.fold(full)
 						mu.Lock()
 						_, seen := visited[key]
 						if !seen {
@@ -203,7 +260,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					e.Key = keyFromInfo(full, info) // unix 填充；win 返回未解析
 					local = append(local, e)
 				}
-				pend.Done()
+			}
+			for {
+				dir, ok := q.pop()
+				if !ok {
+					break // 队列关闭且空：全部完成
+				}
+				handle(dir)
 			}
 			locals[idx] = local
 		}(i)
@@ -231,8 +294,11 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	return res
 }
 
-// dedupeRoots 规范化并剔除被其他根包含的子根（a 与 a/b 同扫时丢弃 a/b）。
-func dedupeRoots(roots []string) []string {
+// dedupeRoots 规范化并剔除被其他根包含的子根（a 与 a/b 同扫时丢弃 a/b），
+// 返回与保留根同序的「该根所在卷是否区分大小写」。
+//
+// I2：判重前按各根所在卷的语义折叠。单根无从判重，也就不必为它写探测文件。
+func dedupeRoots(roots []string) ([]string, []bool) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -245,12 +311,25 @@ func dedupeRoots(roots []string) []string {
 		out = append(out, filepath.Clean(abs))
 	}
 	sort.Strings(out)
+	if len(out) <= 1 {
+		sens := make([]bool, len(out))
+		for i := range sens {
+			sens[i] = fscase.Default()
+		}
+		return out, sens
+	}
+	sens := make([]bool, len(out))
+	for i, r := range out {
+		sens[i] = probeCaseSensitive(r)
+	}
 	var kept []string
-	for _, r := range out {
+	var keepSens []bool
+	for i, r := range out {
 		dup := false
-		for _, k := range kept {
-			// k 是 r 的前缀目录（折叠大小写比较）
-			fk, fr := foldPath(k), foldPath(r)
+		fr := fscase.Fold(r, sens[i])
+		for j, k := range kept {
+			// k 是 r 的前缀目录（各按自身卷的语义折叠后比较）
+			fk := fscase.Fold(k, keepSens[j])
 			if fr == fk || strings.HasPrefix(fr, fk+string(filepath.Separator)) {
 				dup = true
 				break
@@ -258,9 +337,10 @@ func dedupeRoots(roots []string) []string {
 		}
 		if !dup {
 			kept = append(kept, r)
+			keepSens = append(keepSens, sens[i])
 		}
 	}
-	return kept
+	return kept, keepSens
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

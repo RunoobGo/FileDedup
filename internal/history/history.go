@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 
+	"filededup/internal/dbfile"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -30,6 +32,9 @@ const (
 	StateInterrupted = "interrupted"
 	StateUndone      = "undone"
 	StateUndoFailed  = "undo_failed"
+	// StateUndoing 写前标记：已判定要回撤、文件系统动作尚未收口。
+	// 只在执行的瞬间存在，进程死亡后由 Open 收口为 undo_failed（I6）。
+	StateUndoing = "undoing"
 )
 
 // Store 线程安全历史库（单写多读；全部方法内部串行化）。
@@ -109,31 +114,42 @@ func initConn(path string) (*sql.DB, error) {
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=ON",
+		// 跨进程（fdd-cli 与 GUI 并存）瞬时占用时让路 5s，别把 BUSY 报成故障。
+		// 本库连接池限 1，故 Exec 设置的会话级 PRAGMA 对该库所有语句都生效。
+		"PRAGMA busy_timeout=5000",
 		fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion),
 	} {
 		if _, err := db.Exec(p); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("初始化失败（疑似损坏）: %w", err)
+			return nil, fmt.Errorf("初始化失败: %w", err)
 		}
 	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("建表失败（疑似损坏）: %w", err)
+		return nil, fmt.Errorf("建表失败: %w", err)
 	}
 	return db, nil
 }
 
-// Open 打开或创建历史库；损坏时删除重建（丢失历史可接受，绝不卡死功能）。
-// 启动收尾：上次进程死于执行中的 planned 条目统一置 interrupted。
+// Open 打开或创建历史库。**仅**在库影像确证损坏时改名隔离并重建
+// （2026-09-18 审查 C4：原先对任何打开错误都无条件删库，busy/只读/满盘一次误判
+// 就会清空用户全部回撤账本）。启动收尾：上次进程死于执行中的 planned
+// 条目统一置 interrupted，死于回撤中的 undoing 条目统一置 undo_failed（可重试）。
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 	db, err := initConn(path)
 	if err != nil {
-		os.Remove(path)
-		os.Remove(path + "-wal")
-		os.Remove(path + "-shm")
+		if !dbfile.Exists(path) || !dbfile.IsCorruption(err) {
+			// 暂时性/环境故障：报出去（调用方会失去历史能力但绝不丢数据）。
+			return nil, fmt.Errorf("历史库不可用（未改动任何文件）: %w", err)
+		}
+		quarantined, qerr := dbfile.Quarantine(path)
+		if qerr != nil {
+			return nil, fmt.Errorf("历史库影像损坏但隔离失败，已放弃重建（未删除文件）: %w（原始错误：%v）", qerr, err)
+		}
+		fmt.Fprintf(os.Stderr, "[history] 历史库影像损坏，已改名隔离为 %s 后重建\n", quarantined)
 		db, err = initConn(path)
 		if err != nil {
 			return nil, fmt.Errorf("历史库重建失败: %w", err)
@@ -142,6 +158,15 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(`UPDATE op_items SET state = ?,
 		err = '应用中断（记录不完整，未处理项请查看文件系统现状）'
 		WHERE state = ?`, StateInterrupted, StatePlanned); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// 回撤写前标记残留（I6）：上次进程死于「已标记回撤、结果未落账」之间。
+	// 不猜测文件系统现状——置 undo_failed 并说明原因，重试会由 UndoOne 的
+	// 已还原自检决定真实结局（文件已回家则记成功，否则如实报错）。
+	if _, err := db.Exec(`UPDATE op_items SET state = ?,
+		err = '回撤中断（结果未落账）：请重试回撤确认文件系统现状'
+		WHERE state = ?`, StateUndoFailed, StateUndoing); err != nil {
 		db.Close()
 		return nil, err
 	}

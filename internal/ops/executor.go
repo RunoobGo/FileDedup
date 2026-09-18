@@ -220,6 +220,30 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		linkSrc string // hardlink 指向的保留源
 	}
 	outcomes := make([]outcome, len(toProcess))
+	// C6（2026-09-18 审查）：账本收口必须紧跟每次 syscall，而不是等全批走完
+	// 在 aggregate 里统一回调。否则进程在批内被杀/退出时全部条目停在 planned，
+	// 重启后归为 interrupted，而回撤只认 done（见 app.go UndoOperation）——
+	// 结果是「文件已在回收站、应用内永久无法回撤」。
+	// settle 同时完成：写下标结果 + 即时落账 + 进度上报；幂等，
+	// 使 panic 守卫可与正常路径安全竞争同一行。
+	settled := make([]bool, len(toProcess))
+	settle := func(i int, o outcome) {
+		if settled[i] {
+			return
+		}
+		settled[i] = true
+		outcomes[i] = o
+		switch o.code {
+		case ocOK:
+			emitItem(ItemResult{OrigPath: toProcess[i].Path, DestPath: o.dst,
+				LinkSrc: o.linkSrc, State: "done"})
+		case ocSkipped:
+			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "skipped"})
+		case ocFailed:
+			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "failed", Err: o.err})
+		}
+		report(toProcess[i].Path)
+	}
 
 	// C7：worker 内 panic 守卫落地。fn（trash/VerifyFile/HardlinkMerge）panic 会
 	// 穿透 goTask 的 recover（仅包主 goroutine）直接崩进程；此处捕获后把该下标
@@ -233,24 +257,22 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			return
 		}
 		e := toProcess[i]
-		outcomes[i] = outcome{code: ocFailed, stage: "ops",
-			err: fmt.Sprintf("内部错误（panic 已被捕获，未崩溃）: %v", r)}
-		report(e.Path)
+		settle(i, outcome{code: ocFailed, stage: "ops",
+			err: fmt.Sprintf("内部错误（panic 已被捕获，未崩溃）: %v", r)})
 		if opts.OnPanic != nil {
 			opts.OnPanic(fmt.Errorf("文件 %s 操作 panic: %v", e.Path, r))
 		}
 	}
+	// aggregate 仅按序汇总 res（输出顺序确定）。落账已由 settle 在每次 syscall
+	// 之后即时完成（C6），此处不得再对已 settle 的行 emitItem（会二次收口）。
 	aggregate := func() {
 		for i, e := range toProcess {
 			switch outcomes[i].code {
 			case ocOK:
 				res.OK = append(res.OK, e.Path)
 				res.Reclaimed += e.Size
-				emitItem(ItemResult{OrigPath: e.Path, DestPath: outcomes[i].dst,
-					LinkSrc: outcomes[i].linkSrc, State: "done"})
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
-				emitItem(ItemResult{OrigPath: e.Path, State: "skipped"})
 			case ocNone:
 				// 未派发：取消时是常态（P2），须与真正的内部状态缺失区分开，
 				// 否则用户取消一次会得到一堆"内部状态缺失"的误导信息。
@@ -267,7 +289,6 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					stage = "ops"
 				}
 				res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: stage, Err: outcomes[i].err})
-				emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: outcomes[i].err})
 			}
 		}
 	}
@@ -287,9 +308,8 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		usable := make([]int, 0, len(toProcess))
 		for i, e := range toProcess {
 			if !identityStill(e.Path, procIDs[i]) {
-				outcomes[i] = outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
 				continue
 			}
 			usable = append(usable, i)
@@ -302,9 +322,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		if len(paths) > 0 && ctx.Err() == nil {
 			if dstMap, err := trash(paths); err == nil {
 				for _, i := range usable {
-					outcomes[i].code = ocOK
-					outcomes[i].dst = dstMap[toProcess[i].Path]
-					report(toProcess[i].Path)
+					settle(i, outcome{code: ocOK, dst: dstMap[toProcess[i].Path]})
 				}
 			} else {
 				// 批量失败退化为逐文件执行以隔离错误项（S5/S7）；
@@ -313,20 +331,31 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 哪些已移走）。回退前逐个检查源是否还在——已不在的按 S8 语义
 				// 记 Skipped（目标已达成），否则会被记 Failed，但文件实际已在
 				// 回收站，结果集却仍显示「存在」，状态不一致。
+				// 2026-09-18 审查 C2：darwin/linux 的 trash 实现都是「已完成部分 dstMap +
+				// error」一起返回。此前 err 分支整包丢弃 dstMap，回退只能把已
+				// 入站文件记成去向为空的 Skipped，而 Skipped 永不进回撤
+				// （app.go UndoOperation 只认 done）→ 这批文件永久失去应用内
+				// 回撤。故先收下已知去向，命中者按 done+dst 落账。
+				known := dstMap
+				if known == nil {
+					known = map[string]string{}
+				}
 				runIndexed(ctx, len(usable), opWorkers, func(k int) {
 					i := usable[k]
 					p := toProcess[i].Path
 					if _, err := os.Stat(p); os.IsNotExist(err) {
-						outcomes[i].code = ocSkipped
-						report(p)
+						if d, ok := known[p]; ok {
+							settle(i, outcome{code: ocOK, dst: d})
+						} else {
+							settle(i, outcome{code: ocSkipped})
+						}
 						return
 					}
 					if m, err := trash([]string{p}); err != nil {
-						outcomes[i] = outcome{code: ocFailed, err: err.Error()}
+						settle(i, outcome{code: ocFailed, err: err.Error()})
 					} else {
-						outcomes[i] = outcome{code: ocOK, dst: m[p]}
+						settle(i, outcome{code: ocOK, dst: m[p]})
 					}
-					report(p)
 				}, func(k int, r any) { // 下标经 usable 映射回 toProcess
 					onPanic(usable[k], r)
 				})
@@ -337,21 +366,19 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
 			e := toProcess[i]
 			if !identityStill(e.Path, procIDs[i]) { // H2
-				outcomes[i] = outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
 				return
 			}
 			if err := os.Remove(e.Path); err != nil {
 				if os.IsNotExist(err) {
-					outcomes[i].code = ocSkipped
+					settle(i, outcome{code: ocSkipped})
 				} else {
-					outcomes[i] = outcome{code: ocFailed, err: err.Error()}
+					settle(i, outcome{code: ocFailed, err: err.Error()})
 				}
-			} else {
-				outcomes[i].code = ocOK
+				return
 			}
-			report(e.Path)
+			settle(i, outcome{code: ocOK})
 		}, onPanic)
 
 	case "move":
@@ -363,17 +390,15 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				break // move 串行执行，取消后立即停止派发（P2）
 			}
 			if !identityStill(e.Path, procIDs[i]) { // H2
-				outcomes[i] = outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
 				continue
 			}
 			if dst, err := MoveFile(e.Path, op.TargetDir); err != nil {
-				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
+				settle(i, outcome{code: ocFailed, err: err.Error()})
 			} else {
-				outcomes[i] = outcome{code: ocOK, dst: dst}
+				settle(i, outcome{code: ocOK, dst: dst})
 			}
-			report(e.Path)
 		}
 
 	case "hardlink":
@@ -381,15 +406,13 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			e := toProcess[i]
 			src := keepSrcByID[e.ID]
 			if src == nil || src.ID == e.ID {
-				outcomes[i] = outcome{code: ocFailed, err: "未找到组内保留源"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, err: "未找到组内保留源"})
 				return
 			}
 			// H2：dup 在动作前仍须指向校验过的那份内容
 			if !identityStill(e.Path, procIDs[i]) {
-				outcomes[i] = outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
 				return
 			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
@@ -401,21 +424,18 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			v, srcID := VerifyFile(src, hashByID[src.ID], pool)
 			switch v {
 			case VerdictSkipped:
-				outcomes[i] = outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"})
 				return
 			case VerdictFailed:
-				outcomes[i] = outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"}
-				report(e.Path)
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"})
 				return
 			}
 			// HardlinkMerge 使用「dup 路径 + .fdd-tmp」临时名，路径互不冲突 → 并发安全
 			if err := HardlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
-				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
+				settle(i, outcome{code: ocFailed, err: err.Error()})
 			} else {
-				outcomes[i] = outcome{code: ocOK, linkSrc: src.Path}
+				settle(i, outcome{code: ocOK, linkSrc: src.Path})
 			}
-			report(e.Path)
 		}, onPanic)
 
 	default:

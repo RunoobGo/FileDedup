@@ -288,10 +288,11 @@ func TestApplyKeepPolicyReal(t *testing.T) {
 	a.groups[0].Files[0].ModTime = 1000
 	a.groups[0].Files[1].ModTime = 3000
 	a.groups[0].Files[2].ModTime = 2000
-	ds, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "newest"})
+	oc, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "newest"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	ds := oc.Decisions
 	if len(ds) != 1 || ds[0].KeepID != a.groups[0].Files[1].ID {
 		t.Fatalf("newest 决策错误: %+v", ds)
 	}
@@ -468,7 +469,7 @@ func TestApplyKeepPolicyDirectoryValidation(t *testing.T) {
 	}
 	ds, err := a.ApplyKeepPolicy(model.KeepPolicy{Kind: "directory",
 		Directories: []string{"/x"}})
-	if err != nil || len(ds) != 1 {
+	if err != nil || len(ds.Decisions) != 1 {
 		t.Fatalf("有效目录应产生决策: %+v err=%v", ds, err)
 	}
 }

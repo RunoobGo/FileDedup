@@ -37,9 +37,10 @@ func main() {
 			// 比 dataTransfer File.path（WKWebView 不可靠）跨平台稳定
 			EnableFileDrop: true,
 		},
-		OnStartup:  app.startup,
-		OnShutdown: app.shutdown,
-		Bind:       []interface{}{app},
+		OnStartup:     app.startup,
+		OnShutdown:    app.shutdown,
+		OnBeforeClose: app.beforeClose, // 2026-09-18 审查 C5：在途清理/扫描时拦下关窗
+		Bind:          []interface{}{app},
 	})
 	if err != nil {
 		// P3：println 在无控制台附加的发布版（Windows GUI 子系统）里等于丢弃错误，

@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"filededup/internal/cache"
@@ -83,13 +82,6 @@ func main() {
 	}
 
 	p := dedup.New()
-	// 扫描文件总数：经 OnProgress 捕获（Tracker.Stop 必发终值，Run 返回前送达）
-	var filesTotal atomic.Uint64
-	p.OnProgress = func(ev model.ProgressEvent) {
-		if ev.FilesTotal > 0 {
-			filesTotal.Store(ev.FilesTotal)
-		}
-	}
 	if *cachePath != "" {
 		cch, err := cache.Open(*cachePath)
 		if err != nil {
@@ -124,7 +116,10 @@ func main() {
 	}
 	r.Stats.Groups = len(groups)
 	r.Stats.FilesFailed = len(failed)
-	r.Stats.FilesTotal = int(filesTotal.Load())
+	// 语料口径走 Pipeline.ScannedFiles()，不再从进度事件反推：进度事件的
+	// FilesTotal 是阶段口径（预筛/哈希阶段会重设为该阶段处理量），缓存命中
+	// 复扫时远小于语料数，双跑比对会误报漂移。
+	r.Stats.FilesTotal = int(p.ScannedFiles())
 
 	var w io.Writer = os.Stdout
 	if *out != "" {

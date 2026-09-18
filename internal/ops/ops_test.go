@@ -390,29 +390,29 @@ func TestKeepPolicyDirectoryPriority(t *testing.T) {
 		{ID: 2, Path: "/keep1/x/photo.jpg", Size: 10},
 		{ID: 3, Path: "/other/photo.jpg", Size: 10},
 	}}
-	ds := ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
+	ds, _ := ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
 		Kind: "directory", Directories: []string{"/keep1", "/keep2"}})
 	if len(ds) != 1 || ds[0].KeepID != 2 {
 		t.Fatalf("优先级首位命中: got %+v want keep 2", ds)
 	}
-	ds = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
+	ds, _ = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
 		Kind: "directory", Directories: []string{"/miss", "/keep2"}})
 	if len(ds) != 1 || ds[0].KeepID != 1 {
 		t.Fatalf("次位命中: got %+v want keep 1", ds)
 	}
-	ds = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
+	ds, _ = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
 		Kind: "directory", Directories: []string{"/miss"}})
 	if len(ds) != 0 {
 		t.Fatalf("全不命中应跳过: got %+v", ds)
 	}
 	g2 := &model.DuplicateGroup{GroupID: 2, Files: []*model.FileEntry{
 		{ID: 4, Path: "/d/a.jpg", Size: 9}, {ID: 5, Path: "/d/sub/a.jpg", Size: 9}}}
-	ds = ApplyKeepPolicy([]*model.DuplicateGroup{g2}, model.KeepPolicy{
+	ds, _ = ApplyKeepPolicy([]*model.DuplicateGroup{g2}, model.KeepPolicy{
 		Kind: "directory", Directories: []string{"/d"}})
 	if len(ds) != 1 || ds[0].KeepID != 5 {
 		t.Fatalf("最深匹配: got %+v want keep 5", ds)
 	}
-	ds = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
+	ds, _ = ApplyKeepPolicy([]*model.DuplicateGroup{g}, model.KeepPolicy{
 		Kind: "directory", Directories: []string{"", "/keep1"}})
 	if len(ds) != 1 || ds[0].KeepID != 2 {
 		t.Fatalf("空目录项应忽略: got %+v want keep 2", ds)

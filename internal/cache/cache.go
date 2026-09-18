@@ -1,7 +1,7 @@
 // Package cache 哈希缓存（04 M4-T01，01 §7.3）：
 // SQLite WAL；键 (path, size, mtime_ns, dev, ino, ctime_ns)；
 // 命中后仍须四点采样比对，全一致才复用 full；
-// 批量 UPSERT 单事务写回；last_hit 上限淘汰；损坏自愈（重建）。
+// 批量 UPSERT 单事务写回；last_hit 上限淘汰；损坏自愈（确证损坏时隔离重建）。
 package cache
 
 import (
@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"filededup/internal/dbfile"
 	"filededup/internal/fsid"
 
 	_ "modernc.org/sqlite"
@@ -76,17 +77,26 @@ type Cache struct {
 	cntValid bool // cnt/cntFull 是否有效
 }
 
-// Open 打开或创建缓存库；损坏（无法打开/迁移）时自动重建（最坏退化为首扫速度）。
+// Open 打开或创建缓存库。
+//
+// **仅**在库影像确证损坏时改名隔离并重建（最坏退化为首扫速度）；
+// busy/只读/满盘等暂时性故障一律直接报错（2026-09-18 审查 C4：原先无条件删库重建，
+// 一次误判就把可恢复的暂时故障变成整表缓存丢失，且删掉他进程正在写的
+// -wal 本身即可损坏主库）。调用方拿到错误会退化为「无缓存」，扫描照常。
 func Open(path string) (*Cache, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 	db, err := openDB(path)
 	if err != nil {
-		// 损坏自愈：删除重建（丢失仅影响二次扫描速度，01 §11）
-		os.Remove(path)
-		os.Remove(path + "-wal")
-		os.Remove(path + "-shm")
+		if !dbfile.Exists(path) || !dbfile.IsCorruption(err) {
+			return nil, fmt.Errorf("缓存库不可用（未改动任何文件）: %w", err)
+		}
+		quarantined, qerr := dbfile.Quarantine(path)
+		if qerr != nil {
+			return nil, fmt.Errorf("缓存库影像损坏但隔离失败，已放弃重建（未删除文件）: %w（原始错误：%v）", qerr, err)
+		}
+		fmt.Fprintf(os.Stderr, "[cache] 缓存库影像损坏，已改名隔离为 %s 后重建\n", quarantined)
 		db, err = openDB(path)
 		if err != nil {
 			return nil, fmt.Errorf("缓存库重建失败: %w", err)
@@ -187,7 +197,9 @@ func openDB(path string) (*sql.DB, error) {
 	} {
 		if _, err := db.Exec(p); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("初始化失败（疑似损坏）: %w", err)
+			// 不写「疑似损坏」：BUSY/只读/满盘走同一分支，措辞不能替用户下结论
+			// （是否损坏由 dbfile.IsCorruption 看 SQLite 原文判定）
+			return nil, fmt.Errorf("初始化失败: %w", err)
 		}
 	}
 	return db, nil

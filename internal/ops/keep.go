@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"filededup/internal/fscase"
 	"filededup/internal/model"
 )
 
@@ -17,8 +18,11 @@ type KeepDecision struct {
 
 // ApplyKeepPolicy 对全部组计算保留决策（M3-T01）。
 // manual 策略：保持调用方已有勾选，本函数不产生决策（返回空，由前端状态决定）。
-func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) []KeepDecision {
-	var out []KeepDecision
+//
+// unmatched（2026-09-18 审查 I4）：directory 策略下「组内没有任何成员位于
+// 指定保留目录」的组 ID。修正前这类组被静默 continue，整组一个保留者都不标，
+// 用户以为「应用过策略 = 已保护」，实际整组都可被清掉——必须回给调用方明示。
+func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) (decisions []KeepDecision, unmatched []uint64) {
 	for _, g := range groups {
 		if len(g.Files) < 2 {
 			continue
@@ -32,7 +36,9 @@ func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) []
 		case "directory":
 			keep = pickByDirectoryPriority(g, policy.Directories)
 			if keep < 0 {
-				continue // 无匹配：该组保持现状（用户未选择）
+				// 无匹配：该组保持现状（用户未选择），并计入 unmatched
+				unmatched = append(unmatched, g.GroupID)
+				continue
 			}
 		case "manual":
 			continue // 前端已勾选
@@ -45,9 +51,22 @@ func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) []
 				d.RemoveIDs = append(d.RemoveIDs, f.ID)
 			}
 		}
-		out = append(out, d)
+		decisions = append(decisions, d)
 	}
-	return out
+	return decisions, unmatched
+}
+
+// SuggestKeepIndex 默认建议保留者索引（01 §9：优先非隐藏，再路径最短）。
+//
+// 2026-09-18 审查 I5：结果页星标与 "shortest" 策略必须走同一份实现。
+// 修正前 app.go 另写了一份「只比路径长度」的规则，两份在含隐藏目录的组上
+// 会选出不同的文件——界面上被星标的那一份，正是应用默认策略后被清掉的那一份。
+// 无成员时返回 -1。
+func SuggestKeepIndex(g *model.DuplicateGroup) int {
+	if len(g.Files) == 0 {
+		return -1
+	}
+	return pickShortest(g)
 }
 
 // pickBy 返回满足 cmp(a,b) 的第一个文件索引。
@@ -113,15 +132,23 @@ func HasUsableDir(dirs []string) bool {
 }
 
 // pickInDirectory 保留位于 dir 下的文件（最长前缀优先），无匹配返回 -1。
+//
+// I4（2026-09-18 审查）：比较前按 dir 所在卷的大小写语义折叠，并统一分隔符。
+// 修正前是裸的字符串前缀比较：APFS 不敏感卷上用户写 /users/x/docs、实际路径
+// /Users/X/Docs，整组匹配不上 → 整组不受保护；Windows 上 "\" 与 "/" 混用同理。
 func pickInDirectory(g *model.DuplicateGroup, dir string) int {
 	if dir == "" {
 		return -1
 	}
-	dir = filepath.Clean(dir)
+	sensitive := fscase.Sensitive(dir)
+	// 归一后剥掉尾分隔符；根目录（"/"）剥完为空串，此时 HasPrefix(p, ""+"/")
+	// 恰好命中全部绝对路径，语义仍是「该卷下全部保留」。
+	prefix := strings.TrimSuffix(fscase.Fold(filepath.Clean(dir), sensitive), "/")
 	best, bestLen := -1, 0
 	for i, f := range g.Files {
-		if strings.HasPrefix(f.Path, dir+string(filepath.Separator)) || f.Path == dir {
-			if l := len(f.Path); l > bestLen {
+		p := fscase.Fold(f.Path, sensitive)
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			if l := len(p); l > bestLen {
 				best, bestLen = i, l // 深层匹配更精确
 			}
 		}

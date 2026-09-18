@@ -189,3 +189,94 @@ func fileIDs(files []*model.FileEntry) []uint64 {
 	}
 	return ids
 }
+
+// TestOnItemBatchTrashPartialDestKept 回归（2026-09-18 全量审查 C2）：
+// 批量 trash 失败时，平台实现会连同 error 一起带回「已成功部分」的
+// src→dst 映射（darwin 的 osascript 批次、linux 的 trashXDG 逐个执行皆如此）。
+// 修复前 err 分支整包丢弃该映射，回退只能把已入站文件记成去向为空的
+// Skipped，而 Skipped 永不进回撤（app.go UndoOperation 只认 done）
+// → 这批已在回收站的文件永久失去应用内回撤。
+func TestOnItemBatchTrashPartialDestKept(t *testing.T) {
+	dir := t.TempDir()
+	g, files := mkSameContentGroup(t, dir, 4)
+	target := t.TempDir()
+	var mu sync.Mutex
+	var got []ItemResult
+	batchMoved := map[string]string{}
+	res := Execute(Options{
+		Groups: []*model.DuplicateGroup{g},
+		TrashFn: func(paths []string) (map[string]string, error) {
+			if len(paths) > 1 {
+				// 模拟半途失败：前两个已移入回收站，整批仍返回 error
+				for _, p := range paths[:2] {
+					d := filepath.Join(target, filepath.Base(p))
+					if err := os.Rename(p, d); err != nil {
+						t.Fatal(err)
+					}
+					batchMoved[p] = d
+				}
+				return batchMoved, errors.New("批量在第 3 个文件失败（模拟）")
+			}
+			return mockTrash(target, false)(paths)
+		},
+		OnItem: func(r ItemResult) { mu.Lock(); got = append(got, r); mu.Unlock() },
+	}, model.OpRequest{Kind: "trash", FileIDs: fileIDs(files)})
+
+	if len(got) != len(files) {
+		t.Fatalf("收口 %d 次，期望 %d: %+v", len(got), len(files), got)
+	}
+	byPath := map[string]ItemResult{}
+	for _, r := range got {
+		byPath[r.OrigPath] = r
+	}
+	for p, d := range batchMoved {
+		r, ok := byPath[p]
+		if !ok {
+			t.Fatalf("批量已入站文件未收口: %s", p)
+		}
+		if r.State != "done" || r.DestPath != d {
+			t.Fatalf("批量已入站文件须收口为 done+已知去向，实为 %+v", r)
+		}
+	}
+	if len(res.Skipped) != 0 {
+		t.Fatalf("已入站文件不得记为 Skipped（Skipped 不进回撤）: %+v", res.Skipped)
+	}
+	if len(res.OK) != len(files) {
+		t.Fatalf("OK %d，期望 %d（2 个批量 + 2 个回退）: %+v", len(res.OK), len(files), res)
+	}
+}
+
+// TestOnItemClosedBeforeLaterFilesMove 回归（2026-09-18 全量审查 C6）：
+// 账本收口必须紧跟每次 syscall，而不是等全批走完在 aggregate 里统一补记
+// ——批内被杀/退出时，延后收口会让全部条目停在 planned，重启后归为
+// interrupted，而回撤只认 done。
+// 判据取 move 分支（串行派发，时序确定）：首条收口发生时，后续文件必须
+// 仍在原位。修复前所有条目在 Execute 末尾一次性回调，此刻文件已全部移走。
+func TestOnItemClosedBeforeLaterFilesMove(t *testing.T) {
+	dir := t.TempDir()
+	g, files := mkSameContentGroup(t, dir, 6)
+	target := t.TempDir()
+	remaining := -1
+	Execute(Options{
+		Groups: []*model.DuplicateGroup{g},
+		OnItem: func(r ItemResult) {
+			if remaining >= 0 {
+				return // 只关心首条收口的时刻
+			}
+			n := 0
+			for _, f := range files {
+				if f.Path != r.OrigPath {
+					if _, err := os.Stat(f.Path); err == nil {
+						n++
+					}
+				}
+			}
+			remaining = n
+		},
+	}, model.OpRequest{Kind: "move", FileIDs: fileIDs(files), TargetDir: target})
+
+	if want := len(files) - 1; remaining != want {
+		t.Fatalf("首条收口时后续文件剩余 %d，期望 %d：收口未紧跟 syscall，"+
+			"批内被杀将导致全部条目停在 planned 而不可回撤", remaining, want)
+	}
+}

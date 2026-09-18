@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,6 +31,34 @@ type UndoItem struct {
 // undoPool 回撤内容校验的缓冲复用池（仅回撤路径使用，串行调用为主）。
 var undoPool = hasher.NewPool()
 
+// errRestoredAlready 目的地已空、原位证据齐全：上次回撤动了文件系统却没来得及落账
+// （I6 写前标记的崩溃窗口）。上层据此记成功而非"文件已不存在"。
+var errRestoredAlready = errors.New("已还原（上次回撤未落账）")
+
+// alreadyRestored 判定"文件其实已经回家"：回收站/移动目标侧已无文件，
+// 原位却存在一份与记录同尺寸、同 mtime 且内容哈希相符的普通文件。
+// 证据不齐（含旧账本无哈希）一律返回 false，交给正常报错让用户自己核对。
+func alreadyRestored(it UndoItem) bool {
+	if it.DestPath == "" {
+		return false // 无落点记录（映射缺失）：无从判定，交给上层原因报错
+	}
+	if _, err := os.Lstat(it.DestPath); err == nil {
+		return false // 目的地仍有文件，不是已还原
+	}
+	st, err := os.Lstat(it.OrigPath)
+	if err != nil || !st.Mode().IsRegular() || uint64(st.Size()) != it.Size {
+		return false
+	}
+	if it.MtimeNs > 0 && st.ModTime().UnixNano() != it.MtimeNs {
+		return false
+	}
+	if it.Hash == [32]byte{} {
+		return false // 无内容证据（旧账本），不猜
+	}
+	h, err := hashFile(it.OrigPath)
+	return err == nil && h == it.Hash
+}
+
 // UndoOne 回撤单个已执行条目（spec §7.2），单文件独立成败。
 // 安全语义与正向操作对称：任何"记录对象已非原物"的迹象都拦截而非强行恢复。
 func UndoOne(it UndoItem) (string, error) {
@@ -52,6 +81,9 @@ func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
 	st, err := os.Lstat(it.DestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if alreadyRestored(it) {
+				return nil, errRestoredAlready
+			}
 			return nil, fmt.Errorf("%s中的文件已不存在（可能已被清空或手动还原）: %s", where, it.DestPath)
 		}
 		return nil, err
@@ -68,6 +100,9 @@ func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
 // undoTrash 回收站 → 原位：原位被占时落到 name.fdd-restored.ext（宁另名不覆盖）。
 func undoTrash(it UndoItem) (string, error) {
 	st, err := undoSourceCheck(it, "回收站")
+	if errors.Is(err, errRestoredAlready) {
+		return it.OrigPath, nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -100,7 +135,9 @@ func undoTrash(it UndoItem) (string, error) {
 
 // undoMove 移动目标 → 原目录：复用 MoveFile（重名递增天然不覆盖）。
 func undoMove(it UndoItem) (string, error) {
-	if _, err := undoSourceCheck(it, "移动目标"); err != nil {
+	if _, err := undoSourceCheck(it, "移动目标"); errors.Is(err, errRestoredAlready) {
+		return it.OrigPath, nil
+	} else if err != nil {
 		return "", err
 	}
 	dst, err := MoveFile(it.DestPath, filepath.Dir(it.OrigPath))
@@ -141,6 +178,13 @@ func undoHardlink(it UndoItem) (string, error) {
 	lid, kid := fsid.FromFileInfo(lst), fsid.FromFileInfo(kst)
 	if lid.Resolved && kid.Resolved {
 		if !lid.SameIdentity(kid) {
+			// 崩溃残留自检：拆链已完成（原位独立成文件且内容等于记录），
+			// 只是账本没落上——记成功，不再拦成"永不可撤"。
+			if it.Hash != [32]byte{} && uint64(lst.Size()) == it.Size {
+				if h, herr := hashFile(it.OrigPath); herr == nil && h == it.Hash {
+					return it.OrigPath, nil
+				}
+			}
 			return "", fmt.Errorf("目标已非合并时的硬链接（inode 不符），为避免覆盖第三方文件已拦截")
 		}
 	} else if uint64(kst.Size()) != it.Size || uint64(lst.Size()) != it.Size {

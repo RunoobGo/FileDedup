@@ -189,6 +189,55 @@ func TestPipelineParanoidNoFalsePositive(t *testing.T) {
 	}
 }
 
+// TestPipelineParanoidFailedListNotDuplicated 回归（2026-09-18 全量审查 C1）：
+// paranoid 的失败清单必须与真实失败条数一致，不得随重复组数翻倍。
+// 缺陷成因：verifier.group 返回的是「累加后的完整清单」，Run 又
+// `failed = append(failed, dropped...)` 整体接回 → G 个组即 2^G 放大，
+// FilesFailed 虚高、扫描历史写入膨胀直至卡死。
+func TestPipelineParanoidFailedListNotDuplicated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 权限语义不适用")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root 不受文件读取权限限制")
+	}
+	root := t.TempDir()
+	genDataset(t, root) // 3 个重复组
+	// 追加两条同尺寸不可读文件 → 固定产生 2 条 prefilter 失败，且不成组
+	for _, rel := range []string{"lock/d1.bin", "lock/d2.bin"} {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("0123456789abcdef-nr"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(p, 0o644) // 保障 TempDir 清理
+	}
+
+	_, plainFailed, err := New().Run(context.Background(), model.ScanConfig{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plainFailed) == 0 {
+		t.Fatal("前置条件失效：未产生预筛失败项，本测试无法验证累加表接管")
+	}
+	groups, pfailed, err := New().Run(context.Background(), model.ScanConfig{Roots: []string{root}, Paranoid: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) < 2 {
+		t.Fatalf("前置条件失效：组数 %d < 2，放大缺陷无法显现", len(groups))
+	}
+	if len(pfailed) != len(plainFailed) {
+		t.Fatalf("paranoid 失败清单被放大: %d 条，真实失败 %d 条，组数 %d",
+			len(pfailed), len(plainFailed), len(groups))
+	}
+}
+
 // TestPipelineHashFailureNoFalseGroup 回归：同尺寸但预筛/哈希均失败（不可读）的
 // 不同文件不得形成重复组——零哈希假组会导致用户误删。
 func TestPipelineHashFailureNoFalseGroup(t *testing.T) {

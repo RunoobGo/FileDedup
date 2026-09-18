@@ -2,6 +2,7 @@ package filter
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -281,5 +282,56 @@ func TestExcludeDirC2(t *testing.T) {
 	}
 	if m.ExcludeDir("a/x/b", "b") {
 		t.Error("中间 ** 的命中目录不得剪枝（后代不保证命中）")
+	}
+}
+
+// TestNativeSeparatorsMatch 2026-09-18 审查 I1 回归：Windows 遍历产生的 rel 以 "\"
+// 分隔，修正前含 "/" 的模式既不剪枝也不排除（用户以为排掉了 a/b，实则整棵照扫），
+// 且 filepath.Match 在 Windows 上以 "\" 为分隔符 → "*" 跨段，单层语义走形。
+// 现统一归一为 "/" 后用 path.Match：同一模式的两种写法必须给出同一结果。
+func TestNativeSeparatorsMatch(t *testing.T) {
+	cases := []struct {
+		name   string
+		pat    string
+		rel    string // 反斜杠写法（Windows 原生）
+		want   bool   // 期望：被排除
+		prune  bool   // 命中目录时可剪枝
+		dirRel string // 剪枝断言用目录 rel（反斜杠写法）
+		dir    string
+	}{
+		{name: "字面前缀递归", pat: "a/b", rel: `a\b\c\f.txt`, want: true,
+			prune: true, dirRel: `a\b`, dir: "b"},
+		{name: "递归尾随 **", pat: "a/b/**", rel: `a\b\c\d\f.txt`, want: true,
+			prune: true, dirRel: `a\b\c`, dir: "c"},
+		{name: "单层 * 命中直接子层", pat: "a/b/*", rel: `a\b\c`, want: true,
+			prune: false, dirRel: `a\b\c`, dir: "c"},
+		{name: "单层 * 不跨段", pat: "a/b/*", rel: `a\b\c\d\f.txt`, want: false,
+			prune: false, dirRel: `a\b\c`, dir: "c"},
+		{name: "段模式命中中间层", pat: "node_modules", rel: `p\node_modules\q\f.js`, want: true,
+			prune: true, dirRel: `p\node_modules`, dir: "node_modules"},
+		{name: "模式本身写反斜杠", pat: `a\b`, rel: `a\b\c\f.txt`, want: true,
+			prune: true, dirRel: `a\b`, dir: "b"},
+	}
+	for _, c := range cases {
+		// 不用 filepath.ToSlash：unix 上它是恒等函数，此处要的是显式跨写法等价
+		slashRel := strings.ReplaceAll(c.rel, "\\", "/")
+		slashDir := strings.ReplaceAll(c.dirRel, "\\", "/")
+		name := filepath.Base(slashRel)
+		// 两种分隔符写法走同一条断言：不一致即平台相关，即本条缺陷本体
+		for _, sep := range []struct {
+			tag string
+			rel string
+			dr  string
+		}{{"native", c.rel, c.dirRel}, {"slash", slashRel, slashDir}} {
+			m := Compile(&model.Filters{ExcludePaths: []string{c.pat}})
+			if got := m.Apply(name, sep.rel, 1<<20); got == c.want {
+				t.Errorf("%s[%s]: Apply(pat=%q, rel=%q) 排除=%v, want %v",
+					c.name, sep.tag, c.pat, sep.rel, !got, c.want)
+			}
+			if got := m.ExcludeDir(sep.dr, c.dir); got != c.prune {
+				t.Errorf("%s[%s]: ExcludeDir(%q, %q) = %v, want %v",
+					c.name, sep.tag, sep.dr, c.dir, got, c.prune)
+			}
+		}
 	}
 }

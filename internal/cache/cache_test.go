@@ -216,9 +216,27 @@ func TestLookupIdentityMismatch(t *testing.T) {
 			t.Fatalf("身份不一致必须未命中: %+v", id)
 		}
 	}
-	// 未解析平台（Windows 零值 ID）：不因身份拦截，维持旧行为
+	// 未解析平台（无稳定身份的卷）：不因身份拦截，维持旧行为
 	if _, hit, _ := c.Lookup("/id", 10, 1, fsid.ID{}); !hit {
 		t.Fatal("未解析身份应照常命中")
+	}
+}
+
+// I7：Windows 补上句柄身份后，升级前写入的零身份旧行不得继续放行命中——
+// 那样等于让新证据形同虚设。首次未命中重算并补齐身份，之后才有比对基准。
+func TestLookupLegacyZeroIdentityRowMisses(t *testing.T) {
+	c := openTest(t)
+	if err := c.Store([]Entry{{Path: "/legacy0", Size: 10, MtimeNs: 1,
+		Head: 1, Tail: 2, Mid1: 3, Mid2: 4,
+		Full: bytes.Repeat([]byte{0x7}, 32)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, _ := c.Lookup("/legacy0", 10, 1,
+		fsid.ID{Dev: 9, Ino: 9, CtimeNs: 9, Resolved: true}); hit {
+		t.Fatal("零身份旧行 + 已解析身份必须未命中（重算补齐）")
+	}
+	if _, hit, _ := c.Lookup("/legacy0", 10, 1, fsid.ID{}); !hit {
+		t.Fatal("身份仍无法解析时应维持旧行为")
 	}
 }
 

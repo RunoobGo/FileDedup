@@ -32,6 +32,11 @@ type Pipeline struct {
 	cancel      context.CancelFunc
 	cch         *cache.Cache // 可选：哈希缓存（M4）
 
+	// scannedFiles 阶段 0 采集到的语料文件总数。进度事件的 FilesTotal 按设计
+	// 是"当前阶段"口径（R2：阶段切换后重设为该阶段处理量），缓存命中扫尤其明显，
+	// 因此需要"本轮共扫描多少文件"这一稳定口径的调用方（fdd-cli 报告）走这里。
+	scannedFiles atomic.Uint64
+
 	OnProgress func(model.ProgressEvent) // 可选：进度回调
 	OnStage    func(model.StageEvent)    // 可选：阶段回调
 }
@@ -48,6 +53,11 @@ func (p *Pipeline) WithCache(c *cache.Cache) *Pipeline {
 func New() *Pipeline {
 	return &Pipeline{status: model.StatusIdle, gate: NewGate()}
 }
+
+// ScannedFiles 返回本轮 Run 阶段 0 采集到的语料文件总数（Run 结束后读取）。
+// 不复用进度事件的 FilesTotal：那是阶段口径（R2），进入预筛/哈希阶段后会被
+// 重设为该阶段的处理量，缓存命中扫下远小于语料数，作为报告统计会误导。
+func (p *Pipeline) ScannedFiles() uint64 { return p.scannedFiles.Load() }
 
 // Status 当前状态。
 func (p *Pipeline) Status() model.TaskStatus {
@@ -176,6 +186,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	p.cancel = cancel
 	p.afterResume = ""
 	p.mu.Unlock()
+	p.scannedFiles.Store(0)
 	// 闸门复位：上一轮若在 Paused 下被取消（父 ctx 直接取消、未走 CancelScan），
 	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
 	p.gate.Resume()
@@ -215,6 +226,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	}
 	failed = scan.Failed
 	files := scan.Files
+	p.scannedFiles.Store(uint64(len(files)))
 	tracker.SetTotal(uint64(len(files)), sumSize(files))
 
 	// ---------- 阶段 1：size 分组，淘汰独 size ----------
@@ -358,9 +370,10 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				pre[i].skip = true
 				continue
 			}
-			if st, serr := f.Stat(); serr == nil {
-				ids[i] = fsid.FromFileInfo(st)
-			}
+			// H1：持有句柄时立刻取物理身份 (dev, ino, ctime)。它是哈希所依据的
+			// 那份内容的凭证，用于缓存命中判定与阶段 3 写回。Windows 只有句柄
+			// 查询拿得到（I7），故统一走 FromFile 而非 FileInfo。
+			ids[i] = fsid.FromFile(f)
 			buf := pool.GetSmallBuf()
 			r, err := hasher.HashHeadTail(f, int64(e.Size), buf)
 			pool.PutSmallBuf(buf)
@@ -595,7 +608,12 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				p.setStatus(model.StatusCancelled)
 				return nil, failed, ctx.Err()
 			}
-			g, dropped := ver.group(ctx, g, failed)
+			g, failedAcc := ver.group(ctx, g, failed)
+			// group 的第二个返回值是「累加后的完整失败清单」（其内部直接 append
+			// 到传入的 failed）。必须整表接管而非再 append：否则每输出一个组
+			// 就把既有失败翻一倍（G 组 → 2^G 条），失败统计与历史写入全部失真。
+			// 组被 verify 拆散（len(g)<2）时同样要接管，否则该组新增的失败被吞。
+			failed = failedAcc
 			if err := ctx.Err(); err != nil {
 				p.setStatus(model.StatusCancelled)
 				return nil, failed, err
@@ -603,7 +621,6 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			if len(g) < 2 {
 				continue
 			}
-			failed = append(failed, dropped...)
 		}
 		id++
 		groups = append(groups, &model.DuplicateGroup{
@@ -646,6 +663,8 @@ func newVerifier() *verifier {
 // group paranoid 模式：组内所有文件与代表文件逐字节流式比对；
 // 不一致者移出组并计入失败清单。②-B：ctx 取消时立即停步返回，
 // 未处理的文件不记失败（取消是用户意图，不是文件问题）。
+// 第二个返回值是把本组新增失败 append 到入参 failed 之后的**完整累加表**：
+// 调用方必须整表接管，勿再 append（否则既有失败随组数翻倍）。
 func (v *verifier) group(ctx context.Context, g []*model.FileEntry, failed []model.FailedItem) ([]*model.FileEntry, []model.FailedItem) {
 	rep, err := os.Open(g[0].Path)
 	if err != nil {

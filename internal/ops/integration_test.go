@@ -38,7 +38,7 @@ func TestPipelineToOpsIntegration(t *testing.T) {
 	}
 
 	// 2) 保留策略：shortest（b.bin 路径明显最短）
-	ds := ApplyKeepPolicy(groups, model.KeepPolicy{Kind: "shortest"})
+	ds, _ := ApplyKeepPolicy(groups, model.KeepPolicy{Kind: "shortest"})
 	if len(ds) != 1 {
 		t.Fatalf("决策数 = %d", len(ds))
 	}

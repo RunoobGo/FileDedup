@@ -125,8 +125,8 @@ func (s *Store) FinalizeOp(opID int64) error {
 	return tx.Commit()
 }
 
-// MarkItemUndo 记录单条回撤结果（undone / undo_failed）。
-// 原 done 记录保留，审计链不断。
+// MarkItemUndo 记录单条回撤状态：执行前写 undoing（写前，I6），
+// 收口写 undone / undo_failed。原 done 记录保留，审计链不断。
 func (s *Store) MarkItemUndo(itemID int64, state, errMsg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,11 +142,12 @@ func (s *Store) MarkItemUndo(itemID int64, state, errMsg string) error {
 }
 
 // opMetaCols 聚合口径：
-//   - Done = 执行成功过的条目（含其后被回撤/回撤失败的，回撤不冲销执行账目）
+//   - Done = 执行成功过的条目（含其后被回撤/回撤失败的，回撤不冲销执行账目）；
+//     正在回撤中的 undoing 也计入，否则回撤进行中刷新明细会让 Done 凭空少 1
 //   - Undone = 已成功回撤；Failed = 执行失败（不含回撤失败，明细在条目状态）
 const opMetaCols = `r.id, r.op_kind, r.created_at, r.target_dir, r.hist_id, r.undoable,
 	r.reclaimed, COUNT(i.id),
-	COALESCE(SUM(i.state IN (?, ?, ?)), 0),
+	COALESCE(SUM(i.state IN (?, ?, ?, ?)), 0),
 	COALESCE(SUM(i.state = ?), 0),
 	COALESCE(SUM(i.state = ?), 0)`
 
@@ -172,8 +173,9 @@ func scanOpMeta(row interface{ Scan(...any) error }) (OpMeta, error) {
 	return m, nil
 }
 
-// opMetaAggArgs 与 opMetaCols 中五个占位符一一对应。
-var opMetaAggArgs = []any{StateDone, StateUndone, StateUndoFailed, StateUndone, StateFailed}
+// opMetaAggArgs 与 opMetaCols 中的六个状态占位符一一对应。
+var opMetaAggArgs = []any{StateDone, StateUndone, StateUndoFailed, StateUndoing,
+	StateUndone, StateFailed}
 
 // ListOps 操作记录列表（新→旧）。
 func (s *Store) ListOps() ([]OpMeta, error) {

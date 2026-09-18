@@ -169,33 +169,88 @@ func TestOpJournalDeleteNotUndoable(t *testing.T) {
 	}
 }
 
-// 历史库缺失时清理照常执行（journal no-op），不得阻塞主流程。
-func TestExecuteOperationWithoutHistoryStillWorks(t *testing.T) {
-	a, rec := newHistApp(t)
-	g := mkHistGroup(1, 1000, "/u/a/x.bin", "/u/b/y.bin")
-	id, err := a.hist.SaveScan(model.ScanConfig{Roots: []string{"/u"}},
-		[]*model.DuplicateGroup{g}, nil)
-	if err != nil {
-		t.Fatal(err)
+// contains 判断是否收到过某事件（emit 桩记录的名称列表）。
+func (e *eventRecorder) contains(name string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, ev := range e.events {
+		if ev == name {
+			return true
+		}
 	}
-	if _, err := a.LoadScanHistory(id); err != nil {
-		t.Fatal(err)
-	}
-	a.mu.Lock()
-	sel := []uint64{a.groups[0].Files[0].ID, a.groups[0].Files[1].ID}
-	a.hist = nil // 模拟历史库不可用
-	a.mu.Unlock()
+	return false
+}
 
-	if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: sel}); err != nil {
-		t.Fatal(err)
+// 历史库缺失时的清理行为（2026-09-18 审查 C3，用户裁定「仅可回撤类型拒绝」）：
+//   - 承诺可回撤的（回收站/移动/硬链接）必须拒绝执行——无账本即无法回撤，
+//     原先只发一条事件便照常移动文件，用户按手册预期可撤而实际不能；
+//   - 本就不承诺回撤的（永久删除）照常执行，但必须显式留痕（app:error），
+//     绝不静默——一并拒绝会把用户逼向唯一可用的破坏性路径。
+func TestExecuteOperationWithoutHistory(t *testing.T) {
+	newLoadedApp := func(t *testing.T) (*App, *eventRecorder, []uint64) {
+		t.Helper()
+		a, rec := newHistApp(t)
+		g := mkHistGroup(1, 1000, "/u/a/x.bin", "/u/b/y.bin")
+		id, err := a.hist.SaveScan(model.ScanConfig{Roots: []string{"/u"}},
+			[]*model.DuplicateGroup{g}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.LoadScanHistory(id); err != nil {
+			t.Fatal(err)
+		}
+		a.mu.Lock()
+		sel := []uint64{a.groups[0].Files[0].ID, a.groups[0].Files[1].ID}
+		a.hist = nil // 模拟历史库不可用
+		a.mu.Unlock()
+		return a, rec, sel
 	}
-	waitOpsDone(t, rec)
-	a.mu.Lock()
-	n := len(a.groups)
-	a.mu.Unlock()
-	if n != 0 { // S8 语义下结果集照常裁剪
-		t.Fatalf("结果集应清空, got %d 组", n)
-	}
+
+	t.Run("可回撤类拒绝且不动文件", func(t *testing.T) {
+		for _, kind := range []string{"trash", "move", "hardlink"} {
+			a, rec, sel := newLoadedApp(t)
+			target := t.TempDir()
+			a.authorizeDir(target) // 排除 H5 目标未授权这一干扰原因
+			op := model.OpRequest{Kind: kind, FileIDs: sel, TargetDir: target}
+			if _, err := a.ExecuteOperation(op); err == nil {
+				t.Fatalf("%s：账本不可用时不得受理（将造成无记录的文件移动）", kind)
+			}
+			a.mu.Lock()
+			running, groups := a.opsRunning, len(a.groups)
+			a.mu.Unlock()
+			if running {
+				t.Fatalf("%s：拒绝后 opsRunning 未复位，此后所有清理都会被拒", kind)
+			}
+			if groups != 1 {
+				t.Fatalf("%s：拒绝后结果集不应被裁剪", kind)
+			}
+			if rec.contains("ops:done") {
+				t.Fatalf("%s：拒绝却发出了 ops:done", kind)
+			}
+		}
+	})
+
+	t.Run("不可回撤类放行但显式留痕", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows 回收站拿不到映射，undoable 判定不同")
+		}
+		a, rec, sel := newLoadedApp(t)
+		if _, err := a.ExecuteOperation(model.OpRequest{
+			Kind: "delete", FileIDs: sel, ConfirmDanger: true,
+		}); err != nil {
+			t.Fatalf("永久删除本就不支持回撤，账本故障不应使其不可用: %v", err)
+		}
+		waitOpsDone(t, rec)
+		if !rec.contains("app:error") {
+			t.Fatal("未写入账本必须显式告警（app:error），不得静默放行")
+		}
+		a.mu.Lock()
+		n := len(a.groups)
+		a.mu.Unlock()
+		if n != 0 { // S8 语义下结果集照常裁剪
+			t.Fatalf("结果集应清空, got %d 组", n)
+		}
+	})
 }
 
 // ---------- Task 11：App.UndoOperation ----------

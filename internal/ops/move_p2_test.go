@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -34,11 +35,19 @@ func TestCopyVerifyPreservesModeAndMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := dt.Mode().Perm(), os.FileMode(0o750); got != want {
-		t.Errorf("权限位未还原: got %v want %v（旧实现 os.Create 会掉成 0644/0666&^umask）", got, want)
-	}
-	if !dt.ModTime().Equal(mt) {
-		t.Errorf("mtime 未还原: got %v want %v", dt.ModTime(), mt)
+	if runtime.GOOS != "windows" {
+		if got, want := dt.Mode().Perm(), os.FileMode(0o750); got != want {
+			t.Errorf("权限位未还原: got %v want %v（旧实现 os.Create 会掉成 0644/0666&^umask）", got, want)
+		}
+		if !dt.ModTime().Equal(mt) {
+			t.Errorf("mtime 未还原: got %v want %v", dt.ModTime(), mt)
+		}
+	} else if d := dt.ModTime().Sub(mt); d > time.Microsecond || d < -time.Microsecond {
+		// Windows 平台语义差异，不是 copyVerify 的缺陷：
+		//   - 无 POSIX 权限位（os.Chmod 只映射只读属性），权限断言无从成立；
+		//   - 时间戳落在 FILETIME 上，粒度 100ns，纳秒尾数必然被截。
+		// 仍校验时间戳还原到位（误差远小于 1µs 即为生效），不比逐纳秒。
+		t.Errorf("mtime 未还原（偏差超出 FILETIME 粒度）: got %v want %v Δ%v", dt.ModTime(), mt, d)
 	}
 	// 源保持不动：删源由调用方负责
 	if _, err := os.Stat(src); err != nil {

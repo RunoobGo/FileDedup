@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,7 +46,8 @@ func TestWalkBasic(t *testing.T) {
 	var got []string
 	for _, f := range res.Files {
 		rel, _ := filepath.Rel(root, f.Path)
-		got = append(got, rel)
+		// 结果里的路径是原生口径（Windows 为 \），断言统一到 slash 口径
+		got = append(got, filepath.ToSlash(rel))
 	}
 	sort.Strings(got)
 	want := []string{"a/b/inner.txt", "a/big.bin", "a/keep.txt", "a/nodeps/drop.js", "a/tmp.log"} // 0字节/隐藏/符号链接已跳过
@@ -123,6 +125,12 @@ func TestWalkFilters(t *testing.T) {
 }
 
 func TestWalkUnreadableDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows 的访问控制是 ACL，不是 st_mode 位：os.Chmod(0o000) 只落
+		// FILE_ATTRIBUTE_READONLY，目录照样可枚举。这里断言的是 POSIX 权限
+		// 拒绝语义，在该平台无从成立（不是扫描器缺陷）。
+		t.Skip("Windows 无 POSIX 权限拒绝语义（chmod 位不控制访问）")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root 用户无权限拒绝语义")
 	}
@@ -162,14 +170,25 @@ func naiveRelativeTo(roots []string, full string) string {
 	return filepath.Base(full)
 }
 
+// nativePaths 把 slash 口径的测试路径转成当前平台的原生分隔符口径。
+// relativeTo 处理的是磁盘路径：Windows 上写死 "/" 会让所有根都匹配不上、
+// 全部落到 filepath.Base() 兜底分支，等于把被测逻辑整个跳过了。
+func nativePaths(ps ...string) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = filepath.FromSlash(p)
+	}
+	return out
+}
+
 // G2 等价性：新实现必须与改造前逐例一致（多根 / 直接子文件 / 根自身 / 根外路径回退）。
 func TestRelativeToEquivalence(t *testing.T) {
-	roots := []string{"/a", "/b/c", "/d", "/aa"}
+	roots := nativePaths("/a", "/b/c", "/d", "/aa")
 	prefixes := rootPrefixes(roots)
-	cases := []string{
+	cases := nativePaths(
 		"/a/x", "/a/x/y/z.bin", "/b/c/m/n", "/b/other", "/d",
 		"/zzz/qq", "/a", "/b/c", "/aa/f.txt", "/a.txt",
-	}
+	)
 	for _, full := range cases {
 		want := naiveRelativeTo(roots, full)
 		if got := relativeTo(prefixes, full); got != want {
@@ -183,16 +202,17 @@ func TestRelativeToEquivalence(t *testing.T) {
 // 因此本项的收益只在 CPU（省去每次调用的拼接与重复长度计算），而非堆分配。
 // 断言只锁定「新实现零分配」这一契约，避免夸大收益。
 func TestRelativeToNoAllocs(t *testing.T) {
-	prefixes := rootPrefixes([]string{"/a", "/b", "/c", "/d", "/e"})
-	full := "/e/deep/nested/dir/file.bin"
-	if got := relativeTo(prefixes, full); got != "deep/nested/dir/file.bin" {
+	roots := nativePaths("/a", "/b", "/c", "/d", "/e")
+	prefixes := rootPrefixes(roots)
+	full := filepath.FromSlash("/e/deep/nested/dir/file.bin")
+	if got := filepath.ToSlash(relativeTo(prefixes, full)); got != "deep/nested/dir/file.bin" {
 		t.Fatalf("rel = %q", got)
 	}
 	if n := testing.AllocsPerRun(200, func() { _ = relativeTo(prefixes, full) }); n != 0 {
 		t.Fatalf("relativeTo 每次分配 %.1f 次，期望 0（G2 未生效）", n)
 	}
 	naive := testing.AllocsPerRun(200, func() {
-		_ = naiveRelativeTo([]string{"/a", "/b", "/c", "/d", "/e"}, full)
+		_ = naiveRelativeTo(roots, full)
 	})
 	t.Logf("堆分配：新实现 0.0 次/调用，旧实现 %.1f 次/调用（旧写法亦被栈分配优化）", naive)
 }

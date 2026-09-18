@@ -48,7 +48,7 @@ type FileView struct {
 	Name    string `json:"name"`
 	Size    uint64 `json:"size"`
 	ModTime int64  `json:"mtime"`
-	IsKeep  bool   `json:"isKeep"` // 保留建议（路径最短）
+	IsKeep  bool   `json:"isKeep"` // 默认建议保留者（非隐藏优先，再路径最短）
 }
 
 // GroupView 重复组视图。
@@ -57,6 +57,14 @@ type GroupView struct {
 	Reclaimable uint64     `json:"reclaimable"`
 	Size        uint64     `json:"size"`
 	Files       []FileView `json:"files"`
+}
+
+// KeepOutcome 保留策略结果（2026-09-18 审查 I4）。
+type KeepOutcome struct {
+	Decisions []ops.KeepDecision `json:"decisions"`
+	// UnmatchedGroups：directory 策略下没有任何成员命中保留目录的组数。
+	// 这些组不会被标出保留者、不受 S2 保护，UI 必须明示。
+	UnmatchedGroups int `json:"unmatchedGroups"`
 }
 
 // ResultQuery 结果查询参数（GetResultGroups）。
@@ -132,6 +140,20 @@ type App struct {
 	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
 	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
+	// resultGen 结果集代际号（2026-09-18 审查 C7）：StartScan 在锁内自增，
+	// 扫描 goroutine 收尾前比对——不等即「本任务已被新扫描取代」，弃写。
+	// scanInFlight 挡不住这一段：它在写回结果集时就已复位，而随后还有
+	// SaveScan（锁外）→ resultsReady/curHistID → scan:done 三拍。
+	resultGen atomic.Uint64
+
+	// 2026-09-18 审查 C5：绑定层后台任务的生命周期。
+	// wg 由 goTask 统一记账，shutdown 据此等在途 goroutine 收口后再关句柄；
+	// quitPending 记录「用户已按关闭、我们已拦下并请求中止」的次数，
+	// 让关闭按钮第一次按下是"中止并等待"，第二次才是"照办退出"。
+	wg          sync.WaitGroup
+	quitPending int
+	forceExit   func(code int) // 可测接缝：单测里不能真把测试进程带走
+
 	// H5：本会话内经原生目录选择器（SelectDirectory）明确授权过的目录集合
 	// （Clean 后的绝对路径）。move 的 TargetDir 必须落在其内——此前该参数是
 	// 前端任意字符串，绑定层可直接决定任意写位置。
@@ -162,6 +184,7 @@ func NewApp() *App {
 		viewCache: make(map[sortKey]viewCacheEntry),
 		authDirs:  make(map[string]bool),
 		emit:      wruntime.EventsEmit,
+		forceExit: os.Exit,
 	}
 	// 引擎回调 → 事件桥（M2-T03）
 	a.pipe.OnProgress = func(ev model.ProgressEvent) {
@@ -188,7 +211,7 @@ func (a *App) startup(ctx context.Context) {
 	if a.cfgDir != "" {
 		_ = os.MkdirAll(a.cfgDir, 0o755)
 	}
-	// M4：哈希缓存（损坏自愈；失败不阻塞应用）
+	// M4：哈希缓存（确证损坏时隔离重建；打开失败不阻塞应用）
 	if a.cfgDir != "" {
 		dbPath := filepath.Join(a.cfgDir, "cache.db")
 		if cch, err := cache.Open(dbPath); err == nil {
@@ -200,21 +223,89 @@ func (a *App) startup(ctx context.Context) {
 			fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
 		}
 	}
-	// v0.5.0：扫描历史/清理账本（独立 history.db，损坏自愈；失败不阻塞应用）
+	// v0.5.0：扫描历史/清理账本（独立 history.db，确证损坏时隔离重建）
 	if a.cfgDir != "" {
 		histPath := filepath.Join(a.cfgDir, "history.db")
 		if hs, err := history.Open(histPath); err == nil {
 			a.hist = hs
 		} else {
-			// 历史不可用只失去"历史恢复/回撤"能力，扫描与清理不受影响；同 cache 留痕风格。
-			fmt.Fprintf(os.Stderr, "[history] 历史库不可用，本次运行不保存历史与清理记录: %v (path=%s)\n", err, histPath)
+			// 2026-09-18 审查 C3 之后这里不再只是"失去历史/回撤能力"：账本不可用时
+			// 回收站/移动/硬链接会被拒绝执行（仅永久删除照常），见 beginJournal。
+			// 留痕必须说清后果，否则用户只看到"清理报账本不可用"而不知所以然。
+			fmt.Fprintf(os.Stderr, "[history] 历史库不可用：本次运行不保存历史，且回收站/移动/硬链接清理将被拒绝执行: %v (path=%s)\n", err, histPath)
 		}
 	}
 	a.emit(a.ctx, "app:ready", AppVersion)
 }
 
+// beforeClose 挂到 options.OnBeforeClose：返回 true 表示「这一次先别关窗口」。
+// 命名小写与 startup/shutdown 同列——生命周期钩子不该出现在前端绑定面里。
+//
+// 2026-09-18 审查 C5：扫描/清理跑在 goroutine 里，而关窗口即进程退出，原先
+// 毫无拦截——移动被拦腰截断、写前账本停在 planned、句柄被在途 goroutine 继续
+// 使用。交互语义：
+//   - 第一次关闭：拦下，请求中止在途任务，发 app:quit-blocked 让前端提示；
+//   - 第二次关闭（任务仍未收口）：认定用户就是要走，立即结束进程。
+//
+// 硬退出是可接受的而非理想：账本本来就是写前的，未落账条目留在 planned，
+// 下次启动 history.Open 统一标为 interrupted，用户看得到、可追溯。
+// 不无限等待是因为一次卡住的回收站/网络卷调用会让窗口永远关不掉。
+func (a *App) beforeClose(ctx context.Context) bool {
+	a.mu.Lock()
+	if !a.opsRunning && !a.scanInFlight {
+		a.quitPending = 0
+		a.mu.Unlock()
+		return false
+	}
+	running := "scan"
+	if a.opsRunning {
+		running = "ops"
+	}
+	a.quitPending++
+	attempt := a.quitPending
+	a.mu.Unlock()
+
+	if attempt >= 2 {
+		fmt.Fprintf(os.Stderr, "[app] 第二次关闭：在途任务仍未收口，立即退出（未完成条目由下次启动标记为中断）\n")
+		a.forceExit(0)
+		return true // forceExit 被测试替换时可达
+	}
+	a.cancelInFlight()
+	msg := "清理进行中，已请求中止——待其停下后再点一次即可退出（中止后已完成的部分不会回滚）"
+	if running == "scan" {
+		msg = "扫描进行中，已请求中止——待其停下后再点一次即可退出（扫描不涉及文件改动）"
+	}
+	if a.emit != nil {
+		a.emit(ctx, "app:quit-blocked", map[string]string{"message": msg, "running": running})
+	}
+	return true
+}
+
+// cancelInFlight 请求中止在途扫描与清理（幂等；不等待收口）。
+func (a *App) cancelInFlight() {
+	a.mu.Lock()
+	cancel := a.opsCancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = a.pipe.Cancel()
+}
+
 // shutdown Wails 生命周期：释放缓存与历史库句柄。
+//
+// 2026-09-18 审查 C5：句柄必须在在途 goroutine 收口后才关——扫描收尾写
+// SaveScan、清理收尾写 FinishItem/FinalizeOp，先关句柄会让这些落账变成
+// "sql: database is closed"，用户侧表现为历史/账本凭空少一条。
+// 等待设上限：单条文件系统调用（网络卷、回收站服务）不可中断，
+// 不能让"关不掉"成为代价；超时后按现状放行，并在 stderr 留痕。
 func (a *App) shutdown(ctx context.Context) {
+	a.cancelInFlight()
+	if !waitGroupTimeout(&a.wg, inflightDrainGrace) {
+		fmt.Fprintf(os.Stderr, "[app] 在途任务未在 %s 内收口，句柄先行释放（本次落账可能缺失）\n", inflightDrainGrace)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.cch != nil {
 		_ = a.cch.Close()
 		a.cch = nil
@@ -294,6 +385,12 @@ func withinDir(target, dir string) bool {
 	return strings.HasPrefix(target, dir)
 }
 
+// resultSuperseded 报告 myGen 这一代结果集是否已被更新的任务取走
+// （2026-09-18 审查 C7）。收尾 goroutine 据此弃写、弃发终止事件。
+func (a *App) resultSuperseded(myGen uint64) bool {
+	return myGen != a.resultGen.Load()
+}
+
 // StartScan 创建扫描任务，返回 taskID；运行中重复调用返回错误。
 func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	if len(cfg.Roots) == 0 {
@@ -319,6 +416,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		return "", fmt.Errorf("清理操作执行中，请等待完成后再扫描")
 	}
 	a.scanInFlight = true
+	myGen := a.resultGen.Add(1) // 代际号：goroutine 收尾据此判断自己是否已被取代
 	a.groups = nil
 	a.byID = make(map[uint64]*model.FileEntry)
 	a.keepIDs = nil
@@ -347,13 +445,23 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			a.scanInFlight = false
 			a.mu.Unlock()
 		}
+		// 代际判定：复位在途标志后本 goroutine 还剩「写回结果集 → SaveScan →
+		// resultsReady/curHistID → 终止事件」几拍，其间新扫描完全可能已被用户
+		// 发起（StartScan 只看 scanInFlight）。代际不符即弃写、弃发事件，
+		// 否则旧任务会把新扫描的 curHistID 换成自己的历史行——之后的清理
+		// 裁剪的是上一条记录，当前记录永远残留已删文件。
+		superseded := func() bool { return a.resultSuperseded(myGen) }
 		if err != nil {
 			if a.pipe.Status() == model.StatusCancelled {
 				resetInFlight()
-				a.emit(a.ctx, "scan:cancelled", ScanSummary{Elapsed: elapsed.String()})
+				if !superseded() {
+					a.emit(a.ctx, "scan:cancelled", ScanSummary{Elapsed: elapsed.String()})
+				}
 			} else {
 				resetInFlight()
-				a.emit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
+				if !superseded() {
+					a.emit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
+				}
 			}
 			return
 		}
@@ -385,6 +493,11 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			}
 		}
 		a.mu.Lock()
+		if superseded() {
+			a.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "[scan] 第 %d 代扫描已被新任务取代，收尾结果弃写\n", myGen)
+			return
+		}
 		a.resultsReady = true
 		a.curHistID = histID
 		a.mu.Unlock()
@@ -428,11 +541,32 @@ func (a *App) CancelScan() error { return a.pipe.Cancel() }
 // 因此 panic 展开时先复位在途标志、再吞掉 panic 发错误事件——
 // 前端收到 error 时应用已确定处于"空闲"，不会再看到"扫描中"的残影。
 func (a *App) goTask(kind string, reset, body func()) {
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done() // 最先注册 → 最后执行：panic 路径也不会漏记账
 		defer a.recoverGoroutine(kind)
 		defer reset()
 		body()
 	}()
+}
+
+// inflightDrainGrace 退出前等在途任务收口的上限。超过它说明有不可中断的
+// 单次系统调用卡住（网络卷、回收站服务），此时宁可放行退出也不能让窗口关不掉。
+const inflightDrainGrace = 10 * time.Second
+
+// waitGroupTimeout 等待 wg 归零，返回是否在期限内完成。
+func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // recoverGoroutine P3：绑定层 goroutine 的兜底 panic 守卫。
@@ -605,12 +739,10 @@ func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
 		}
 	}
 	if keep < 0 {
-		keep = 0
-		for i, f := range g.Files {
-			if len(f.Path) < len(g.Files[keep].Path) {
-				keep = i
-			}
-		}
+		// I5：默认建议与 ApplyKeepPolicy("shortest") 共用 ops.SuggestKeepIndex。
+		// 修正前这里另写了一份「只比路径长度」的规则，含隐藏目录的组上两份会
+		// 选出不同文件——星标显示的那一份正是被默认策略清掉的那一份。
+		keep = ops.SuggestKeepIndex(g)
 	}
 	for i, f := range g.Files {
 		v.Files = append(v.Files, FileView{
@@ -847,21 +979,21 @@ func (a *App) GetVersion() string { return AppVersion }
 // ApplyKeepPolicy 保留策略引擎（M3-T01）：返回决策并记录 keepIDs（S2 保护依据）。
 // 遍历阶段全程持锁（须与操作 goroutine 的结果集清理写互斥）；
 // 历史持久化放到放锁之后（hist 自有锁，禁止与 a.mu 嵌套）。
-func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, error) {
+func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) (KeepOutcome, error) {
 	a.mu.Lock()
 	if a.opsRunning {
 		a.mu.Unlock()
-		return nil, fmt.Errorf("清理操作执行中，请稍后再应用保留策略")
+		return KeepOutcome{}, fmt.Errorf("清理操作执行中，请稍后再应用保留策略")
 	}
 	if len(a.groups) == 0 {
 		a.mu.Unlock()
-		return nil, fmt.Errorf("暂无结果集")
+		return KeepOutcome{}, fmt.Errorf("暂无结果集")
 	}
 	if policy.Kind == "directory" && !ops.HasUsableDir(policy.Directories) {
 		a.mu.Unlock()
-		return nil, fmt.Errorf("请至少添加一个保留目录")
+		return KeepOutcome{}, fmt.Errorf("请至少添加一个保留目录")
 	}
-	decisions := ops.ApplyKeepPolicy(a.groups, policy)
+	decisions, unmatched := ops.ApplyKeepPolicy(a.groups, policy)
 	a.keepIDs = make(map[uint64]bool, len(decisions))
 	for _, d := range decisions {
 		a.keepIDs[d.KeepID] = true
@@ -869,16 +1001,26 @@ func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, erro
 	histID, paths := a.curHistID, a.keepPathsLocked()
 	a.mu.Unlock()
 	a.persistKeepPaths(histID, paths)
-	return decisions, nil
+	// I4：directory 策略下没有任何成员命中保留目录的组，一个保留者都不会被标出来。
+	// 这类组不受 S2 保护，必须让 UI 说清楚，不能让用户以为"已应用=已保护"。
+	return KeepOutcome{Decisions: decisions, UnmatchedGroups: len(unmatched)}, nil
 }
 
 // ClearKeepDecisions 清除保留决策（回到默认建议）。
-func (a *App) ClearKeepDecisions() {
+// B3-1：与 ApplyKeepPolicy 同口径的在途互斥。修正前只有本方法无守卫——清理
+// 执行中点「重置」会成功改写 a.keepIDs，而同一次操作实际用的是派发时的快照，
+// 于是「界面已重置、文件系统仍按旧保护集执行」两套事实并存。
+func (a *App) ClearKeepDecisions() error {
 	a.mu.Lock()
+	if a.opsRunning {
+		a.mu.Unlock()
+		return fmt.Errorf("清理操作执行中，请稍后重置保留策略")
+	}
 	a.keepIDs = nil
 	histID := a.curHistID
 	a.mu.Unlock()
 	a.persistKeepPaths(histID, nil)
+	return nil
 }
 
 // keepPathsLocked 当前保留决策对应的路径集合（须持 a.mu 调用）。
@@ -1000,6 +1142,9 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 	a.keepIDs = keepIDs
 	a.failed = meta.Failed
 	a.invalidateViewCacheLocked()
+	// 载入即换代（2026-09-18 审查 C7）：此刻 scanInFlight 可能已是 false 而旧
+	// 扫描 goroutine 仍在收尾，不换新代际就会被它把 curHistID 写回自己那行。
+	a.resultGen.Add(1)
 	a.curHistID = id
 	a.resultsReady = true
 	a.mu.Unlock()
@@ -1038,6 +1183,44 @@ func (a *App) ClearScanHistory() error {
 	a.curHistID = 0
 	a.mu.Unlock()
 	return nil
+}
+
+// beginJournal 在任何文件系统动作之前把本次清理的完整计划落盘（写前账本）。
+// undoable 判定：delete 不可撤；Windows 回收站拿不到 src→dst 映射，
+// 回撤改由「打开系统回收站」引导；其余可撤。
+//
+// 2026-09-18 审查 C3（用户裁定：仅可回撤类型拒绝）：账本不可用（hist 为 nil 或 BeginOp
+// 失败）时，承诺过可回撤的操作（回收站/移动/硬链接）一律拒绝执行——原先
+// 只发一条事件便照常移动文件，用户按手册 09 §6.7 预期可回撤而实际无账本可撤。
+// 不承诺回撤的（永久删除、Windows 回收站）仍放行：这类操作故障前后能力等价，
+// 若一并拒绝反而会把用户逼向唯一可用的破坏性路径；改为 stderr + app:error
+// 显式留痕（绝不静默）。
+//
+// 必须在 a.mu 之外调用（hist 访问不与 a.mu 嵌套）；调用方已置 opsRunning。
+func (a *App) beginJournal(hs *history.Store, histID int64, op model.OpRequest,
+	groups []*model.DuplicateGroup, keepIDs map[uint64]bool) (int64, error) {
+	plans := planOpItems(groups, keepIDs, op.FileIDs)
+	if len(plans) == 0 {
+		return 0, fmt.Errorf("无可操作文件（所选 id 均不在当前结果集，或均为保留项）")
+	}
+	undoable := op.Kind != "delete" && !(op.Kind == "trash" && runtime.GOOS == "windows")
+	jid, jerr := func() (int64, error) {
+		if hs == nil {
+			return 0, fmt.Errorf("history.db 未就绪")
+		}
+		return hs.BeginOp(op.Kind, op.TargetDir, histID, undoable, plans)
+	}()
+	if jerr == nil {
+		return jid, nil
+	}
+	if undoable {
+		return 0, fmt.Errorf("清理账本不可用，已拒绝执行（无账本即无法回撤与追溯）：%w", jerr)
+	}
+	// 不可回撤类：留痕放行
+	msg := fmt.Sprintf("本次操作未写入清理账本（%v）：该操作本就不支持应用内回撤，已照常执行并在此留痕", jerr)
+	fmt.Fprintf(os.Stderr, "[history] %s\n", msg)
+	a.emit(a.ctx, "app:error", map[string]string{"error": msg})
+	return 0, nil
 }
 
 // ExecuteOperation 操作执行器（M3-T02~T06）：
@@ -1087,6 +1270,22 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 
 	opID := fmt.Sprintf("ops-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
 
+	// 2026-09-18 审查 C3：写前账本改为 fail-closed。原先 BeginOp 失败只发一条事件、
+	// journalID 保持 0 后照常移动文件（hist 为 nil 时更是零提示），与手册
+	// 09 §6.7「动手之前先把完整计划写入账本」的承诺相反——用户按界面预期
+	// 可回撤，实际账本上什么都没有。此处在派发前落盘计划，失败即拒绝执行。
+	// 放在锁外是因为 hist 访问绝不与 a.mu 嵌套（见 App.hist 注释）；
+	// opsRunning 已在锁内置位，新扫描与新操作在此期间都被拒。
+	journalID, jerr := a.beginJournal(hs, histID, op, groups, keepIDs)
+	if jerr != nil {
+		a.mu.Lock()
+		a.opsRunning = false
+		a.opsCancel = nil
+		a.mu.Unlock()
+		cancelOp()
+		return "", jerr
+	}
+
 	a.goTask("ops", func() {
 		a.mu.Lock()
 		a.opsRunning = false
@@ -1094,23 +1293,6 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		cancelOp()
 	}, func() {
-		// v0.5.0 功能 4：写前账本——任何文件系统动作之前落盘全部计划。
-		// undoable 判定：delete 不可撤；Windows 回收站拿不到 src→dst 映射，
-		// 回撤改由「打开系统回收站」引导；其余可撤。
-		undoable := op.Kind != "delete" && !(op.Kind == "trash" && runtime.GOOS == "windows")
-		var journalID int64
-		if hs != nil {
-			if plans := planOpItems(groups, keepIDs, op.FileIDs); len(plans) > 0 {
-				jid, jerr := hs.BeginOp(op.Kind, op.TargetDir, histID, undoable, plans)
-				if jerr != nil {
-					fmt.Fprintf(os.Stderr, "[history] 操作账本写入失败: %v\n", jerr)
-					a.emit(a.ctx, "app:error", map[string]string{
-						"error": "操作账本写入失败，本次清理将无法在「记录」页回撤：" + jerr.Error()})
-				} else {
-					journalID = jid
-				}
-			}
-		}
 		res := ops.Execute(ops.Options{
 			Ctx:     opCtx,
 			Groups:  groups,
@@ -1249,7 +1431,16 @@ func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 }
 
 // ClearOpRecords 删除全部清理账本（不动已回收/已移动的文件本身）。
+// B3-1：清理/回撤在途时拒绝——账本此刻正被 FinishItem/FinalizeOp 逐项落账，
+// 整表删除会让一个仍在移动文件的操作失去全部记录（事后既无从回撤也无从追溯），
+// 而界面上只表现为"清空成功"。
 func (a *App) ClearOpRecords() error {
+	a.mu.Lock()
+	busy := a.opsRunning
+	a.mu.Unlock()
+	if busy {
+		return fmt.Errorf("清理/回撤操作执行中，请等待结束后再清空记录")
+	}
 	if a.hist == nil {
 		return fmt.Errorf("历史库不可用")
 	}
@@ -1328,16 +1519,25 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 	return undoID, nil
 }
 
-// undoExecuteItem 执行单条回撤并落账（批量/单项共用）：成功置 undone，
-// 失败置 undo_failed 并保留原因供排查与重试；调用方据 error 汇总成败。
+// undoOneFn 回撤执行入口的间接引用：测试据此断言"账本先落、文件后动"的先后顺序。
+var undoOneFn = ops.UndoOne
+
+// undoExecuteItem 执行单条回撤并落账（批量/单项共用）。写前落账（2026-09-18
+// 审查 I6）：先把条目置为 undoing 再动文件系统——原先先移动后落账，中途被杀会让
+// 账本永久停在 done，文件其实已回家却显示"未回撤"，重试还必报"已不存在"。
+// 收口：成功置 undone，失败置 undo_failed 并保留原因供排查与重试；
+// 写前落账失败则拒绝执行（与 C3「无账本不动文件」同口径），调用方据 error 汇总成败。
 func undoExecuteItem(hs *history.Store, kind string, it history.OpItem) (string, error) {
+	if err := hs.MarkItemUndo(it.ID, history.StateUndoing, ""); err != nil {
+		return "", fmt.Errorf("回撤写前落账失败，已放弃执行（文件系统未改动）: %w", err)
+	}
 	var restored string
 	var uerr error
 	if kind == "trash" && it.DestPath == "" {
 		// darwin 旧版/映射失败时条目没有回收站落点，无法定位
 		uerr = fmt.Errorf("无法定位回收站位置，请打开系统回收站手动还原")
 	} else {
-		restored, uerr = ops.UndoOne(ops.UndoItem{
+		restored, uerr = undoOneFn(ops.UndoItem{
 			Kind: kind, OrigPath: it.OrigPath, DestPath: it.DestPath,
 			LinkSrc: it.LinkSrc, Hash: it.Hash, Size: it.Size, MtimeNs: it.MtimeNs,
 		})
