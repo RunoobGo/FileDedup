@@ -98,9 +98,10 @@ type FailedItem struct {
 }
 
 // KeepPolicy 一键保留策略。
+// directory 策略的 Directories 为有序优先级列表：靠前目录优先保留。
 type KeepPolicy struct {
-	Kind      string // newest/oldest/shortest/directory/manual
-	Directory string
+	Kind        string // newest/oldest/shortest/directory/manual
+	Directories []string
 }
 
 // OpRequest 清理操作请求。

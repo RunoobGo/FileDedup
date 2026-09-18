@@ -30,7 +30,7 @@ func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) []
 		case "oldest":
 			keep = pickBy(g, func(a, b *model.FileEntry) bool { return a.ModTime < b.ModTime })
 		case "directory":
-			keep = pickInDirectory(g, policy.Directory)
+			keep = pickByDirectoryPriority(g, policy.Directories)
 			if keep < 0 {
 				continue // 无匹配：该组保持现状（用户未选择）
 			}
@@ -85,6 +85,20 @@ func hidden(p string) bool {
 		}
 	}
 	return false
+}
+
+// pickByDirectoryPriority 按目录优先级顺序取首个命中目录的保留者，
+// 全部未命中返回 -1。dirs 中空串项忽略。
+func pickByDirectoryPriority(g *model.DuplicateGroup, dirs []string) int {
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		if i := pickInDirectory(g, d); i >= 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 // pickInDirectory 保留位于 dir 下的文件（最长前缀优先），无匹配返回 -1。
