@@ -150,14 +150,37 @@ func uniqueXDG(dir, name string) (string, error) {
 // writeTrashInfo 生成规范 .trashinfo。
 //
 // H4：Path= 必须是"绝对路径或相对路径"（freedesktop Trash Spec 1.0），
-// 主流实现（glib/Nautilus）写的是原样绝对路径。修正前写 `file:///...`，
-// 会被按相对路径解析到 $XDG_DATA_HOME 下 → 回收站无法还原，
-// 文件事实上永久失联。换行符（含 %5Cn 编码歧义）格式无法表达，直接拒绝。
+// 修正前写 `file:///...`，会被按相对路径解析到 $XDG_DATA_HOME 下 → 回收站
+// 无法还原，文件事实上永久失联。换行符格式无法表达，直接拒绝。
+//
+// 按规范 Path 值需做 desktop-entry location 转义（glib/Nautilus 即如此）：
+// 空格与非 ASCII 字节写成原样会让 key-file 解析产生歧义，回收站按
+// %XX 解码后找不到原路径。此处仅保留 unreserved 字符与 '/'，其余字节
+// （含多字节 UTF-8）逐字节 percent 编码。
 func writeTrashInfo(infoDir, name, origAbs string) error {
 	if strings.ContainsAny(origAbs, "\n\r") {
 		return fmt.Errorf("路径含换行符，trashinfo 格式无法表达: %s", origAbs)
 	}
 	now := time.Now().Format("2006-01-02T15:04:05")
-	content := fmt.Sprintf("[Trash Info]\nPath=%s\nDeletionDate=%s\n", origAbs, now)
+	content := fmt.Sprintf("[Trash Info]\nPath=%s\nDeletionDate=%s\n", xdgEscapePath(origAbs), now)
 	return os.WriteFile(filepath.Join(infoDir, name+".trashinfo"), []byte(content), 0o600)
+}
+
+// xdgEscapePath 桌面入口 location 转义：A-Za-z0-9-._~/ 之外的字节 → %XX。
+func xdgEscapePath(p string) string {
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		const upperhex = "0123456789ABCDEF"
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '.', c == '_', c == '~', c == '/':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(upperhex[c>>4])
+			b.WriteByte(upperhex[c&0x0f])
+		}
+	}
+	return b.String()
 }

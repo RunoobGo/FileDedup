@@ -29,12 +29,32 @@ func resolvedID(t *testing.T, p string) fsid.ID {
 
 func replaceWith(t *testing.T, p, content string) {
 	t.Helper()
+	before := fsid.FromFileInfo(mustLstat(t, p))
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
+	// ext4/tmpfs 会立即回收刚释放的 inode：先用占位文件吸收它，
+	// 再重建目标路径，保证新文件的 inode 与被删者不同。
+	filler := filepath.Join(filepath.Dir(p), ".inode-filler")
+	if err := os.WriteFile(filler, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(filler)
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if after := fsid.FromFileInfo(mustLstat(t, p)); before.SameIdentity(after) {
+		t.Skip("文件系统复用了 inode，无法构造替换场景")
+	}
+}
+
+func mustLstat(t *testing.T, p string) os.FileInfo {
+	t.Helper()
+	lst, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lst
 }
 
 func TestHardlinkMergeRejectsReplacedKeep(t *testing.T) {
