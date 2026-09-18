@@ -343,3 +343,100 @@ func TestUndoOperationGates(t *testing.T) {
 		t.Fatal("操作在途时应拒绝")
 	}
 }
+
+// ---------- 单项回撤（在全部回撤之上的增量通道） ----------
+
+// 单项回撤只处理目标项：其余 done 项不受牵连；已 undone 项再撤同步拒绝。
+func TestUndoOperationItemSingleRestore(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("UNDO-ITEM-OK!!")
+	dest := filepath.Join(dir, "trash", "b.bin")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, rec := newHistApp(t)
+	orig := filepath.Join(dir, "home", "b.bin")
+	opID := seedDoneOp(t, a, "trash", true,
+		[]string{filepath.Join(dir, "lost", "a.bin"), orig},
+		[]string{"", dest}, uint64(len(content)))
+	_, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodID := items[1].ID
+
+	if _, err := a.UndoOperationItem(opID, goodID); err != nil {
+		t.Fatal(err)
+	}
+	waitUndoDone(t, rec)
+	if got, err := os.ReadFile(orig); err != nil || string(got) != string(content) {
+		t.Fatalf("目标项未回原位: err=%v", err)
+	}
+	_, items, err = a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0].State != history.StateDone {
+		t.Fatalf("非目标项被牵连: %+v", items[0])
+	}
+	if items[1].State != history.StateUndone {
+		t.Fatalf("目标项未记 undone: %+v", items[1])
+	}
+	// 已回撤项再撤 → 同步拒绝（done/undo_failed 之外不可撤）
+	if _, err := a.UndoOperationItem(opID, goodID); err == nil ||
+		!strings.Contains(err.Error(), "不可回撤") {
+		t.Fatalf("undone 项应拒绝再撤: %v", err)
+	}
+}
+
+// 回收站映射缺失项：单项回撤走异步逐项失败——undo_failed + 原因落库，可修正后重试。
+func TestUndoOperationItemMissingDestFails(t *testing.T) {
+	a, rec := newHistApp(t)
+	opID := seedDoneOp(t, a, "trash", true, []string{"/nn/x.bin"}, []string{""}, 3)
+	_, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UndoOperationItem(opID, items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUndoDone(t, rec)
+	_, items, err = a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0].State != history.StateUndoFailed || items[0].Err == "" {
+		t.Fatalf("映射缺失项应记 undo_failed+原因: %+v", items[0])
+	}
+}
+
+// 入口同步校验：记录不可撤 / 条目不属于该记录。
+func TestUndoOperationItemGuards(t *testing.T) {
+	a, _ := newHistApp(t)
+	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)
+	_, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UndoOperationItem(opID, items[0].ID); err == nil ||
+		!strings.Contains(err.Error(), "该记录不可回撤") {
+		t.Fatalf("delete 记录应拒绝回撤: %v", err)
+	}
+	trashOp := seedDoneOp(t, a, "trash", true,
+		[]string{filepath.Join(t.TempDir(), "h", "a.bin")}, []string{""}, 3)
+	if _, err := a.UndoOperationItem(trashOp, 999999); err == nil ||
+		!strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("缺失条目应报错: %v", err)
+	}
+	// 操作在途 → 同步拒绝
+	a.mu.Lock()
+	a.opsRunning = true
+	a.mu.Unlock()
+	_, items, _ = a.hist.GetOp(trashOp)
+	if _, err := a.UndoOperationItem(trashOp, items[0].ID); err == nil {
+		t.Fatal("操作在途时应拒绝")
+	}
+}

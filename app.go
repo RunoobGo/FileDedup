@@ -1314,31 +1314,116 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 				break // 剩余项保持 done，可再次回撤
 			}
 			a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: i, Total: total, Current: it.OrigPath})
-			var restored string
-			var uerr error
-			if meta.Kind == "trash" && it.DestPath == "" {
-				// darwin 旧版/映射失败时条目没有回收站落点，无法定位
-				uerr = fmt.Errorf("无法定位回收站位置，请打开系统回收站手动还原")
-			} else {
-				restored, uerr = ops.UndoOne(ops.UndoItem{
-					Kind: meta.Kind, OrigPath: it.OrigPath, DestPath: it.DestPath,
-					LinkSrc: it.LinkSrc, Hash: it.Hash, Size: it.Size, MtimeNs: it.MtimeNs,
-				})
-			}
+			restored, uerr := undoExecuteItem(hs, meta.Kind, it)
 			if uerr != nil {
-				if merr := hs.MarkItemUndo(it.ID, history.StateUndoFailed, uerr.Error()); merr != nil {
-					fmt.Fprintf(os.Stderr, "[history] 回撤失败态落库出错 %s: %v\n", it.OrigPath, merr)
-				}
 				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
 				continue
-			}
-			if merr := hs.MarkItemUndo(it.ID, history.StateUndone, ""); merr != nil {
-				fmt.Fprintf(os.Stderr, "[history] 回撤成功态落库出错 %s: %v\n", it.OrigPath, merr)
 			}
 			res.OK++
 			res.Restored = append(res.Restored, restored)
 		}
 		a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: total, Total: total, Current: ""})
+		a.emit(a.ctx, "ops:undo:done", res)
+	})
+	return undoID, nil
+}
+
+// undoExecuteItem 执行单条回撤并落账（批量/单项共用）：成功置 undone，
+// 失败置 undo_failed 并保留原因供排查与重试；调用方据 error 汇总成败。
+func undoExecuteItem(hs *history.Store, kind string, it history.OpItem) (string, error) {
+	var restored string
+	var uerr error
+	if kind == "trash" && it.DestPath == "" {
+		// darwin 旧版/映射失败时条目没有回收站落点，无法定位
+		uerr = fmt.Errorf("无法定位回收站位置，请打开系统回收站手动还原")
+	} else {
+		restored, uerr = ops.UndoOne(ops.UndoItem{
+			Kind: kind, OrigPath: it.OrigPath, DestPath: it.DestPath,
+			LinkSrc: it.LinkSrc, Hash: it.Hash, Size: it.Size, MtimeNs: it.MtimeNs,
+		})
+	}
+	if uerr != nil {
+		if merr := hs.MarkItemUndo(it.ID, history.StateUndoFailed, uerr.Error()); merr != nil {
+			fmt.Fprintf(os.Stderr, "[history] 回撤失败态落库出错 %s: %v\n", it.OrigPath, merr)
+		}
+		return "", uerr
+	}
+	if merr := hs.MarkItemUndo(it.ID, history.StateUndone, ""); merr != nil {
+		fmt.Fprintf(os.Stderr, "[history] 回撤成功态落库出错 %s: %v\n", it.OrigPath, merr)
+	}
+	return restored, nil
+}
+
+// UndoOperationItem 回撤记录中的单个条目（全部回撤之外的增量通道）：
+// done 与 undo_failed（修正后重试）可撤；互斥/可撤性/条目状态入口同步校验，
+// 受理后异步执行，终止事件与批量回撤同构（ops:undo:done）。
+// 与批量口径一致：已回撤项不重复处理（同步拒绝），结果集不动。
+func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
+	a.mu.Lock()
+	if a.opsRunning {
+		a.mu.Unlock()
+		return "", fmt.Errorf("清理/回撤操作执行中，请稍候")
+	}
+	if a.scanInFlight {
+		a.mu.Unlock()
+		return "", fmt.Errorf("扫描进行中，请等待结束后再回撤")
+	}
+	hs := a.hist // 锁内快照：goroutine 内不得再解引用可变字段
+	if hs == nil {
+		a.mu.Unlock()
+		return "", fmt.Errorf("历史库不可用")
+	}
+	a.opsRunning = true
+	opCtx, cancelOp := context.WithCancel(context.Background())
+	a.opsCancel = cancelOp
+	a.mu.Unlock()
+
+	release := func() {
+		a.mu.Lock()
+		a.opsRunning = false
+		a.opsCancel = nil
+		a.mu.Unlock()
+		cancelOp()
+	}
+
+	meta, items, err := hs.GetOp(opLogID)
+	if err != nil {
+		release()
+		return "", err
+	}
+	if !meta.Undoable {
+		release()
+		return "", fmt.Errorf("该记录不可回撤（永久删除与 Windows 回收站不支持应用内回撤）")
+	}
+	var target *history.OpItem
+	for i := range items {
+		if items[i].ID == itemID {
+			target = &items[i]
+			break
+		}
+	}
+	if target == nil {
+		release()
+		return "", fmt.Errorf("该记录中不存在此条目（itemID=%d）", itemID)
+	}
+	if target.State != history.StateDone && target.State != history.StateUndoFailed {
+		release()
+		return "", fmt.Errorf("该项不可回撤（当前状态：%s）", target.State)
+	}
+	it := *target
+
+	undoID := fmt.Sprintf("undo-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
+	a.goTask("ops", release, func() {
+		res := UndoResult{OpID: opLogID, Restored: []string{}, Failed: []model.FailedItem{}}
+		if opCtx.Err() == nil {
+			restored, uerr := undoExecuteItem(hs, meta.Kind, it)
+			if uerr != nil {
+				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
+			} else {
+				res.OK++
+				res.Restored = append(res.Restored, restored)
+			}
+		}
 		a.emit(a.ctx, "ops:undo:done", res)
 	})
 	return undoID, nil

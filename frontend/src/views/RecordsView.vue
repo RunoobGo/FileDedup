@@ -102,6 +102,38 @@ function askUndo(m: OpRecord) {
   }
 }
 
+// ---------- 单项回撤 ----------
+
+const undoingItem = ref<number | null>(null)
+
+// done 可撤；undo_failed 给修正后重试通道（与批量回撤的后端口径一致）
+function canUndoItem(m: OpRecord, it: OpRecordItem): boolean {
+  return m.undoable && (it.state === 'done' || it.state === 'undo_failed')
+}
+
+function undoOne(m: OpRecord, it: OpRecordItem) {
+  undoingItem.value = it.id
+  store.undoItem(m.id, it.id)
+}
+
+async function reloadDetail() {
+  if (expandedOp.value === null) return
+  try {
+    const d = await api.getOpRecord(expandedOp.value)
+    opDetail.value = d.list ?? []
+  } catch {
+    // 明细刷新失败不打断：列表计数已由 refreshOps 更新
+  }
+}
+
+// 回撤收尾（opsRunning 下降沿）：清执行中标记并重拉展开中的明细
+watch(() => store.opsRunning, (now, prev) => {
+  if (prev && !now) {
+    undoingItem.value = null
+    reloadDetail()
+  }
+})
+
 async function clearAllOps() {
   if (!confirmClearOps.value) { confirmClearOps.value = true; return }
   confirmClearOps.value = false
@@ -232,7 +264,7 @@ function destSummary(it: OpRecordItem): string {
                 <div v-if="opDetailLoading" class="detail-loading">读取明细…</div>
                 <table v-else-if="opDetail" class="item-table">
                   <thead>
-                    <tr><th>原路径</th><th>去向</th><th>大小</th><th>状态</th><th>错误</th></tr>
+                    <tr><th>原路径</th><th>去向</th><th>大小</th><th>状态</th><th>错误</th><th>操作</th></tr>
                   </thead>
                   <tbody>
                     <tr v-for="it in opDetail" :key="it.id">
@@ -241,6 +273,14 @@ function destSummary(it: OpRecordItem): string {
                       <td class="num">{{ humanBytes(it.size) }}</td>
                       <td><span :class="stateCls(it.state)">{{ STATE_LABEL[it.state] ?? it.state }}</span></td>
                       <td class="err-cell" :title="it.err">{{ it.err }}</td>
+                      <td class="ops-col">
+                        <button v-if="canUndoItem(m, it)" class="btn-ghost xs"
+                          :disabled="store.opsRunning || store.scanning"
+                          :title="store.opsRunning ? '操作执行中' : '仅回撤此文件（恢复回原位置）'"
+                          @click="undoOne(m, it)">
+                          {{ undoingItem === it.id ? '执行中…' : (it.state === 'undo_failed' ? '重试回撤' : '回撤') }}
+                        </button>
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -298,6 +338,7 @@ function destSummary(it: OpRecordItem): string {
 .st-bad { color: var(--danger-ink); background: rgba(220, 80, 80, 0.12); }
 .st-mute { color: var(--text-3); background: rgba(127, 127, 127, 0.1); }
 .err-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-ink); }
+.btn-ghost.xs { padding: 1px 6px; font-size: 12px; line-height: 1.5; }
 /* 空态样式与 ResultView 空态同节奏 */
 .empty { text-align: center; color: var(--text-2); padding: 56px 24px; }
 .empty-ico { color: var(--text-3); display: block; margin: 0 auto 10px; }

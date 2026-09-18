@@ -207,6 +207,7 @@ export interface BackendAPI {
   ListOpRecords(): Promise<OpRecord[]>
   GetOpRecord(id: number): Promise<OpRecordDetail>
   UndoOperation(opLogId: number): Promise<string>
+  UndoOperationItem(opLogId: number, itemId: number): Promise<string>
   ClearOpRecords(): Promise<void>
   CacheStats(): Promise<CacheStats>
   CacheClear(): Promise<void>
@@ -271,6 +272,7 @@ export const api = {
   listOpRecords: (): Promise<OpRecord[]> => backend().ListOpRecords(),
   getOpRecord: (id: number): Promise<OpRecordDetail> => backend().GetOpRecord(id),
   undoOperation: (opLogId: number): Promise<string> => backend().UndoOperation(opLogId),
+  undoOperationItem: (opLogId: number, itemId: number): Promise<string> => backend().UndoOperationItem(opLogId, itemId),
   clearOpRecords: (): Promise<void> => backend().ClearOpRecords(),
   cacheStats: (): Promise<CacheStats> => backend().CacheStats(),
   cacheClear: (): Promise<void> => backend().CacheClear(),

@@ -321,6 +321,21 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
+  // undoItem 回撤记录中的单个条目（done/undo_failed 可撤），事件与互斥同 undoRecord。
+  async function undoItem(opId: number, itemId: number) {
+    if (opsRunning.value) {
+      toast().notifyError('回撤失败', '清理/回撤操作执行中，请稍候')
+      return
+    }
+    opsRunning.value = true
+    try {
+      await api.undoOperationItem(opId, itemId)
+    } catch (e: any) {
+      opsRunning.value = false
+      toast().notifyError('回撤失败', e)
+    }
+  }
+
   async function clearOps() {
     try {
       await api.clearOpRecords()
@@ -603,7 +618,7 @@ export const useScanStore = defineStore('scan', () => {
     groups, totalGroups, reclaimableTotal, resultSort, resultExt, hasResult, pageSize,
     loadCap, loadingPage, resultPage,
     histList, histResult, histLoading, refreshHistory, openHistory, rescanHistory, deleteHistory, clearHistory,
-    opList, refreshOps, undoRecord, clearOps,
+    opList, refreshOps, undoRecord, undoItem, clearOps,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
