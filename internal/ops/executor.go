@@ -66,13 +66,29 @@ func runIndexed(ctx context.Context, n, workers int, fn func(i int), onPanic ...
 	wg.Wait()
 }
 
+// ItemResult 单个文件走完校验/执行阶段的终态（v0.5.0 写前日志收口用）。
+// State ∈ done / failed / skipped；DestPath 为 trash/move 的实际去向
+// （回收站映射缺失时为空），LinkSrc 为 hardlink 指向的保留源。
+type ItemResult struct {
+	OrigPath string
+	DestPath string
+	LinkSrc  string
+	State    string
+	Err      string
+}
+
 // Options 执行器配置。
 type Options struct {
 	Groups     []*model.DuplicateGroup // 当前结果集（含组哈希）
 	KeepIDs    map[uint64]bool         // 各组保留文件 ID（S2：不可操作）
 	Pool       *hasher.Pool
-	TrashFn    func(paths []string) error // 回收站（可注入，默认平台实现）
+	TrashFn    func(paths []string) (map[string]string, error) // 回收站（可注入，默认平台实现）
 	OnProgress func(done, total int, current string)
+
+	// OnItem 每个进入校验/执行阶段的文件恰好回调一次（nil 安全）。
+	// 保留项拒绝与结果集外 id 不回调——它们不在写前日志的计划里；
+	// 取消后未派发项不回调，由上层 Finalize 统一归为 cancelled。
+	OnItem func(ItemResult)
 
 	// OnPanic C7 兜底：worker 内 panic 时回调（由调用方发 ops:error 并复位在途标志）。
 	// 不提供则 runIndexed 的 panic 守卫退化为不拦截（保留默认崩溃行为，便于测试暴露缺陷）。
@@ -149,6 +165,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			opts.OnProgress(n, total, path)
 		}
 	}
+	emitItem := func(r ItemResult) {
+		if opts.OnItem != nil {
+			opts.OnItem(r)
+		}
+	}
 
 	// 校验阶段（S1/S8）
 	// H2：procIDs 与 toProcess 下标平行，记录「通过校验那一刻」的文件身份；
@@ -171,9 +192,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		switch v {
 		case VerdictSkipped:
 			res.Skipped = append(res.Skipped, e.Path) // S8：已消失 = 目标达成
+			emitItem(ItemResult{OrigPath: e.Path, State: "skipped"})
 			report(e.Path)
 		case VerdictFailed:
 			res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: "校验失败：文件在扫描后被修改"})
+			emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: "校验失败：文件在扫描后被修改"})
 			report(e.Path)
 		default:
 			toProcess = append(toProcess, e)
@@ -190,9 +213,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		ocSkipped
 	)
 	type outcome struct {
-		code  int
-		stage string // 失败阶段（空 = ops，用于保留源校验等 verify 语义）
-		err   string
+		code    int
+		stage   string // 失败阶段（空 = ops，用于保留源校验等 verify 语义）
+		err     string
+		dst     string // trash/move 实际去向（未知时空）
+		linkSrc string // hardlink 指向的保留源
 	}
 	outcomes := make([]outcome, len(toProcess))
 
@@ -221,15 +246,20 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			case ocOK:
 				res.OK = append(res.OK, e.Path)
 				res.Reclaimed += e.Size
+				emitItem(ItemResult{OrigPath: e.Path, DestPath: outcomes[i].dst,
+					LinkSrc: outcomes[i].linkSrc, State: "done"})
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
+				emitItem(ItemResult{OrigPath: e.Path, State: "skipped"})
 			case ocNone:
 				// 未派发：取消时是常态（P2），须与真正的内部状态缺失区分开，
 				// 否则用户取消一次会得到一堆"内部状态缺失"的误导信息。
+				// 取消项不回调：写前日志由上层 Finalize 统一置 cancelled。
 				if ctx.Err() != nil {
 					res.Cancelled = append(res.Cancelled, e.Path)
 				} else {
 					res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ops", Err: "未执行（内部状态缺失）"})
+					emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: "未执行（内部状态缺失）"})
 				}
 			default:
 				stage := outcomes[i].stage
@@ -237,6 +267,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					stage = "ops"
 				}
 				res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: stage, Err: outcomes[i].err})
+				emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: outcomes[i].err})
 			}
 		}
 	}
@@ -269,9 +300,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		}
 		// 已取消则整批不派发（outcome 保持 ocNone → aggregate 归入 Cancelled）
 		if len(paths) > 0 && ctx.Err() == nil {
-			if err := trash(paths); err == nil {
+			if dstMap, err := trash(paths); err == nil {
 				for _, i := range usable {
 					outcomes[i].code = ocOK
+					outcomes[i].dst = dstMap[toProcess[i].Path]
 					report(toProcess[i].Path)
 				}
 			} else {
@@ -289,10 +321,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 						report(p)
 						return
 					}
-					if err := trash([]string{p}); err != nil {
+					if m, err := trash([]string{p}); err != nil {
 						outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 					} else {
-						outcomes[i].code = ocOK
+						outcomes[i] = outcome{code: ocOK, dst: m[p]}
 					}
 					report(p)
 				}, func(k int, r any) { // 下标经 usable 映射回 toProcess
@@ -336,10 +368,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				report(e.Path)
 				continue
 			}
-			if _, err := MoveFile(e.Path, op.TargetDir); err != nil {
+			if dst, err := MoveFile(e.Path, op.TargetDir); err != nil {
 				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 			} else {
-				outcomes[i].code = ocOK
+				outcomes[i] = outcome{code: ocOK, dst: dst}
 			}
 			report(e.Path)
 		}
@@ -381,7 +413,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if err := HardlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
 				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 			} else {
-				outcomes[i].code = ocOK
+				outcomes[i] = outcome{code: ocOK, linkSrc: src.Path}
 			}
 			report(e.Path)
 		}, onPanic)

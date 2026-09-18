@@ -18,15 +18,15 @@ import (
 // 锁覆盖「选名 + 写 info + 移动」整段，保证同一回收站命名空间下串行化。
 var trashXDGGuard sync.Mutex
 
-func defaultTrash(paths []string) error {
+func defaultTrash(paths []string) (map[string]string, error) {
 	if len(paths) == 0 {
-		return nil
+		return map[string]string{}, nil
 	}
 	root := os.Getenv("XDG_DATA_HOME")
 	if root == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		root = filepath.Join(home, ".local", "share")
 	}
@@ -34,25 +34,27 @@ func defaultTrash(paths []string) error {
 }
 
 // trashXDG 规范实现（root 可注入：测试用）。
-func trashXDG(trashDir string, paths []string) error {
+// 返回 src→dst 映射，键为传入的原始路径（未 Abs 化），失败时返回已完成部分。
+func trashXDG(trashDir string, paths []string) (map[string]string, error) {
 	filesDir := filepath.Join(trashDir, "files")
 	infoDir := filepath.Join(trashDir, "info")
+	dstMap := make(map[string]string, len(paths))
 	if err := os.MkdirAll(filesDir, 0o700); err != nil {
-		return err
+		return dstMap, err
 	}
 	if err := os.MkdirAll(infoDir, 0o700); err != nil {
-		return err
+		return dstMap, err
 	}
 	for _, p := range paths {
 		abs, err := filepath.Abs(p)
 		if err != nil {
-			return err
+			return dstMap, err
 		}
 		trashXDGGuard.Lock()
 		dst, err := uniqueXDG(filesDir, filepath.Base(abs))
 		if err != nil {
 			trashXDGGuard.Unlock()
-			return err
+			return dstMap, err
 		}
 		// P2：trashinfo 必须先写。若顺序颠倒，moveIntoTrash 成功后写 info 失败
 		// 会留下无元数据的孤儿文件——回收站看不到原始路径，用户无法还原，
@@ -60,16 +62,17 @@ func trashXDG(trashDir string, paths []string) error {
 		// 移动失败只留下一个无害的空 info（回收站会忽略无对应文件的条目）。
 		if err := writeTrashInfo(infoDir, filepath.Base(dst), abs); err != nil {
 			trashXDGGuard.Unlock()
-			return err
+			return dstMap, err
 		}
 		if err := moveIntoTrash(abs, dst); err != nil {
 			os.Remove(filepath.Join(infoDir, filepath.Base(dst)+".trashinfo"))
 			trashXDGGuard.Unlock()
-			return err
+			return dstMap, err
 		}
 		trashXDGGuard.Unlock()
+		dstMap[p] = dst
 	}
-	return nil
+	return dstMap, nil
 }
 
 // moveIntoTrash 同卷 rename；跨卷退化复制+删除（复制失败时清理半成品再返回错误）。

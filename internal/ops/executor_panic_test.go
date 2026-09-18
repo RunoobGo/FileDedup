@@ -53,13 +53,13 @@ func TestExecuteWorkerPanicContained(t *testing.T) {
 	var mu sync.Mutex
 	// 批量调用（len>1）先失败 → 触发执行器退化为逐文件派发（runIndexed），
 	// 逐文件调用 panic → 命中 C7 守卫。两个 dup 都应被标记为失败且进程存活。
-	trash := func(paths []string) error {
+	trash := func(paths []string) (map[string]string, error) {
 		mu.Lock()
 		c := calls
 		calls++
 		mu.Unlock()
 		if c == 0 {
-			return errors.New("批量 trash 失败（触发退化）")
+			return nil, errors.New("批量 trash 失败（触发退化）")
 		}
 		panic("worker boom")
 	}
@@ -92,7 +92,7 @@ func TestTrashFallbackSkipsAlreadyTrashed(t *testing.T) {
 	var calls int32
 	var mu sync.Mutex
 	trashedDir := t.TempDir()
-	trash := func(paths []string) error {
+	trash := func(paths []string) (map[string]string, error) {
 		mu.Lock()
 		c := calls
 		calls++
@@ -103,15 +103,18 @@ func TestTrashFallbackSkipsAlreadyTrashed(t *testing.T) {
 				filepath.Join(trashedDir, "dup1.bin")); err != nil {
 				t.Fatalf("模拟部分成功失败: %v", err)
 			}
-			return errors.New("批量 trash 失败（模拟）")
+			return nil, errors.New("批量 trash 失败（模拟）")
 		}
 		// 回退逐文件：成功移入
+		dst := map[string]string{}
 		for _, p := range paths {
-			if err := os.Rename(p, filepath.Join(trashedDir, filepath.Base(p))); err != nil {
-				return err
+			d := filepath.Join(trashedDir, filepath.Base(p))
+			if err := os.Rename(p, d); err != nil {
+				return dst, err
 			}
+			dst[p] = d
 		}
-		return nil
+		return dst, nil
 	}
 	res := Execute(Options{
 		Groups:  []*model.DuplicateGroup{fx.group},

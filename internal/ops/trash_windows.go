@@ -84,9 +84,13 @@ func unsafeDriveReason(p string) string {
 	}
 }
 
-func defaultTrash(paths []string) error {
+// defaultTrash Windows 无公开 API 可枚举 SHFileOperation 的回收站落位
+// （hNameMappings 需额外 COM 释放处理），恒返回空映射；
+// 回撤以「打开系统回收站」引导代替（spec §7）。
+func defaultTrash(paths []string) (map[string]string, error) {
+	dst := map[string]string{}
 	if len(paths) == 0 {
-		return nil
+		return dst, nil
 	}
 	// 先全量预检再动手：任一文件位于不可回收卷则整批拒绝。
 	// 执行器的批量失败回退（C6）会逐个重试，可回收文件逐项成功、
@@ -98,7 +102,7 @@ func defaultTrash(paths []string) error {
 		}
 	}
 	if len(rejected) > 0 {
-		return fmt.Errorf("%d 个文件所在卷无回收站，已拒绝以防静默永久删除；请改用「移动」或自行确认后再「永久删除」。首个: %s",
+		return dst, fmt.Errorf("%d 个文件所在卷无回收站，已拒绝以防静默永久删除；请改用「移动」或自行确认后再「永久删除」。首个: %s",
 			len(rejected), rejected[0])
 	}
 	// 注意：SHFileOperation 不支持 \\?\ 前缀，使用普通路径
@@ -116,12 +120,12 @@ func defaultTrash(paths []string) error {
 	}
 	r0, _, _ := procSHFileOperation.Call(uintptr(unsafe.Pointer(&op)))
 	if r0 != 0 {
-		return fmt.Errorf("SHFileOperation 错误码 %d", r0)
+		return dst, fmt.Errorf("SHFileOperation 错误码 %d", r0)
 	}
 	if op.fAnyOperationsAborted != 0 {
-		return fmt.Errorf("操作被系统中止")
+		return dst, fmt.Errorf("操作被系统中止")
 	}
-	return nil
+	return dst, nil
 }
 
 func utf16FromString(s string) []uint16 {

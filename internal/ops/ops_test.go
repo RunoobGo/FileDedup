@@ -51,21 +51,24 @@ func newFixture(t *testing.T) *fixture {
 	}
 }
 
-// mockTrash 可控回收站：成功移入指定目录 / 可注入失败。
-func mockTrash(target string, fail bool) func([]string) error {
-	return func(paths []string) error {
+// mockTrash 可控回收站：成功移入指定目录并返回 src→dst 映射 / 可注入失败。
+func mockTrash(target string, fail bool) func([]string) (map[string]string, error) {
+	return func(paths []string) (map[string]string, error) {
 		if fail {
-			return fmt.Errorf("回收站写入失败（模拟磁盘满/权限）")
+			return nil, fmt.Errorf("回收站写入失败（模拟磁盘满/权限）")
 		}
 		if err := os.MkdirAll(target, 0o755); err != nil {
-			return err
+			return nil, err
 		}
+		dst := map[string]string{}
 		for _, p := range paths {
-			if err := os.Rename(p, filepath.Join(target, filepath.Base(p))); err != nil {
-				return err
+			d := filepath.Join(target, filepath.Base(p))
+			if err := os.Rename(p, d); err != nil {
+				return dst, err
 			}
+			dst[p] = d
 		}
-		return nil
+		return dst, nil
 	}
 }
 

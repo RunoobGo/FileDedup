@@ -22,7 +22,7 @@ func TestTrashXDGWritesInfoAndFile(t *testing.T) {
 	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := trashXDG(trash, []string{src}); err != nil {
+	if _, err := trashXDG(trash, []string{src}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(src); !os.IsNotExist(err) {
@@ -58,7 +58,7 @@ func TestTrashXDGRollbacksInfoOnMoveFail(t *testing.T) {
 	dir := t.TempDir()
 	trash := filepath.Join(dir, "trash")
 	ghost := filepath.Join(dir, "already-gone.txt")
-	if err := trashXDG(trash, []string{ghost}); err == nil {
+	if _, err := trashXDG(trash, []string{ghost}); err == nil {
 		t.Fatal("源不存在时必须报错（不得静默吞掉）")
 	}
 	if _, err := os.Stat(filepath.Join(trash, "info", "already-gone.txt.trashinfo")); !os.IsNotExist(err) {
@@ -87,7 +87,7 @@ func TestTrashXDGInfoWriteFailureLeavesNoOrphan(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(trash, "info", "foo.txt.trashinfo"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := trashXDG(trash, []string{src}); err == nil {
+	if _, err := trashXDG(trash, []string{src}); err == nil {
 		t.Fatal("trashinfo 写入必然失败，应返回错误")
 	}
 	if _, err := os.Stat(src); err != nil {
@@ -118,7 +118,7 @@ func TestTrashXDGCrossDeviceNoPartialCopy(t *testing.T) {
 	trash := filepath.Join(t.TempDir(), "trash") // tmp 在根卷 → 与 shm 跨卷
 	defer os.RemoveAll(src)
 
-	if err := trashXDG(trash, []string{src}); err == nil {
+	if _, err := trashXDG(trash, []string{src}); err == nil {
 		t.Skip("本次环境未产生预期的复制失败，跳过")
 	}
 	moved, err := os.ReadDir(filepath.Join(trash, "files"))
@@ -139,7 +139,7 @@ func TestTrashXDGCrossDeviceNoPartialCopy(t *testing.T) {
 func TestTrashXDGEmptyIsNoop(t *testing.T) {
 	dir := t.TempDir()
 	trash := filepath.Join(dir, "trash")
-	if err := trashXDG(trash, nil); err != nil {
+	if _, err := trashXDG(trash, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(trash, "files")); err != nil {
@@ -188,7 +188,7 @@ func TestTrashXDGConcurrentSameName(t *testing.T) {
 		wg.Add(1)
 		go func(p string) {
 			defer wg.Done()
-			if e := trashXDG(trashRoot, []string{p}); e != nil {
+			if _, e := trashXDG(trashRoot, []string{p}); e != nil {
 				mu.Lock()
 				errs = append(errs, e)
 				mu.Unlock()
@@ -289,5 +289,46 @@ func TestUniqueXDGIncrementAndDanglingSymlink(t *testing.T) {
 	}
 	if filepath.Base(dst2) != "bar.log.2" {
 		t.Errorf("悬空链接应视为占用, dst = %q", filepath.Base(dst2))
+	}
+}
+
+// v0.5.0 功能 4：trashXDG 返回 src→dst 映射（回撤账本用）。
+// 键为传入的原始路径；重名递增后目标仍须逐一对应。
+func TestTrashXDGReturnsMapping(t *testing.T) {
+	dir := t.TempDir()
+	trashRoot := filepath.Join(dir, "trash")
+	files := filepath.Join(trashRoot, "files")
+	if err := os.MkdirAll(files, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 预占 a.bin → 两个同名源依次落位 a.bin.2 / a.bin.3
+	if err := os.WriteFile(filepath.Join(files, "a.bin"), []byte("占位"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(dir, "x", "a.bin")
+	y := filepath.Join(dir, "y", "a.bin")
+	for _, p := range []string{x, y} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("dup"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err := trashXDG(trashRoot, []string{x, y})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 2 || m[x] == "" || m[y] == "" || m[x] == m[y] {
+		t.Fatalf("映射不完整/错配: %+v", m)
+	}
+	for src, dst := range m {
+		if _, err := os.Stat(dst); err != nil {
+			t.Errorf("%s → %s 目标不存在: %v", src, dst, err)
+		}
+	}
+	// 空输入也返回非 nil 空映射（调用方直接索引）
+	if m, err := trashXDG(trashRoot, nil); err != nil || m == nil {
+		t.Fatalf("空输入应为 (非nil空映射, nil)，got %v %v", m, err)
 	}
 }

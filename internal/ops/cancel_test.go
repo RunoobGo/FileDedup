@@ -57,9 +57,9 @@ func TestExecuteHonoursContextCancel(t *testing.T) {
 		Groups:  []*model.DuplicateGroup{fx.group},
 		KeepIDs: map[uint64]bool{fx.orig.ID: true},
 		Ctx:     ctx,
-		TrashFn: func(paths []string) error {
+		TrashFn: func(paths []string) (map[string]string, error) {
 			if len(paths) > 1 {
-				return errFakeBatch // 强制走逐文件隔离路径
+				return nil, errFakeBatch // 强制走逐文件隔离路径
 			}
 			time.Sleep(10 * time.Millisecond)
 			return mockTrash(target, false)(paths)

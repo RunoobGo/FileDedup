@@ -116,3 +116,39 @@ func TestDefaultTrashUsesTimeoutAndChunks(t *testing.T) {
 		t.Error("不得保留无超时的 exec.Command(\"osascript\"...)")
 	}
 }
+
+// v0.5.0 功能 4：Finder 输出解析为 src→dst 映射（回撤账本用）。
+// 真实 Finder 移动不入单测；parseTrashOutput 是纯函数。
+
+func TestParseTrashOutputPairsByBasename(t *testing.T) {
+	inputs := []string{"/vol/a/report.txt", "/vol/b/照片.png"}
+	stdout := "/Volumes/.Trash/report.txt\n/Volumes/.Trash/照片.png\n"
+	m := parseTrashOutput(stdout, inputs)
+	if m == nil {
+		t.Fatal("匹配批次不应返回 nil")
+	}
+	if m[inputs[0]] != "/Volumes/.Trash/report.txt" || m[inputs[1]] != "/Volumes/.Trash/照片.png" {
+		t.Fatalf("映射失真: %+v", m)
+	}
+}
+
+func TestParseTrashOutputRejectsMismatch(t *testing.T) {
+	// 数量不符
+	if m := parseTrashOutput("/T/a.txt\n", []string{"/x/a.txt", "/y/b.txt"}); m != nil {
+		t.Errorf("数量不符应放弃: %+v", m)
+	}
+	// 基名多重集不符（Finder 重命名为 "a 2.txt" 时宁缺勿错配）
+	inputs := []string{"/x/a.txt", "/y/other.txt"}
+	stdout := "/T/a.txt\n/T/a 2.txt\n"
+	if m := parseTrashOutput(stdout, inputs); m != nil {
+		t.Errorf("基名对不上应放弃: %+v", m)
+	}
+	// 空 stdout + 空输入 → 空映射（非 nil）
+	if m := parseTrashOutput("", nil); m == nil || len(m) != 0 {
+		t.Errorf("双双为空应为空映射, got %+v", m)
+	}
+	// 含换行的文件名破坏行协议 → 数量对不上 → nil（安全降级）
+	if m := parseTrashOutput("/T/a\nb.txt\n", []string{"/x/a\nb.txt"}); m != nil {
+		t.Errorf("行协议被破坏时应放弃: %+v", m)
+	}
+}

@@ -4,8 +4,10 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -17,12 +19,22 @@ import (
 // \n、\"）不是 AppleScript 字符串转义，路径含双引号/反斜杠/换行时脚本非法，
 // 移回收站直接失败。改为 on run argv + POSIX file (contents of p) 后，
 // 任意路径（含引号/反斜杠/换行/unicode）都原样到达脚本，无转义面。
+//
+// v0.5.0 功能 4：Finder move 返回已入站条目的引用列表，逐条转 POSIX 路径
+// 输出（每行一个），供 parseTrashOutput 建立 src→dst 映射（回撤账本）。
 const trashScript = `on run argv
 set itemList to {}
 repeat with p in argv
 set end of itemList to POSIX file (contents of p)
 end repeat
-tell application "Finder" to move itemList to trash
+tell application "Finder"
+set movedItems to move itemList to trash
+end tell
+set out to ""
+repeat with o in movedItems
+set out to out & (POSIX path of (o as alias)) & linefeed
+end repeat
+return out
 end run`
 
 // osascriptArgs 构造命令行：静态脚本 + 原样路径参数（argv 机制，无转义）。
@@ -60,25 +72,69 @@ func chunkPaths(paths []string, size int) [][]string {
 	return out
 }
 
-func defaultTrash(paths []string) error {
+func defaultTrash(paths []string) (map[string]string, error) {
+	dst := map[string]string{}
 	if len(paths) == 0 {
-		return nil
+		return dst, nil
 	}
 	batches := chunkPaths(paths, trashBatchSize)
 	for bi, batch := range batches {
 		ctx, cancel := context.WithTimeout(context.Background(), trashBatchTimeout)
 		cmd := exec.CommandContext(ctx, "osascript", osascriptArgs(batch)...)
 		cmd.WaitDelay = trashProcessDelay
-		out, err := cmd.CombinedOutput()
+		// Output()（仅 stdout）：stderr 若混入会破坏逐行路径协议
+		out, err := cmd.Output()
 		cancel()
 		if err != nil {
+			stderr := strings.TrimSpace(err.Error())
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				stderr = strings.TrimSpace(string(ee.Stderr))
+			}
 			if ctx.Err() == context.DeadlineExceeded {
-				return fmt.Errorf("osascript 超时（>%v，第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %w",
+				return dst, fmt.Errorf("osascript 超时（>%v，第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %w",
 					trashBatchTimeout, bi+1, len(batches), len(batch), err)
 			}
-			return fmt.Errorf("osascript（第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %v: %s",
-				bi+1, len(batches), len(batch), err, strings.TrimSpace(string(out)))
+			return dst, fmt.Errorf("osascript（第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %v: %s",
+				bi+1, len(batches), len(batch), err, stderr)
+		}
+		for k, v := range parseTrashOutput(string(out), batch) {
+			dst[k] = v
 		}
 	}
-	return nil
+	return dst, nil
+}
+
+// parseTrashOutput 把 Finder 输出的 moved POSIX 路径（每行一个）与输入路径
+// 按基名多重集配对，返回 src→dst。数量或基名对不上（如入站重命名
+// "a 2.txt"、含换行的文件名破坏行协议）时返回 nil——回撤依赖正确的
+// dst，宁缺勿错配；调用方按「去向未知」处理。
+func parseTrashOutput(stdout string, inputs []string) map[string]string {
+	var lines []string
+	for _, l := range strings.Split(stdout, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) != len(inputs) {
+		return nil
+	}
+	used := make([]bool, len(lines))
+	out := make(map[string]string, len(inputs))
+	for _, in := range inputs {
+		base := filepath.Base(in)
+		match := -1
+		for j, l := range lines {
+			if !used[j] && filepath.Base(l) == base {
+				match = j
+				break
+			}
+		}
+		if match < 0 {
+			return nil
+		}
+		used[match] = true
+		out[in] = lines[match]
+	}
+	return out
 }
