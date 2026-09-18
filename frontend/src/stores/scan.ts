@@ -228,6 +228,28 @@ export const useScanStore = defineStore('scan', () => {
     selection.value.clear()
   }
 
+  // ---------- 组内全选（功能 2）：候选 = 组内全部非保留项，保留项照旧不可勾 ----------
+
+  function groupSelCandidates(g: GroupView): number[] {
+    return g.files.filter(f => !f.isKeep).map(f => f.id)
+  }
+
+  function groupSelState(g: GroupView): 'none' | 'some' | 'all' {
+    const c = groupSelCandidates(g)
+    if (c.length === 0) return 'none'
+    const sel = selection.value
+    let n = 0
+    for (const id of c) if (sel.has(id)) n++
+    return n === 0 ? 'none' : n === c.length ? 'all' : 'some'
+  }
+
+  function toggleGroupSelection(g: GroupView) {
+    const c = groupSelCandidates(g)
+    const sel = selection.value
+    if (groupSelState(g) === 'all') for (const id of c) sel.delete(id)
+    else for (const id of c) sel.add(id)
+  }
+
   // addKeepDir 去重追加（Clean 意义有限，按 trim 后全等去重）
   function addKeepDir(dir: string) {
     const d = dir.trim()
@@ -437,6 +459,7 @@ export const useScanStore = defineStore('scan', () => {
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
+    groupSelState, toggleGroupSelection,
     applyKeep, clearKeep, executeOp, openTrash, cancelOp,
     running, startScan, pauseScan, resumeScan, cancelScan,
     loadResultPage, loadMore, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,

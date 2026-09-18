@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 重复组卡片：文件行 + 保留建议高亮（M2-T06）。
-import { ref } from 'vue'
+// 重复组卡片：文件行 + 保留建议高亮（M2-T06）+ 组内全选（功能 2）。
+import { computed, onMounted, ref, watch } from 'vue'
 import type { GroupView } from '../wails'
 import { api } from '../wails'
 import { humanBytes, formatMtime } from '../utils/format'
@@ -14,6 +14,15 @@ const toast = useToastStore()
 const expanded = ref(true)
 // M3：勾选与操作状态由 store 管理
 
+// 组内全选三态框：indeterminate 是 DOM  property（非 attribute），须经元素引用设置
+const selState = computed(() => store.groupSelState(props.group))
+const selEl = ref<HTMLInputElement | null>(null)
+function syncIndeterminate() {
+  if (selEl.value) selEl.value.indeterminate = selState.value === 'some'
+}
+onMounted(syncIndeterminate)
+watch(selState, syncIndeterminate)
+
 function reveal(id: number) {
   store.preview = null
   api.revealInFolder(id).catch((e: any) => toast.notifyError('打开文件夹失败', e))
@@ -24,6 +33,17 @@ function reveal(id: number) {
   <div class="card panel" :style="{ '--n': group.files.length }">
     <div class="head" @click="expanded = !expanded">
       <Icon name="chevron-down" :size="14" :class="['chev', { closed: !expanded }]" />
+      <!-- 组内全选：勾选/取消该组全部待清理项（不含保留项，S2 约定不变） -->
+      <label class="check-wrap" title="全选/取消该组待清理项（不含保留项）" @click.stop>
+        <input
+          ref="selEl"
+          class="check"
+          type="checkbox"
+          :checked="selState === 'all'"
+          :aria-label="`全选该组待清理项（${group.files.length - 1} 个冗余项）`"
+          @change="store.toggleGroupSelection(group)"
+        />
+      </label>
       <span class="size">{{ humanBytes(group.size) }}</span>
       <span class="sep" aria-hidden="true"></span>
       <span class="count">{{ group.files.length }} 个文件</span>
