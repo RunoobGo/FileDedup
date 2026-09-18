@@ -7,25 +7,23 @@ import (
 	"syscall"
 	"unsafe"
 
+	"filededup/internal/fsid"
 	"filededup/internal/model"
 )
 
-// Windows 没有 inode；按需解析（决策 11）：仅候选组内调用 ResolveKey。
-// 通过 GetFileInformationByHandle 获取 卷序列号 + 64 位文件索引。
-
-type byHandleFileInformation struct {
-	VolumeSerialNumber uint32
-	FileSizeHigh       uint32
-	FileSizeLow        uint32
-	NumberOfLinks      uint32
-	FileIndexHigh      uint32
-	FileIndexLow       uint32
-}
+// Windows 没有 inode：按需解析（决策 11）——仅候选组内调用 ResolveKey，
+// 身份取句柄查询的「卷序列号 + 64 位文件索引」，实现统一在 internal/fsid
+// （它的 byHandleInfo 与 Win32 定义逐字节对齐，并有编译期尺寸断言兜底）。
+//
+// 2026-09-19 修正：本文件此前自带一份 24 字节的 byHandleFileInformation，
+// 少了 dwFileAttributes 与三个 FILETIME——字段整体前移 28 字节，于是
+// 卷号读成文件属性、文件索引读成 (最后访问, 最后写入) 时间戳，且 Win32 朝这个
+// 24 字节变量写入 52 字节。后果不是崩溃就是"同时刻创建的同尺寸文件键值全相同"，
+// 阶段 1.5 据此把不同文件当硬链接合并，整组重复静默消失（windows CI 实测）。
 
 var (
-	modkernel32                    = syscall.NewLazyDLL("kernel32.dll")
-	procGetFileInformationByHandle = modkernel32.NewProc("GetFileInformationByHandle")
-	procCreateFileW                = modkernel32.NewProc("CreateFileW")
+	modkernel32     = syscall.NewLazyDLL("kernel32.dll")
+	procCreateFileW = modkernel32.NewProc("CreateFileW")
 )
 
 const (
@@ -64,7 +62,7 @@ func resolveByHandle(path string) (model.FileKey, bool) {
 	// 第一选择：标准打开（句柄生命周期由 runtime 管理，自动关闭）
 	if f, err := os.Open(path); err == nil {
 		defer f.Close()
-		return infoFromHandle(uintptr(f.Fd()))
+		return keyFromID(fsid.FromFile(f))
 	}
 	// C4 兜底：全共享 + BACKUP_SEMANTICS 重开，覆盖被占用的文件
 	p16, err := syscall.UTF16PtrFromString(path)
@@ -85,21 +83,14 @@ func resolveByHandle(path string) (model.FileKey, bool) {
 		return model.FileKey{}, false
 	}
 	defer syscall.CloseHandle(syscall.Handle(h))
-	return infoFromHandle(h)
+	return keyFromID(fsid.FromHandle(h))
 }
 
-func infoFromHandle(h uintptr) (model.FileKey, bool) {
-	var info byHandleFileInformation
-	r1, _, _ := procGetFileInformationByHandle.Call(
-		h,
-		uintptr(unsafe.Pointer(&info)),
-	)
-	if r1 == 0 {
+// keyFromID fsid.ID → 硬链接去重用的 FileKey（丢掉 ctime：本阶段只问"是否同一文件"）。
+// 未解析一律传 false，交由调用方退回内容级证据。
+func keyFromID(id fsid.ID) (model.FileKey, bool) {
+	if !id.Resolved {
 		return model.FileKey{}, false
 	}
-	return model.FileKey{
-		VolumeID:  uint64(info.VolumeSerialNumber),
-		FileIndex: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
-		Resolved:  true,
-	}, true
+	return model.FileKey{VolumeID: id.Dev, FileIndex: id.Ino, Resolved: true}, true
 }
