@@ -17,6 +17,11 @@
 #   bash scripts/check-version-sync.sh v0.5.1         # 再比对指定 tag
 #   GITHUB_REF_NAME=refs/tags/v0.5.1 ...              # CI 里无需插值，脚本自解析
 #                                                     # （不把事件字段拼进 shell 命令）
+#
+# JSON 一律显式按 UTF-8 读：Python 的 open() 默认用平台 locale 编码，Windows 上是 cp1252，
+# 而 wails.json 的 productDescription 是中文——build.yml 的 windows 矩阵 job 曾在第一步
+# 就被 json.load 的 UnicodeDecodeError 打断，三个 Linux/macOS job 全绿、Release 却整体没建
+# （2026-09-19 首次 tag 触发发布时暴露；此门禁此前从未在 Windows 上跑过）。
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,10 +31,10 @@ fail() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; BAD=1; }
 BAD=0
 
 APP_VER=$(sed -nE 's/^const AppVersion = "([^"]+)".*/\1/p' app.go)
-WAILS_VER=$(python3 -c 'import json;print(json.load(open("wails.json"))["info"]["productVersion"])')
-PKG_VER=$(python3 -c 'import json;print(json.load(open("frontend/package.json"))["version"])')
-LOCK_VER=$(python3 -c 'import json;d=json.load(open("frontend/package-lock.json"));print(d["version"])')
-LOCK_ROOT_VER=$(python3 -c 'import json;d=json.load(open("frontend/package-lock.json"));print(d["packages"][""]["version"])')
+WAILS_VER=$(python3 -c 'import json;print(json.load(open("wails.json",encoding="utf-8"))["info"]["productVersion"])')
+PKG_VER=$(python3 -c 'import json;print(json.load(open("frontend/package.json",encoding="utf-8"))["version"])')
+LOCK_VER=$(python3 -c 'import json;d=json.load(open("frontend/package-lock.json",encoding="utf-8"));print(d["version"])')
+LOCK_ROOT_VER=$(python3 -c 'import json;d=json.load(open("frontend/package-lock.json",encoding="utf-8"));print(d["packages"][""]["version"])')
 DOC_VER=$(sed -nE 's/^> 适用版本：([^ ｜]+).*/\1/p' docs/09-用户手册.md | head -1)
 
 printf '  app.go            AppVersion        = %s\n' "${APP_VER:-<缺失>}"
