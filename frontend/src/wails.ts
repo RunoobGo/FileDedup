@@ -139,7 +139,7 @@ export interface BackendAPI {
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
-  ApplyKeepPolicy(policy: { Kind: string; Directory: string }): Promise<KeepDecision[]>
+  ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepDecision[]>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
   CancelOperation(): Promise<void>
@@ -194,8 +194,8 @@ export const api = {
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),
-  applyKeepPolicy: (kind: string, directory?: string): Promise<KeepDecision[]> =>
-    backend().ApplyKeepPolicy({ Kind: kind, Directory: directory ?? '' }),
+  applyKeepPolicy: (kind: string, dirs: string[] = []): Promise<KeepDecision[]> =>
+    backend().ApplyKeepPolicy({ Kind: kind, Directories: dirs }),
   clearKeepDecisions: (): Promise<void> => backend().ClearKeepDecisions(),
   executeOperation: (op: OpRequest): Promise<string> => backend().ExecuteOperation(op),
   cancelOperation: (): Promise<void> => backend().CancelOperation(),

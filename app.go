@@ -816,6 +816,9 @@ func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) ([]ops.KeepDecision, erro
 	if len(a.groups) == 0 {
 		return nil, fmt.Errorf("暂无结果集")
 	}
+	if policy.Kind == "directory" && !ops.HasUsableDir(policy.Directories) {
+		return nil, fmt.Errorf("请至少添加一个保留目录")
+	}
 	decisions := ops.ApplyKeepPolicy(a.groups, policy)
 	a.keepIDs = make(map[uint64]bool, len(decisions))
 	for _, d := range decisions {

@@ -88,9 +88,10 @@ func hidden(p string) bool {
 }
 
 // pickByDirectoryPriority 按目录优先级顺序取首个命中目录的保留者，
-// 全部未命中返回 -1。dirs 中空串项忽略。
+// 全部未命中返回 -1。dirs 中空/纯空白项忽略。
 func pickByDirectoryPriority(g *model.DuplicateGroup, dirs []string) int {
 	for _, d := range dirs {
+		d = strings.TrimSpace(d)
 		if d == "" {
 			continue
 		}
@@ -99,6 +100,16 @@ func pickByDirectoryPriority(g *model.DuplicateGroup, dirs []string) int {
 		}
 	}
 	return -1
+}
+
+// HasUsableDir 目录优先级列表中是否存在有效项（非空/非纯空白）。
+func HasUsableDir(dirs []string) bool {
+	for _, d := range dirs {
+		if strings.TrimSpace(d) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // pickInDirectory 保留位于 dir 下的文件（最长前缀优先），无匹配返回 -1。

@@ -12,7 +12,7 @@ const store = useScanStore()
 const toast = useToastStore()
 const confirmKind = ref<'trash' | 'delete' | 'move' | 'hardlink' | null>(null)
 const keepKind = ref('shortest')
-const keepDir = ref('')
+const keepDirInput = ref('')
 
 // store.confirmOpen 单一出口：弹框期间挂起全局快捷键（App.vue 用它拦截
 // Space/Cmd+A/Delete，避免确认框打开时选中集被悄悄扩大），关闭后自动恢复。
@@ -59,16 +59,24 @@ const moreLabel = computed(() =>
 )
 
 async function applyKeep() {
-  await store.applyKeep(keepKind.value, keepDir.value || undefined)
+  await store.applyKeep(keepKind.value, store.keepDirs)
 }
+
+const keepDirsDisabled = computed(() => keepKind.value === 'directory' && store.keepDirs.length === 0)
 
 async function pickKeepDir() {
   const { api } = await import('../wails')
   try {
-    keepDir.value = await api.selectDirectory()
+    const dir = await api.selectDirectory()
+    if (dir) store.addKeepDir(dir)
   } catch (e: any) {
     toast.notifyError('选择目录失败', e)
   }
+}
+
+function addKeepDirInput() {
+  store.addKeepDir(keepDirInput.value)
+  keepDirInput.value = ''
 }
 
 // 只改 confirmKind：store.confirmOpen 的复位由上方 watch 统一负责（不再手工赋值）
@@ -121,13 +129,9 @@ function onConfirm(targetDir?: string) {
             <option value="shortest">路径最短（默认）</option>
             <option value="newest">最新</option>
             <option value="oldest">最旧</option>
-            <option value="directory">指定目录…</option>
+            <option value="directory">指定目录优先级…</option>
           </select>
-          <input v-if="keepKind === 'directory'" v-model="keepDir" type="text"
-            aria-label="保留此目录下的文件" placeholder="保留此目录下的文件" style="width: 200px" />
-          <button v-if="keepKind === 'directory'" class="btn-ghost"
-            title="选择保留目录" aria-label="选择保留目录" @click="pickKeepDir">…</button>
-          <button class="btn-ghost" @click="applyKeep">应用</button>
+          <button class="btn-ghost" :disabled="keepDirsDisabled" @click="applyKeep">应用</button>
           <button class="btn-ghost" title="清除决策回到默认建议" @click="store.clearKeep()">重置</button>
         </div>
         <span class="sel-info" aria-live="polite">
@@ -136,6 +140,27 @@ function onConfirm(targetDir?: string) {
           </template>
           <template v-else>未选择——点「全选」选中全部冗余项</template>
         </span>
+      </div>
+      <!-- 多目录优先级列表：序号即优先级，命中多个目录时保留最靠前目录内的文件 -->
+      <div v-if="keepKind === 'directory'" class="keepdirs">
+        <div v-for="(d, i) in store.keepDirs" :key="d" class="kd-row">
+          <span class="kd-idx" :title="`优先级 ${i + 1}`">{{ i + 1 }}</span>
+          <span class="kd-path" :title="d">{{ d }}</span>
+          <button class="btn-ghost xs" :disabled="i === 0" title="上移（提高优先级）"
+            aria-label="上移目录" @click="store.moveKeepDir(i, -1)">↑</button>
+          <button class="btn-ghost xs" :disabled="i === store.keepDirs.length - 1"
+            title="下移（降低优先级）" aria-label="下移目录" @click="store.moveKeepDir(i, 1)">↓</button>
+          <button class="btn-ghost xs" title="移除该目录" aria-label="移除目录"
+            @click="store.removeKeepDir(i)">✕</button>
+        </div>
+        <div class="kd-add">
+          <button class="btn-ghost" @click="pickKeepDir">＋ 添加目录</button>
+          <input v-model="keepDirInput" type="text" aria-label="粘贴目录路径"
+            placeholder="粘贴目录路径后回车添加" @keyup.enter="addKeepDirInput" />
+          <span v-if="!store.keepDirs.length" class="kd-hint">
+            尚未添加目录：按优先级从高到低排列，组内文件命中多个目录时保留最靠前目录内的那份
+          </span>
+        </div>
       </div>
       <div class="ops">
         <button class="btn-ghost" :class="{ 'btn-emph': store.selectedFiles.length === 0 }"
@@ -248,4 +273,14 @@ button.stat:hover b { text-decoration: underline; }
 .btn-ghost.capped { color: var(--warn-ink); border-color: var(--warn-ink); }
 /* Y8：未勾选时弱强调「全选」，引导用户显式选择（不再默认全选） */
 .btn-ghost.btn-emph { border-color: var(--primary); color: var(--primary-ink); }
+/* 多目录优先级列表 */
+.keepdirs { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; }
+.kd-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); }
+.kd-idx { flex: none; width: 18px; height: 18px; border-radius: 50%; background: var(--primary);
+  color: #fff; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
+.kd-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.btn-ghost.xs { padding: 1px 6px; font-size: 12px; line-height: 1.5; }
+.kd-add { display: flex; align-items: center; gap: var(--sp-2); }
+.kd-add input { flex: 1; min-width: 160px; }
+.kd-hint { color: var(--text-3); font-size: var(--fs-sm); }
 </style>

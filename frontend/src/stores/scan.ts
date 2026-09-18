@@ -73,6 +73,8 @@ export const useScanStore = defineStore('scan', () => {
   const currentFileID = ref<number | null>(null) // Space 快捷键预览目标
   // 勾选与操作（M3）
   const selection = ref<Set<number>>(new Set())
+  // 保留策略「指定目录」的有序优先级列表（跨页面切换保持）
+  const keepDirs = ref<string[]>([])
   const opsRunning = ref(false)
   const opsProgress = ref<OpsProgress | null>(null)
   const opsResult = ref<OpsResult | null>(null)
@@ -226,6 +228,20 @@ export const useScanStore = defineStore('scan', () => {
     selection.value.clear()
   }
 
+  // addKeepDir 去重追加（Clean 意义有限，按 trim 后全等去重）
+  function addKeepDir(dir: string) {
+    const d = dir.trim()
+    if (!d || keepDirs.value.includes(d)) return
+    keepDirs.value.push(d)
+  }
+  function removeKeepDir(i: number) { keepDirs.value.splice(i, 1) }
+  function moveKeepDir(i: number, delta: number) {
+    const j = i + delta
+    if (j < 0 || j >= keepDirs.value.length) return
+    const [d] = keepDirs.value.splice(i, 1)
+    keepDirs.value.splice(j, 0, d)
+  }
+
   const selectedFiles = computed(() => {
     const out: { id: number; size: number; path: string }[] = []
     for (const g of groups.value)
@@ -236,9 +252,9 @@ export const useScanStore = defineStore('scan', () => {
 
   const selectedBytes = computed(() => selectedFiles.value.reduce((s, f) => s + f.size, 0))
 
-  async function applyKeep(kind: string, directory?: string) {
+  async function applyKeep(kind: string, dirs: string[] = []) {
     try {
-      await api.applyKeepPolicy(kind, directory)
+      await api.applyKeepPolicy(kind, dirs)
       await loadResultPage(false) // 后端决策已生效，重载视图（并清空勾选）
     } catch (e: any) {
       toast().notifyError('保留策略应用失败', e)
@@ -418,6 +434,7 @@ export const useScanStore = defineStore('scan', () => {
     loadCap, loadingPage, resultPage,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
+    keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     applyKeep, clearKeep, executeOp, openTrash, cancelOp,
