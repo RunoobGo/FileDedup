@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"filededup/internal/fsid"
 )
 
 // TestHardlinkMerge_Success 验证正常合并：dup 成为指向 keep 的硬链接，
@@ -19,7 +21,7 @@ func TestHardlinkMerge_Success(t *testing.T) {
 	if err := os.WriteFile(dup, []byte("shared"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := HardlinkMerge(keep, dup); err != nil {
+	if err := HardlinkMerge(keep, dup, fsid.ID{}, fsid.ID{}); err != nil {
 		t.Fatalf("HardlinkMerge 失败: %v", err)
 	}
 	ki, _ := os.Stat(keep)
@@ -60,7 +62,7 @@ func TestHardlinkMerge_RollbackOnRenameFailure(t *testing.T) {
 		return errors.New("simulated rename failure")
 	}
 
-	if err := HardlinkMerge(keep, dup); err == nil {
+	if err := HardlinkMerge(keep, dup, fsid.ID{}, fsid.ID{}); err == nil {
 		t.Fatal("期望 Rename 失败时返回错误")
 	}
 	di, err := os.Stat(dup)

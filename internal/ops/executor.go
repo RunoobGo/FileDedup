@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"filededup/internal/fsid"
 	"filededup/internal/hasher"
 	"filededup/internal/model"
 )
@@ -150,20 +151,24 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	}
 
 	// 校验阶段（S1/S8）
+	// H2：procIDs 与 toProcess 下标平行，记录「通过校验那一刻」的文件身份；
+	// 各执行分支在破坏性动作前用 identityStill 复核路径未被换成另一 inode。
 	var toProcess []*model.FileEntry
-	for _, id := range op.FileIDs {
-		e, ok := byID[id]
+	var procIDs []fsid.ID
+	for _, fid := range op.FileIDs {
+		e, ok := byID[fid]
 		if !ok {
-			res.Failed = append(res.Failed, model.FailedItem{Stage: "ops", Err: fmt.Sprintf("文件不在当前结果集（id=%d）", id)})
+			res.Failed = append(res.Failed, model.FailedItem{Stage: "ops", Err: fmt.Sprintf("文件不在当前结果集（id=%d）", fid)})
 			report("")
 			continue
 		}
-		if opts.KeepIDs != nil && opts.KeepIDs[id] {
+		if opts.KeepIDs != nil && opts.KeepIDs[fid] {
 			res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ops", Err: "保留文件不可操作"})
 			report(e.Path)
 			continue
 		}
-		switch VerifyFile(e, hashByID[id], pool) {
+		v, vid := VerifyFile(e, hashByID[fid], pool)
+		switch v {
 		case VerdictSkipped:
 			res.Skipped = append(res.Skipped, e.Path) // S8：已消失 = 目标达成
 			report(e.Path)
@@ -172,6 +177,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			report(e.Path)
 		default:
 			toProcess = append(toProcess, e)
+			procIDs = append(procIDs, vid)
 		}
 	}
 
@@ -245,14 +251,26 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 
 	switch op.Kind {
 	case "trash":
-		paths := make([]string, 0, len(toProcess))
-		for _, e := range toProcess {
-			paths = append(paths, e.Path)
+		// H2：入站前复核身份。校验（读内容）与回收站（动路径）之间，
+		// 路径可能被换成另一 inode——彼时删的是"第三方文件"，必须拦截。
+		usable := make([]int, 0, len(toProcess))
+		for i, e := range toProcess {
+			if !identityStill(e.Path, procIDs[i]) {
+				outcomes[i] = outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"}
+				report(e.Path)
+				continue
+			}
+			usable = append(usable, i)
+		}
+		paths := make([]string, 0, len(usable))
+		for _, i := range usable {
+			paths = append(paths, toProcess[i].Path)
 		}
 		// 已取消则整批不派发（outcome 保持 ocNone → aggregate 归入 Cancelled）
 		if len(paths) > 0 && ctx.Err() == nil {
 			if err := trash(paths); err == nil {
-				for i := range toProcess {
+				for _, i := range usable {
 					outcomes[i].code = ocOK
 					report(toProcess[i].Path)
 				}
@@ -263,7 +281,8 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 哪些已移走）。回退前逐个检查源是否还在——已不在的按 S8 语义
 				// 记 Skipped（目标已达成），否则会被记 Failed，但文件实际已在
 				// 回收站，结果集却仍显示「存在」，状态不一致。
-				runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
+				runIndexed(ctx, len(usable), opWorkers, func(k int) {
+					i := usable[k]
 					p := toProcess[i].Path
 					if _, err := os.Stat(p); os.IsNotExist(err) {
 						outcomes[i].code = ocSkipped
@@ -276,13 +295,21 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 						outcomes[i].code = ocOK
 					}
 					report(p)
-				}, onPanic)
+				}, func(k int, r any) { // 下标经 usable 映射回 toProcess
+					onPanic(usable[k], r)
+				})
 			}
 		}
 
 	case "delete":
 		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
 			e := toProcess[i]
+			if !identityStill(e.Path, procIDs[i]) { // H2
+				outcomes[i] = outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"}
+				report(e.Path)
+				return
+			}
 			if err := os.Remove(e.Path); err != nil {
 				if os.IsNotExist(err) {
 					outcomes[i].code = ocSkipped
@@ -303,6 +330,12 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if ctx.Err() != nil {
 				break // move 串行执行，取消后立即停止派发（P2）
 			}
+			if !identityStill(e.Path, procIDs[i]) { // H2
+				outcomes[i] = outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"}
+				report(e.Path)
+				continue
+			}
 			if _, err := MoveFile(e.Path, op.TargetDir); err != nil {
 				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 			} else {
@@ -320,11 +353,21 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				report(e.Path)
 				return
 			}
+			// H2：dup 在动作前仍须指向校验过的那份内容
+			if !identityStill(e.Path, procIDs[i]) {
+				outcomes[i] = outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"}
+				report(e.Path)
+				return
+			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
 			// 覆盖 dup 的原内容（不可逆），必须拦截。
 			// P0-3：校验为内容级（见 VerifyFile），时间戳未变不再放行。
+			// H2：源身份一并下传，HardlinkMerge 在建立临时链接后复核其
+			// inode 仍是校验时那一个（防 verify→act 窗口内源被替换）。
 			// 注：同组多个 dup 共享同一 keep 源，校验为只读操作，并发安全。
-			switch VerifyFile(src, hashByID[src.ID], pool) {
+			v, srcID := VerifyFile(src, hashByID[src.ID], pool)
+			switch v {
 			case VerdictSkipped:
 				outcomes[i] = outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"}
 				report(e.Path)
@@ -335,7 +378,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			}
 			// HardlinkMerge 使用「dup 路径 + .fdd-tmp」临时名，路径互不冲突 → 并发安全
-			if err := HardlinkMerge(src.Path, e.Path); err != nil {
+			if err := HardlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
 				outcomes[i] = outcome{code: ocFailed, err: err.Error()}
 			} else {
 				outcomes[i].code = ocOK

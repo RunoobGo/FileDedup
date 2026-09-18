@@ -22,10 +22,15 @@ const (
 	StreamChunk = 1 << 20
 )
 
-// Partial 首尾 xxHash64 双指纹。
+// Partial 多点 xxHash64 指纹（H1 修复）：头 + 尾 + 两个中点。
+// 此前只有头尾 2 点：>128KiB 文件若中段被原地改写而首尾 128KiB 与
+// size/mtime 全部保持不变（cp -p/备份还原、粗时间戳卷），会命中旧缓存
+// 全量哈希 → 组成假重复组。分桶键只由采样构成，多点采样直接压缩该窗口。
 type Partial struct {
 	Head uint64
 	Tail uint64
+	Mid1 uint64 // size/2 处 64KiB
+	Mid2 uint64 // 3size/4 处 64KiB
 }
 
 // Result 哈希结果。
@@ -38,9 +43,29 @@ type Result struct {
 // ErrClosed 由上层注入文件句柄失败时使用。
 var ErrClosed = errors.New("hasher: file handle closed")
 
+// PrefilterMax 单文件预筛最大读量：4 个采样点 × HeadTailChunk。
+const PrefilterMax = 4 * HeadTailChunk
+
+// sampleOffsets 预筛采样偏移（升序、仅由 size 决定，两次计算必然一致）：
+// 头 0、中点 size/2、3size/4、尾 size-chunk；中点越界时钳制到 size-chunk
+// （128KiB<size<256KiB 时 mid2 与 tail 重合，无害）。
+func sampleOffsets(size int64) [4]int64 {
+	chunk := int64(HeadTailChunk)
+	tail := size - chunk
+	mid1 := size / 2
+	mid2 := size * 3 / 4
+	if mid1 > tail {
+		mid1 = tail
+	}
+	if mid2 > tail {
+		mid2 = tail
+	}
+	return [4]int64{0, mid1, mid2, tail}
+}
+
 // HashHeadTail 预筛哈希（一次 open 已由调用方完成）：
 //   - size ≤ SmallFileMax：读全文件，同趟完成 xxHash64 + BLAKE3（小文件捷径，决策 8）
-//   - size >  SmallFileMax：ReadAt 头/尾各 64KiB 的 xxHash64
+//   - size >  SmallFileMax：按 sampleOffsets 读 4×64KiB 各自 xxHash64
 func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 	if size <= SmallFileMax {
 		n, err := io.ReadFull(f, buf[:size])
@@ -50,25 +75,22 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 		b := buf[:n]
 		h := xxhash.Sum64(b)
 		return Result{
-			Partial: Partial{Head: h, Tail: h}, // 全文件：头尾指纹相同
+			// 全文件被单点覆盖：四个指纹相同
+			Partial: Partial{Head: h, Tail: h, Mid1: h, Mid2: h},
 			Full:    blake3.Sum256(b),
 			Small:   true,
 		}, nil
 	}
 	var r Result
-	// 头部
-	n, err := f.ReadAt(buf[:HeadTailChunk], 0)
-	if err != nil && err != io.EOF {
-		return Result{}, err
+	offs := sampleOffsets(size)
+	dst := []*uint64{&r.Partial.Head, &r.Partial.Mid1, &r.Partial.Mid2, &r.Partial.Tail}
+	for i, off := range offs {
+		n, err := f.ReadAt(buf[:HeadTailChunk], off)
+		if err != nil && err != io.EOF {
+			return Result{}, err
+		}
+		*dst[i] = xxhash.Sum64(buf[:n])
 	}
-	r.Partial.Head = xxhash.Sum64(buf[:n])
-	// 尾部（size > 128KiB 时与头部不重叠）
-	off := size - HeadTailChunk
-	n, err = f.ReadAt(buf[:HeadTailChunk], off)
-	if err != nil && err != io.EOF {
-		return Result{}, err
-	}
-	r.Partial.Tail = xxhash.Sum64(buf[:n])
 	return r, nil
 }
 

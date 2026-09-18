@@ -152,7 +152,7 @@ func TestVerifyGroupTamper(t *testing.T) {
 		{Path: p3, Size: uint64(len(base))},
 	}
 	var failed []model.FailedItem
-	kept, failed := newVerifier().group(g, failed)
+	kept, failed := newVerifier().group(context.Background(), g, failed)
 	if len(kept) != 2 {
 		t.Fatalf("保留 = %d, want 2", len(kept))
 	}
@@ -613,7 +613,7 @@ func TestVerifierReusesBuffers(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	kept, _ := ver.group(g, failed)
+	kept, _ := ver.group(context.Background(), g, failed)
 	runtime.ReadMemStats(&after)
 
 	if len(kept) != n {
@@ -667,7 +667,7 @@ func TestVerifierMultiChunkEquivalence(t *testing.T) {
 		{Path: pTail, Size: uint64(size)},
 	}
 	var failed []model.FailedItem
-	kept, failed := newVerifier().group(g, failed)
+	kept, failed := newVerifier().group(context.Background(), g, failed)
 
 	if len(kept) != 2 {
 		t.Fatalf("保留 = %d, want 2 (rep + same)", len(kept))
@@ -701,7 +701,7 @@ func TestVerifierSeekResetBetweenFiles(t *testing.T) {
 		g = append(g, &model.FileEntry{Path: p, Size: uint64(size)})
 	}
 	var failed []model.FailedItem
-	kept, _ := newVerifier().group(g, failed)
+	kept, _ := newVerifier().group(context.Background(), g, failed)
 	if len(kept) != 4 {
 		t.Fatalf("保留 = %d, want 4（若句柄未复位，第 3 个起会读到 EOF 而误判）", len(kept))
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTrashXDGWritesInfoAndFile(t *testing.T) {
@@ -223,5 +224,70 @@ func TestTrashXDGConcurrentSameName(t *testing.T) {
 		if !got[c] {
 			t.Fatalf("回收站缺少内容 %q（被覆盖丢失）", c)
 		}
+	}
+}
+
+// ② 收口回归：uniqueXDG 必须有界、对 stat 错误快速失败。
+// 修正前：os.Stat 的非 NotExist 错误（如 EACCES）被当作"名字被占用"继续递增，
+// 在不可读目录下会无限循环（且全程持 trashXDGGuard，拖死全部并发 trash）。
+
+// TestUniqueXDGFailFastOnUnreadableDir：files/ 目录 chmod 000 后，
+// uniqueXDG 应在有限时间内返回错误而非转圈。root 下 000 不生效，跳过。
+func TestUniqueXDGFailFastOnUnreadableDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 忽略目录权限位，跳过")
+	}
+	dir := t.TempDir()
+	files := filepath.Join(dir, "files")
+	if err := os.MkdirAll(files, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(files, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(files, 0o700) })
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := uniqueXDG(files, "foo.txt")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("不可读目录应返回错误，而非选中某个名字")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("uniqueXDG 在不可读目录上疑似无限循环")
+	}
+}
+
+// TestUniqueXDBoundsAndDanglingSymlink：正常递增（.2/.3）+ 悬空符号链接视为占用。
+func TestUniqueXDGIncrementAndDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	// foo.txt 与 foo.txt.2 已存在 → 应给 foo.txt.3
+	for _, n := range []string{"foo.txt", "foo.txt.2"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dst, err := uniqueXDG(dir, "foo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(dst) != "foo.txt.3" {
+		t.Errorf("dst = %q, want foo.txt.3", filepath.Base(dst))
+	}
+	// 悬空符号链接（目标不存在）不得当空位：rename 目录会失败且语义丢失
+	dangling := filepath.Join(dir, "bar.log")
+	if err := os.Symlink(filepath.Join(dir, "no-such-target"), dangling); err != nil {
+		t.Skipf("平台不支持符号链接: %v", err)
+	}
+	dst2, err := uniqueXDG(dir, "bar.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(dst2) != "bar.log.2" {
+		t.Errorf("悬空链接应视为占用, dst = %q", filepath.Base(dst2))
 	}
 }

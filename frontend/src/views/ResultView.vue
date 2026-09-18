@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 结果页（M3 版）：统计条 + 保留策略工具栏 + 操作按钮 + 执行反馈 + 组列表。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import GroupCard from '../components/GroupCard.vue'
@@ -14,8 +14,15 @@ const confirmKind = ref<'trash' | 'delete' | 'move' | 'hardlink' | null>(null)
 const keepKind = ref('shortest')
 const keepDir = ref('')
 
+// store.confirmOpen 单一出口：弹框期间挂起全局快捷键（App.vue 用它拦截
+// Space/Cmd+A/Delete，避免确认框打开时选中集被悄悄扩大），关闭后自动恢复。
+// 修复点：原先由各按钮/回调手工赋值，trash/hardlink 分支漏置、onConfirm 漏复位，
+// 导致确认过一次后拦截条件永久为假。
+watch(confirmKind, v => { store.confirmOpen = !!v })
+
 // C12：切页时本组件卸载，但局部 confirmKind 不会自动复位——切回结果页会
 // 自动重开确认弹窗（且与 store.confirmOpen 脱钩，快捷键拦截失真）。卸载时复位。
+// 此处仍手工清 confirmOpen：组件作用域已停，上面的 watch 不会再触发。
 onUnmounted(() => {
   confirmKind.value = null
   store.confirmOpen = false
@@ -64,6 +71,7 @@ async function pickKeepDir() {
   }
 }
 
+// 只改 confirmKind：store.confirmOpen 的复位由上方 watch 统一负责（不再手工赋值）
 function onConfirm(targetDir?: string) {
   const kind = confirmKind.value!
   confirmKind.value = null
@@ -136,12 +144,12 @@ function onConfirm(targetDir?: string) {
         <button class="btn-primary" :disabled="store.selectedFiles.length === 0"
           @click="confirmKind = 'trash'">移入回收站</button>
         <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'move'; store.confirmOpen = true">移动到…</button>
+          @click="confirmKind = 'move'">移动到…</button>
         <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
           title="替换为指向保留文件的硬链接（同卷）"
           @click="confirmKind = 'hardlink'">硬链接合并</button>
         <button class="btn-danger" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'delete'; store.confirmOpen = true">永久删除</button>
+          @click="confirmKind = 'delete'">永久删除</button>
       </div>
     </div>
 
@@ -192,7 +200,8 @@ function onConfirm(targetDir?: string) {
       <GroupCard v-for="g in store.groups" :key="g.groupID" :group="g" />
     </div>
 
-    <ConfirmDialog v-if="confirmKind" :kind="confirmKind" @close="confirmKind = null; store.confirmOpen = false" @confirm="onConfirm" />
+    <!-- close/confirm 都只改 confirmKind，store.confirmOpen 由 watch 统一复位 -->
+    <ConfirmDialog v-if="confirmKind" :kind="confirmKind" @close="confirmKind = null" @confirm="onConfirm" />
   </div>
 </template>
 

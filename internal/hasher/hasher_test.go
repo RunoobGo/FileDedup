@@ -77,23 +77,44 @@ func TestHashHeadTailLargeFile(t *testing.T) {
 }
 
 func TestHashHeadTailIdenticalFiles(t *testing.T) {
-	// 相同内容 → 相同指纹；首尾相同中间不同 → 预筛相同（正确性由全量兜底）
+	// H1 修正后语义：预筛采 4 点（头/中点/3/4/尾）。
+	//   - 相同内容 → 相同指纹；
+	//   - 改在采样窗口内（size/2 处）→ 预筛即可区分（旧两点采样漏检的正是这类）；
+	//   - 改在未采样的空隙 [64KiB,128KiB) → 预筛指纹仍相同，正确性由全量哈希兜底。
 	base := bytes.Repeat([]byte("A"), SmallFileMax*2)
 	p1 := filepath.Join(t.TempDir(), "1.bin")
 	p2 := filepath.Join(t.TempDir(), "2.bin")
+	p3 := filepath.Join(t.TempDir(), "3.bin")
 	if err := os.WriteFile(p1, base, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mid := append(append([]byte{}, base[:SmallFileMax]...), append(bytes.Repeat([]byte("B"), 64), base[SmallFileMax+64:]...)...)
-	if err := os.WriteFile(p2, mid, 0o644); err != nil {
+	poke := func(off, n int, b byte) []byte {
+		m := append([]byte{}, base...)
+		for i := off; i < off+n; i++ {
+			m[i] = b
+		}
+		return m
+	}
+	// size/2 = 128KiB：落在 mid1 采样窗口 [128KiB,192KiB) 内
+	if err := os.WriteFile(p2, poke(SmallFileMax, 64, 'B'), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h1, h2 := headTail(t, p1), headTail(t, p2)
-	if h1 != h2 {
-		t.Fatal("首尾相同中间不同的文件预筛指纹应相同（全量哈希兜底正确性）")
+	// 96KiB：落在未采样空隙 [64KiB,128KiB) 内
+	if err := os.WriteFile(p3, poke(SmallFileMax/2+HeadTailChunk/2, 64, 'C'), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	full1, full2 := fullOf(t, p1), fullOf(t, p2)
-	if full1 == full2 {
+	h1, h2, h3 := headTail(t, p1), headTail(t, p2), headTail(t, p3)
+	if h1 != headTail(t, p1) {
+		t.Fatal("相同内容的预筛指纹必须一致")
+	}
+	if h1 == h2 {
+		t.Fatal("中段采样窗口内的改动应被 4 点预筛区分（H1 回归）")
+	}
+	if h1 != h3 {
+		t.Fatal("未采样空隙内的改动不应影响预筛指纹")
+	}
+	full1, full3 := fullOf(t, p1), fullOf(t, p3)
+	if full1 == full3 {
 		t.Fatal("内容不同的文件全量哈希不应相同")
 	}
 }

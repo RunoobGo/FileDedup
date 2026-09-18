@@ -16,6 +16,7 @@
 //
 // 几何数据见 ./icons.ts。纯装饰，恒 aria-hidden；需要可访问名称的按钮请把名称
 // 放在按钮自身的 aria-label 上（见 P2-3）。
+import { computed } from 'vue'
 import { ICONS, ICON_SIZE } from './icons'
 import type { IconName } from './icons'
 
@@ -23,7 +24,9 @@ const props = withDefaults(defineProps<{ name: IconName; size?: number; stroke?:
   size: 16,
   stroke: 2,
 })
-const def = ICONS[props.name]
+// 必须响应式取：一次性求值会让图标定格在首次渲染的名字（GroupCard 的
+// star ⇄ close 保留标记此前就不随 isKeep 更新）；未知名回落 info，防 def.d 抛错。
+const def = computed(() => ICONS[props.name] ?? ICONS.info)
 </script>
 
 <template>

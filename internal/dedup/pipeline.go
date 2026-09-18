@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"filededup/internal/cache"
+	"filededup/internal/fsid"
 	"filededup/internal/hasher"
 	"filededup/internal/media"
 	"filededup/internal/model"
@@ -206,7 +208,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 
 	// ---------- 阶段 0：元数据扫描 ----------
 	stage("scan", "扫描目录")
-	scan := scanner.Walk(ctx, cfg.Roots, &cfg.Filters, workers)
+	scan := scanner.WalkWithGate(ctx, cfg.Roots, &cfg.Filters, workers, p.gate)
 	if ctx.Err() != nil {
 		p.setStatus(model.StatusCancelled)
 		return nil, scan.Failed, ctx.Err()
@@ -269,6 +271,8 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		size uint64
 		head uint64
 		tail uint64
+		mid1 uint64
+		mid2 uint64
 	}
 	type preEntry struct {
 		sample    sampleKey
@@ -277,6 +281,9 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		skip      bool // 预筛失败：已入失败清单，不参与任何分组（防零哈希假组）
 	}
 	pre := make([]preEntry, len(candidates))
+	// H1：打开文件句柄后立刻 fstat，记录物理身份 (dev, ino, ctime)。
+	// 它是哈希所依据的那份内容的凭证，用于缓存命中判定与阶段 3 写回。
+	ids := make([]fsid.ID, len(candidates))
 	// 阶段 3 全量哈希产物，与 candidates 下标平行（独立槽位，避免与采样字段互相污染）
 	fulls := make([][32]byte, len(candidates))
 	fullsValid := make([]bool, len(candidates))
@@ -289,6 +296,19 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	idx := atomic.Int64{}
 	cacheOn := p.cch != nil && cfg.UseCache
 	var hitPaths []string // R1：缓存命中路径，任务结束批量续期 last_hit（LRU 语义）
+	// ②-P：worker panic 收口——记失败清单 + cancel + 标记，Run 在取消检查点
+	// 据标记区分「内部故障 Failed」与「用户 Cancelled」（两种路径前端语义不同）。
+	var workerPanic atomic.Pointer[string]
+	stagePanicHandler := func(stage string) func(string) {
+		return func(msg string) {
+			m := stage + ": " + msg
+			workerPanic.CompareAndSwap(nil, &m)
+			preMu.Lock()
+			failed = append(failed, model.FailedItem{Stage: "worker", Err: m})
+			preMu.Unlock()
+			cancel()
+		}
+	}
 	// M4：任务结束单事务批量写回 + 命中续期（含 Cancelled：已算哈希不浪费，01 §5.5）
 	defer func() {
 		if !cacheOn {
@@ -306,7 +326,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			}
 		}
 	}()
-	runWorkers(ctx, workers, func() error {
+	runWorkers(ctx, workers, stagePanicHandler("prefilter"), func() error {
 		localHits := make([]string, 0, 64) // R1：worker 本地累积，退出时合并（免锁热路径）
 		defer func() {
 			if len(localHits) == 0 {
@@ -338,6 +358,9 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				pre[i].skip = true
 				continue
 			}
+			if st, serr := f.Stat(); serr == nil {
+				ids[i] = fsid.FromFileInfo(st)
+			}
 			buf := pool.GetSmallBuf()
 			r, err := hasher.HashHeadTail(f, int64(e.Size), buf)
 			pool.PutSmallBuf(buf)
@@ -350,52 +373,63 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				continue
 			}
 			if cacheOn {
-				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime); hit {
+				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime, ids[i]); hit {
 					localHits = append(localHits, e.Path)
 					var full [32]byte
 					fullValidNow := false
-					// 抽样一致 → 内容极可能未变，信任缓存 full；否则内容已变，full 须重算。
-					if r.Partial.Head == ent.Head && r.Partial.Tail == ent.Tail {
+					// 四点采样全一致 → 内容极可能未变，信任缓存 full；否则内容已变，full 须重算。
+					if r.Partial.Head == ent.Head && r.Partial.Tail == ent.Tail &&
+						r.Partial.Mid1 == ent.Mid1 && r.Partial.Mid2 == ent.Mid2 {
 						if fullValid {
 							copy(full[:], ent.Full)
 						}
 						fullValidNow = fullValid
 					}
 					pre[i] = preEntry{
-						sample:    sampleKey{size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail},
+						sample: sampleKey{
+							size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail,
+							mid1: r.Partial.Mid1, mid2: r.Partial.Mid2,
+						},
 						full:      full,
 						fullValid: fullValidNow,
 					}
 					tracker.AddFile()
 					// R2：命中视作该文件的预筛工作量已完成，字节数同样计入，
 					// 否则命中越多进度越滞后（总量口径已按预筛读量设定）
-					tracker.AddBytes(minU64(e.Size, hasher.SmallFileMax))
+					tracker.AddBytes(minU64(e.Size, hasher.PrefilterMax))
 					continue
 				}
 			}
 			// 未命中：用实际抽样分桶，full 视小文件与否（小文件一趟即得全量）
 			var ent cache.Entry
+			ent = cache.Entry{Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
+				Head: r.Partial.Head, Tail: r.Partial.Tail,
+				Mid1: r.Partial.Mid1, Mid2: r.Partial.Mid2,
+				Dev: ids[i].Dev, Ino: ids[i].Ino, CtimeNs: ids[i].CtimeNs}
 			if r.Small { // 小文件一趟双哈希：full 一并缓存
-				ent = cache.Entry{Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
-					Head: r.Partial.Head, Tail: r.Partial.Tail, Full: r.Full[:]}
-			} else { // 大文件先缓存 partial（full 阶段 3 后补/UPSERT 覆盖）
-				ent = cache.Entry{Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
-					Head: r.Partial.Head, Tail: r.Partial.Tail}
+				ent.Full = r.Full[:]
 			}
 			preMu.Lock()
 			pendIdx[i] = len(pending) // P0-2：阶段 3 补算后原位更新，不再追加第二条
 			pending = append(pending, ent)
 			preMu.Unlock()
 			pre[i] = preEntry{
-				sample:    sampleKey{size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail},
+				sample: sampleKey{
+					size: e.Size, head: r.Partial.Head, tail: r.Partial.Tail,
+					mid1: r.Partial.Mid1, mid2: r.Partial.Mid2,
+				},
 				full:      r.Full,
 				fullValid: r.Small, // 小文件一趟即得全量
 			}
 			tracker.AddFile()
-			tracker.AddBytes(minU64(e.Size, hasher.SmallFileMax))
+			tracker.AddBytes(minU64(e.Size, hasher.PrefilterMax))
 		}
 	})
 	if ctx.Err() != nil {
+		if pm := workerPanic.Load(); pm != nil { // ②-P：内部故障按 Failed 收口
+			p.setStatus(model.StatusFailed)
+			return nil, failed, fmt.Errorf("扫描内部故障（%s）", *pm)
+		}
 		p.setStatus(model.StatusCancelled)
 		return nil, failed, ctx.Err()
 	}
@@ -443,7 +477,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	// BytesDone 可超 BytesTotal，导致进度虚满、ETA 提前归零。
 	filesDone, bytesDone := tracker.Done()
 	tracker.SetTotal(filesDone+uint64(len(hashTargets)), bytesDone+sumSize(hashTargets))
-	runWorkers(ctx, workers, func() error {
+	runWorkers(ctx, workers, stagePanicHandler("hash"), func() error {
 		for {
 			i := int(idx.Add(1) - 1)
 			if i >= len(hashTargets) {
@@ -497,7 +531,10 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				copy(cp, full[:])
 				pending = append(pending, cache.Entry{
 					Path: e.Path, Size: e.Size, MtimeNs: e.ModTime,
-					Head: pre[ci].sample.head, Tail: pre[ci].sample.tail, Full: cp,
+					Head: pre[ci].sample.head, Tail: pre[ci].sample.tail,
+					Mid1: pre[ci].sample.mid1, Mid2: pre[ci].sample.mid2,
+					Dev: ids[ci].Dev, Ino: ids[ci].Ino, CtimeNs: ids[ci].CtimeNs,
+					Full: cp,
 				})
 			}
 			preMu.Unlock()
@@ -506,6 +543,10 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		}
 	})
 	if ctx.Err() != nil {
+		if pm := workerPanic.Load(); pm != nil { // ②-P：内部故障按 Failed 收口
+			p.setStatus(model.StatusFailed)
+			return nil, failed, fmt.Errorf("扫描内部故障（%s）", *pm)
+		}
 		p.setStatus(model.StatusCancelled)
 		return nil, failed, ctx.Err()
 	}
@@ -548,7 +589,17 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		}
 		sortEntries(g)
 		if cfg.Paranoid {
-			g, dropped := ver.group(g, failed)
+			// ②-B：paranoid 是纯 I/O 长阶段——组间过 gate（暂停即时停步），
+			// 取消经 ctx 在组内逐文件/逐块感知（见 group/equal）。
+			if err := p.gate.Wait(ctx); err != nil {
+				p.setStatus(model.StatusCancelled)
+				return nil, failed, ctx.Err()
+			}
+			g, dropped := ver.group(ctx, g, failed)
+			if err := ctx.Err(); err != nil {
+				p.setStatus(model.StatusCancelled)
+				return nil, failed, err
+			}
 			if len(g) < 2 {
 				continue
 			}
@@ -593,8 +644,9 @@ func newVerifier() *verifier {
 }
 
 // group paranoid 模式：组内所有文件与代表文件逐字节流式比对；
-// 不一致者移出组并计入失败清单。
-func (v *verifier) group(g []*model.FileEntry, failed []model.FailedItem) ([]*model.FileEntry, []model.FailedItem) {
+// 不一致者移出组并计入失败清单。②-B：ctx 取消时立即停步返回，
+// 未处理的文件不记失败（取消是用户意图，不是文件问题）。
+func (v *verifier) group(ctx context.Context, g []*model.FileEntry, failed []model.FailedItem) ([]*model.FileEntry, []model.FailedItem) {
 	rep, err := os.Open(g[0].Path)
 	if err != nil {
 		failed = append(failed, model.FailedItem{Path: g[0].Path, Stage: "verify", Err: err.Error()})
@@ -603,6 +655,9 @@ func (v *verifier) group(g []*model.FileEntry, failed []model.FailedItem) ([]*mo
 	defer rep.Close()
 	kept := []*model.FileEntry{g[0]}
 	for _, e := range g[1:] {
+		if ctx.Err() != nil {
+			return kept, failed
+		}
 		cur, err := os.Open(e.Path)
 		if err != nil {
 			failed = append(failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: err.Error()})
@@ -614,8 +669,11 @@ func (v *verifier) group(g []*model.FileEntry, failed []model.FailedItem) ([]*mo
 			failed = append(failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: err.Error()})
 			continue
 		}
-		same, err := v.equal(rep, cur, int64(g[0].Size))
+		same, err := v.equal(ctx, rep, cur, int64(g[0].Size))
 		cur.Close()
+		if ctx.Err() != nil {
+			return kept, failed // 比对中途取消：err 是 ctx 错误，不记文件失败
+		}
 		if err != nil {
 			failed = append(failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: err.Error()})
 			continue
@@ -630,10 +688,14 @@ func (v *verifier) group(g []*model.FileEntry, failed []model.FailedItem) ([]*mo
 }
 
 // equal 复用 v 的缓冲逐字节比对两个等长流（顺序读，非并发安全）。
-func (v *verifier) equal(a, b *os.File, size int64) (bool, error) {
+// ②-B：每块（256KiB）之间检查取消——单对超大文件也不能拖住取消路径。
+func (v *verifier) equal(ctx context.Context, a, b *os.File, size int64) (bool, error) {
 	buf1, buf2 := v.buf1, v.buf2
 	remain := size
 	for remain > 0 {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
 		n := int64(len(buf1))
 		if remain < n {
 			n = remain
@@ -687,11 +749,11 @@ func sumSize(files []*model.FileEntry) uint64 {
 	return s
 }
 
-// prefilterBytes 预筛阶段理论读量（R2 口径）：每候选文件最多 SmallFileMax 字节。
+// prefilterBytes 预筛阶段理论读量（R2 口径）：每候选文件最多 PrefilterMax 字节。
 func prefilterBytes(files []*model.FileEntry) uint64 {
 	var s uint64
 	for _, f := range files {
-		s += minU64(f.Size, hasher.SmallFileMax)
+		s += minU64(f.Size, hasher.PrefilterMax)
 	}
 	return s
 }
@@ -723,12 +785,25 @@ func minU64(a, b uint64) uint64 {
 }
 
 // runWorkers 固定 worker 池：任一 worker 返回错误即等待全部退出（不中断他人）。
-func runWorkers(ctx context.Context, n int, fn func() error) {
+//
+// ②-P：worker  panic 不得带走整个进程（现象曾是"点扫描后软件消失"）。
+// 每个 worker 挂 recover：堆栈写 stderr 留痕，一行摘要经 onPanic 上报——
+// 调用方的 onPanic 负责记入失败清单并 cancel ctx，兄弟 worker 经
+// gate.Wait/循环头感知取消后尽快退出，Run 据 panic 标记以 Failed 收口。
+func runWorkers(ctx context.Context, n int, onPanic func(string), fn func() error) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "[panic] dedup worker 已恢复: %v\n%s\n", r, debug.Stack())
+					if onPanic != nil {
+						onPanic(fmt.Sprintf("worker panic（已拦截）: %v", r))
+					}
+				}
+			}()
 			_ = fn() // 错误经由 ctx/failed 通道表达
 		}()
 	}

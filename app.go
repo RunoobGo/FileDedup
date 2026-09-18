@@ -34,8 +34,9 @@ import (
 	"filededup/internal/ops"
 )
 
-// AppVersion 当前版本（GetVersion 契约，04 附录 A：随里程碑递增）。
-const AppVersion = "0.4.0-m4"
+// AppVersion 当前版本（GetVersion 契约，04 附录 A）：与 wails.json productVersion、
+// frontend/package.json version 统一口径，发布时三处同改。
+const AppVersion = "0.4.0"
 
 // ---------- 契约视图类型（01 §7.2） ----------
 
@@ -130,6 +131,11 @@ type App struct {
 	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
 	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
+	// H5：本会话内经原生目录选择器（SelectDirectory）明确授权过的目录集合
+	// （Clean 后的绝对路径）。move 的 TargetDir 必须落在其内——此前该参数是
+	// 前端任意字符串，绑定层可直接决定任意写位置。
+	authDirs map[string]bool
+
 	cfgDir string
 	cch    *cache.Cache
 
@@ -147,6 +153,7 @@ func NewApp() *App {
 		pipe:      dedup.New(),
 		byID:      make(map[uint64]*model.FileEntry),
 		viewCache: make(map[sortKey]viewCacheEntry),
+		authDirs:  make(map[string]bool),
 		emit:      wruntime.EventsEmit,
 	}
 	// 引擎回调 → 事件桥（M2-T03）
@@ -201,10 +208,69 @@ func (a *App) shutdown(ctx context.Context) {
 
 // SelectDirectory 调起系统目录选择器。
 // 注：Wails v2 目录选择为单选（平台对话框限制），前端可连续多次添加。
+// H5：选择结果同时登记为本会话授权目录（move 目标的白名单来源）。
 func (a *App) SelectDirectory() (string, error) {
-	return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{
-		Title: "选择扫描目录",
+	dir, err := wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{
+		Title: "选择目录",
 	})
+	if err == nil && dir != "" {
+		a.authorizeDir(dir)
+	}
+	return dir, err
+}
+
+// authorizeDir 登记授权目录（Clean 绝对路径；符号链接解析变体一并登记）。
+func (a *App) authorizeDir(dir string) {
+	abs, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.authDirs == nil {
+		a.authDirs = make(map[string]bool)
+	}
+	a.authDirs[abs] = true
+	if ev, err := filepath.EvalSymlinks(abs); err == nil {
+		a.authDirs[filepath.Clean(ev)] = true
+	}
+}
+
+// moveTargetAllowed 校验 move 目标：必须位于某个授权目录内（含授权目录本身）。
+// 对已存在的路径同时校验符号链接解析后的形态，防经由链接逃逸。
+// 调用方须持 a.mu。
+func (a *App) moveTargetAllowed(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	abs, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return false
+	}
+	candidates := []string{abs}
+	if ev, err := filepath.EvalSymlinks(abs); err == nil && ev != abs {
+		candidates = append(candidates, filepath.Clean(ev))
+	}
+	for auth := range a.authDirs {
+		for _, c := range candidates {
+			if withinDir(c, auth) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// withinDir target 是否等于 dir 或位于 dir 之下（按路径段边界比较）。
+func withinDir(target, dir string) bool {
+	if target == dir {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if !strings.HasSuffix(dir, sep) {
+		dir += sep
+	}
+	return strings.HasPrefix(target, dir)
 }
 
 // StartScan 创建扫描任务，返回 taskID；运行中重复调用返回错误。
@@ -250,10 +316,20 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		start := time.Now()
 		groups, failed, err := a.pipe.Run(a.ctx, cfg)
 		elapsed := time.Since(start)
+		// 复位必须先于终止事件发出：前端（与单测）收到 done/cancelled/error 后
+		// 可能立刻重扫，若此刻在途标志仍为 true 会被误拒。goTask 的 reset
+		// 保留为 panic 展开路径的兜底（其 LIFO 顺序本就先于 recover 发事件）。
+		resetInFlight := func() {
+			a.mu.Lock()
+			a.scanInFlight = false
+			a.mu.Unlock()
+		}
 		if err != nil {
 			if a.pipe.Status() == model.StatusCancelled {
+				resetInFlight()
 				a.emit(a.ctx, "scan:cancelled", ScanSummary{Elapsed: elapsed.String()})
 			} else {
+				resetInFlight()
 				a.emit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
 			}
 			return
@@ -271,6 +347,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		for _, g := range groups {
 			reclaim += g.Reclaimable
 		}
+		a.scanInFlight = false
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
 			Groups:      len(groups),
@@ -779,6 +856,12 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	if len(a.groups) == 0 {
 		a.mu.Unlock()
 		return "", fmt.Errorf("暂无结果集")
+	}
+	// H5：move 的目标是前端传入的字符串——只允许落在本会话经原生对话框
+	// 选择过的目录（或其子目录）内，堵住"绑定层写任意路径"的越权面。
+	if op.Kind == "move" && !a.moveTargetAllowed(op.TargetDir) {
+		a.mu.Unlock()
+		return "", fmt.Errorf("移动目标无效或未经选择目录对话框授权，请重新选择目标目录")
 	}
 	groups := a.groups
 	keepIDs := a.keepIDs

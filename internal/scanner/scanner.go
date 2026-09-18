@@ -67,12 +67,24 @@ type Result struct {
 	Visited int // 实际访问目录数（诊断用）
 }
 
-// Walk 并行遍历 roots：
+// Waiter 暂停闸门（②-S）：dedup.Gate 实现本接口。扫描器不 import dedup
+// （依赖方向相反），经窄接口注入；nil 表示不支持暂停。
+type Waiter interface {
+	Wait(ctx context.Context) error
+}
+
+// Walk 并行遍历 roots（无暂停闸门）。
+func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *Result {
+	return WalkWithGate(ctx, roots, f, workers, nil)
+}
+
+// WalkWithGate 并行遍历 roots：
 //   - 跳过符号链接与 0 字节文件（内置行为）
 //   - 应用过滤器
 //   - 重叠根目录与子目录去重（平台大小写折叠）
 //   - unix 平台 FileKey 由 lstat 顺带填充；Windows 留待 ResolveKey 按需解析
-func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *Result {
+//   - ②-S：每目录处理前过 gate（暂停挂起、取消快速排空），取消后不再触盘
+func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers int, gate Waiter) *Result {
 	if workers < 1 {
 		workers = 4
 	}
@@ -115,17 +127,27 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 				if !ok {
 					break // 队列关闭且空：全部完成
 				}
+				// ②-S：暂停挂起在目录处理前（in-flight 目录完成后停步，符合 01 §5.5）。
+				// gate.Wait 只在 ctx 结束时返回错误 → 走下方取消排空路径。
+				if gate != nil {
+					_ = gate.Wait(ctx)
+				}
+				if ctx.Err() != nil {
+					// 取消排空：只销在途计数，绝不再 ReadDir——
+					// 修正前取消后仍会把队列里剩余全部目录逐个读一遍才退出。
+					pend.Done()
+					continue
+				}
 				entries, err := os.ReadDir(dir)
 				if err != nil {
 					fails[idx] = append(fails[idx], model.FailedItem{Path: dir, Stage: "scan", Err: err.Error()})
 					pend.Done()
 					continue
 				}
-				if ctx.Err() != nil {
-					pend.Done()
-					continue // 取消：清空剩余在途目录
-				}
-				for _, de := range entries {
+				for j, de := range entries {
+					if j&1023 == 512 && ctx.Err() != nil {
+						break // 单个超大目录内的取消粒度（目录级检查之间最长 1024 项）
+					}
 					full := filepath.Join(dir, de.Name())
 					typ := de.Type()
 					if typ&fs.ModeSymlink != 0 {

@@ -17,6 +17,11 @@ export const emptyFilters = (): Filters => ({
   IncludeHidden: false,
 })
 
+// 大小过滤单位换算：UI 输入框标注 KB（ScanView），后端 internal/filter/filter.go
+// 直接与字节比较 —— 差 1024 倍。store 内保持 KB 语义，换算只放在发往后端这一处，
+// 加载/保存设置（settings.filtersDefault）走的都是 KB 口径，因此不会重复换算。
+const kbToBytes = (kb: number) => (Number.isFinite(+kb) ? +kb * 1024 : 0)
+
 export const useScanStore = defineStore('scan', () => {
   // 导航
   const view = ref<'scan' | 'result' | 'settings'>('scan')
@@ -85,6 +90,24 @@ export const useScanStore = defineStore('scan', () => {
     })
   }
 
+  // 上一轮结果作废：后端 StartScan 一成功就清掉 groups/byID（app.go），旧 fileID 全部失效。
+  // 前端若继续显示旧结果，切到结果页既能看到旧数据、又能对失效 fileID 发起删除 →
+  // 启动成功即清（启动失败时后端未清理，旧结果仍然有效，不能连带清掉）。
+  // 只清结果态：roots/filters/threads/settings 是用户输入，保持不动。
+  function clearStaleResult() {
+    groups.value = []
+    totalGroups.value = 0
+    reclaimableTotal.value = 0
+    resultPage.value = 0
+    loadCap.value = DEFAULT_LOAD_CAP // 放量上限回到初始档
+    hasResult.value = false
+    failed.value = []
+    preview.value = null
+    currentFileID.value = null
+    opsResult.value = null
+    resetSelection()
+  }
+
   function startScan() {
     if (roots.value.length === 0) return
     scanning.value = true
@@ -93,11 +116,17 @@ export const useScanStore = defineStore('scan', () => {
     api
       .startScan({
         Roots: roots.value,
-        Filters: { ...filters },
+        // 唯一出口处做 KB → 字节换算，见文件头 kbToBytes 注释
+        Filters: {
+          ...filters,
+          MinSize: kbToBytes(filters.MinSize),
+          MaxSize: kbToBytes(filters.MaxSize),
+        },
         Threads: threads.value,
         Paranoid: paranoid.value,
         UseCache: true,
       })
+      .then(clearStaleResult)
       .catch((e: any) => {
         scanning.value = false
         status.value = 'Idle'

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"filededup/internal/fsid"
 )
 
 // MoveFile 移动文件至 targetDir（M3-T04）：
@@ -48,8 +50,12 @@ func MoveFile(src, targetDir string) (string, error) {
 }
 
 // HardlinkMerge 硬链接合并（M3-T05）：冗余路径替换为指向 keep 的硬链接。
-// 仅同卷可用（调用方已用 FileKey.VolumeID 判断，此处 os.Link 天然失败兜底）。
-func HardlinkMerge(keep, dup string) error {
+// 仅同卷可用（跨卷时 os.Link 天然失败兜底）。
+//
+// H2：keepID/dupID 来自 VerifyFile 通过校验那一刻的 fstat。临时硬链接建立后
+// 复核 tmp 的 inode == keepID（窗口内 keep 路径被替换时，链接会指向非预期
+// 文件）；替换 dup 前复核 dup 路径仍指向 dupID。零值 ID（未解析平台）跳过。
+func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	if keep == dup {
 		return fmt.Errorf("同一路径")
 	}
@@ -59,6 +65,14 @@ func HardlinkMerge(keep, dup string) error {
 	_ = os.Remove(tmp) // 清理上次残留
 	if err := os.Link(keep, tmp); err != nil {
 		return fmt.Errorf("硬链接失败（可能跨卷或权限）: %w", err)
+	}
+	if !identityStill(tmp, keepID) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("保留源在校验后被替换（inode 已变化），已拦截（S1）")
+	}
+	if !identityStill(dup, dupID) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
 	}
 	backup := dup + ".fdd-old"
 	_ = os.Remove(backup)

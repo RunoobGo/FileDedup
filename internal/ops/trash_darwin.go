@@ -3,9 +3,11 @@
 package ops
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // trashScript 静态 AppleScript：路径经 osascript 的 run handler argv 传入，
@@ -30,14 +32,53 @@ func osascriptArgs(paths []string) []string {
 	return append(args, paths...)
 }
 
+// osascript 批量与超时参数（D6）：
+//   - trashBatchSize：单次 Finder 调用过万条会长时间独占进程且失败面变大，
+//     按 100 条分批；后续批失败时前面批次已入回收站（不丢数据，
+//     executor 的 C6 逐文件回退重试对已入站文件按 ENOENT→Skipped 处理）。
+//   - trashBatchTimeout：Finder 无响应/授权弹窗时 osascript 可无限挂起，
+//     每批 2 分钟上限；WaitDelay 防子进程持有 stdio 管道导致超时后仍不返回。
+const (
+	trashBatchSize    = 100
+	trashBatchTimeout = 2 * time.Minute
+	trashProcessDelay = 5 * time.Second
+)
+
+// chunkPaths 纯函数：按 size 切分路径批次（size<1 视为 1）。
+func chunkPaths(paths []string, size int) [][]string {
+	if size < 1 {
+		size = 1
+	}
+	var out [][]string
+	for start := 0; start < len(paths); start += size {
+		end := start + size
+		if end > len(paths) {
+			end = len(paths)
+		}
+		out = append(out, paths[start:end])
+	}
+	return out
+}
+
 func defaultTrash(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	// 单次 osascript 批量移入 Finder 回收站（避免逐文件进程开销）
-	out, err := exec.Command("osascript", osascriptArgs(paths)...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("osascript: %v: %s", err, strings.TrimSpace(string(out)))
+	batches := chunkPaths(paths, trashBatchSize)
+	for bi, batch := range batches {
+		ctx, cancel := context.WithTimeout(context.Background(), trashBatchTimeout)
+		cmd := exec.CommandContext(ctx, "osascript", osascriptArgs(batch)...)
+		cmd.WaitDelay = trashProcessDelay
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("osascript 超时（>%v，第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %w",
+					trashBatchTimeout, bi+1, len(batches), len(batch), err)
+			}
+			return fmt.Errorf("osascript（第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %v: %s",
+				bi+1, len(batches), len(batch), err, strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
 }

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"filededup/internal/fsid"
 )
 
 func mustOpenC5(t *testing.T) *Cache {
@@ -89,7 +91,7 @@ func TestGetStatsConcurrentWithWriters(t *testing.T) {
 	go func() { // 读命中路径
 		defer wg.Done()
 		for i := 0; i < rounds; i++ {
-			c.Lookup(fmt.Sprintf("/p/%d", i), uint64(i), int64(i))
+			c.Lookup(fmt.Sprintf("/p/%d", i), uint64(i), int64(i), fsid.ID{})
 		}
 	}()
 	go func() { // 统计读者

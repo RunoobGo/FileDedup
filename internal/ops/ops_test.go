@@ -297,13 +297,13 @@ func TestVerifyFastPathAndTouch(t *testing.T) {
 	pool := hasher.NewPool()
 
 	// 快速路径：元数据未变
-	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
+	if v, _ := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
 		t.Fatalf("元数据未变应快速通过, got %d", v)
 	}
 	// touch（内容未变 mtime 变）→ 重算通过
 	future := time.Unix(0, fx.dup1.ModTime).Add(time.Hour)
 	os.Chtimes(fx.dup1.Path, future, future)
-	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
+	if v, _ := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
 		t.Fatalf("仅 touch 应通过（内容未变）, got %d", v)
 	}
 }
@@ -334,7 +334,7 @@ func TestS1TamperWithUnchangedMtime(t *testing.T) {
 	}
 
 	// 内容级校验必须拦截（修正前：size+mtime 双一致 → 快速路径直接放行）
-	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
+	if v, _ := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
 		t.Fatalf("元数据未变但内容已篡改，VerifyFile 应 Failed，got %d", v)
 	}
 
@@ -364,17 +364,17 @@ func TestS1TamperWithUnchangedMtime(t *testing.T) {
 func TestVerifySizeMismatchFails(t *testing.T) {
 	fx := newFixture(t)
 	pool := hasher.NewPool()
-	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
+	if v, _ := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictPass {
 		t.Fatalf("未修改应通过, got %d", v)
 	}
 	raw, _ := os.ReadFile(fx.dup1.Path)
 	os.WriteFile(fx.dup1.Path, append(raw, 'x'), 0o644)
-	if v := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
+	if v, _ := VerifyFile(fx.dup1, fx.group.Hash, pool); v != VerdictFailed {
 		t.Fatalf("size 变化应 Failed, got %d", v)
 	}
 	// ENOENT 仍为 Skipped（S8）
 	os.Remove(fx.dup2.Path)
-	if v := VerifyFile(fx.dup2, fx.group.Hash, pool); v != VerdictSkipped {
+	if v, _ := VerifyFile(fx.dup2, fx.group.Hash, pool); v != VerdictSkipped {
 		t.Fatalf("已消失应 Skipped, got %d", v)
 	}
 }

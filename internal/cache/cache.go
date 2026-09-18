@@ -1,5 +1,6 @@
 // Package cache 哈希缓存（04 M4-T01，01 §7.3）：
-// SQLite WAL；键 (path, size, mtime_ns)；命中即复用，跳过读盘；
+// SQLite WAL；键 (path, size, mtime_ns, dev, ino, ctime_ns)；
+// 命中后仍须四点采样比对，全一致才复用 full；
 // 批量 UPSERT 单事务写回；last_hit 上限淘汰；损坏自愈（重建）。
 package cache
 
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"filededup/internal/fsid"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -21,6 +24,11 @@ type Entry struct {
 	MtimeNs int64
 	Head    uint64 // xxHash64 头部 64KiB（小文件=全文件）
 	Tail    uint64 // xxHash64 尾部 64KiB（小文件=全文件）
+	Mid1    uint64 // xxHash64 size/2 处 64KiB（H1：中段采样）
+	Mid2    uint64 // xxHash64 3size/4 处 64KiB
+	Dev     uint64 // 物理身份（unix）；Windows 恒 0（fsid 未解析，比较平凡通过）
+	Ino     uint64
+	CtimeNs int64
 	Full    []byte // BLAKE3-256；nil = 未算过全量（大文件预筛后被淘汰）
 }
 
@@ -46,7 +54,10 @@ const MaxEntries = 500_000
 // 修正前无任何版本标记：升级或换算法后旧库继续命中，可能造出错误分组。
 // 旧库还存在「阶段 3 写回把 partial 清零」留下的脏行（head=tail=0），
 // 这些行与新算出的采样永远不同桶 → 漏报。bump 版本可一并清掉。
-const AlgoVersion = "blake3-256+xxh64-64k-v2"
+//
+// v3（H1）：partial 从 2 点扩到 4 点（+size/2、+3size/4），并新增
+// dev/ino/ctime_ns 身份列。旧行既缺中段采样又缺身份，一律作废。
+const AlgoVersion = "blake3-256+xxh64-4pt+id-v3"
 
 // metaKey 元信息表主键。
 const metaKey = "algo_version"
@@ -105,14 +116,43 @@ func enforceAlgoVersion(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM hash_cache`); err != nil {
+	// v3 起表结构含 dev/ino/ctime_ns 列；旧库缺列，DELETE 不足以让 schema
+	// 追上写入语句，直接删表重建（enforce 后 openDB 的建表语句仍留在连接
+	// 生命周期内首次执行，这里显式重放）。
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS hash_cache`); err != nil {
 		return fmt.Errorf("作废旧缓存失败: %w", err)
+	}
+	if err := createSchema(tx); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO cache_meta (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaKey, AlgoVersion); err != nil {
 		return fmt.Errorf("写入缓存版本失败: %w", err)
 	}
 	return tx.Commit()
+}
+
+// createSchema 哈希表结构（tx 版，供版本作废后重建；与 openDB 保持同构）。
+func createSchema(tx *sql.Tx) error {
+	for _, p := range []string{
+		`CREATE TABLE IF NOT EXISTS hash_cache (
+			path     TEXT    NOT NULL PRIMARY KEY,
+			size     INTEGER NOT NULL,
+			mtime_ns INTEGER NOT NULL,
+			partial  BLOB    NOT NULL,
+			full     BLOB,
+			last_hit INTEGER NOT NULL DEFAULT 0,
+			dev      INTEGER NOT NULL DEFAULT 0,
+			ino      INTEGER NOT NULL DEFAULT 0,
+			ctime_ns INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_cache_last_hit ON hash_cache(last_hit)`,
+	} {
+		if _, err := tx.Exec(p); err != nil {
+			return fmt.Errorf("重建缓存表失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -130,7 +170,10 @@ func openDB(path string) (*sql.DB, error) {
 			mtime_ns INTEGER NOT NULL,
 			partial  BLOB    NOT NULL,
 			full     BLOB,
-			last_hit INTEGER NOT NULL DEFAULT 0
+			last_hit INTEGER NOT NULL DEFAULT 0,
+			dev      INTEGER NOT NULL DEFAULT 0,
+			ino      INTEGER NOT NULL DEFAULT 0,
+			ctime_ns INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS cache_meta (
 			key   TEXT NOT NULL PRIMARY KEY,
@@ -150,27 +193,36 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// Lookup 命中判定：path 存在且 size/mtime 完全一致。
+// Lookup 命中判定：path 存在且 size/mtime 与物理身份 (dev, ino, ctime_ns)
+// 完全一致。id 未解析（Windows）时身份比较平凡通过，兜底仍靠四点采样。
 // 返回条目与 full 是否有效（决定阶段 3 是否跳过）。
-func (c *Cache) Lookup(path string, size uint64, mtimeNs int64) (Entry, bool, bool) {
+func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Entry, bool, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	row := c.db.QueryRow(
-		`SELECT size, mtime_ns, partial, full FROM hash_cache WHERE path = ?`, path)
+		`SELECT size, mtime_ns, partial, full, dev, ino, ctime_ns FROM hash_cache WHERE path = ?`, path)
 	var e Entry
 	var partial []byte
+	var dev64, ino64 int64
 	e.Path = path
-	if err := row.Scan(&e.Size, &e.MtimeNs, &partial, &e.Full); err != nil {
+	if err := row.Scan(&e.Size, &e.MtimeNs, &partial, &e.Full, &dev64, &ino64, &e.CtimeNs); err != nil {
 		return Entry{}, false, false
 	}
+	e.Dev, e.Ino = uint64(dev64), uint64(ino64)
 	if e.Size != size || e.MtimeNs != mtimeNs {
 		return Entry{}, false, false // 元数据变化 → 未命中（重算）
 	}
-	e.Head, e.Tail = decodePartial(partial)
+	// H1：mtime 无法证明内容未变（粗粒度卷/原地改写保 mtime），ctime 与
+	// inode 身份提供第二重证据：写内容、rename、chmod 都会推进 ctime；
+	// 路径被换成另一文件则 dev/ino 必不同。不一致宁可当次未命中重算。
+	if id.Resolved && (e.Dev != id.Dev || e.Ino != id.Ino || e.CtimeNs != id.CtimeNs) {
+		return Entry{}, false, false
+	}
+	e.Head, e.Tail, e.Mid1, e.Mid2 = decodePartial(partial)
 	// P0-2 防御：采样为全零的行不可信（历史写入路径曾把 partial 覆盖为零，
 	// 见 enforceAlgoVersion 的说明）。这类行若参与分桶会让文件与真正的同内容
 	// 文件永远不同桶，表现为漏报；宁可当作未命中重算一次。
-	if e.Head == 0 && e.Tail == 0 {
+	if e.Head == 0 && e.Tail == 0 && e.Mid1 == 0 && e.Mid2 == 0 {
 		return Entry{}, false, false
 	}
 	fullValid := len(e.Full) == 32
@@ -192,12 +244,13 @@ func (c *Cache) Store(entries []Entry) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO hash_cache (path, size, mtime_ns, partial, full, last_hit)
-		VALUES (?, ?, ?, ?, ?, ?)
+	stmt, err := tx.Prepare(`INSERT INTO hash_cache (path, size, mtime_ns, partial, full, last_hit, dev, ino, ctime_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
-			partial=CASE WHEN excluded.partial = x'00000000000000000000000000000000'
+			partial=CASE WHEN excluded.partial = x'0000000000000000000000000000000000000000000000000000000000000000'
 				THEN hash_cache.partial ELSE excluded.partial END,
-			full=excluded.full, last_hit=excluded.last_hit`)
+			full=excluded.full, last_hit=excluded.last_hit,
+			dev=excluded.dev, ino=excluded.ino, ctime_ns=excluded.ctime_ns`)
 	if err != nil {
 		return err
 	}
@@ -207,7 +260,9 @@ func (c *Cache) Store(entries []Entry) error {
 		if len(e.Full) == 32 {
 			full = e.Full
 		}
-		if _, err := stmt.Exec(e.Path, e.Size, e.MtimeNs, encodePartial(e.Head, e.Tail), full, now); err != nil {
+		if _, err := stmt.Exec(e.Path, e.Size, e.MtimeNs,
+			encodePartial(e.Head, e.Tail, e.Mid1, e.Mid2), full, now,
+			int64(e.Dev), int64(e.Ino), e.CtimeNs); err != nil {
 			return err
 		}
 	}
@@ -317,22 +372,26 @@ func (c *Cache) Clear() error {
 // Close 关闭。
 func (c *Cache) Close() error { return c.db.Close() }
 
-func encodePartial(head, tail uint64) []byte {
-	b := make([]byte, 16)
+func encodePartial(head, tail, mid1, mid2 uint64) []byte {
+	b := make([]byte, 32)
 	for i := 0; i < 8; i++ {
 		b[i] = byte(head >> (8 * i))
 		b[8+i] = byte(tail >> (8 * i))
+		b[16+i] = byte(mid1 >> (8 * i))
+		b[24+i] = byte(mid2 >> (8 * i))
 	}
 	return b
 }
 
-func decodePartial(b []byte) (head, tail uint64) {
-	if len(b) != 16 {
-		return 0, 0
+func decodePartial(b []byte) (head, tail, mid1, mid2 uint64) {
+	if len(b) != 32 {
+		return 0, 0, 0, 0
 	}
 	for i := 0; i < 8; i++ {
 		head |= uint64(b[i]) << (8 * i)
 		tail |= uint64(b[8+i]) << (8 * i)
+		mid1 |= uint64(b[16+i]) << (8 * i)
+		mid2 |= uint64(b[24+i]) << (8 * i)
 	}
-	return head, tail
+	return head, tail, mid1, mid2
 }

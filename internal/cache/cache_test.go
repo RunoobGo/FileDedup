@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"filededup/internal/fsid"
 )
 
 func openTest(t *testing.T) *Cache {
@@ -30,20 +32,20 @@ func TestLookupHitAndMiss(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 完全一致 → 命中 + full 有效
-	e, hit, fullValid := c.Lookup("/a", 100, 111)
+	e, hit, fullValid := c.Lookup("/a", 100, 111, fsid.ID{})
 	if !hit || !fullValid || e.Head != 1 || e.Tail != 2 {
 		t.Fatalf("命中失败: %+v hit=%v fullValid=%v", e, hit, fullValid)
 	}
 	// mtime 变化 → 未命中
-	if _, hit, _ := c.Lookup("/a", 100, 222); hit {
+	if _, hit, _ := c.Lookup("/a", 100, 222, fsid.ID{}); hit {
 		t.Fatal("mtime 变化应未命中")
 	}
 	// size 变化 → 未命中
-	if _, hit, _ := c.Lookup("/a", 101, 111); hit {
+	if _, hit, _ := c.Lookup("/a", 101, 111, fsid.ID{}); hit {
 		t.Fatal("size 变化应未命中")
 	}
 	// 路径不存在 → 未命中
-	if _, hit, _ := c.Lookup("/missing", 100, 111); hit {
+	if _, hit, _ := c.Lookup("/missing", 100, 111, fsid.ID{}); hit {
 		t.Fatal("不存在的路径应未命中")
 	}
 }
@@ -54,7 +56,7 @@ func TestStorePartialOnlyUpsertFull(t *testing.T) {
 	if err := c.Store([]Entry{{Path: "/b", Size: 10, MtimeNs: 1, Head: 9, Tail: 9}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, hit, fullValid := c.Lookup("/b", 10, 1); !hit || fullValid {
+	if _, hit, fullValid := c.Lookup("/b", 10, 1, fsid.ID{}); !hit || fullValid {
 		t.Fatalf("partial-only: hit=%v fullValid=%v", hit, fullValid)
 	}
 	// 后补 full（UPSERT 覆盖）
@@ -63,7 +65,7 @@ func TestStorePartialOnlyUpsertFull(t *testing.T) {
 	if err := c.Store([]Entry{{Path: "/b", Size: 10, MtimeNs: 1, Full: full}}); err != nil {
 		t.Fatal(err)
 	}
-	got, hit, fullValid := c.Lookup("/b", 10, 1)
+	got, hit, fullValid := c.Lookup("/b", 10, 1, fsid.ID{})
 	if !hit || !fullValid {
 		t.Fatalf("补 full 后: hit=%v fullValid=%v", hit, fullValid)
 	}
@@ -145,7 +147,7 @@ func TestCorruptSelfHeal(t *testing.T) {
 	if err := c.Store([]Entry{{Path: "/z", Size: 1, MtimeNs: 1, Head: 1, Tail: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, hit, _ := c.Lookup("/z", 1, 1); !hit {
+	if _, hit, _ := c.Lookup("/z", 1, 1, fsid.ID{}); !hit {
 		t.Fatal("重建后应可正常使用")
 	}
 }
@@ -176,18 +178,47 @@ func TestTouchRefreshesLastHit(t *testing.T) {
 	if err := c.evictOverForTest(1); err != nil {
 		t.Fatal(err)
 	}
-	if _, hit, _ := c.Lookup("/f0", 1, 1); !hit {
+	if _, hit, _ := c.Lookup("/f0", 1, 1, fsid.ID{}); !hit {
 		t.Fatal("续期的 f0 不应被淘汰（R1 回归）")
 	}
-	if _, hit, _ := c.Lookup("/f1", 1, 1); hit {
+	if _, hit, _ := c.Lookup("/f1", 1, 1, fsid.ID{}); hit {
 		t.Fatal("最旧的 f1 应被淘汰")
 	}
-	if _, hit, _ := c.Lookup("/f2", 1, 1); !hit {
+	if _, hit, _ := c.Lookup("/f2", 1, 1, fsid.ID{}); !hit {
 		t.Fatal("f2 不应被淘汰")
 	}
 	// 空列表无操作
 	if err := c.Touch(nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// H2：缓存命中须核对物理身份（dev/ino/ctime_ns）。同路径被换 inode 或原地写
+// （ctime 前进）后，旧 full 哈希不可再用——任一要素不符即视为未命中。
+func TestLookupIdentityMismatch(t *testing.T) {
+	c := openTest(t)
+	full := bytes.Repeat([]byte{0x5}, 32)
+	if err := c.Store([]Entry{{Path: "/id", Size: 10, MtimeNs: 1,
+		Head: 1, Tail: 2, Mid1: 3, Mid2: 4,
+		Dev: 66, Ino: 77, CtimeNs: 88, Full: full}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, fullValid := c.Lookup("/id", 10, 1,
+		fsid.ID{Dev: 66, Ino: 77, CtimeNs: 88, Resolved: true}); !hit || !fullValid {
+		t.Fatal("身份三要素一致应命中且 full 有效")
+	}
+	for _, id := range []fsid.ID{
+		{Dev: 67, Ino: 77, CtimeNs: 88, Resolved: true},
+		{Dev: 66, Ino: 78, CtimeNs: 88, Resolved: true},
+		{Dev: 66, Ino: 77, CtimeNs: 89, Resolved: true},
+	} {
+		if _, hit, _ := c.Lookup("/id", 10, 1, id); hit {
+			t.Fatalf("身份不一致必须未命中: %+v", id)
+		}
+	}
+	// 未解析平台（Windows 零值 ID）：不因身份拦截，维持旧行为
+	if _, hit, _ := c.Lookup("/id", 10, 1, fsid.ID{}); !hit {
+		t.Fatal("未解析身份应照常命中")
 	}
 }
 
@@ -264,7 +295,7 @@ func TestOpenDropsLegacyUnusedIndex(t *testing.T) {
 		t.Fatalf("last_hit 索引缺失（淘汰依赖它）: %v", names)
 	}
 	// 3) 旧版本记录被整体作废（P0-2），且版本已写入
-	if _, hit, _ := c.Lookup("/legacy", 7, 8); hit {
+	if _, hit, _ := c.Lookup("/legacy", 7, 8, fsid.ID{}); hit {
 		t.Fatal("无版本标记的旧库记录不应继续命中")
 	}
 	st, err := c.GetStats()
@@ -300,7 +331,7 @@ func TestAlgoVersionStableAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	got, hit, fullValid := c2.Lookup("/keep", 4096, 42)
+	got, hit, fullValid := c2.Lookup("/keep", 4096, 42, fsid.ID{})
 	if !hit || !fullValid {
 		t.Fatalf("同版本重开后应命中且带全量: hit=%v fullValid=%v", hit, fullValid)
 	}
@@ -322,7 +353,7 @@ func TestLookupRejectsZeroSampleRow(t *testing.T) {
 		VALUES ('/z', 5, 6, x'00000000000000000000000000000000', ?, 1)`, bytes.Repeat([]byte{0x1}, 32)); err != nil {
 		t.Fatal(err)
 	}
-	if _, hit, _ := c.Lookup("/z", 5, 6); hit {
+	if _, hit, _ := c.Lookup("/z", 5, 6, fsid.ID{}); hit {
 		t.Fatal("全零采样行应视为未命中")
 	}
 }
