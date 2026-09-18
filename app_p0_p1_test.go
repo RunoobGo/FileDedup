@@ -27,7 +27,7 @@ func (e *eventRecorder) emit(_ context.Context, name string, _ ...interface{}) {
 	e.events = append(e.events, name)
 	e.mu.Unlock()
 	switch name {
-	case "scan:done", "scan:error", "scan:cancelled", "ops:done", "ops:error":
+	case "scan:done", "scan:error", "scan:cancelled", "ops:done", "ops:error", "ops:undo:done":
 		select {
 		case e.done <- name:
 		default:

@@ -1212,6 +1212,138 @@ func planOpItems(groups []*model.DuplicateGroup, keepIDs map[uint64]bool, ids []
 	return plans
 }
 
+// ---------- v0.5.0 功能 4：清理记录读取与回撤 ----------
+
+// UndoResult ops:undo:done 终止载荷（Restored 为实际落地路径，可能因重名另置）。
+type UndoResult struct {
+	OpID     int64              `json:"opId"`
+	OK       int                `json:"ok"`
+	Restored []string           `json:"restored"`
+	Failed   []model.FailedItem `json:"failed"`
+}
+
+// OpRecordDetail 单条清理记录（摘要 + 条目明细），供前端展开视图。
+type OpRecordDetail struct {
+	Meta  history.OpMeta   `json:"meta"`
+	Items []history.OpItem `json:"list"`
+}
+
+// ListOpRecords 清理记录列表（新→旧）。
+func (a *App) ListOpRecords() ([]history.OpMeta, error) {
+	if a.hist == nil {
+		return nil, fmt.Errorf("历史库不可用")
+	}
+	return a.hist.ListOps()
+}
+
+// GetOpRecord 单条清理记录的条目明细。
+func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
+	if a.hist == nil {
+		return OpRecordDetail{}, fmt.Errorf("历史库不可用")
+	}
+	m, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		return OpRecordDetail{}, err
+	}
+	return OpRecordDetail{*m, items}, nil
+}
+
+// ClearOpRecords 删除全部清理账本（不动已回收/已移动的文件本身）。
+func (a *App) ClearOpRecords() error {
+	if a.hist == nil {
+		return fmt.Errorf("历史库不可用")
+	}
+	return a.hist.ClearOps()
+}
+
+// UndoOperation 回撤一条清理记录：入口同步校验（历史库/互斥/记录可撤性），
+// 通过后异步逐项执行，进度复用 ops:progress，终止发 ops:undo:done。
+// 只处理 state=done 的条目——失败/跳过/取消项本就没动过文件系统，
+// 回撤失败的项保持 undo_failed，用户可修正后再次回撤（done 项已转 undone，
+// 天然幂等）。结果集不动：恢复的文件需要重新扫描确认状态。
+func (a *App) UndoOperation(opLogID int64) (string, error) {
+	a.mu.Lock()
+	if a.opsRunning {
+		a.mu.Unlock()
+		return "", fmt.Errorf("清理/回撤操作执行中，请稍候")
+	}
+	if a.scanInFlight {
+		a.mu.Unlock()
+		return "", fmt.Errorf("扫描进行中，请等待结束后再回撤")
+	}
+	hs := a.hist // 锁内快照：goroutine 内不得再解引用可变字段
+	if hs == nil {
+		a.mu.Unlock()
+		return "", fmt.Errorf("历史库不可用")
+	}
+	a.opsRunning = true
+	opCtx, cancelOp := context.WithCancel(context.Background())
+	a.opsCancel = cancelOp
+	a.mu.Unlock()
+
+	release := func() {
+		a.mu.Lock()
+		a.opsRunning = false
+		a.opsCancel = nil
+		a.mu.Unlock()
+		cancelOp()
+	}
+
+	meta, items, err := hs.GetOp(opLogID)
+	if err != nil {
+		release()
+		return "", err
+	}
+	if !meta.Undoable {
+		release()
+		return "", fmt.Errorf("该记录不可回撤（永久删除与 Windows 回收站不支持应用内回撤）")
+	}
+
+	undoID := fmt.Sprintf("undo-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
+	a.goTask("ops", release, func() {
+		var todo []history.OpItem
+		for _, it := range items {
+			if it.State == history.StateDone {
+				todo = append(todo, it)
+			}
+		}
+		res := UndoResult{OpID: opLogID, Restored: []string{}, Failed: []model.FailedItem{}}
+		total := len(todo)
+		for i, it := range todo {
+			if opCtx.Err() != nil {
+				break // 剩余项保持 done，可再次回撤
+			}
+			a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: i, Total: total, Current: it.OrigPath})
+			var restored string
+			var uerr error
+			if meta.Kind == "trash" && it.DestPath == "" {
+				// darwin 旧版/映射失败时条目没有回收站落点，无法定位
+				uerr = fmt.Errorf("无法定位回收站位置，请打开系统回收站手动还原")
+			} else {
+				restored, uerr = ops.UndoOne(ops.UndoItem{
+					Kind: meta.Kind, OrigPath: it.OrigPath, DestPath: it.DestPath,
+					LinkSrc: it.LinkSrc, Hash: it.Hash, Size: it.Size, MtimeNs: it.MtimeNs,
+				})
+			}
+			if uerr != nil {
+				if merr := hs.MarkItemUndo(it.ID, history.StateUndoFailed, uerr.Error()); merr != nil {
+					fmt.Fprintf(os.Stderr, "[history] 回撤失败态落库出错 %s: %v\n", it.OrigPath, merr)
+				}
+				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
+				continue
+			}
+			if merr := hs.MarkItemUndo(it.ID, history.StateUndone, ""); merr != nil {
+				fmt.Fprintf(os.Stderr, "[history] 回撤成功态落库出错 %s: %v\n", it.OrigPath, merr)
+			}
+			res.OK++
+			res.Restored = append(res.Restored, restored)
+		}
+		a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: total, Total: total, Current: ""})
+		a.emit(a.ctx, "ops:undo:done", res)
+	})
+	return undoID, nil
+}
+
 // OpenTrash 打开系统回收站（M3-T06：恢复引导）。
 func (a *App) OpenTrash() error {
 	switch runtime.GOOS {

@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
+	"filededup/internal/history"
 	"filededup/internal/model"
 )
 
@@ -193,5 +195,151 @@ func TestExecuteOperationWithoutHistoryStillWorks(t *testing.T) {
 	a.mu.Unlock()
 	if n != 0 { // S8 语义下结果集照常裁剪
 		t.Fatalf("结果集应清空, got %d 组", n)
+	}
+}
+
+// ---------- Task 11：App.UndoOperation ----------
+
+// waitUndoDone 阻塞直到 ops:undo:done。
+func waitUndoDone(t *testing.T, rec *eventRecorder) {
+	t.Helper()
+	if ev := rec.waitTerminal(t, "undo"); ev != "ops:undo:done" {
+		t.Fatalf("undo 终止事件 = %s", ev)
+	}
+}
+
+// seedDoneOp 直接落一条「已执行完」的操作账本（绕过真实清理，构造回撤输入）。
+// dests[i] 为空串模拟回收站映射缺失；hash 仅 hardlink 类型用到。
+func seedDoneOp(t *testing.T, a *App, kind string, undoable bool,
+	origs, dests []string, size uint64) int64 {
+	t.Helper()
+	plans := make([]history.OpItemPlan, len(origs))
+	for i, p := range origs {
+		plans[i] = history.OpItemPlan{OrigPath: p, Size: size}
+	}
+	opID, err := a.hist.BeginOp(kind, "", 0, undoable, plans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range origs {
+		if err := a.hist.FinishItem(opID, p, dests[i], "", history.StateDone, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.hist.FinalizeOp(opID); err != nil {
+		t.Fatal(err)
+	}
+	return opID
+}
+
+// trash 记录回撤：文件回原位、条目变 undone、重复回撤幂等（0 项处理）。
+func TestUndoOperationTrashRestores(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("UNDO-APP-TRASH!!!")
+	dest := filepath.Join(dir, "trash", "a.bin")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := filepath.Join(dir, "home", "a.bin")
+	a, rec := newHistApp(t)
+	opID := seedDoneOp(t, a, "trash", true, []string{orig}, []string{dest}, uint64(len(content)))
+
+	if _, err := a.UndoOperation(opID); err != nil {
+		t.Fatal(err)
+	}
+	waitUndoDone(t, rec)
+	if got, err := os.ReadFile(orig); err != nil || string(got) != string(content) {
+		t.Fatalf("文件未回原位: err=%v", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("回收站侧残留")
+	}
+	_, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].State != history.StateUndone {
+		t.Fatalf("条目未记 undone: %+v", items)
+	}
+
+	// 幂等：再次回撤 → 正常收尾但 0 项处理
+	if _, err := a.UndoOperation(opID); err != nil {
+		t.Fatal(err)
+	}
+	waitUndoDone(t, rec)
+	if got, _ := os.ReadFile(orig); string(got) != string(content) {
+		t.Fatal("重复回撤改动了已恢复的文件")
+	}
+}
+
+// 不可撤记录（delete / Windows trash 映射缺失）→ 入口同步报错。
+func TestUndoOperationNotUndoable(t *testing.T) {
+	a, _ := newHistApp(t)
+	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)
+	if _, err := a.UndoOperation(opID); err == nil ||
+		!strings.Contains(err.Error(), "该记录不可回撤") {
+		t.Fatalf("delete 记录应拒绝回撤: %v", err)
+	}
+	if _, err := a.UndoOperation(99999); err == nil ||
+		!strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("缺失记录应报错: %v", err)
+	}
+}
+
+// 部分条目失败不中断整批：映射缺失项记 undo_failed，其余照常恢复。
+func TestUndoOperationPartialFailure(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("PARTIAL-OK!")
+	dest := filepath.Join(dir, "t", "b.bin")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, rec := newHistApp(t)
+	opID := seedDoneOp(t, a, "trash", true,
+		[]string{filepath.Join(dir, "lost", "a.bin"), filepath.Join(dir, "home", "b.bin")},
+		[]string{"", dest}, uint64(len(content)))
+
+	if _, err := a.UndoOperation(opID); err != nil {
+		t.Fatal(err)
+	}
+	waitUndoDone(t, rec)
+	_, items, err := a.hist.GetOp(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].State != history.StateUndoFailed ||
+		items[1].State != history.StateUndone {
+		t.Fatalf("部分失败收口不符: %+v", items)
+	}
+	if items[0].Err == "" {
+		t.Fatal("失败原因未落库")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "home", "b.bin")); string(got) != string(content) {
+		t.Fatal("正常项未恢复")
+	}
+}
+
+// 历史库缺失 / 操作在途 → 同步拒绝。
+func TestUndoOperationGates(t *testing.T) {
+	a, _ := newHistApp(t)
+	a.mu.Lock()
+	a.hist = nil
+	a.mu.Unlock()
+	if _, err := a.UndoOperation(1); err == nil || !strings.Contains(err.Error(), "历史库不可用") {
+		t.Fatalf("hist=nil 应报错: %v", err)
+	}
+
+	a2, _ := newHistApp(t)
+	a2.mu.Lock()
+	a2.opsRunning = true
+	a2.mu.Unlock()
+	if _, err := a2.UndoOperation(1); err == nil {
+		t.Fatal("操作在途时应拒绝")
 	}
 }
