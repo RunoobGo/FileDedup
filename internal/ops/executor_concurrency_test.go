@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 
@@ -51,13 +52,17 @@ func TestExecuteConcurrentDeleteOrdering(t *testing.T) {
 		ids = append(ids, f.ID)
 	}
 
+	// 并发下「先原子加一再回调」不保证到达顺序（39 可能晚于 40 触发），
+	// 因此断言完备性而非末值：回调恰 n 次且取值集合为 1..n，即无丢失无重复。
 	var mu sync.Mutex
-	var lastDone, lastTotal int
+	var seen []int
+	var totalSeen int
 	res := Execute(Options{
 		Groups: []*model.DuplicateGroup{g},
 		OnProgress: func(done, total int, _ string) {
 			mu.Lock()
-			lastDone, lastTotal = done, total
+			seen = append(seen, done)
+			totalSeen = total
 			mu.Unlock()
 		},
 	}, model.OpRequest{Kind: "delete", FileIDs: ids, ConfirmDanger: true})
@@ -75,8 +80,14 @@ func TestExecuteConcurrentDeleteOrdering(t *testing.T) {
 		}
 	}
 	// 进度走满（含失败项亦计入完成）
-	if lastDone != n || lastTotal != n {
-		t.Fatalf("进度未走满: %d/%d", lastDone, lastTotal)
+	if totalSeen != n || len(seen) != n {
+		t.Fatalf("进度回调次数 = %d (total=%d), want %d", len(seen), totalSeen, n)
+	}
+	sort.Ints(seen)
+	for i, v := range seen {
+		if v != i+1 {
+			t.Fatalf("进度取值集合非 1..n: %v", seen)
+		}
 	}
 	// 释放空间汇总正确（并发下无丢失更新）
 	wantBytes := g.Files[0].Size * uint64(n)
