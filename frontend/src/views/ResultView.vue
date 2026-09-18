@@ -135,8 +135,10 @@ function onConfirm(targetDir?: string) {
             <option value="oldest">最旧</option>
             <option value="directory">指定目录优先级…</option>
           </select>
-          <button class="btn-ghost" :disabled="keepDirsDisabled" @click="applyKeep">应用</button>
-          <button class="btn-ghost" title="清除决策回到默认建议" @click="store.clearKeep()">重置</button>
+          <button class="btn-ghost" :disabled="keepDirsDisabled || store.busy"
+            :title="store.busyTip || '按所选策略标出保留项'" @click="applyKeep">应用</button>
+          <button class="btn-ghost" :disabled="store.busy"
+            :title="store.busyTip || '清除决策回到默认建议'" @click="store.clearKeep()">重置</button>
         </div>
         <span class="sel-info" aria-live="polite">
           <template v-if="store.selectedFiles.length">
@@ -170,15 +172,15 @@ function onConfirm(targetDir?: string) {
         <button class="btn-ghost" :class="{ 'btn-emph': store.selectedFiles.length === 0 }"
           title="选中全部冗余项（保留项不可勾选）" @click="store.selectAll()">全选</button>
         <button class="btn-ghost" @click="store.clearSelection()">清除</button>
-        <button class="btn-primary" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'trash'">移入回收站</button>
-        <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'move'">移动到…</button>
-        <button class="btn-ghost" :disabled="store.selectedFiles.length === 0"
-          title="替换为指向保留文件的硬链接（同卷）"
+        <button class="btn-primary" :disabled="store.selectedFiles.length === 0 || store.busy"
+          :title="store.busyTip || '把所选重复文件移入系统回收站'" @click="confirmKind = 'trash'">移入回收站</button>
+        <button class="btn-ghost" :disabled="store.selectedFiles.length === 0 || store.busy"
+          :title="store.busyTip || '移动到本会话授权的目录'" @click="confirmKind = 'move'">移动到…</button>
+        <button class="btn-ghost" :disabled="store.selectedFiles.length === 0 || store.busy"
+          :title="store.busyTip || '替换为指向保留文件的硬链接（同卷）'"
           @click="confirmKind = 'hardlink'">硬链接合并</button>
-        <button class="btn-danger" :disabled="store.selectedFiles.length === 0"
-          @click="confirmKind = 'delete'">永久删除</button>
+        <button class="btn-danger" :disabled="store.selectedFiles.length === 0 || store.busy"
+          :title="store.busyTip || '不可恢复，需二次确认'" @click="confirmKind = 'delete'">永久删除</button>
       </div>
     </div>
 

@@ -54,6 +54,7 @@ const OP_KIND_LABEL: Record<string, string> = {
 const STATE_LABEL: Record<string, string> = {
   planned: '待处理', done: '已执行', failed: '失败', skipped: '已跳过',
   cancelled: '已取消', interrupted: '中断', undone: '已回撤', undo_failed: '回撤失败',
+  undoing: '回撤中',
 }
 
 // done 口径含已回撤项（执行账本不冲销），剩余可撤 = done - undone
@@ -166,10 +167,12 @@ function destSummary(it: OpRecordItem): string {
       <template v-if="tab === 'ops'">
         <button class="btn-ghost" title="在系统回收站中查看/还原已回收文件" @click="store.openTrash()">打开系统回收站</button>
         <template v-if="store.opList.length">
-          <button v-if="!confirmClearOps" class="btn-ghost" @click="confirmClearOps = true">清空</button>
+          <!-- B3-1：账本在途时不可清空（后端同样拒绝，这里免掉"点了才报错"） -->
+          <button v-if="!confirmClearOps" class="btn-ghost" :disabled="store.busy"
+            :title="store.busyTip || '清空全部清理记录'" @click="confirmClearOps = true">清空</button>
           <template v-else>
             <span class="confirm-tip">确认清空清理记录？清空后未回撤的操作将无法再回撤</span>
-            <button class="btn-danger" @click="clearAllOps">确认清空</button>
+            <button class="btn-danger" :disabled="store.busy" @click="clearAllOps">确认清空</button>
             <button class="btn-ghost" @click="confirmClearOps = false">取消</button>
           </template>
         </template>

@@ -92,6 +92,37 @@ export const useScanStore = defineStore('scan', () => {
 
   const running = () => ['Scanning', 'Prefiltering', 'Hashing', 'Paused'].includes(status.value)
 
+  // B3-1：所有会改写后端状态/文件系统的入口统一过这道门。
+  // 后端对同类请求本来就回绝（StartScan / ExecuteOperation / ApplyKeepPolicy /
+  // Undo* / ClearOpRecords 都检 opsRunning），但只在失败时才弹一条 toast 的做
+  // 法有两个问题：连点时界面先被置成"执行中"再复位（闪烁），而 clearKeep 这类
+  // 入口原先后端无守卫、前端也没挡，等于在操作途中改写保护集。
+  function busyReason(): string | null {
+    if (opsRunning.value) return '清理/回撤操作执行中，请等待完成'
+    if (scanning.value) return '扫描进行中，请等待完成'
+    return null
+  }
+  function guard(what: string): boolean {
+    const r = busyReason()
+    if (r) {
+      toast().notifyError(`${what}失败`, r)
+      return false
+    }
+    return true
+  }
+  // 视图侧禁用态：与 guard 同源，避免"按钮可点、点了报错"。
+  const busyTip = computed(() => busyReason() ?? '')
+  const busy = computed(() => busyTip.value !== '')
+
+  // B3-2：结果集代际号。后端已用同一思路弃写陈旧收尾（C7），前端必须配套：
+  // 一次分页请求在途时可能启动新扫描或改开另一条历史，返回的页属于已作废的
+  // 集合，照写会把旧结果盖回界面——此时界面上的 fileID 已失效，勾选即可对
+  // 错文件发起清理。故请求发起时记下代际，回写前必须仍相等。
+  let resultGen = 0
+  function bumpResultGen() {
+    resultGen++
+  }
+
   function refreshStatus() {
     if (!isBackendAvailable()) return
     api.getStatus().then((s: string) => {
@@ -105,6 +136,7 @@ export const useScanStore = defineStore('scan', () => {
   // 启动成功即清（启动失败时后端未清理，旧结果仍然有效，不能连带清掉）。
   // 只清结果态：roots/filters/threads/settings 是用户输入，保持不动。
   function clearStaleResult() {
+    bumpResultGen() // 在途分页回包就此作废（B3-2）
     groups.value = []
     totalGroups.value = 0
     reclaimableTotal.value = 0
@@ -121,6 +153,7 @@ export const useScanStore = defineStore('scan', () => {
 
   function startScan() {
     if (roots.value.length === 0) return
+    if (!guard('启动扫描')) return
     scanning.value = true
     status.value = 'Scanning'
     progress.value = null
@@ -171,6 +204,7 @@ export const useScanStore = defineStore('scan', () => {
   async function doLoadResultPage(append: boolean) {
     // Y7：已达放量上限时忽略滚动追加，需经 loadMore 显式放量
     if (append && groups.value.length >= loadCap.value) return
+    const gen = resultGen
     loadingPage.value = true
     try {
       const r = await api.getResultGroups({
@@ -179,6 +213,7 @@ export const useScanStore = defineStore('scan', () => {
         sort: resultSort.value,
         ext: resultExt.value,
       })
+      if (gen !== resultGen) return // 结果集已被新扫描/新历史作废，回包不得盖回界面
       if (append) {
         groups.value.push(...r.groups)
         resultPage.value++
@@ -225,13 +260,15 @@ export const useScanStore = defineStore('scan', () => {
   // openHistory 把一条历史恢复为当前结果集并切到结果页。
   // 陈旧文件安全由后端操作前逐文件校验兜底（S1/S8），载入不做文件系统遍历。
   async function openHistory(id: number) {
-    if (opsRunning.value || scanning.value) {
-      toast().notifyError('打开历史失败', '扫描/清理进行中，请稍后再试')
+    const reason = busyReason()
+    if (reason) {
+      toast().notifyError('打开历史失败', `${reason}，请稍后再试`)
       return
     }
     histLoading.value = true
     try {
       const s = await api.loadScanHistory(id)
+      bumpResultGen() // 上一代结果集就此作废（B3-2）
       groups.value = []
       resultPage.value = 0
       loadCap.value = DEFAULT_LOAD_CAP
@@ -306,10 +343,7 @@ export const useScanStore = defineStore('scan', () => {
   // undoRecord 回撤一条清理记录。后端同步拒绝（不可撤/在途）时走 catch；
   // 受理后的终止事件是 ops:undo:done（复用 opsRunning 互斥）。
   async function undoRecord(opId: number) {
-    if (opsRunning.value) {
-      toast().notifyError('回撤失败', '清理/回撤操作执行中，请稍候')
-      return
-    }
+    if (!guard('回撤')) return
     opsRunning.value = true
     opsProgress.value = { Done: 0, Total: 0, Current: '' }
     try {
@@ -323,20 +357,20 @@ export const useScanStore = defineStore('scan', () => {
 
   // undoItem 回撤记录中的单个条目（done/undo_failed 可撤），事件与互斥同 undoRecord。
   async function undoItem(opId: number, itemId: number) {
-    if (opsRunning.value) {
-      toast().notifyError('回撤失败', '清理/回撤操作执行中，请稍候')
-      return
-    }
+    if (!guard('回撤')) return
     opsRunning.value = true
+    opsProgress.value = { Done: 0, Total: 0, Current: '' }
     try {
       await api.undoOperationItem(opId, itemId)
     } catch (e: any) {
       opsRunning.value = false
+      opsProgress.value = null
       toast().notifyError('回撤失败', e)
     }
   }
 
   async function clearOps() {
+    if (!guard('清空清理记录')) return
     try {
       await api.clearOpRecords()
       await refreshOps()
@@ -418,15 +452,26 @@ export const useScanStore = defineStore('scan', () => {
   const selectedBytes = computed(() => selectedFiles.value.reduce((s, f) => s + f.size, 0))
 
   async function applyKeep(kind: string, dirs: string[] = []) {
+    if (!guard('应用保留策略')) return
     try {
-      await api.applyKeepPolicy(kind, dirs)
+      const oc = await api.applyKeepPolicy(kind, dirs)
       await loadResultPage(false) // 后端决策已生效，重载视图（并清空勾选）
+      // I4：按目录保留时，组内没有任何文件落在保留目录的组不会被标出保留者，
+      // 也就完全不受「保留文件不可清理」的保护——必须显式告知，不能说"已应用"就完事。
+      const n = oc?.unmatchedGroups ?? 0
+      if (n > 0) {
+        toast().push(
+          `${n} 组没有任何重复文件位于保留目录，未标出保留项、不受保护；对这些组仍需手动勾选或改用其他策略`,
+          'warn',
+        )
+      }
     } catch (e: any) {
       toast().notifyError('保留策略应用失败', e)
     }
   }
 
   async function clearKeep() {
+    if (!guard('重置保留决策')) return
     try {
       await api.clearKeepDecisions()
       await loadResultPage(false)
@@ -438,6 +483,7 @@ export const useScanStore = defineStore('scan', () => {
   async function executeOp(kind: 'trash' | 'delete' | 'move' | 'hardlink', targetDir?: string, confirmDanger = false) {
     const ids = selectedFiles.value.map(f => f.id)
     if (ids.length === 0) return
+    if (!guard('执行清理操作')) return
     opsRunning.value = true
     opsResult.value = null
     opsProgress.value = { Done: 0, Total: ids.length, Current: '' }
@@ -464,10 +510,12 @@ export const useScanStore = defineStore('scan', () => {
   }
 
   // ---------- 事件桥绑定 ----------
-  // 失败清单安全拉取：事件回调内的 rejection 无人接棒会变 unhandled
-  async function refreshFailed() {
+  // 失败清单安全拉取：事件回调内的 rejection 无人接棒会变 unhandled。
+  // 与分页同口径带代际：拉回时结果集已换代则丢弃（失败清单属于上一代结果）。
+  async function refreshFailed(gen = resultGen) {
     try {
-      failed.value = await api.getFailedItems()
+      const list = await api.getFailedItems()
+      if (gen === resultGen) failed.value = list
     } catch {
       // 后端暂不可用：保留现有清单
     }
@@ -514,6 +562,12 @@ export const useScanStore = defineStore('scan', () => {
     bind('app:error', (e: any) => {
       const msg = (e && typeof e === 'object' && e.error) ? e.error : String(e ?? '未知错误')
       toast().notifyError('后台提示', msg)
+    })
+    // 2026-09-18 审查 C5：关窗时在途扫描/清理被拦下（后端已同时请求中止）。
+    // 不给提示的话第一次点关闭看起来像"按钮坏了"。
+    bind('app:quit-blocked', (e: any) => {
+      const msg = (e && typeof e === 'object' && e.message) ? e.message : String(e ?? '任务进行中')
+      toast().push(msg, 'info')
     })
     bind('scan:progress', (ev: ProgressEvent) => {
       progress.value = ev
@@ -565,13 +619,15 @@ export const useScanStore = defineStore('scan', () => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
   }
 
-  async function saveSettings(s: Settings) {
-    try {
-      settings.value = await api.saveSettings(s)
-      applyTheme(s.theme)
-    } catch (e: any) {
-      toast().notifyError('保存设置失败', e)
-    }
+  // B3-3：保存失败必须让调用方知道。修正前这里把异常吞成 fulfilled 的
+  // undefined，设置页 `store.settings = await store.saveSettings(draft)`
+  // 于是把整个设置态赋成 undefined，同时还提示"已保存"。
+  // 主题按后端回包（已归一）应用，不按草稿应用，避免界面与实际生效值分叉。
+  async function saveSettings(s: Settings): Promise<Settings> {
+    const saved = await api.saveSettings(s)
+    settings.value = saved
+    applyTheme(saved.theme)
+    return saved
   }
 
   async function openPreview(fileID: number) {
@@ -621,6 +677,7 @@ export const useScanStore = defineStore('scan', () => {
     opList, refreshOps, undoRecord, undoItem, clearOps,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
+    busy, busyTip,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,

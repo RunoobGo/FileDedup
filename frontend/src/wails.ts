@@ -104,6 +104,13 @@ export interface KeepDecision {
   removeIDs: number[]
 }
 
+// 保留策略结果（app.go KeepOutcome）。unmatchedGroups > 0 表示有组在
+// 「按目录保留」下一条保留者都没标出来，这些组不受保护，必须提示用户。
+export interface KeepOutcome {
+  decisions?: KeepDecision[]
+  unmatchedGroups: number
+}
+
 export interface OpsProgress {
   Done: number
   Total: number
@@ -148,7 +155,7 @@ export interface OpRecordItem {
   origPath: string
   destPath: string
   linkSrc: string
-  state: string // planned/done/failed/skipped/cancelled/interrupted/undone/undo_failed
+  state: string // planned/done/failed/skipped/cancelled/interrupted/undoing/undone/undo_failed
   err: string
   size: number
   mtimeNs: number
@@ -199,7 +206,7 @@ export interface BackendAPI {
   LoadScanHistory(id: number): Promise<ScanSummary>
   DeleteScanHistory(id: number): Promise<void>
   ClearScanHistory(): Promise<void>
-  ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepDecision[]>
+  ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepOutcome>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
   CancelOperation(): Promise<void>
@@ -263,7 +270,7 @@ export const api = {
   loadScanHistory: (id: number): Promise<ScanSummary> => backend().LoadScanHistory(id),
   deleteScanHistory: (id: number): Promise<void> => backend().DeleteScanHistory(id),
   clearScanHistory: (): Promise<void> => backend().ClearScanHistory(),
-  applyKeepPolicy: (kind: string, dirs: string[] = []): Promise<KeepDecision[]> =>
+  applyKeepPolicy: (kind: string, dirs: string[] = []): Promise<KeepOutcome> =>
     backend().ApplyKeepPolicy({ Kind: kind, Directories: dirs }),
   clearKeepDecisions: (): Promise<void> => backend().ClearKeepDecisions(),
   executeOperation: (op: OpRequest): Promise<string> => backend().ExecuteOperation(op),

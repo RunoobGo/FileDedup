@@ -41,11 +41,19 @@ onMounted(async () => {
   }
 })
 
+// B3-3：store.saveSettings 现在会抛出失败。修正前它吞掉异常返回 undefined，
+// 这里既把整个设置态赋空、又提示"已保存"——保存失败在界面上完全不可见。
 async function save() {
   if (!draft.value) return
-  store.settings = await store.saveSettings(draft.value)
-  saved.value = true
-  setTimeout(() => (saved.value = false), 1500)
+  try {
+    const result = await store.saveSettings(draft.value)
+    // 后端会归一取值（threads 钳制、theme 兜底），回填草稿使界面 = 实际生效值
+    draft.value = JSON.parse(JSON.stringify(result))
+    saved.value = true
+    setTimeout(() => (saved.value = false), 1500)
+  } catch (e: any) {
+    toast.notifyError('保存设置失败', e)
+  }
 }
 </script>
 

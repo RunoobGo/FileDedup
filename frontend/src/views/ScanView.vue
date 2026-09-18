@@ -203,8 +203,8 @@ const progressPercent = computed(() => {
         <div class="filter-foot">
           <button class="btn-ghost" @click="resetFilters">重置过滤</button>
           <button class="btn-primary start"
-            :disabled="store.roots.length === 0 || store.opsRunning"
-            :title="store.opsRunning ? '清理操作执行中，请等待完成' : undefined"
+            :disabled="store.roots.length === 0 || store.busy"
+            :title="store.busyTip || undefined"
             @click="store.startScan()">
             开始扫描（{{ store.roots.length }} 个目录）
           </button>
