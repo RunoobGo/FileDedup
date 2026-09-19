@@ -1,0 +1,190 @@
+name: Build Wails App
+
+on:
+  push:
+    tags:
+      - 'v*'           # 推送 v1.0.0 等标签时自动构建并发布 Release
+  workflow_dispatch:   # 允许在 GitHub 网页端手动点击触发
+
+jobs:
+  build:
+    name: Build - ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read   # 最小权限：仅 release job 需要 contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1. Linux AMD64
+          # webkit2_41：wails v2.16 仅按构建标签选择 WebKit 4.1（ubuntu-24.04 无 4.0 包，
+          # 且 wails doctor 的依赖表只认 4.0 包名，报 Not Found 属显示局限，非真实缺失）
+          - os: ubuntu-latest
+            platform: linux
+            arch: amd64
+            go_tags: webkit2_41
+            asset_name: FileDedup-linux-amd64
+            archive_name: FileDedup-linux-amd64.tar.gz
+          # 2. Windows AMD64
+          - os: windows-latest
+            platform: windows
+            arch: amd64
+            asset_name: FileDedup-windows-amd64
+            archive_name: FileDedup-windows-amd64.zip
+          # 3. macOS ARM64 (Apple Silicon M1/M2/M3)
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            asset_name: FileDedup-macos-arm64
+            archive_name: FileDedup-macos-arm64.zip
+          # 4. macOS AMD64 (Intel)：macos-13 已退役，用 macos-15-intel
+          - os: macos-15-intel
+            platform: darwin
+            arch: amd64
+            asset_name: FileDedup-macos-amd64
+            archive_name: FileDedup-macos-amd64.zip
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      # B3-5 发布门禁第一道：5 处版本号声明位必须对齐，且 v* tag 必须等于 AppVersion。
+      # 不把事件字段插值进 shell——脚本自行读 GITHUB_REF_NAME，非 v* tag（如
+      # workflow_dispatch）自动跳过 tag 比对。
+      - name: Version Sync Check
+        shell: bash
+        run: bash scripts/check-version-sync.sh
+
+      # ================= 1. Linux 系统依赖 (修复 Exit Code 1) =================
+      - name: Install Linux Dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          # ubuntu-24.04：wails v2 要求 WebKit 4.1，无 4.0 包，不做回退（回退只会把错误推迟到 wails build）
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev
+
+      # ================= 2. 前端构建 =================
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        shell: bash
+        run: |
+          if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+          npm run build
+
+      # ================= 3. Go & Wails 环境 =================
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod   # 与 go.mod 保持一致，勿硬编码版本
+          cache: true
+
+      - name: Install Wails CLI
+        # 固定与 go.mod 相同的 wails 版本，避免 @latest 与项目版本漂移
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0
+
+      # ================= 4. Go 测试（发布门槛） =================
+      - name: Run Go Tests
+        if: matrix.platform != 'windows'
+        run: go test -count=1 ./...
+
+      # B3-4：Windows 测试改为阻断式白名单门禁。原先 continue-on-error 让整个
+      # 平台的测试不设防（任何回归都被"仅告警"吞掉）。现在只有清单内逐条列明
+      # 原因的用例被隔离，其余失败直接断掉发布构建。
+      - name: Run Go Tests (Windows, quarantined)
+        if: matrix.platform == 'windows'
+        run: bash scripts/test-windows-quarantine.sh
+
+      # B3-4：发布构建补数据正确性冒烟（回归配方第 6 步，见 docs/archive/里程碑开发与测试报告.md 第 4 篇 §7.5）。只在 linux
+      # 一腿跑一次：冷扫 / 缓存首扫 / 缓存复扫三跑逐项一致，并与 benchgen
+      # manifest 对账（漏报无法靠互比发现，必须对期望值）。
+      - name: CLI Smoke (cold / cache / warm-cache)
+        if: matrix.platform == 'linux'
+        run: bash scripts/smoke-cli.sh
+
+      # ================= 5. Wails 编译 (带详细诊断) =================
+      - name: Build Wails Binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.platform }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 1
+          GO_TAGS: ${{ matrix.go_tags }}
+        run: |
+          # 打印环境诊断信息，方便排查
+          wails doctor || true
+
+          # 注意：-v 是 int 型 flag（0/1/2），裸 -v 会报 "flag needs an argument"
+          wails build -clean -s -skipbindings -ldflags "-s -w" -tags "$GO_TAGS"
+
+          echo "✅ Build output:"
+          ls -la build/bin/
+
+      # ================= 6. 打包 =================
+      - name: Package Artifact
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          if [ "$PLATFORM" == "darwin" ]; then
+            # macOS：打包完整 .app bundle（保留 Info.plist/图标），不用 find 挑裸二进制
+            [ -d "build/bin/FileDedup.app" ] || { echo "❌ build/bin/FileDedup.app not found"; exit 1; }
+            zip -ry "$ARCHIVE_NAME" build/bin/FileDedup.app
+          else
+            # 自动查找 build/bin 下的可执行文件
+            BINARY=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \) | head -1)
+
+            if [ -z "$BINARY" ]; then
+              echo "❌ Binary not found in build/bin/"
+              exit 1
+            fi
+
+            if [ "$PLATFORM" == "windows" ]; then
+              powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '$ARCHIVE_NAME'"
+            else
+              tar -czf "$ARCHIVE_NAME" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
+            fi
+          fi
+
+      # ================= 7. 上传产物 =================
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.archive_name }}
+          retention-days: 7
+
+  # ================= 8. 自动发布 Release =================
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # 04 附录 A「SHA-256 checksum 文件」：随 Release 一并发布，用户可比对下载完整性
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum FileDedup-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true

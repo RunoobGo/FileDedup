@@ -1,0 +1,123 @@
+# CI 流水线（04 §4：PR 检查阶段）
+#
+# 覆盖本地已认可的回归配方（docs/archive/里程碑开发与测试报告.md 第 4 篇 §7.5，原 docs/08）：gofmt + 跨平台 vet + go test -race
+# （全包 count=2 / 根包 count=4）+ 前端 typecheck 与 build + CLI 冒烟双跑比对。
+#
+# 顺序约束（勿调换）：main.go 使用 `//go:embed frontend/dist`，
+# 而 frontend/dist 属构建产物（.gitignore 排除），因此必须先构建前端，
+# 否则 go vet / go test 会因 embed 找不到目录而失败。
+#
+# 本流水线不依赖 wails CLI：前端由 npm 直接构建，后端由 go 直接编译。
+#
+# 尚未纳入（原因见同文 §7.5 与 docs/04 §4.3）：
+#   - eslint：前端未配置 lint 规则集
+#   - 契约 diff 检查：需专门的"Go json tag ↔ TS 接口"校验器（尚未实现）
+#   - macOS/Linux 真实回收站与 GUI 端到端：需人工或桌面会话
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: gofmt / vet x3 / test -race / frontend / smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: gofmt 检查
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请执行 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # B3-5：版本号声明位（app.go / wails.json / package{,-lock}.json / docs/09）
+      # 必须互相对齐；tag 触发时脚本自解析 GITHUB_REF_NAME 再比对 tag。
+      - name: 版本号一致性检查
+        run: bash scripts/check-version-sync.sh
+
+      - name: 前端类型检查（vue-tsc）
+        working-directory: frontend
+        run: npm ci && npm run typecheck
+
+      - name: 前端构建（须先于 Go 步骤：go:embed 依赖 frontend/dist）
+        working-directory: frontend
+        run: npm run build
+
+      - name: go vet（本机 linux）
+        run: go vet ./...
+
+      # 跨平台 vet：本平台 runner 无法跑 Windows 测试，但至少保证 Windows 分支
+      # 能编译且通过静态检查（fsid 句柄查询、路径处理等 build tag 分文件）。
+      - name: go vet（GOOS=windows）
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: go vet（GOOS=darwin）
+        run: GOOS=darwin GOARCH=arm64 go vet ./...
+
+      - name: go test -race -count=2
+        run: go test -race -count=2 ./...
+
+      # 根包（App 层）与事件/互斥状态机耦合最紧，单独多跑两轮压竞态窗口
+      - name: go test -race -count=4（根包）
+        run: go test -race -count=4 .
+
+      # CLI 冒烟：固定数据集上「冷扫 / 缓存首扫 / 缓存复扫」三次结果必须逐项一致，
+      # 断言口径是分组路径集合与可释放字节（files_total 属阶段口径，见脚本说明）。
+      - name: CLI 冒烟（benchgen C×0.02 + fdd-cli 三跑比对）
+        run: bash scripts/smoke-cli.sh
+
+  windows:
+    name: go test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 前端产物：main.go 的 go:embed 需要 frontend/dist（本 job 不跑 npm，
+      # 只测不含 embed 依赖的内部包之外仍需可编译，故直接构建一次 dist）
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 前端构建
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # 白名单式隔离：清单内的历史失败暂不阻断，其余一律阻断（含 fsid 的
+      # Windows 句柄身份用例，I7 的真实验证入口）
+      - name: go test（隔离清单见 scripts/test-windows-quarantine.sh）
+        run: bash scripts/test-windows-quarantine.sh

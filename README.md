@@ -1,0 +1,124 @@
+# FileDedup
+
+重复文件查找与清理桌面应用。基于 **Wails v2 + Vue 3 + Go** 构建，可在 macOS / Windows / Linux 上以原生窗口运行。
+
+## 功能特性
+
+- 多根目录扫描，按内容哈希（默认 BLAKE3-256）识别重复文件
+- 分组展示重复项：按可释放空间 / 单文件大小 / 文件数排序，按扩展名过滤；扫描前可按扩展名 / 大小 / 路径预筛
+- 可预览文件元信息与内容（Markdown 等），一键在文件管理器中定位
+- 增量缓存：已扫描文件的哈希结果落盘（`cache.db`），二次扫描大幅提速；命中前须过四道检查
+  （大小 + mtime → 物理身份 → 四点采样复核 → 采样非全零）。物理身份 unix 取 `fstat`
+  的卷/inode/ctime，Windows 取句柄查询的卷序列号 + 文件索引；不给稳定索引的卷（FAT/exFAT、
+  部分网络共享）上身份那道自动跳过，缓存只是加速手段而非等价证明
+- 安全删除：默认移入系统回收站，永久删除需显式二次确认；每次清理写"写前账本"（`history.db`），
+  逐文件落账，失败项可单项重试回撤
+  - 可回撤范围：回收站（macOS / Linux）、移动、硬链接合并；**Windows 回收站与永久删除标注为
+    不可回撤**（前者系统 API 不返回可靠落点，用「打开系统回收站」手动还原）
+  - 账本写不进时**承诺可回撤的操作一律拒绝执行**，不允许"清完才发现无从恢复"
+  - 硬链接合并校验 inode 防"校验后被替换"；跨卷移动为「复制 + 字节数校验 + fsync + 还原权限与
+    mtime + 删源」，任一步失败保留源（不承诺复制后的内容哈希复核）
+- 扫描历史与清理记录可回看；清理/回撤执行期由后端互斥门统一拒绝并发操作，前端按钮同时置灰
+
+> 当前版本：**0.5.0**（应用内「关于」/ `GetVersion` 与仓库 5 处版本号声明位由
+> `scripts/check-version-sync.sh` 强制对齐，详见下方[发布](#发布)）。
+> 完整功能与安全性说明以 [docs/09-用户手册.md](docs/09-用户手册.md) 为准；
+> 工程现状与门禁看 [docs/04-开发与测试计划.md](docs/04-开发与测试计划.md)；
+> 该看哪份文档的索引见 [docs/README.md](docs/README.md)。
+
+## 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 桌面壳 | Wails v2（Go + WebView） |
+| 前端 | Vue 3 + Pinia + Vite 5 |
+| 后端 | Go（哈希、缓存、去重分析） |
+| 存储 | SQLite（`cache.db` 哈希缓存 / `history.db` 扫描历史与清理账本，均 modernc 纯 Go 驱动） |
+
+## 构建与运行
+
+```bash
+# 依赖：Go 1.27.1+（与 go.mod 的 go 指令一致）、Node 22（CI 口径，≥18 可本地跑）、Wails v2 CLI
+wails dev      # 开发模式（热更新）
+wails build    # 产出当前平台安装包（build/bin/）
+```
+
+CI 不使用 wails CLI（前端 npm 直构 + 后端 go 直编），仅发布构建 build.yml 装
+`wails@v2.16.0`（与 go.mod 锁定的库版本一致，防 CLI 静默改写依赖）。
+
+命令行工具（无界面，用于冒烟与基准）：
+
+```bash
+go run ./cmd/fdd-cli -paranoid -cache ./cache.db -o report.json <目录...>
+go run ./cmd/benchgen -dataset C -scale 0.02 -out ./benchdata   # 合成数据集 + manifest
+```
+
+## 目录结构
+
+```
+.
+├── main.go                 # 应用入口与窗口配置（go:embed frontend/dist）
+├── app.go                  # Wails 应用生命周期与绑定（AppVersion 声明位）
+├── internal/               # Go 后端（scanner / dedup / hasher / cache / ops / history /
+│                           #   fsid / filter / media / progress / fscase / dbfile / model）
+├── cmd/                    # fdd-cli（JSON 报告冒烟工具）、benchgen（合成数据集生成器）
+├── frontend/               # Vue 3 前端
+├── scripts/                # 回归与门禁脚本（见下）
+├── build/                  # 图标与打包资源（Info.plist / manifest 模板）
+└── docs/                   # 文档（索引见 docs/README.md）
+    ├── 09-用户手册.md       # 活文档：功能与安全性口径真源
+    ├── 04-开发与测试计划.md # 活文档：V2.0 起为「现状与质量门禁」，§6 是唯一权威待办清单
+    ├── 01/02/03-*.md        # 冻结设计/选型档案（正文不回填，偏差记页首日期化勘误表）
+    ├── superpowers/         # 0.5.0 那批功能的设计 + 实施计划（历史产物，顶部有偏差说明）
+    └── archive/             # 编年史：代码审查与修复 / UI 视觉与品牌 / 里程碑报告 /
+                             #   04 计划原文快照 + 审核截图证据
+```
+
+## 测试与回归
+
+改动后的本地回归配方（与 CI 同口径，见 `.github/workflows/ci.yml`）：
+
+```bash
+gofmt -l .                                                   # 必须无输出
+go vet ./...                                                 # 本机
+GOOS=windows GOARCH=amd64 go vet ./...                       # 跨平台
+GOOS=darwin GOARCH=arm64 go vet ./...                        # 跨平台
+cd frontend && npm ci && npm run build                       # 先产 dist（go test 依赖 embed）
+                                                             # 含 prebuild: vue-tsc 类型检查
+go test -race -count=2 ./...                                 # 全包
+go test -race -count=4 .                                     # 根包（App 层状态机多压两轮）
+bash scripts/smoke-cli.sh                                    # 数据集 C×0.02 三跑比对
+bash scripts/check-version-sync.sh                           # 5 处版本号声明位对齐
+```
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/smoke-cli.sh` | benchgen 生成固定数据集 → `fdd-cli` 冷扫 / 缓存首扫 / 缓存复扫，逐项比对分组集合、可释放字节、语料数，并与 manifest 对账 |
+| `scripts/check-version-sync.sh` | 5 处版本号声明位对齐；tag 触发时再比对 `v<版本>` |
+| `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因），其余用例一律阻断 |
+
+CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runner 上跑隔离后的
+`go test`；`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
+真实回收站 / GUI 端到端仍需人工，平台 checklist 见 docs/04 §3.5。
+
+## 发布
+
+1. 同步版本号（5 处）：`app.go` 的 `AppVersion`、`wails.json` 的 `info.productVersion`、
+   `frontend/package.json`、`frontend/package-lock.json`（两处）、`docs/09` 首部「适用版本」。
+   `build/darwin/*.plist` 用 `{{.Info.ProductVersion}}` 模板，无需手改。
+2. `bash scripts/check-version-sync.sh` 绿。
+3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z` —— tag 必须等于 `AppVersion`，
+   否则 build.yml 第一步就断掉（历史上出现过 v1.0.0 发布物对应 0.5.0 产品的错位）。
+4. build.yml 自动构建四平台产物、生成 `SHA256SUMS.txt`，一并挂到 GitHub Release。
+   发布前人工过 docs/04 附录 A checklist。
+
+## 开发前置：先构建前端
+
+`main.go` 用 `//go:embed frontend/dist` 内嵌前端产物，而 `frontend/dist` 属构建产物
+（被 .gitignore 排除）。因此全新克隆后须先 `cd frontend && npm ci && npm run build`，
+否则 `go build` / `go vet` / `go test` 会因 embed 找不到目录而失败（CI 已按此顺序编排）。
+
+## 许可证
+
+本项目采用 **MIT License**，详见仓库根目录 [LICENSE](LICENSE) 文件。
+依赖链（Wails / xxhash / BLAKE3 / SQLite 驱动等）均为 MIT/BSD 等宽松许可，无 GPL 传染。
