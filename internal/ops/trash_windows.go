@@ -61,7 +61,14 @@ func unsafeDriveReason(p string) string {
 	if len(p) < 3 || p[1] != ':' || (p[2] != '\\' && p[2] != '/') {
 		return "无法识别所在卷"
 	}
-	root, err := syscall.UTF16PtrFromString(p[:2] + `\)`)
+	// GetDriveTypeW 要求盘根路径，且**必须以反斜杠结尾**（MSDN：
+	// "A trailing backslash is required."）。此处必须拼出 `F:\`。
+	//
+	// 修正前写作 p[:2] + `\)`：Go 的**反引号 raw string 不做转义**，
+	// 该字面量是「反斜杠 + 右括号」两个字符，拼出的实参是 `F:\)`——
+	// 不是合法盘根，GetDriveTypeW 返回 DRIVE_NO_ROOT_DIR(1)，
+	// 于是**所有**盘符都被判成「根目录不存在」而拒绝回收站操作。
+	root, err := syscall.UTF16PtrFromString(p[:2] + `\`)
 	if err != nil {
 		return "路径编码失败"
 	}
