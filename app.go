@@ -1185,6 +1185,30 @@ func (a *App) ClearScanHistory() error {
 	return nil
 }
 
+// undoableReason 解释「这条记录为什么不可回撤」，并给出可执行的下一步。
+//
+// 2026-09-19 改进：原文案是「该记录不可回撤（永久删除与 Windows 回收站不支持
+// 应用内回撤）」。用户读完仍然不知道**自己能做什么**——尤其 Windows 回收站
+// 这一条，其不可回撤并非「设计取舍」而是 API 层面的客观限制，必须讲清楚，
+// 否则容易被理解成「软件偷懒，故意不给撤」。
+//
+// 区分两类的本质差异：
+//   - 永久删除：文件已不在磁盘上，**物理上无从恢复**（应用内绝无可能）。
+//   - Windows 回收站：文件**好好地躺在回收站里**，只是 SHFileOperation
+//     不返回「哪个文件落到了哪个 $Recycle.Bin 路径」的映射，应用无法
+//     自己算回去向。**手动还原完全可行**，出口是系统回收站。
+//
+// 二者都「不可应用内回撤」，但用户的可行动作截然不同，故分别成文。
+func undoableReason(kind string) string {
+	if kind == "trash" && runtime.GOOS == "windows" {
+		return "Windows 回收站操作不支持应用内回撤：系统 API 不返回" +
+			"「每个文件落在回收站的哪个位置」的映射，应用无法定位文件而把它搬回原处。" +
+			"文件本身仍在回收站里，请点上方「打开系统回收站」，右键选择「还原」即可取回。"
+	}
+	return "永久删除不支持回撤：文件已从磁盘移除，没有任何可恢复的来源。" +
+		"若还需保留这些文件，请重新扫描后改用「移入回收站」或「移动」。"
+}
+
 // beginJournal 在任何文件系统动作之前把本次清理的完整计划落盘（写前账本）。
 // undoable 判定：delete 不可撤；Windows 回收站拿不到 src→dst 映射，
 // 回撤改由「打开系统回收站」引导；其余可撤。
@@ -1487,7 +1511,7 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 	}
 	if !meta.Undoable {
 		release()
-		return "", fmt.Errorf("该记录不可回撤（永久删除与 Windows 回收站不支持应用内回撤）")
+		return "", fmt.Errorf("%s", undoableReason(meta.Kind))
 	}
 
 	undoID := fmt.Sprintf("undo-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
@@ -1593,7 +1617,7 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 	}
 	if !meta.Undoable {
 		release()
-		return "", fmt.Errorf("该记录不可回撤（永久删除与 Windows 回收站不支持应用内回撤）")
+		return "", fmt.Errorf("%s", undoableReason(meta.Kind))
 	}
 	var target *history.OpItem
 	for i := range items {

@@ -113,12 +113,7 @@ func defaultTrash(paths []string) (map[string]string, error) {
 			len(rejected), rejected[0])
 	}
 	// 注意：SHFileOperation 不支持 \\?\ 前缀，使用普通路径
-	var from []uint16
-	for _, p := range paths {
-		from = append(from, utf16FromString(p)...)
-		from = append(from, 0)
-	}
-	from = append(from, 0) // 列表整体再以 \0 结尾
+	from := buildPathList(paths)
 
 	op := shFileOpStruct{
 		wFunc:  foDelete,
@@ -133,6 +128,36 @@ func defaultTrash(paths []string) (map[string]string, error) {
 		return dst, fmt.Errorf("操作被系统中止")
 	}
 	return dst, nil
+}
+
+// buildPathList 构造 SHFileOperation 的 pFrom：**以单个 \0 分隔的路径列表，
+// 末尾再补一个 \0**（即整体双 \0 结尾）。
+//
+// 2026-09-19 修复：原实现每个路径额外补一个 \0（`append(from, 0)`），
+// 而 syscall.StringToUTF16 **本身就已带终止 NUL**（其实现末尾为
+// `return append(buf, 0), nil`）。于是产生连续两个 \0：
+//
+//	缺陷缓冲区: ["F:\dup\a1.bin",0, 0, "F:\dup\sub\a2.bin",0, 0, "F:\dup\a3.bin",0, 0, 0]
+//	                └─ 段0 ─┘  └空段┘
+//
+// SHFileOperation 把列表解析到**第一个空段**为止，因此它只看到第 1 个路径，
+// 其余全被丢弃 —— 用户勾选 N 个文件，**实际只有 1 个进了回收站**，
+// 而返回值是 0（成功），界面上看不出任何异常。
+//
+// 单文件场景恰好正确（第一段就是那个路径），所以此前一直没被发现。
+//
+// 对照 winapi 的既有实现（WGo/rsrc 等）与 SHFILEOPSTRUCT 文档，
+// 正确构造是「每个路径各含自己的终止 NUL，最后再补 1 个 NUL」。
+func buildPathList(paths []string) []uint16 {
+	n := 0
+	for _, p := range paths {
+		n += len(utf16FromString(p)) // 已含每段自己的终止 NUL
+	}
+	buf := make([]uint16, 0, n+1)
+	for _, p := range paths {
+		buf = append(buf, utf16FromString(p)...)
+	}
+	return append(buf, 0) // 列表终结符：与上一个 NUL 构成双 \0 结尾
 }
 
 func utf16FromString(s string) []uint16 {

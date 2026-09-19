@@ -62,6 +62,22 @@ function undoLeft(m: OpRecord): number {
   return m.undoable ? Math.max(0, m.done - m.undone) : 0
 }
 
+// noUndoTitle 「不可回撤」徽标的悬浮说明。
+// 2026-09-19：原来是一句笼统的「永久删除与 Windows 回收站不支持应用内回撤」，
+// 但这两类的**原因与出路完全不同**，笼统措辞让用户以为软件偷懒：
+//   - 永久删除：文件已不在磁盘，物理上无从恢复；
+//   - Windows 回收站：文件仍在回收站里，只是系统 API 不返回落点映射，
+//     应用算不出该搬回哪里 —— 手动还原完全可行。
+// 与后端 undoableReason()（app.go）保持同一口径。
+function noUndoTitle(m: OpRecord): string {
+  if (m.kind === 'trash') {
+    return 'Windows 回收站不支持应用内回撤：系统 API 不返回每个文件的落点映射，'
+      + '应用无法定位后搬回原处。文件仍在回收站里，请用「打开系统回收站」右键「还原」。'
+  }
+  return '永久删除不支持回撤：文件已从磁盘移除，没有可恢复的来源。'
+    + '若仍需保留，请改用「移入回收站」或「移动」。'
+}
+
 function stateCls(s: string): string {
   if (s === 'undone' || s === 'done') return s === 'undone' ? 'st st-ok' : 'st st-done'
   if (s === 'failed' || s === 'undo_failed' || s === 'interrupted') return 'st st-bad'
@@ -239,7 +255,7 @@ function destSummary(it: OpRecordItem): string {
               <td class="mono">{{ fmtTime(m.createdAt) }}</td>
               <td>
                 <span class="kind-badge" :class="'k-' + m.kind">{{ OP_KIND_LABEL[m.kind] ?? m.kind }}</span>
-                <span v-if="!m.undoable" class="no-undo" title="永久删除与 Windows 回收站不支持应用内回撤">不可回撤</span>
+                <span v-if="!m.undoable" class="no-undo" :title="noUndoTitle(m)">不可回撤</span>
               </td>
               <td class="num">
                 {{ formatCount(m.items) }}
