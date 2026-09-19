@@ -385,6 +385,35 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				pre[i].skip = true
 				continue
 			}
+			// 2026-09-19 修复（Windows 首扫 0 组 / 未保存缓存）：
+			// 短读（实际可读 < 遍历时记录的 size）不再丢弃该文件，而是**用实际
+			// 长度就地纠正条目**再参与分桶。此前调用方拿不到短读事实，只能沿用
+			// 失真的 size；而 hasher 又会把 ErrUnexpectedEOF 当错误返回，文件被
+			// skip=true 整个剔除 → 整组重复静默消失（用户：扫不到重复），且永远
+			// 走不到 pending 入队那一行（用户：未保存缓存）。
+			//
+			// 纠正而非沿用是关键：若仍用失真的 size 去分桶，两个内容不同的文件
+			// 可能因截断被算成同一哈希，造出假重复组——比漏报更危险。
+			if r.Short {
+				actual := uint64(r.ActualSize)
+				if actual == 0 {
+					// 推不出任何有效长度（文件已被删空/不可读）：记失败并剔除，
+					// 避免把零长度塞进分桶造出假组。
+					preMu.Lock()
+					failed = append(failed, model.FailedItem{Path: e.Path, Stage: "prefilter",
+						Err: "文件在扫描期间被截断为空或不可读，已跳过"})
+					preMu.Unlock()
+					pre[i].skip = true
+					continue
+				}
+				preMu.Lock()
+				failed = append(failed, model.FailedItem{Path: e.Path, Stage: "prefilter",
+					Err: fmt.Sprintf("文件在扫描期间被修改：记录 %d 字节，实际可读 %d 字节；已按实际长度参与去重",
+						e.Size, actual)})
+				preMu.Unlock()
+				// 就地纠正：size 是分桶键，必须与哈希所依据的内容一致。
+				e.Size = actual
+			}
 			if cacheOn {
 				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime, ids[i]); hit {
 					localHits = append(localHits, e.Path)
