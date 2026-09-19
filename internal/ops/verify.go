@@ -65,15 +65,29 @@ func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verd
 }
 
 // identityStill 复核 path 当前指向的物理文件仍是 id 记录的那一个。
-// Lstat 不跟随符号链接：路径被换成链接/目录/另一文件时 dev+ino 必不同。
-// id 未解析（Windows）时无从判断，返回 true（内容由 VerifyFile 已证）。
+// 不跟随符号链接：路径被换成链接/目录/另一文件时，身份必不同。
+//
+// 2026-09-19（关联隐患修复）：修正前直接 FromFileInfo(Lstat(...))。在 Windows 上
+// 这条链恒返回未解析 ID，于是本函数**恒返回 true**——"扫描后文件被替换"
+// 这重拦截在 Windows 上完全不存在。改为 fsid.FromPathNoFollow：
+// unix 等价 lstat，Windows 走 CreateFileW(+OPEN_REPARSE_POINT) 的句柄查询，
+// 两个平台都拿得到真实身份，且都不跟随链接。
+//
+// 仍保留 id 未解析时放行：那是"我们本来就不知道原身份"（例如 FAT/exFAT
+// 不提供稳定索引），此时无从比对，强行判否会让这些卷上完全无法操作。
+// 内容级证据（VerifyFile）仍是这些平台上的实际防线。
 func identityStill(path string, id fsid.ID) bool {
 	if !id.Resolved {
 		return true
 	}
-	lst, err := os.Lstat(path)
+	cur, err := fsid.FromPathNoFollow(path)
 	if err != nil {
 		return false
 	}
-	return fsid.FromFileInfo(lst).SameIdentity(id)
+	if !cur.Resolved {
+		// 原先能解析、现在解析不出：卷行为异常或路径已被换成不支持索引的对象。
+		// 判否——宁可拦一次让用户重扫，也不放行一次可能覆盖他人文件的操作。
+		return false
+	}
+	return cur.SameIdentity(id)
 }

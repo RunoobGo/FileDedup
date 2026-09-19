@@ -56,6 +56,7 @@ var (
 	modkernel32                      = syscall.NewLazyDLL("kernel32.dll")
 	procGetFileInformationByHandle   = modkernel32.NewProc("GetFileInformationByHandle")
 	procGetFileInformationByHandleEx = modkernel32.NewProc("GetFileInformationByHandleEx")
+	procCreateFileW                  = modkernel32.NewProc("CreateFileW")
 )
 
 const (
@@ -63,11 +64,58 @@ const (
 	win32EpochDiff = 116444736000000000
 	// fileBasicInfoClass FILE_INFO_BY_HANDLE_CLASS.FileBasicInfo。
 	fileBasicInfoClass = 1
+
+	// CreateFileW 参数常量（取自 Win32 头文件）。
+	genericRead        = 0x80000000
+	fullShare          = syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE | syscall.FILE_SHARE_DELETE
+	openExisting       = 3
+	fileAttrNormal     = 0x80
+	fileFlagBackupSem  = 0x02000000
+	fileFlagOpenRepars = 0x00200000 // FILE_FLAG_OPEN_REPARSE_POINT：不跟随重解析点
+	invalidHandleValue = ^uintptr(0)
 )
 
 // fromInfo Windows：os 层伪造的 Stat_t 跨重命名不稳定且无卷号/索引，
 // 不足以支撑身份判定 → 未解析（调用方退回内容级证据）。
 func fromInfo(info os.FileInfo) ID { return ID{} }
+
+// FromPathNoFollow 取 path **自身**的物理身份，不跟随符号链接/重解析点。
+//
+// 为什么必须有它（2026-09-19 关联隐患修复）：
+// Windows 的 Lstat 产物经 fromInfo 恒返回未解析 ID，导致所有
+// 「FromFileInfo(Lstat(...))」形式的身份校验在这个平台上**静默失效**；
+// 而直接用 os.Open + FromFile 又会**跟随**符号链接，使"路径被换成链接"
+// 这类替换检测不到，反而制造新的绕过面。
+//
+// 这里用 CreateFileW 显式带 FILE_FLAG_OPEN_REPARSE_POINT：
+//   - 不跟随链接 → 取到的就是 path 位置上的那个对象本身；
+//   - 走句柄查询 → 拿得到真实的 (卷序列号, 文件索引)。
+//
+// 语义与 unix 的 lstat 对齐，调用方因此不必分平台。
+//
+// 打不开（不存在/权限/被独占）时返回 error；打开成功但卷不给稳定索引
+// （FAT/exFAT 恒 0）时返回 Resolved == false 的 ID——两种情形调用方需分开处置。
+func FromPathNoFollow(path string) (ID, error) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return ID{}, err
+	}
+	h, _, callErr := procCreateFileW.Call(
+		uintptr(unsafe.Pointer(p)),
+		uintptr(genericRead),
+		uintptr(fullShare),
+		0,
+		uintptr(openExisting),
+		// BACKUP_SEMANTICS 用于能打开目录；OPEN_REPARSE_POINT 用于不跟随链接。
+		uintptr(fileAttrNormal|fileFlagBackupSem|fileFlagOpenRepars),
+		0,
+	)
+	if h == invalidHandleValue {
+		return ID{}, callErr
+	}
+	defer syscall.CloseHandle(syscall.Handle(h))
+	return fromHandle(h), nil
+}
 
 // FromHandle Windows 专属：从调用方已持有的原生句柄取身份。
 //

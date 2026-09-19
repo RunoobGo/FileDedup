@@ -175,8 +175,10 @@ func undoHardlink(it UndoItem) (string, error) {
 	if !kst.Mode().IsRegular() {
 		return "", fmt.Errorf("保留源不是普通文件: %s", it.LinkSrc)
 	}
-	lid, kid := fsid.FromFileInfo(lst), fsid.FromFileInfo(kst)
-	if lid.Resolved && kid.Resolved {
+	lid, lerr := identityByHandle(it.OrigPath)
+	kid, kerr := identityByHandle(it.LinkSrc)
+	switch {
+	case lerr == nil && kerr == nil && lid.Resolved && kid.Resolved:
 		if !lid.SameIdentity(kid) {
 			// 崩溃残留自检：拆链已完成（原位独立成文件且内容等于记录），
 			// 只是账本没落上——记成功，不再拦成"永不可撤"。
@@ -187,9 +189,23 @@ func undoHardlink(it UndoItem) (string, error) {
 			}
 			return "", fmt.Errorf("目标已非合并时的硬链接（inode 不符），为避免覆盖第三方文件已拦截")
 		}
-	} else if uint64(kst.Size()) != it.Size || uint64(lst.Size()) != it.Size {
-		// 未解析平台（Windows）降级：路径存在 + 大小与记录一致
-		return "", fmt.Errorf("目标或保留源大小与记录不一致，可能已被修改，已拦截")
+	default:
+		// 2026-09-19（关联隐患修复）：此处原先直接用 fsid.FromFileInfo(Lstat 产物)。
+		// Windows 的 Stat/Lstat **不携带卷序列号与 64 位文件索引**，FromFileInfo
+		// 必然返回未解析 ID，于是身份防线①在 Windows 上**整条失效**，退化为
+		// 「只比大小」。后果：只要用户把 OrigPath 换成另一个**同样大小**的无关
+		// 文件，回撤就会认它为"该恢复的目标"并 rename 覆盖上去——防线①形同虚设。
+		// 现在改为经句柄查询取身份（identityByHandle），Windows 上同样拿得到
+		// (卷序列号, 文件索引)，防线①真正生效。
+		//
+		// 落在 default 分支 = 句柄身份不可用（文件被独占锁、权限不足等）：
+		// 此时只能退回大小校验——否则在杀软占句柄的机器上会完全无法回撤。
+		// 风险面被第②道防线收敛：临时文件仍要全量 BLAKE3 等于记录哈希才会改名，
+		// 因此"被换成内容不同的文件"仍会被拦；仅"同大小的第三方文件恰好出现在
+		// 原路径且内容也恰好相同"这一极端组合能穿过，而那与原文件本就无法区分。
+		if uint64(kst.Size()) != it.Size || uint64(lst.Size()) != it.Size {
+			return "", fmt.Errorf("目标或保留源大小与记录不一致，可能已被修改，已拦截")
+		}
 	}
 
 	tmp := it.OrigPath + FddUndoSuffix
@@ -220,6 +236,26 @@ func undoHardlink(it UndoItem) (string, error) {
 }
 
 // hashFile 全量 BLAKE3（回撤内容复核）。
+// identityByHandle 经**句柄**取文件的物理身份（卷序列号 + 64 位文件索引）。
+//
+// 为什么不直接用 fsid.FromFileInfo(Lstat 产物)：Windows 的 Stat/Lstat 结果
+// 不携带卷序列号与文件索引，FromFileInfo 在 Windows 上恒返回未解析 ID，
+// 使依赖它的身份校验**静默失效**（2026-09-19 关联隐患）。
+// 句柄查询（fsid.FromFile）在 Windows 上能拿到真实身份，unix 上等价于
+// (dev, ino)——两条路径都成立。
+//
+// 返回的 error 非 nil 表示"连打开都失败"（不存在/权限/独占锁），
+// 与"打开成功但身份未解析"（ID.Resolved == false）是两种不同情形，
+// 调用方需分开处置。
+func identityByHandle(p string) (fsid.ID, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return fsid.ID{}, err
+	}
+	defer f.Close()
+	return fsid.FromFile(f), nil
+}
+
 func hashFile(p string) ([32]byte, error) {
 	f, err := os.Open(p)
 	if err != nil {
