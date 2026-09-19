@@ -114,7 +114,7 @@ func undoTrash(it UndoItem) (string, error) {
 		// Lstat 报非 ENOENT 的错误时同样另名恢复：rename 会静默覆盖已存在目标
 		base := filepath.Base(it.OrigPath)
 		ext := filepath.Ext(base)
-		name := strings.TrimSuffix(base, ext) + ".fdd-restored" + ext
+		name := strings.TrimSuffix(base, ext) + FddRestoreMark + ext
 		target = uniqueDst(filepath.Dir(it.OrigPath), name)
 	}
 	if err := os.Rename(it.DestPath, target); err != nil {
@@ -192,7 +192,7 @@ func undoHardlink(it UndoItem) (string, error) {
 		return "", fmt.Errorf("目标或保留源大小与记录不一致，可能已被修改，已拦截")
 	}
 
-	tmp := it.OrigPath + ".fdd-undo-tmp"
+	tmp := it.OrigPath + FddUndoSuffix
 	_ = os.Remove(tmp)
 	sf, err := os.Open(it.LinkSrc)
 	if err != nil {

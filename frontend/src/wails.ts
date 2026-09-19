@@ -124,6 +124,7 @@ export interface OpsResult {
   Cancelled: string[] // P2：取消后未派发的条目（未处理，仍在结果集中）
   Reclaimed: number // 已从磁盘真正释放的字节（trash/delete/move 出卷）
   LinkedBytes?: number // 硬链接合并涉及的字节：当期不释放空间，仅变为共享
+  Warnings?: string[] // 操作已成功、但需告知用户的情况（如临时文件残留未删净）
 }
 
 export interface OpRequest {

@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -69,12 +70,14 @@ func runIndexed(ctx context.Context, n, workers int, fn func(i int), onPanic ...
 // ItemResult 单个文件走完校验/执行阶段的终态（v0.5.0 写前日志收口用）。
 // State ∈ done / failed / skipped；DestPath 为 trash/move 的实际去向
 // （回收站映射缺失时为空），LinkSrc 为 hardlink 指向的保留源。
+// Warn 为「操作已成功、但有需要告知用户的情况」（如临时文件残留未能删除）。
 type ItemResult struct {
 	OrigPath string
 	DestPath string
 	LinkSrc  string
 	State    string
 	Err      string
+	Warn     string
 }
 
 // Options 执行器配置。
@@ -115,6 +118,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	}
 	res := model.OpsResult{
 		OK: []string{}, Failed: []model.FailedItem{}, Skipped: []string{}, Cancelled: []string{},
+		Warnings: []string{},
 	}
 	if len(op.FileIDs) == 0 {
 		return res
@@ -218,6 +222,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		err     string
 		dst     string // trash/move 实际去向（未知时空）
 		linkSrc string // hardlink 指向的保留源
+		warn    string // 成功但有需要告知用户的情况（如临时文件残留）
 	}
 	outcomes := make([]outcome, len(toProcess))
 	// C6（2026-09-18 审查）：账本收口必须紧跟每次 syscall，而不是等全批走完
@@ -236,7 +241,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		switch o.code {
 		case ocOK:
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, DestPath: o.dst,
-				LinkSrc: o.linkSrc, State: "done"})
+				LinkSrc: o.linkSrc, State: "done", Warn: o.warn})
 		case ocSkipped:
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "skipped"})
 		case ocFailed:
@@ -280,6 +285,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					res.LinkedBytes += e.Size
 				} else {
 					res.Reclaimed += e.Size
+				}
+				// 成功但有残留等情况：逐条收集，供上层提示（不改变成败判定）
+				if outcomes[i].warn != "" {
+					res.Warnings = append(res.Warnings,
+						fmt.Sprintf("%s：%s", e.Path, outcomes[i].warn))
 				}
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
@@ -442,7 +452,15 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// HardlinkMerge 使用「dup 路径 + .fdd-tmp」临时名，路径互不冲突 → 并发安全
 			if err := HardlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
-				settle(i, outcome{code: ocFailed, err: err.Error()})
+				// 2026-09-19：区分「真失败」与「已成功但有临时文件残留」。
+				// 后者链接已经建好，若计为失败，用户会以为合并没生效，进而
+				// 反复重试——而重试时 dup 与 keep 已是同一文件，行为更费解。
+				var residue *ResidueError
+				if errors.As(err, &residue) {
+					settle(i, outcome{code: ocOK, linkSrc: src.Path, warn: residue.Error()})
+				} else {
+					settle(i, outcome{code: ocFailed, err: err.Error()})
+				}
 			} else {
 				settle(i, outcome{code: ocOK, linkSrc: src.Path})
 			}

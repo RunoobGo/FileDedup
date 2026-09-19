@@ -20,6 +20,17 @@ const keepDirInput = ref('')
 // 导致确认过一次后拦截条件永久为假。
 watch(confirmKind, v => { store.confirmOpen = !!v })
 
+// 硬链接/回收站操作的残留提示：记录明细在 title 里（悬停可见全量），
+// 点击则逐条弹出，避免长列表把 toast 撑爆。
+function showWarnings() {
+  const ws = store.opsResult?.Warnings ?? []
+  if (!ws.length) return
+  toast.push(`有 ${ws.length} 个临时文件未能删除（不影响已完成的操作），可悬停查看明细；` +
+    `这些文件已被扫描忽略，如需清理请手动删除`, 'error', 12000)
+  for (const w of ws.slice(0, 5)) toast.push(w, 'error', 12000)
+  if (ws.length > 5) toast.push(`……另有 ${ws.length - 5} 条，详见提示条悬停内容`, 'error', 12000)
+}
+
 // C12：切页时本组件卸载，但局部 confirmKind 不会自动复位——切回结果页会
 // 自动重开确认弹窗（且与 store.confirmOpen 脱钩，快捷键拦截失真）。卸载时复位。
 // 此处仍手工清 confirmOpen：组件作用域已停，上面的 watch 不会再触发。
@@ -206,6 +217,12 @@ function onConfirm(targetDir?: string) {
       <span v-if="store.opsResult.Skipped.length" class="skip"><Icon name="skip" :size="13" /> 已跳过 {{ formatCount(store.opsResult.Skipped.length) }}（文件已消失）</span>
       <!-- P2：中止后必须说清"还有多少没处理"，否则用户无法判断是否需要重跑 -->
       <span v-if="store.opsResult.Cancelled?.length" class="skip"><Icon name="skip" :size="13" /> 未处理 {{ formatCount(store.opsResult.Cancelled.length) }}（已中止，仍在列表中）</span>
+      <!-- 2026-09-19：操作已成功但有残留（如 .fdd-old 被占用未删净）。
+           不并入失败——链接确实建立了——但必须显式告知，否则用户下次
+           扫描会看到莫名多出的"重复文件"而无法解释其来源。 -->
+      <button v-if="store.opsResult.Warnings?.length" type="button" class="skip"
+        :title="store.opsResult.Warnings.join('\n')"
+        @click="showWarnings()"><Icon name="alert" :size="13" /> 提示 {{ formatCount(store.opsResult.Warnings.length) }}（有临时文件未清除）</button>
       <button v-if="store.opsResult.Failed.length" type="button" class="fail"
         @click="store.failedOpen = true"><Icon name="alert" :size="13" /> 失败 {{ formatCount(store.opsResult.Failed.length) }}（查看）</button>
       <button class="x" title="关闭结果提示" aria-label="关闭结果提示"
