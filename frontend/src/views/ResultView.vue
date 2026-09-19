@@ -195,7 +195,12 @@ function onConfirm(targetDir?: string) {
     </div>
     <div v-else-if="store.opsResult" class="opsbar panel done">
       <template v-if="store.opsResult.OK.length">
-        <span class="ok"><Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（释放 {{ humanBytes(store.opsResult.Reclaimed) }}）</span>
+        <!-- 硬链接合并当期不释放空间（数据块转为多路径共享），必须与 trash/delete
+             的"释放"分开措辞，否则用户去资源管理器核对会发现占用未变，像是失败了 -->
+        <span v-if="store.opsResult.LinkedBytes" class="ok">
+          <Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（已合并为硬链接 {{ humanBytes(store.opsResult.LinkedBytes) }}，占用不变）
+        </span>
+        <span v-else class="ok"><Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（释放 {{ humanBytes(store.opsResult.Reclaimed) }}）</span>
         <button class="btn-ghost" @click="store.openTrash()">打开回收站</button>
       </template>
       <span v-if="store.opsResult.Skipped.length" class="skip"><Icon name="skip" :size="13" /> 已跳过 {{ formatCount(store.opsResult.Skipped.length) }}（文件已消失）</span>

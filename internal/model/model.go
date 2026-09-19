@@ -126,6 +126,13 @@ type OpsResult struct {
 	Skipped   []string // 操作时文件已不存在（ENOENT）
 	Cancelled []string // 取消后未派发（P2：使操作可中止且结果可解释）
 	Reclaimed uint64
+	// LinkedBytes 硬链接合并涉及的字节数（2026-09-19 新增，与 Reclaimed 互斥）。
+	//
+	// 语义区分很重要：Reclaimed 是**已经**从磁盘释放的字节（trash/delete/
+	// move 出卷）；而硬链接只是把数据块变为多路径共享，**当期并不释放空间**，
+	// 真正释放发生在最后一个链接被删除时。混在一起会让 UI 报出"释放 X"，
+	// 而用户查看文件夹占用发现毫无变化——自相矛盾且像是操作失败。
+	LinkedBytes uint64
 }
 
 // ScanConfig 扫描任务配置。

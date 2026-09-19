@@ -270,7 +270,17 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			switch outcomes[i].code {
 			case ocOK:
 				res.OK = append(res.OK, e.Path)
-				res.Reclaimed += e.Size
+				// 2026-09-19：硬链接合并**不立即释放空间**，只把数据块变为共享。
+				// 修正前此处对 hardlink 也累加 e.Size，UI 于是显示"释放 X"，
+				// 而用户去资源管理器一看文件夹占用丝毫未变——与事实不符的假账，
+				// 也让"总占用未变化"看起来像操作失败。
+				// 现在把硬链接的贡献单列（LinkedBytes），Reclaimed 只统计
+				// 真正从磁盘上消失的数据量（trash/delete/move 出卷）。
+				if op.Kind == "hardlink" {
+					res.LinkedBytes += e.Size
+				} else {
+					res.Reclaimed += e.Size
+				}
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
 			case ocNone:

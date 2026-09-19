@@ -55,6 +55,16 @@ func MoveFile(src, targetDir string) (string, error) {
 // H2：keepID/dupID 来自 VerifyFile 通过校验那一刻的 fstat。临时硬链接建立后
 // 复核 tmp 的 inode == keepID（窗口内 keep 路径被替换时，链接会指向非预期
 // 文件）；替换 dup 前复核 dup 路径仍指向 dupID。零值 ID（未解析平台）跳过。
+//
+// 2026-09-19（缺陷：Windows 上"显示已执行但链接未生效"）：
+// 此前本函数**只要有一步没报错就返回 nil**，从不确认链接真的建立了。
+// 而 Windows 上 os.Link → CreateHardLinkW **仅 NTFS 支持**（MSDN 原文：
+// "only supported on the NTFS file system"，且 ReFS 不支持、exFAT/FAT 完全不支持），
+// 跨卷也一律失败。一旦平台/卷不支持，上层却把它记为 done 并累加"已释放空间"，
+// 用户看到"执行成功"但文件夹总占用不变、改一个文件另一个不跟着变。
+// 现在收尾处**强制复核**：dup 与 keep 必须真的互为同一文件（同 inode /
+// 同 64 位文件索引）。对不上就回滚成原独立文件并报错——宁可显式失败，
+// 也不留下"假装成功"的假账。
 func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	if keep == dup {
 		return fmt.Errorf("同一路径")
@@ -87,7 +97,55 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	// 收尾复核（见函数头注释）：确认 dup 现在真的是 keep 的那个文件。
+	// 这里的证据是「同文件」而非「无错误」——两者在 Windows 上不等价。
+	if err := verifyHardlinked(keep, dup); err != nil {
+		// 未真正建立链接：把 dup 还原为原来的独立文件，不留假成功的账。
+		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
+			if berr := hardlinkRename(backup, dup); berr != nil {
+				// 还原失败：至少保证两份都存在（数据不丢），并明确指出残留位置。
+				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）",
+					err, backup+".undo")
+			}
+			_ = os.Remove(backup + ".undo")
+			return err
+		}
+		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", err, backup)
+	}
 	_ = os.Remove(backup) // 合并成功：删除原独立副本
+	return nil
+}
+
+// verifyHardlinked 确认 dup 与 keep 现在指向同一份物理文件。
+//
+// 这是**平台无关**的终局判据，不依赖 fsid.ID 是否解析得出来：
+//   - os.SameFile 比较 os.FileInfo 的 (dev, ino)，在 unix 上是 inode、
+//     在 Windows 上由 Go 用文件索引填充——正是硬链接成立的定义。
+//
+// 之所以必须显式复核：os.Link/os.Rename 系列在 Windows 上有若干"语义近似但不等价"的
+// 成功路径（卷不支持、重定向、Filter 驱动介入），仅凭"没返回错误"不足以断言
+// 链接已建立。这里补上唯一的、可证伪的终态检查。
+func verifyHardlinked(keep, dup string) error {
+	ki, err := os.Stat(keep)
+	if err != nil {
+		return fmt.Errorf("硬链接复核失败：无法读取保留源 %s: %w", keep, err)
+	}
+	di, err := os.Stat(dup)
+	if err != nil {
+		return fmt.Errorf("硬链接复核失败：无法读取目标 %s: %w", dup, err)
+	}
+	if !ki.Mode().IsRegular() || !di.Mode().IsRegular() {
+		return fmt.Errorf("硬链接复核失败：keep/dup 不都是普通文件")
+	}
+	if !os.SameFile(ki, di) {
+		return fmt.Errorf("硬链接未生效：%s 与 %s 仍是两个独立文件"+
+			"（该卷可能不支持硬链接，如 exFAT/FAT/ReFS，或两者不在同一卷）", dup, keep)
+	}
+	// 尺寸一致（同文件必然一致，这里防的是竞态下的诡异状态）
+	if ki.Size() != di.Size() {
+		return fmt.Errorf("硬链接复核失败：%s(%d) 与 %s(%d) 尺寸不一致",
+			dup, di.Size(), keep, ki.Size())
+	}
 	return nil
 }
 
