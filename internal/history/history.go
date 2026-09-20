@@ -112,7 +112,15 @@ func initConn(path string) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
+		// M11（2026-09-21 全仓审计 §五 11）：账本必须 FULL，**不与 cache 同口径**。
+		// NORMAL 下 commit 只写 WAL 不 fsync，掉电/内核崩溃时最近的 BeginOp/FinishItem
+		// 随 WAL 一起丢——而**删除动作已经生效**，账本丢了就等于永久失去撤销依据。
+		// （进程崩溃不受影响，WAL 会回放；这里防的是断电那一档。）
+		// cache 是可再生件（丢了重算即可），同一参数对它成立、对账本不成立。
+		// 代价实测可忽略（本机 APFS，2026-09-21）：500 条 FinishItem 逐条提交
+		// NORMAL 64.9ms → FULL 79.6ms，约 30µs/条，而每条对应的文件操作本身就要
+		// 一次落盘；全仓 5 个基准无一涉及账本写入路径，不存在以 NORMAL 为前提的性能结论。
+		"PRAGMA synchronous=FULL",
 		"PRAGMA foreign_keys=ON",
 		// 跨进程（fdd-cli 与 GUI 并存）瞬时占用时让路 5s，别把 BUSY 报成故障。
 		// 本库连接池限 1，故 Exec 设置的会话级 PRAGMA 对该库所有语句都生效。
