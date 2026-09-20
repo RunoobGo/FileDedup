@@ -264,6 +264,9 @@ export interface BackendAPI {
   ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepOutcome>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
+  // FilterInDirs 后端判定「paths 里哪些位于任一优先目录下」，返回命中的下标。
+  // 前端不再自己比路径（AS-H6）：见 api.filterInDirs 上方注释。
+  FilterInDirs(dirs: string[], paths: string[]): Promise<number[]>
   CancelOperation(): Promise<void>
   OpenTrash(): Promise<void>
   ListOpRecords(): Promise<OpRecord[]>
@@ -329,6 +332,18 @@ export const api = {
     backend().ApplyKeepPolicy({ Kind: kind, Directories: dirs }),
   clearKeepDecisions: (): Promise<void> => backend().ClearKeepDecisions(),
   executeOperation: (op: OpRequest): Promise<string> => backend().ExecuteOperation(op),
+  // filterInDirs 「这条路径在不在优先文件夹里」的唯一权威（AS-H6 / 决策 D-1 方案 b）。
+  //
+  // 为什么必须问后端而不是前端自己算：执行范围由后端 ops.inDir 决定，前端此前
+  // 另写了一份 dirContains（按路径形状猜大小写语义、不做 Clean 归一），两份实现
+  // 已经漂移，方向是**少报命中**——界面说"已排除"的那一项后端其实会处理，
+  // 等于对"不会动的文件"做了假承诺。现在前端只显示这里返回的下标。
+  //
+  // 返回的是 **入参 paths 的下标**（升序、不重复），不是文件 ID：
+  // 与 ID 解耦后，同一次调用可以服务任意候选集（勾选集、全量结果集）。
+  // dirs 全空白时返回空数组 = 未启用处理策略，调用方走"不过滤"的原路径。
+  filterInDirs: (dirs: string[], paths: string[]): Promise<number[]> =>
+    backend().FilterInDirs(dirs, paths).then(r => r ?? []),
   cancelOperation: (): Promise<void> => backend().CancelOperation(),
   openTrash: (): Promise<void> => backend().OpenTrash(),
   listOpRecords: (): Promise<OpRecord[]> => backend().ListOpRecords(),

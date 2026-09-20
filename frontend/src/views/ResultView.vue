@@ -160,6 +160,21 @@ const procKind = computed<'all' | 'dirs'>({
 })
 const procDirInput = ref('')
 
+// 操作按钮的禁用判据（AS-H6，2026-09-20）。
+//
+// 为什么把 pending 也算进来：命中数现在要问后端（判据只留一份），
+// 那一次往返期间 effectiveCount 是 0。若只按 effectiveCount 灰按钮，
+// 用户看到的仍是"选了 40 项，按钮是灰的"这种无从解释的状态；
+// 显式把原因摆出来（灰 + 文案"正在核算命中数"）才是真话。
+// 确认框同理：宁可等一次后端回包，也不显示一个猜出来的数。
+const opDisabled = computed(() =>
+  store.effectiveCount === 0 || store.procCountPending || store.busy)
+const opDisabledTip = computed(() => {
+  if (store.procCountPending) return '正在按后端判据核算优先文件夹内的命中数…'
+  if (store.procCountError) return `命中数计算失败：${store.procCountError}`
+  return store.busyTip
+})
+
 async function pickProcDir() {
   const { api } = await import('../wails')
   try {
@@ -245,6 +260,11 @@ function onConfirm(targetDir?: string) {
             <template v-if="store.procFiltering">
               ，其中<b>{{ store.effectiveCount }}</b> 项在优先文件夹内 / <b>{{ humanBytes(store.effectiveBytes) }}</b>
             </template>
+            <!-- 命中数要问后端（判据不再前端自算），那一次往返期间显示"计算中"
+                 而不是 0——0 是一句假话，它读起来像"你的优先文件夹没命中任何东西"。 -->
+            <template v-else-if="store.procCountPending">
+              ，优先文件夹内的命中数<b>计算中…</b>
+            </template>
           </template>
           <template v-else>未选择——点「全选」选中全部冗余项</template>
         </span>
@@ -313,21 +333,21 @@ function onConfirm(targetDir?: string) {
         <button class="btn-ghost" :class="{ 'btn-emph': store.selectedFiles.length === 0 }"
           title="选中全部冗余项（保留项不可勾选）" @click="store.selectAll()">全选</button>
         <button class="btn-ghost" @click="store.clearSelection()">清除</button>
-        <button class="btn-primary" :disabled="store.effectiveCount === 0 || store.busy"
-          :title="store.busyTip || '把所选重复文件移入系统回收站'" @click="confirmKind = 'trash'">移入回收站</button>
-        <button class="btn-ghost" :disabled="store.effectiveCount === 0 || store.busy"
-          :title="store.busyTip || '移动到本会话授权的目录'" @click="confirmKind = 'move'">移动到…</button>
-        <button class="btn-ghost" :disabled="store.effectiveCount === 0 || store.busy"
-          :title="store.busyTip || '替换为指向保留文件的硬链接（同卷）'"
+        <button class="btn-primary" :disabled="opDisabled"
+          :title="opDisabledTip || '把所选重复文件移入系统回收站'" @click="confirmKind = 'trash'">移入回收站</button>
+        <button class="btn-ghost" :disabled="opDisabled"
+          :title="opDisabledTip || '移动到本会话授权的目录'" @click="confirmKind = 'move'">移动到…</button>
+        <button class="btn-ghost" :disabled="opDisabled"
+          :title="opDisabledTip || '替换为指向保留文件的硬链接（同卷）'"
           @click="confirmKind = 'hardlink'">硬链接合并</button>
         <!-- 跨卷软链接合并（2026-09-20）：仅当已加载的重复组里存在跨卷组时出现。
              同卷组不显示——同卷用硬链接是零权限、无悬空风险的严格更优解，
              给一个"能用但更差"的选项不是自由。 -->
-        <button v-if="hasCrossVolume" class="btn-ghost" :disabled="store.effectiveCount === 0 || store.busy"
-          :title="store.busyTip || '把所选冗余项替换为指向保留文件的软链接（可跨卷；需要权限，且保留文件被删/移动后会失效）'"
+        <button v-if="hasCrossVolume" class="btn-ghost" :disabled="opDisabled"
+          :title="opDisabledTip || '把所选冗余项替换为指向保留文件的软链接（可跨卷；需要权限，且保留文件被删/移动后会失效）'"
           @click="confirmKind = 'symlink'">软链接合并（跨卷）</button>
-        <button class="btn-danger" :disabled="store.effectiveCount === 0 || store.busy"
-          :title="store.busyTip || '不可恢复，需二次确认'" @click="confirmKind = 'delete'">永久删除</button>
+        <button class="btn-danger" :disabled="opDisabled"
+          :title="opDisabledTip || '不可恢复，需二次确认'" @click="confirmKind = 'delete'">永久删除</button>
       </div>
       <!-- 收窄发生时的**就地**说明。确认框里已经说了一次，但用户点"取消"后
            回到这一屏如果看不到任何痕迹，下一次可能就忘了自己开着处理策略——
@@ -341,8 +361,21 @@ function onConfirm(targetDir?: string) {
           请调整优先文件夹或清除该设置。
         </template>
       </p>
-      <!-- 上一次执行的实际范围回执。ops:filtered 事件带回来的真实数字，
-           与前端预估值互为印证（预估值基于路径前缀，这里基于后端权威判据）。 -->
+      <!-- 计数还没到位 / 问后端失败：这两态都必须显式说，且**不能**用 0 顶替。
+           按钮此时是灰的，若不写这一行，用户看到的就是"按钮莫名其妙灰了"。
+           失败态尤其重要——它是唯一能告诉用户"不是你的目录没命中，是没算出来"的地方。 -->
+      <p v-else-if="store.procCountPending" class="proc-note">
+        <Icon name="filter" :size="13" />
+        正在按后端判据核算优先文件夹内的命中数，操作按钮在算出结果前灰化。
+      </p>
+      <p v-else-if="store.procCountError" class="proc-note warn">
+        <Icon name="alert" :size="13" />
+        命中数未能算出（{{ store.procCountError }}）——为避免显示错误的数量，操作按钮已灰化。
+        请重新勾选或调整优先文件夹后重试。
+      </p>
+      <!-- 上一次执行的实际范围回执。ops:filtered 事件带回来的是后端执行时的真实数字，
+           与这里的预览计数同源于后端判据（AS-H6 之后前端不再自算，
+           所以两者不再可能像以前那样各说一套）。 -->
       <p v-if="store.lastFilter && store.lastFilter.unmatched.length" class="proc-note warn">
         <Icon name="alert" :size="13" />
         这些优先文件夹内没有可处理的重复文件：<b>{{ store.lastFilter.unmatched.join('、') }}</b>

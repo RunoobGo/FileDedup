@@ -2,9 +2,10 @@
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
 import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
-import { reactive, ref, computed } from 'vue'
+import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
-import { dirContains, fsCaseSensitiveForPath } from '../utils/pathpolicy'
+// AS-H6（2026-09-20）：路径归属判据收回后端，这里不再 import 前端的 dirContains
+// 与大小写猜测——判据只有一份才不会再漂移。utils/pathpolicy.ts 只剩卷比较用的纯函数。
 
 // 错误提示统一走 toast（Y6：替代阻塞式 alert，且可堆叠查看多条）
 const toast = () => useToastStore()
@@ -487,36 +488,101 @@ export const useScanStore = defineStore('scan', () => {
   //   procFiltering   → 结果页（决定要不要显示"正在收窄"的提示行）
   //   procExcluded    → 灰化提示（哪些勾选项因为不在优先目录里而落空）
   //
-  // 必须在**前端**算，不能等后端回包：
-  // 确认框要在用户点"确定"**之前**就说清数量，而 PreviewProcessPolicy 是
-  // 异步的，等它回来弹窗会闪一下再改数字。前端已经持有全部文件路径与勾选集，
-  // 这个交集的判据必须与后端一致 —— 实现收在 utils/pathpolicy.ts，
-  // 与 internal/ops/keep.go 的 inDir 同语义（折叠分隔符 + 按卷大小写语义）。
+  // ★ 2026-09-20（AS-H6 / 决策 D-1 方案 b）：命中判定**不再在前端做**。
+  // 此前这里有一份本地 dirContains（utils/pathpolicy.ts），注释声称与后端
+  // internal/ops/keep.go 的 inDir 同语义，实际两处已经漂移：它不做 Clean 等价
+  // 归一（`//`、`./`、`..`），还要按路径形状猜大小写语义。漂移方向是**少报命中**——
+  // 界面说"已排除"的那一项后端其实会处理，等于对"不会动的文件"做假承诺。
+  // 现在判据只有一份（后端），前端只负责显示 api.filterInDirs 返回的下标。
   //
-  // ★ 2026-09-20（审查 M3）：修正前这里是本地的一份"按原样比大小写"的实现，
-  // 注释却声称与后端同语义。macOS/Windows 默认的大小写不敏感卷上，
-  // 用户手输 `C:\Users\Dups` 匹配不到扫描结果的 `c:\users\dups\a.bin`：
-  // 后端会处理它，前端却报成"已排除"——计数说假话。
+  // 代价是异步：确认框要在用户点"确定"**之前**说清数量，所以
+  //   1) 勾选集/优先目录变化后 debounce 150ms 预取（用户读完屏幕上的数字时通常已到位）；
+  //   2) 数字未到位期间 procCountPending 为真 → 操作按钮灰掉、确认框显示"计算中…"，
+  //      **绝不显示一个猜出来的数**；
+  //   3) ConfirmDialog 挂载时再 ensureProcCounts() 兜一次，避免 debounce 还没跑完就弹窗。
 
   // procActive 是否启用了处理策略（列表里有非空白项）。
   const procActive = computed(() => procDirs.value.some(d => (d ?? '').trim() !== ''))
+  const usableProcDirs = () => procDirs.value.filter(d => (d ?? '').trim() !== '')
+
+  // procSelKey 当前「优先目录 + 勾选路径」的指纹：变了就得重新问后端。
+  // 用 JSON 而不是字符串拼接，是为了不让路径里的分隔符混出假指纹
+  // （["a","b"] 与 ["a\u0000b"] 直接拼起来同串，JSON 不会）。
+  const procSelKey = computed(() =>
+    procActive.value ? JSON.stringify([usableProcDirs(), selectedFiles.value.map(f => f.path)]) : '',
+  )
+
+  // procMatch 后端给回的真值：命中的是**勾选序列里的第几个下标**。
+  const procMatch = ref<{ key: string; idx: number[] } | null>(null)
+  const procCountError = ref('')
+  let procReqSeq = 0
+
+  // refreshProcCounts 向后端问一次命中下标。
+  // 只认最后一次请求的回执（用户在途改了勾选时，旧回包不得覆盖新状态）。
+  async function refreshProcCounts(): Promise<void> {
+    if (!procActive.value) {
+      procMatch.value = null
+      procCountError.value = ''
+      return
+    }
+    const key = procSelKey.value
+    if (!key || procMatch.value?.key === key) return
+    const [dirs, paths] = JSON.parse(key) as [string[], string[]]
+    const seq = ++procReqSeq
+    try {
+      const idx = await api.filterInDirs(dirs, paths)
+      if (seq !== procReqSeq) return
+      procMatch.value = { key, idx }
+      procCountError.value = ''
+    } catch (e: any) {
+      if (seq !== procReqSeq) return
+      procMatch.value = null
+      procCountError.value = String(e?.message ?? e ?? '后端判定失败')
+      toast().notifyError('优先文件夹命中数计算失败', e)
+    }
+  }
+
+  // ensureProcCounts 把真值备好（确认框打开时调用）：已到位就是空操作。
+  async function ensureProcCounts(): Promise<void> {
+    if (procTimer) { clearTimeout(procTimer); procTimer = null }
+    await refreshProcCounts()
+  }
+
+  // procCountPending 启用了策略但后端真值还没到位。
+  // 此刻任何"将处理 N"的数字都无从谈起，UI 必须显式说"计算中"而不是显示 0。
+  const procCountPending = computed(() =>
+    procActive.value && procMatch.value?.key !== procSelKey.value,
+  )
+
+  let procTimer: ReturnType<typeof setTimeout> | null = null
+  watch(procSelKey, () => {
+    if (procTimer) clearTimeout(procTimer)
+    procTimer = setTimeout(() => { procTimer = null; void refreshProcCounts() }, 150)
+  })
+  onScopeDispose(() => { if (procTimer) clearTimeout(procTimer) })
 
   // effectiveFiles 真正会被处理的那部分勾选项。
   // 未启用时恒等于 selectedFiles——不做任何过滤，走与新增本功能前一致的路径。
+  // 启用但真值未到位时返回空：宁可不给数字，也不给一个可能虚高或虚低的数字
+  // （按钮因此灰掉，用户被引导去等那 150ms，而不是被误导去点确认）。
   const effectiveFiles = computed(() => {
     if (!procActive.value) return selectedFiles.value
-    const dirs = procDirs.value.filter(d => (d ?? '').trim() !== '')
-    return selectedFiles.value.filter(f => {
-      const sensitive = fsCaseSensitiveForPath(f.path)
-      return dirs.some(d => dirContains(d, f.path, sensitive))
-    })
+    const m = procMatch.value
+    if (!m || m.key !== procSelKey.value) return []
+    const hit = new Set(m.idx)
+    return selectedFiles.value.filter((_, i) => hit.has(i))
   })
 
   const effectiveBytes = computed(() => effectiveFiles.value.reduce((s, f) => s + f.size, 0))
   const effectiveCount = computed(() => effectiveFiles.value.length)
   // procExcluded 勾选了、却因为不在优先目录内而不会被处理的项数。
+  // 真值未到位时给 0 而不是 selectedFiles.length：effectiveFiles 此刻是空的，
+  // 直接相减会算出"全部勾选项都被排除了"，那是一句假话（而且比数字缺失更糟——
+  // 它会点亮"已收窄"的提示行，用户以为策略把所有东西都滤掉了）。
   const procExcluded = computed(() =>
-    procActive.value ? selectedFiles.value.length - effectiveFiles.value.length : 0,
+    procActive.value && !procCountPending.value
+      ? selectedFiles.value.length - effectiveFiles.value.length
+      : 0,
   )
   // procFiltering 是否需要提示"正在收窄"。只在真的收窄了东西时才提示：
   // 勾选项全都在优先目录内时提示"已收窄"是噪音。
@@ -568,8 +634,12 @@ export const useScanStore = defineStore('scan', () => {
     if (ids.length === 0) return
     // 优先目录为空时不传字段（而不是传空数组）：后端对两者都判为"未启用"，
     // 但传 undefined 能让"这个请求没用到处理策略"在日志/抓包里一眼可见。
-    const dirs = procDirs.value.filter(d => (d ?? '').trim() !== '')
+    const dirs = usableProcDirs()
     if (!guard('执行清理操作')) return
+    // 进度条分母要用生效数，所以这里必须拿到后端真值。按钮在 pending 时是灰的，
+    // 正常走不到"还没到位"这条路；这一句是把这个不变式变成代码而不是靠 UI 约定
+    // （key 已匹配时 ensureProcCounts 是空操作，不会多跑一次 RPC）。
+    await ensureProcCounts()
     opsRunning.value = true
     opsResult.value = null
     lastFilter.value = null
@@ -789,6 +859,8 @@ export const useScanStore = defineStore('scan', () => {
     // 处理策略只导出 add/remove/clear —— 没有 move 是有意的，见 procDirs 注释
     procDirs, addProcDir, removeProcDir, clearProcDirs,
     procActive, procFiltering, procExcluded, lastFilter,
+    // AS-H6：命中数来自后端，UI 需要知道"还没到位"和"问失败了"
+    procCountPending, procCountError, ensureProcCounts,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     effectiveFiles, effectiveBytes, effectiveCount,

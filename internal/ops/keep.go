@@ -165,21 +165,87 @@ func pickInDirectory(g *model.DuplicateGroup, dir string) int {
 // 两份独立的路径比较实现，在含隐藏目录的组上选出不同的文件——界面上被星标
 // 的那一份，正是应用默认策略后要被清掉的那一份。多一份实现就多一次这种事故。
 //
+// ★ 2026-09-20（AS-H6）：这条"唯一"被前端破了——pathpolicy.ts 自己实现了一份
+// dirContains 用来算「将处理 N / 已排除 M」，且实测漂移（不做 Clean 归一、
+// 按路径形状猜大小写语义）。现在判据收回后端一处，前端经 FilterInDirs 取真值；
+// 本函数与 FilterInDirs 共用 normalizeDirs/inAnyDir，口径不可能再分叉。
+//
 // 语义：
 //   - 按 dir 所在卷的大小写语义折叠（不敏感卷上 /Users/X 与 /users/x 等价）
 //   - 统一分隔符后再比较（Windows 上 "\" 与 "/" 混用不误判）
 //   - 目录根（"/"、"C:\"）剥掉尾分隔符后命中该卷下全部绝对路径
 //   - dir 为空或纯空白返回 false（调用方自行 TrimSpace）
 func inDir(p, dir string) bool {
-	d := strings.TrimSpace(dir)
-	if d == "" {
-		return false
+	return inAnyDir(p, normalizeDirs([]string{dir})) >= 0
+}
+
+// normDir 一条已归一的优先目录：用户原文（回显用）+ 该卷的大小写语义。
+type normDir struct {
+	raw       string
+	sensitive bool
+}
+
+// normalizeDirs 归一优先目录列表：丢弃空白项、按折叠后形态去重（保留首条原文）。
+//
+// 去重键用 Clean+Fold 后的形态，所以 "/proc"、"/proc/"、" /proc " 只留第一条——
+// ApplyProcessPolicy 靠这一点避免 UnmatchedDirs 出现重复条目。
+// raw 保留**用户输入的原文**：提示信息要指出"你加的这一条没起作用"，
+// 回显原文他才找得到自己加的是哪条。
+func normalizeDirs(dirs []string) []normDir {
+	out := make([]normDir, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		raw := strings.TrimSpace(d)
+		if raw == "" {
+			continue // 与 HasUsableDir 同口径：空白项忽略
+		}
+		sensitive := fscase.Sensitive(raw)
+		norm := fscase.Fold(filepath.Clean(raw), sensitive)
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, normDir{raw: raw, sensitive: sensitive})
 	}
-	sensitive := fscase.Sensitive(d)
-	// inDirFold 的契约是接收**已折叠**的路径（见其注释）；此处不折叠的话，
-	// 不敏感卷上 inDir 与 pickInDirectory 会对同一输入给出相反答案——
-	// TestInDirAgreesWithPickInDirectory 在大小写不敏感文件系统上必红。
-	return inDirFold(fscase.Fold(p, sensitive), d, sensitive)
+	return out
+}
+
+// inAnyDir 返回 p 命中的第一个归一目录的下标，全不命中返回 -1。
+//
+// 目录与文件在同一卷，敏感性一致；以**目录**的探测结果为准折叠，
+// 是为了在"目录写错大小写"时仍能命中（I4 的核心场景）。
+// inDirFold 的契约是接收**已折叠**的路径（见其注释），所以折叠必须在这里做。
+func inAnyDir(p string, dirs []normDir) int {
+	for i, e := range dirs {
+		if inDirFold(fscase.Fold(p, e.sensitive), e.raw, e.sensitive) {
+			return i
+		}
+	}
+	return -1
+}
+
+// FilterInDirs 返回 paths 中落在 dirs 任一条目之下的**下标**（升序、不重复）。
+//
+// 为什么要有它（AS-H6，2026-09-20 全仓审计）：界面上的「将处理 N / 已排除 M」
+// 此前由前端自己判路径归属，而真正决定执行范围的是后端的 inDir。同一判据两份
+// 实现必然漂移，这次漂移的方向是**少报命中**——前端说"已排除"的那一项，后端其实
+// 会处理，等于界面对"不会动的文件"做了承诺。前端只该负责显示。
+//
+// 语义与 ApplyProcessPolicy 完全一致（共用 normalizeDirs/inAnyDir）：
+// dirs 是**并集**，无优先级；空白目录忽略；全部空白或 dirs 为空 → 空结果，
+// 调用方据此判定"未启用处理策略"。
+func FilterInDirs(dirs []string, paths []string) []int {
+	normalized := normalizeDirs(dirs)
+	if len(normalized) == 0 {
+		return []int{}
+	}
+	out := make([]int, 0, len(paths))
+	for i, p := range paths {
+		if inAnyDir(p, normalized) >= 0 {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // inDirFold 是 inDir 的内核，接收已折叠好的敏感性与已归一化的目录。
@@ -232,52 +298,28 @@ func ApplyProcessPolicy(groups []*model.DuplicateGroup, dirs []string,
 
 	out := ProcessPolicyOutcome{MatchIDs: map[uint64]bool{}}
 
-	// 归一目录列表，同时按"当前结果集内是否有可处理文件"逐条判定未命中。
-	// 用 seen 记已处理过的目录（折叠后比较），避免用户重复添加同一目录时
-	// UnmatchedDirs 里出现重复条目。
-	type dirEntry struct {
-		raw       string // 用户原文，用于回显
-		sensitive bool
-		hit       bool
-	}
-	entries := make([]*dirEntry, 0, len(dirs))
-	seen := make(map[string]bool, len(dirs))
-	for _, d := range dirs {
-		raw := strings.TrimSpace(d)
-		if raw == "" {
-			continue // 与 HasUsableDir 同口径：空白项忽略，不计入未命中
-		}
-		norm := fscase.Fold(filepath.Clean(raw), fscase.Sensitive(raw))
-		if seen[norm] {
-			continue // 重复目录只留第一条
-		}
-		seen[norm] = true
-		entries = append(entries, &dirEntry{raw: raw, sensitive: fscase.Sensitive(raw)})
-	}
+	// 归一目录列表（丢弃空白、按折叠形态去重），同时逐条记录是否命中。
+	// 判据与 FilterInDirs 共用 inAnyDir——预览计数与执行范围必须来自同一个内核。
+	entries := normalizeDirs(dirs)
 	if len(entries) == 0 {
 		return out
 	}
+	hit := make([]bool, len(entries))
 
 	for _, g := range groups {
 		for _, f := range g.Files {
 			if keepIDs != nil && keepIDs[f.ID] {
 				continue // 保留项不可处理，也不计入命中数
 			}
-			for _, e := range entries {
-				// 按该目录的敏感性折叠文件路径：目录与文件在同一卷，
-				// 敏感性一致；以目录的探测结果为准，是为了在"目录写错
-				// 大小写"时仍能命中（I4 的核心场景）。
-				if inDirFold(fscase.Fold(f.Path, e.sensitive), e.raw, e.sensitive) {
-					out.MatchIDs[f.ID] = true
-					e.hit = true
-					break // 落在多个目录下也只计一次
-				}
+			if i := inAnyDir(f.Path, entries); i >= 0 {
+				out.MatchIDs[f.ID] = true
+				hit[i] = true // 落在多个目录下也只记第一个（与命中判定同步收口）
 			}
 		}
 	}
 
-	for _, e := range entries {
-		if !e.hit {
+	for i, e := range entries {
+		if !hit[i] {
 			out.UnmatchedDirs = append(out.UnmatchedDirs, e.raw)
 		}
 	}

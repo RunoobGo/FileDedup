@@ -38,18 +38,25 @@ const meta = computed(() => {
 })
 
 const canConfirm = computed(() => {
+  // 命中数还没从后端回来时不给确认：此刻"将处理几个文件"是未知的，
+  // 而确认框的全部意义就是在动手前把数量说准（AS-H6）。
+  if (store.procCountPending) return false
   if (props.kind === 'delete' && !acknowledged.value) return false
   if (props.kind === 'move' && !moveTarget.value) return false
   return true
 })
 
-// 启用了处理策略且真的收窄了范围时，计数必须分两层显示。
+// 启用了处理策略且**已拿到后端真值**、且真的收窄了范围时，计数必须分两层显示。
 //
 // ★ 这里原先直接写 store.selectedFiles.length / store.selectedBytes。
 // 处理策略上线后那两个数就不等于"将被处理的数量"了：用户勾了 40 项、
 // 优先文件夹只覆盖 12 项，确认框若还说"将处理 40 个文件"，
 // 他点下确认后只有 12 项被动，剩下的 28 项无声无息——这属于**计数说谎**，
 // 比不做这个功能更糟。所以两个数都给出来，落差写在明面上。
+//
+// pending 时 procExcluded 恒为 0（真值未到位，无从判断有没有收窄），
+// 所以 procFiltering 此时必为假——但"没显示落差"不等于"没收窄"，
+// 必须走下面的"计算中"分支，否则会落到 v-else 那条"将处理 40 个文件"上，又是一句假话。
 const narrowed = computed(() => store.procFiltering)
 const procDirsTip = computed(() => store.procDirs.filter(d => d.trim()).join('、'))
 
@@ -76,7 +83,12 @@ function onKeydown(e: KeyboardEvent) {
     emit('close')
   }
 }
-onMounted(() => window.addEventListener('keydown', onKeydown, true))
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown, true)
+  // 结果页的 debounce 预取可能还没跑完就弹了窗；这里兜一次，
+  // key 已匹配时是空操作（不会多跑一次 RPC）。
+  void store.ensureProcCounts()
+})
 onUnmounted(() => window.removeEventListener('keydown', onKeydown, true))
 
 // P2-3：浮层语义 + 焦点管理。首焦点落在 DOM 序第一个可聚焦元素上 ——
@@ -98,7 +110,13 @@ useModal(dlgRef)
       <div id="confirm-dialog-title" class="t" :class="{ danger: meta.danger }">{{ meta.title }}</div>
       <p class="d">{{ meta.desc }}</p>
       <div class="box">
-        <template v-if="narrowed">
+        <!-- 命中数尚未从后端返回：既不说"将处理 N 项"，也不说 0 项，只说在算。
+             结果页的操作按钮此时已经是灰的，走到这一步通常是 debounce 与弹窗
+             竞速的极窄窗口；ensureProcCounts 会在挂载时立刻补一次，几毫秒后就换真数。 -->
+        <template v-if="store.procCountPending">
+          <div>正在核算实际处理范围（优先文件夹内的命中数尚未返回）…</div>
+        </template>
+        <template v-else-if="narrowed">
           <div>将处理 <b>{{ store.effectiveCount }}</b> 个文件（已勾选 {{ store.selectedFiles.length }} 项，其中 {{ store.procExcluded }} 项不在优先文件夹内，本次不改动）</div>
           <div>共 <b>{{ humanBytes(store.effectiveBytes) }}</b> 空间可释放</div>
         </template>

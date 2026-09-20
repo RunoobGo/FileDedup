@@ -1143,6 +1143,24 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 	return pv, nil
 }
 
+// FilterInDirs 批量判定「哪些路径位于任一优先目录下」，返回 paths 的下标（升序、不重复）。
+//
+// ★ 2026-09-20（全仓审计 AS-H6 / 决策 D-1 方案 b）：界面上的「将处理 N / 已排除 M」
+// 此前由前端自己实现一份路径归属判据算出来，而后端执行范围由 ops.inDir 决定——
+// 同一判据两份实现，且前端那份已经实测漂移（不做 Clean 归一、按路径形状猜大小写
+// 语义），漂移方向是**少报命中**：界面说"已排除"的那一项后端其实会处理，
+// 等于对"不会动的文件"做了假承诺。现在前端只显示这里返回的下标。
+//
+// 与 PreviewProcessPolicy 的分工：那个绑定求的是「勾选 ID ∩ 后端结果集」，
+// 需要 a.mu；本绑定是纯字符串判据，输入完全由前端给出（前端手上有当前
+// 展示的路径），因此**不加锁、不受 opsRunning 互斥限制**，可以在清理进行中调用。
+//
+// 语义与执行侧严格一致：并集、无优先级、空白目录忽略；dirs 全空白时返回空列表
+// （= 未启用处理策略，前端据此走"不过滤"的原路径）。
+func (a *App) FilterInDirs(dirs []string, paths []string) []int {
+	return ops.FilterInDirs(dirs, paths)
+}
+
 // ApplyKeepPolicy 保留策略引擎（M3-T01）：返回决策并记录 keepIDs（S2 保护依据）。
 // 遍历阶段全程持锁（须与操作 goroutine 的结果集清理写互斥）；
 // 历史持久化放到放锁之后（hist 自有锁，禁止与 a.mu 嵌套）。
