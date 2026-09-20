@@ -113,6 +113,51 @@ func TestUndoTrashOrigOccupiedUsesRestoredName(t *testing.T) {
 	}
 }
 
+// TestUndoTrashSecondOccupiedLandsAsWorkTemp AS-R1（2026-09-20 全仓审计）端到端：
+// 原位与 a.fdd-restored.bin 都被占时，第二次恢复经 uniqueDst 落到
+// a.fdd-restored_1.bin —— 序号插在扩展名**之前**，把标记与扩展名隔开了。
+// 这个名字必须仍被 worktemp 认出来，否则恢复产物会重新参与重复分组，
+// 用户看到的还是缺陷 6 那句「刚恢复的文件重扫又变重复」。
+func TestUndoTrashSecondOccupiedLandsAsWorkTemp(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("SECOND-OCCUPIED-CASE")
+	dest := filepath.Join(dir, "trashbin", "a.bin")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := filepath.Join(dir, "a.bin")
+	if err := os.WriteFile(orig, []byte("someone-else"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(dir, "a.fdd-restored.bin")
+	if err := os.WriteFile(first, []byte("first-restore"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	it := UndoItem{Kind: "trash", OrigPath: orig, DestPath: dest,
+		Hash: hashOfFileT(t, dest), Size: uint64(len(content)), MtimeNs: pastNs()}
+	dst, err := UndoOne(it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst != filepath.Join(dir, "a.fdd-restored_1.bin") {
+		t.Fatalf("第二次恢复应落到带序号的名字，实得 %s", dst)
+	}
+	if !IsWorkTempName(filepath.Base(dst)) {
+		t.Fatalf("%q 是恢复产物，必须判为工作临时名（否则残留会重新参与重复分组）", filepath.Base(dst))
+	}
+	// 两份既有文件都不许被动过
+	if got, _ := os.ReadFile(orig); string(got) != "someone-else" {
+		t.Fatal("原位占位文件被覆盖")
+	}
+	if got, _ := os.ReadFile(first); string(got) != "first-restore" {
+		t.Fatal("第一次恢复的产物被覆盖")
+	}
+}
+
 func TestUndoTrashDestMissing(t *testing.T) {
 	dir := t.TempDir()
 	it := UndoItem{Kind: "trash", OrigPath: filepath.Join(dir, "gone", "a.bin"),

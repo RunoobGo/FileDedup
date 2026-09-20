@@ -38,6 +38,8 @@ func TestWalkSkipsWorkTempResidue(t *testing.T) {
 	mk("dup.bin.fdd-tmp", "identical-payload")      // 中断留下的临时硬链接
 	mk("dup.bin.fdd-old.undo", "identical-payload") // 回滚暂存
 	mk("photo.jpg.fdd-restored.jpg", "identical-payload")
+	// AS-R1：原位与 a.fdd-restored.jpg 都被占时，uniqueDst 把 _N 插在扩展名之前
+	mk("photo.jpg.fdd-restored_2.jpg", "identical-payload")
 
 	// 用户正常文件：必须仍被收集，绝不能被误忽略
 	mk("real1.bin", "identical-payload")
@@ -51,7 +53,7 @@ func TestWalkSkipsWorkTempResidue(t *testing.T) {
 	}
 	for _, name := range []string{
 		"dup.bin.fdd-old", "dup.bin.fdd-tmp", "dup.bin.fdd-old.undo",
-		"photo.jpg.fdd-restored.jpg",
+		"photo.jpg.fdd-restored.jpg", "photo.jpg.fdd-restored_2.jpg",
 	} {
 		if got[name] {
 			t.Errorf("工作临时文件 %q 不应被扫描收集（会污染重复分组）", name)
