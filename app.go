@@ -1118,7 +1118,13 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 		return pv, nil
 	}
 
-	// 全程持锁：ApplyProcessPolicy 是纯内存计算（无 I/O、不回调整个 App），
+	// ★ AS-R3（2026-09-20 全仓审计）：卷语义探测要**往用户目录写探测文件**，
+	// 属于 I/O，必须在取锁之前做完——死挂载（网络盘拔走后 stat 挂死）时，
+	// 锁内一次写盘就能把 a.mu 连同全部 Wails 绑定一起卡住，而预览本应是只读操作。
+	// 预热之后（结论按目录缓存），锁内那次调用是纯查表 + 纯比较。
+	resolve := ops.WarmSensitivity(dirs)
+
+	// 全程持锁：这里只剩纯内存计算（无 I/O、不回调整个 App），
 	// 耗时与组数成正比，锁住它不伤害交互。此前"锁内浅快照、锁外遍历"的写法
 	// 挡不住**元素级**竞争——a.groups 是 []*DuplicateGroup，浅拷贝共享指针，
 	// 执行器收尾会在锁内就地改写 g.Files（app.go 结果集清理段 g.Files = files），
@@ -1126,7 +1132,7 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 	a.mu.Lock()
 	groups := a.groups
 	keepIDs := a.keepIDs
-	out := ops.ApplyProcessPolicy(groups, dirs, keepIDs)
+	out := ops.ApplyProcessPolicyWith(groups, dirs, keepIDs, resolve)
 	a.mu.Unlock()
 
 	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，

@@ -65,10 +65,34 @@ var (
 	mu      sync.Mutex
 	cache   = make(map[string]bool)
 	probeNo atomic.Uint64 // 进程内递增，避免与上次运行的残留探测文件撞名
+	hook    func(dir string)
 )
+
+// SetProbeHook 安装（传 nil 清除）一个「即将开始卷语义探测」的观察点。**仅供测试**。
+//
+// 为什么需要它（AS-R3，2026-09-20 全仓审计）：探测不是纯计算——它要往目标目录
+// **写一个文件**再反向 Lstat。调用方若在持锁期间触发探测，一个死挂载（NFS/网络盘
+// 拔走后 stat 会挂住）就会把该锁连同全部应用绑定一起卡死。
+// "有没有在锁内做 I/O" 这种性质从返回值上完全观测不到，只能有个能插在 I/O 之前的钩子。
+func SetProbeHook(h func(dir string)) {
+	mu.Lock()
+	hook = h
+	mu.Unlock()
+}
+
+// fireProbeHook 在探测动手前回调（不持 mu：钩子里可能做任意观测）。
+func fireProbeHook(dir string) {
+	mu.Lock()
+	h := hook
+	mu.Unlock()
+	if h != nil {
+		h(dir)
+	}
+}
 
 // probe 实际探测。任何一步不确定都退回默认值，不猜测。
 func probe(dir string) bool {
+	fireProbeHook(dir)
 	base := fmt.Sprintf(".fdd-case-probe-%d", probeNo.Add(1))
 	lower := filepath.Join(dir, strings.ToLower(base))
 	upper := filepath.Join(dir, strings.ToUpper(base))

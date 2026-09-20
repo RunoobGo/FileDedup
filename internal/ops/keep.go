@@ -176,7 +176,7 @@ func pickInDirectory(g *model.DuplicateGroup, dir string) int {
 //   - 目录根（"/"、"C:\"）剥掉尾分隔符后命中该卷下全部绝对路径
 //   - dir 为空或纯空白返回 false（调用方自行 TrimSpace）
 func inDir(p, dir string) bool {
-	return inAnyDir(p, normalizeDirs([]string{dir})) >= 0
+	return inAnyDir(p, normalizeDirs([]string{dir}, nil)) >= 0
 }
 
 // normDir 一条已归一的优先目录：用户原文（回显用）+ 该卷的大小写语义。
@@ -185,13 +185,55 @@ type normDir struct {
 	sensitive bool
 }
 
+// SensResolver 报告某目录所在卷是否区分大小写。
+type SensResolver func(dir string) bool
+
+// dirKey 归一「同一目录」的比较键：预热表与查询两侧共用同一个函数，
+// 避免出现"存进去的键和查出来的键不是一套"这类静默失效。
+func dirKey(dir string) string { return filepath.Clean(strings.TrimSpace(dir)) }
+
+// WarmSensitivity 提前把各目录的卷语义探测好，返回一个纯查表的解析器。
+//
+// 为什么要单独一步（AS-R3，2026-09-20 全仓审计）：fscase.Sensitive 不是纯函数，
+// 它要往目标目录**写一个探测文件**再反向 Lstat。调用方若在持有应用锁的窗口里
+// 触发它，一个死挂载（网络盘拔走后 stat 会挂死）就会把 a.mu 连同全部 Wails
+// 绑定一起卡住。所以必须"I/O 在锁外做完，锁内只剩纯比较"。
+//
+// 探测结论在 fscase 内按目录缓存，预热之后同一目录再问不重复写盘。
+func WarmSensitivity(dirs []string) SensResolver {
+	sens := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		raw := strings.TrimSpace(d)
+		if raw == "" {
+			continue
+		}
+		if _, ok := sens[dirKey(raw)]; !ok {
+			sens[dirKey(raw)] = fscase.Sensitive(raw)
+		}
+	}
+	return func(dir string) bool {
+		if v, ok := sens[dirKey(dir)]; ok {
+			return v
+		}
+		// 表外目录：调用方传的 dirs 与这里问的 dirs 本该同一批，真出现意外时
+		// 实测一次也比拿平台默认值瞎猜更安全。
+		return fscase.Sensitive(dir)
+	}
+}
+
 // normalizeDirs 归一优先目录列表：丢弃空白项、按折叠后形态去重（保留首条原文）。
+//
+// resolve 为 nil 时按需就地实测卷语义（无锁场景，如 FilterInDirs）；
+// 持锁的调用方必须先 ops.WarmSensitivity 再把解析器传进来（AS-R3）。
 //
 // 去重键用 Clean+Fold 后的形态，所以 "/proc"、"/proc/"、" /proc " 只留第一条——
 // ApplyProcessPolicy 靠这一点避免 UnmatchedDirs 出现重复条目。
 // raw 保留**用户输入的原文**：提示信息要指出"你加的这一条没起作用"，
 // 回显原文他才找得到自己加的是哪条。
-func normalizeDirs(dirs []string) []normDir {
+func normalizeDirs(dirs []string, resolve SensResolver) []normDir {
+	if resolve == nil {
+		resolve = fscase.Sensitive
+	}
 	out := make([]normDir, 0, len(dirs))
 	seen := make(map[string]bool, len(dirs))
 	for _, d := range dirs {
@@ -199,7 +241,7 @@ func normalizeDirs(dirs []string) []normDir {
 		if raw == "" {
 			continue // 与 HasUsableDir 同口径：空白项忽略
 		}
-		sensitive := fscase.Sensitive(raw)
+		sensitive := resolve(raw)
 		norm := fscase.Fold(filepath.Clean(raw), sensitive)
 		if seen[norm] {
 			continue
@@ -235,7 +277,7 @@ func inAnyDir(p string, dirs []normDir) int {
 // dirs 是**并集**，无优先级；空白目录忽略；全部空白或 dirs 为空 → 空结果，
 // 调用方据此判定"未启用处理策略"。
 func FilterInDirs(dirs []string, paths []string) []int {
-	normalized := normalizeDirs(dirs)
+	normalized := normalizeDirs(dirs, nil)
 	if len(normalized) == 0 {
 		return []int{}
 	}
@@ -295,12 +337,23 @@ type ProcessPolicyOutcome struct {
 // 走与新增本功能之前完全一致的代码路径。
 func ApplyProcessPolicy(groups []*model.DuplicateGroup, dirs []string,
 	keepIDs map[uint64]bool) ProcessPolicyOutcome {
+	return ApplyProcessPolicyWith(groups, dirs, keepIDs, nil)
+}
+
+// ApplyProcessPolicyWith 是 ApplyProcessPolicy 的持锁安全版本：
+// 卷语义由调用方在**取锁之前**用 WarmSensitivity 预热好传进来。
+//
+// 为什么要有这个参数（AS-R3）：默认那一路会在归一目录时按需在用户目录写探测文件，
+// 而那几步 I/O 一旦落在调用方的临界区里，死挂载就能把整把锁卡死。
+// 结论按目录缓存，预热与就地实测给出的判定逐位相同。
+func ApplyProcessPolicyWith(groups []*model.DuplicateGroup, dirs []string,
+	keepIDs map[uint64]bool, resolve SensResolver) ProcessPolicyOutcome {
 
 	out := ProcessPolicyOutcome{MatchIDs: map[uint64]bool{}}
 
 	// 归一目录列表（丢弃空白、按折叠形态去重），同时逐条记录是否命中。
 	// 判据与 FilterInDirs 共用 inAnyDir——预览计数与执行范围必须来自同一个内核。
-	entries := normalizeDirs(dirs)
+	entries := normalizeDirs(dirs, resolve)
 	if len(entries) == 0 {
 		return out
 	}
