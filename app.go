@@ -1551,23 +1551,26 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	// 可回撤，实际账本上什么都没有。此处在派发前落盘计划，失败即拒绝执行。
 	// 放在锁外是因为 hist 访问绝不与 a.mu 嵌套（见 App.hist 注释）；
 	// opsRunning 已在锁内置位，新扫描与新操作在此期间都被拒。
-	journalID, jerr := a.beginJournal(hs, histID, op, groups, keepIDs)
-	if jerr != nil {
+	// resetOps 复位在途标志并释放取消函数。M8：它在下面被调用**两次**——
+	// 一次在终止事件之前，一次留给 goTask 的 defer。
+	// defer 那一次一定晚于 body 内的 emit（`defer reset()` 注册在 `body()` 之前），
+	// 于是前端在 ops:done 回调里立刻 StartScan / ApplyKeepPolicy 会被
+	// 「清理操作执行中」误拒。与扫描路径的 resetInFlight 同构（见 :496 注释）。
+	// 保留 defer 那份是 panic 展开路径的兜底；两次调用均为幂等。
+	resetOps := func() {
 		a.mu.Lock()
 		a.opsRunning = false
 		a.opsCancel = nil
 		a.mu.Unlock()
 		cancelOp()
+	}
+	journalID, jerr := a.beginJournal(hs, histID, op, groups, keepIDs)
+	if jerr != nil {
+		resetOps()
 		return "", jerr
 	}
 
-	a.goTask("ops", func() {
-		a.mu.Lock()
-		a.opsRunning = false
-		a.opsCancel = nil
-		a.mu.Unlock()
-		cancelOp()
-	}, func() {
+	a.goTask("ops", resetOps, func() {
 		res := opsExecuteFn(ops.Options{
 			Ctx:     opCtx,
 			Groups:  groups,
@@ -1638,6 +1641,9 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 				fmt.Fprintf(os.Stderr, "[history] 历史裁剪失败: %v\n", perr)
 			}
 		}
+		// M8：终止事件必须在复位之后发。结果集回写已完成（上面解锁那一刻起
+		// 本 goroutine 不再改写 a.groups），此后任何新扫描/新操作都与它无关。
+		resetOps()
 		a.emit(a.ctx, "ops:done", res)
 	})
 	return opID, nil
@@ -1819,6 +1825,9 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 			res.Restored = append(res.Restored, restored)
 		}
 		a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: total, Total: total, Current: ""})
+		// M8：同 ExecuteOperation——终止事件前必须先复位（release 也留给
+		// goTask 的 defer 兜 panic 路径，两次调用幂等）。
+		release()
 		a.emit(a.ctx, "ops:undo:done", res)
 	})
 	return undoID, nil
@@ -1935,6 +1944,8 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 				res.Restored = append(res.Restored, restored)
 			}
 		}
+		// M8：单项回撤与批量回撤同构——终止事件前必须先复位。
+		release()
 		a.emit(a.ctx, "ops:undo:done", res)
 	})
 	return undoID, nil
