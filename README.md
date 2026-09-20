@@ -20,7 +20,7 @@
     mtime + 删源」，任一步失败保留源（不承诺复制后的内容哈希复核）
 - 扫描历史与清理记录可回看；清理/回撤执行期由后端互斥门统一拒绝并发操作，前端按钮同时置灰
 
-> 当前版本：**0.5.0**（应用内「关于」/ `GetVersion` 与仓库 5 处版本号声明位由
+> 当前版本：**0.5.0**（应用内「关于」/ `GetVersion` 与仓库 6 个取值位 / 5 个文件的版本号由
 > `scripts/check-version-sync.sh` 强制对齐，详见下方[发布](#发布)）。
 > 完整功能与安全性说明以 [docs/09-用户手册.md](docs/09-用户手册.md) 为准；
 > 工程现状与门禁看 [docs/04-开发与测试计划.md](docs/04-开发与测试计划.md)；
@@ -88,13 +88,13 @@ cd frontend && npm ci && npm run build                       # 先产 dist（go 
 go test -race -count=2 ./...                                 # 全包
 go test -race -count=4 .                                     # 根包（App 层状态机多压两轮）
 bash scripts/smoke-cli.sh                                    # 数据集 C×0.02 三跑比对
-bash scripts/check-version-sync.sh                           # 5 处版本号声明位对齐
+bash scripts/check-version-sync.sh                           # 6 个取值位 / 5 个文件版本号对齐
 ```
 
 | 脚本 | 作用 |
 |---|---|
 | `scripts/smoke-cli.sh` | benchgen 生成固定数据集 → `fdd-cli` 冷扫 / 缓存首扫 / 缓存复扫，逐项比对分组集合、可释放字节、语料数，并与 manifest 对账 |
-| `scripts/check-version-sync.sh` | 5 处版本号声明位对齐；tag 触发时再比对 `v<版本>` |
+| `scripts/check-version-sync.sh` | 6 个取值位 / 5 个文件的版本号对齐（`package-lock.json` 贡献 2 处）；tag 触发时再比对 `v<版本>` |
 | `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因），其余用例一律阻断 |
 
 CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runner 上跑隔离后的
@@ -103,8 +103,9 @@ CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runne
 
 ## 发布
 
-1. 同步版本号（5 处）：`app.go` 的 `AppVersion`、`wails.json` 的 `info.productVersion`、
-   `frontend/package.json`、`frontend/package-lock.json`（两处）、`docs/09` 首部「适用版本」。
+1. 同步版本号（6 个取值位 / 5 个文件）：`app.go` 的 `AppVersion`、`wails.json` 的
+   `info.productVersion`、`frontend/package.json`、`frontend/package-lock.json`（顶层
+   `version` 与 `packages[""].version` 两处）、`docs/09` 首部「适用版本」。
    `build/darwin/*.plist` 用 `{{.Info.ProductVersion}}` 模板，无需手改。
 2. `bash scripts/check-version-sync.sh` 绿。
 3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z` —— tag 必须等于 `AppVersion`，

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # 版本号一致性门禁（04 附录 A「版本号与 GetVersion 一致」的机器化版本）。
 #
-# 校验以下声明位必须完全相等：
-#   1. app.go                 const AppVersion      （GetVersion 绑定返回值）
-#   2. wails.json             info.productVersion   （打包壳；Win/Linux 资源与
-#                              build/*/Info.plist 的 {{.Info.ProductVersion} 同源）
-#   3. frontend/package.json  version
-#   4. frontend/package-lock.json version + packages[""].version
-#   5. docs/09-用户手册.md    「适用版本：」
+# 校验以下声明位必须完全相等。共 **6 个取值位 / 5 个文件**：
+#   取值位 1   app.go                 const AppVersion      （GetVersion 绑定返回值）
+#   取值位 2   wails.json             info.productVersion   （打包壳；Win/Linux 资源与
+#                                     build/*/Info.plist 的 {{.Info.ProductVersion}} 同源）
+#   取值位 3   frontend/package.json  version
+#   取值位 4   frontend/package-lock.json version
+#   取值位 5   frontend/package-lock.json packages[""].version   （同一文件贡献 2 个取值位）
+#   取值位 6   docs/09-用户手册.md    「适用版本：」
+# 注：对外叙述习惯说"5 处"（按文件数），但门禁实际读 6 个值——包锁文件里
+#     `version` 与 `packages[""].version` 是两处独立声明，任一漂移都会被本脚本抓住。
 #
 # 打 tag 发布时额外校验：tag 必须是 v<版本号>（build.yml 由 v* 触发并建 Release，
 # 修复前 tag 与产品版本各说各话，Release 资产名与"关于"里读到的版本会不一致）。
@@ -72,7 +75,8 @@ fi
 
 if [ "$BAD" -ne 0 ]; then
 	echo
-	echo "修复：改版本号只需一次同步 5 处（app.go / wails.json / frontend/package{,-lock}.json / docs/09），"
+	echo "修复：改版本号只需一次同步 6 个取值位 / 5 个文件——"
+	echo "      app.go / wails.json / frontend/package.json / frontend/package-lock.json(2 处) / docs/09，"
 	echo "     然后重新运行本脚本。build/darwin/*.plist 用 {{.Info.ProductVersion}} 模板，无需手改。"
 	exit 1
 fi

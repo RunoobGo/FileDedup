@@ -10,6 +10,14 @@
         <asmv3:windowsSettings>
             <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware> <!-- fallback for Windows 7 and 8 -->
             <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2,permonitor</dpiAwareness> <!-- falls back to per-monitor if per-monitor v2 is not supported -->
+            <!-- 长路径（>260 字符）支持：本产品处理深目录树，属刚需。
+                 Win10 1607+ 需**同时**满足两个条件才生效：① 本元素；② 注册表
+                 HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1。
+                 只声明本元素而注册表未开启时，长路径仍按 MAX_PATH 截断——故 09 手册
+                 对此标注了环境前提。声明后 CreateFileW/DeleteFileW/MoveFileW/
+                 GetFileAttributesW 等不再受 MAX_PATH 限制（不含 Shell 的
+                 SHFileOperationW，其路径仍在调用处按需处理）。 -->
+            <ws2:longPathAware xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</ws2:longPathAware>
         </asmv3:windowsSettings>
     </asmv3:application>
 </assembly>
