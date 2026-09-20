@@ -143,7 +143,9 @@ func (s *Store) ListScans() ([]ScanMeta, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ScanMeta
+	// 同 oplog.ListOps：空列表必须是 []，不能是 nil（→ JSON null）。
+	// 否则扫描历史页在"一条历史都没有"时同样整页空白。
+	out := make([]ScanMeta, 0, 16)
 	for rows.Next() {
 		m, err := scanMeta(rows)
 		if err != nil {

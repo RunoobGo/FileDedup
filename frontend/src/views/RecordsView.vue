@@ -49,7 +49,8 @@ async function clearAll() {
 // ---------- 清理记录（功能 4） ----------
 
 const OP_KIND_LABEL: Record<string, string> = {
-  trash: '回收站', delete: '永久删除', move: '移动', hardlink: '硬链接合并',
+  trash: '回收站', delete: '永久删除', move: '移动',
+  hardlink: '硬链接合并', symlink: '软链接合并',
 }
 const STATE_LABEL: Record<string, string> = {
   planned: '待处理', done: '已执行', failed: '失败', skipped: '已跳过',
@@ -158,10 +159,29 @@ async function clearAllOps() {
 }
 
 // 明细表「去向」列：trash/move 看 destPath，hardlink 看 linkSrc
+// destSummary 条目「去向」列的文案。
+//
+// 链接类条目（hardlink/symlink）的去向是"指向哪个保留源"，而非某个路径，
+// 故这里统一渲染成「→ 目标路径」。软链接额外标注「软链接」字样：
+// 后端的 isSymlink 标记来自 Lstat，能区分"当时建的链接"与"同栏但其实是
+// 硬链接的记录"——不靠 OP_KIND_LABEL 猜，避免旧记录/异常记录被误标。
 function destSummary(it: OpRecordItem): string {
   if (it.destPath) return it.destPath
-  if (it.linkSrc) return `链接到 ${it.linkSrc}`
+  if (it.linkSrc) return it.isSymlink ? `软链接 → ${it.linkSrc}` : `链接到 ${it.linkSrc}`
   return '—'
+}
+
+// danglingTitle 悬空链接的悬浮说明。
+//
+// 悬空 = 链接本身还在，但它指向的保留文件已经不在原路径了
+// （被删除、被移动、或所在磁盘未接入）。用户此时最需要知道的是
+// 「我的文件没丢，数据在保留源那边；而且这一条仍然可以回撤」——
+// 这正是它和"文件丢失"的根本区别，必须说清楚，否则用户会以为数据没了。
+function danglingTitle(it: OpRecordItem): string {
+  return `软链接已失效（悬空）：它指向的保留文件当前不可访问（可能已被删除、移动，或所在磁盘未接入）。\n` +
+    `你的数据没有丢失——合并时磁盘上只保留了一份，而这一条只是指向它的路径替身。\n` +
+    `目标：${it.linkSrc}\n` +
+    `如需恢复成独立文件，点右侧「回撤」即可（备份仍在，回撤不依赖链接是否有效）。`
 }
 </script>
 
@@ -286,9 +306,17 @@ function destSummary(it: OpRecordItem): string {
                     <tr><th>原路径</th><th>去向</th><th>大小</th><th>状态</th><th>错误</th><th>操作</th></tr>
                   </thead>
                   <tbody>
-                    <tr v-for="it in opDetail" :key="it.id">
+                    <tr v-for="it in opDetail" :key="it.id" :class="{ 'row-dangling': it.dangling }">
                       <td class="roots" :title="it.origPath">{{ it.origPath }}</td>
-                      <td class="roots" :title="destSummary(it)">{{ destSummary(it) }}</td>
+                      <td class="roots" :title="destSummary(it)">
+                        {{ destSummary(it) }}
+                        <!-- 悬空链接必须一眼可见（红标 + 可悬停看原因）。
+                             不做自动修复：链接失效是用户环境变化（拔盘/移动文件）
+                             的结果，应用替用户"修好"它反而可能指向错误的地方。 -->
+                        <span v-if="it.dangling" class="dangling-tag" :title="danglingTitle(it)">
+                          <Icon name="alert" :size="11" /> 链接已失效
+                        </span>
+                      </td>
                       <td class="num">{{ humanBytes(it.size) }}</td>
                       <td><span :class="stateCls(it.state)">{{ STATE_LABEL[it.state] ?? it.state }}</span></td>
                       <td class="err-cell" :title="it.err">{{ it.err }}</td>
@@ -357,6 +385,17 @@ function destSummary(it: OpRecordItem): string {
 .st-bad { color: var(--danger-ink); background: rgba(220, 80, 80, 0.12); }
 .st-mute { color: var(--text-3); background: rgba(127, 127, 127, 0.1); }
 .err-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-ink); }
+/* 悬空链接行：整行淡红底 + 行内红标。
+   为什么要整行着色而不是只标一个图标：明细表可能有几十行，
+   悬空项是需要用户**动手处理**的（回撤或重新放回保留文件），
+   只标图标在长表里会被扫过去。底色把视线拉住，图标说明原因。 */
+.row-dangling > td { background: rgba(220, 80, 80, 0.08); }
+.dangling-tag {
+  display: inline-flex; align-items: center; gap: 3px;
+  margin-left: 6px; padding: 0 6px; border-radius: 999px;
+  font-size: 11px; white-space: nowrap;
+  color: var(--danger-ink); background: rgba(220, 80, 80, 0.14);
+}
 .btn-ghost.xs { padding: 1px 6px; font-size: 12px; line-height: 1.5; }
 /* 空态样式与 ResultView 空态同节奏 */
 .empty { text-align: center; color: var(--text-2); padding: 56px 24px; }

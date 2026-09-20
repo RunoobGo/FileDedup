@@ -49,6 +49,27 @@ type FileView struct {
 	Size    uint64 `json:"size"`
 	ModTime int64  `json:"mtime"`
 	IsKeep  bool   `json:"isKeep"` // 默认建议保留者（非隐藏优先，再路径最短）
+
+	// Volume 所在卷标识（2026-09-20 新增，"symlink" 前置能力）。
+	//
+	// 为什么必须由后端给出，而不是让前端从路径里自己截：
+	//   - 前端要判断"这个重复组是否跨卷"，才决定显不显示「软链接合并」按钮。
+	//     硬链接跨卷必失败，软链接在同卷又只有净损失（见 ops/symlink.go 头注释），
+	//     所以这个判定直接决定按钮该不该出现，判错等于把用户引向必然失败的路径。
+	//   - Windows 上"卷"不等于"盘符"：一个盘符可能是一个卷，也可能是一个挂载点
+	//     （如 C:\Mount\Data 指向另一个卷）。而且路径大小写、UNC
+	//     （\\server\share）、以及 \\?\ 前缀都会让字符串比较得出一堆假阳性。
+	//     只有后端有能力用平台 API（volumeRoot / fsid）给出对的答案。
+	//
+	// 取值：优先取 FileKey.VolumeID（扫描阶段解析出的卷序列号/设备号），
+	// 未解析时退化为路径的卷根（filepath.VolumeName，unix 为 "/"）。
+	// 前端只做相等比较，不解释其内容。
+	Volume string `json:"volume"`
+
+	// VolumeResolved 表示 Volume 是否来自**真实卷身份**（而非路径推断）。
+	// false 时不参与跨卷判定（保守按"同卷"处理，不显示按钮）：
+	// 与其猜错让用户点出一个注定失败的按钮，不如不显示。
+	VolumeResolved bool `json:"volumeResolved"`
 }
 
 // GroupView 重复组视图。
@@ -745,16 +766,44 @@ func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
 		keep = ops.SuggestKeepIndex(g)
 	}
 	for i, f := range g.Files {
+		vol, volOK := fileVolume(f)
 		v.Files = append(v.Files, FileView{
-			ID:      f.ID,
-			Path:    f.Path,
-			Name:    filepath.Base(f.Path),
-			Size:    f.Size,
-			ModTime: f.ModTime,
-			IsKeep:  i == keep,
+			ID:             f.ID,
+			Path:           f.Path,
+			Name:           filepath.Base(f.Path),
+			Size:           f.Size,
+			ModTime:        f.ModTime,
+			IsKeep:         i == keep,
+			Volume:         vol,
+			VolumeResolved: volOK,
 		})
 	}
 	return v
+}
+
+// fileVolume 计算文件所在卷的标识（供 UI 判定跨卷，见 FileView.Volume）。
+//
+// 两级来源，优先"真实卷身份"：
+//
+//	① f.Key.VolumeID —— 扫描阶段由平台层解析的卷序列号/设备号。
+//	   Windows 上 FileKey 只在候选组内按需解析（scanner 阶段 1.5），
+//	   所以这里**可能为未解析**；unix 上遍历时顺带填充，总是有值。
+//	② 路径卷根 filepath.VolumeName —— 兜底。Windows 上恒为盘符（"D:"），
+//	   unix 上为空串（此时用 "/" 统一表示"唯一根"）。
+//
+// 返回的第二个值区分二者，因为**可信度不同**：① 是内核给出的卷身份，
+// 可直接用于跨卷判定；② 只是路径前缀，在挂载点/UNC 场景下会误判，
+// 因此前端应跳过未解析的组而不是拿它去猜（见 FileView.VolumeResolved）。
+func fileVolume(f *model.FileEntry) (string, bool) {
+	if f.Key.Resolved {
+		// 前缀区分来源，避免"恰好等于某盘符字符串"的荒诞碰撞。
+		return fmt.Sprintf("vid:%d", f.Key.VolumeID), true
+	}
+	root := filepath.VolumeName(f.Path)
+	if root == "" {
+		root = string(filepath.Separator) // unix：全部路径同属一个根
+	}
+	return "root:" + root, false
 }
 
 // GetFailedItems 失败清单（扫描失败；操作失败随 M3 并入）。
@@ -976,6 +1025,70 @@ func defaultSettings() Settings {
 // GetVersion 当前版本。
 func (a *App) GetVersion() string { return AppVersion }
 
+// emptyIntersectionMsg 处理策略把勾选全部过滤掉时的拒绝文案。
+//
+// 措辞要点：
+//   - 说清"发生了什么"（已选 N、命中 0）——让用户自己能判断是不是范围配错了；
+//   - 说"已取消操作"而不是"请重试"——用户最怕"以为做了其实没做"，这句直接消歧义；
+//   - 顺带提示未命中的文件夹数——那通常就是配错的那一条。
+func emptyIntersectionMsg(selected, unmatchedDirs int) string {
+	extra := ""
+	if unmatchedDirs > 0 {
+		extra = fmt.Sprintf("；其中 %d 个文件夹内没有任何可处理的重复文件（可能写错了路径）", unmatchedDirs)
+	}
+	return fmt.Sprintf("所选文件均不在「优先处理的文件夹」范围内（已选 %d 项，命中 0 项%s），"+
+		"已取消操作，未改动任何文件。请调整优先文件夹，或清空该设置后重试。",
+		selected, extra)
+}
+
+// ProcessPreview 处理策略的实际生效范围预览（供 UI 在执行前展示真实数量）。
+type ProcessPreview struct {
+	EffectiveIDs   []uint64 `json:"effectiveIds"`   // 勾选中位于优先文件夹内的 ID
+	EffectiveCount int      `json:"effectiveCount"` // = len(EffectiveIDs)
+	UnmatchedDirs  []string `json:"unmatchedDirs"`  // 一个可处理文件都没命中的目录
+}
+
+// PreviewProcessPolicy 在**不执行任何操作**的前提下，算出处理策略的实际生效范围。
+//
+// 为什么需要它：处理策略只做执行时过滤、不改动用户勾选，所以"实际会处理哪些"
+// 在界面上天然不可见。若不预览，用户会看到"已勾选 40 项"点下去却只处理 12 项，
+// 然后以为操作失败了。有了它，按钮计数、选择区说明、确认框三处都能显示真实数量。
+//
+// 参数带上 selectedIDs 并在此处求交，是为了让"交集"只有一份实现——
+// 若让前端自己算，就又出现两处独立实现，正是 I5 那类事故的温床。
+//
+// 无副作用：只读 groups/keepIDs 快照，不置 opsRunning、不写账本、不动文件系统。
+// 因此它**不受 opsRunning 互斥限制**（预览是只读的，不该被正在进行的清理挡住）。
+func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (ProcessPreview, error) {
+	pv := ProcessPreview{EffectiveIDs: []uint64{}, UnmatchedDirs: []string{}}
+	if len(dirs) == 0 {
+		// 未启用处理策略：生效范围就是全部勾选。前端据此走原路径。
+		pv.EffectiveIDs = append(pv.EffectiveIDs, selectedIDs...)
+		pv.EffectiveCount = len(pv.EffectiveIDs)
+		return pv, nil
+	}
+
+	a.mu.Lock()
+	groups := a.groups
+	keepIDs := a.keepIDs
+	a.mu.Unlock()
+
+	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，
+	// 正是最需要提示的场景），所以不在这里提前返回。
+	out := ops.ApplyProcessPolicy(groups, dirs, keepIDs)
+
+	for _, id := range selectedIDs {
+		if out.MatchIDs[id] {
+			pv.EffectiveIDs = append(pv.EffectiveIDs, id)
+		}
+	}
+	pv.EffectiveCount = len(pv.EffectiveIDs)
+	if out.UnmatchedDirs != nil {
+		pv.UnmatchedDirs = append(pv.UnmatchedDirs, out.UnmatchedDirs...)
+	}
+	return pv, nil
+}
+
 // ApplyKeepPolicy 保留策略引擎（M3-T01）：返回决策并记录 keepIDs（S2 保护依据）。
 // 遍历阶段全程持锁（须与操作 goroutine 的结果集清理写互斥）；
 // 历史持久化放到放锁之后（hist 自有锁，禁止与 a.mu 嵌套）。
@@ -1026,7 +1139,9 @@ func (a *App) ClearKeepDecisions() error {
 // keepPathsLocked 当前保留决策对应的路径集合（须持 a.mu 调用）。
 // 跨会话只有路径稳定——历史恢复后按 path→rowid 重建 keepIDs。
 func (a *App) keepPathsLocked() []string {
-	var out []string
+	// 空集合用 [] 而非 nil：本函数的返回值语义就是"路径列表"，
+	// nil 在这里只是"没数据"的另一种写法，徒增调用方的判空负担。
+	out := make([]string, 0, len(a.keepIDs))
 	if len(a.keepIDs) == 0 {
 		return out
 	}
@@ -1294,6 +1409,49 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 
 	opID := fmt.Sprintf("ops-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
 
+	// 处理策略过滤（2026-09-20）：实际处理范围 = FileIDs ∩ 优先文件夹内。
+	//
+	// 为什么在**这里**取交集，而不是下沉到 ops.Execute：
+	//   ① ops.Execute 是纯执行器，不该感知"处理策略"这个业务概念；
+	//   ② 它在 len(FileIDs)==0 时会早退——若把过滤下沉，勾选全部落在范围外时
+	//      会**静默执行 0 个文件**，用户以为做了其实什么都没做。这正是要避免的。
+	//   ③ 写前账本（beginJournal → planOpItems）也用 op.FileIDs，必须在此之前
+	//      收窄，否则账本记录的范围超出实际执行范围，账本失真。
+	//
+	// op 是值传递：op.FileIDs = kept 只改本地副本，前端勾选状态不受影响。
+	if len(op.ProcessDirs) > 0 {
+		pout := ops.ApplyProcessPolicy(groups, op.ProcessDirs, keepIDs)
+		selectedCount := len(op.FileIDs) // 过滤前的勾选数，用于事件与拒绝文案
+		kept := make([]uint64, 0, selectedCount)
+		for _, id := range op.FileIDs {
+			if pout.MatchIDs[id] {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == 0 {
+			// 交集为空必须**明确拒绝**，不能静默执行 0 项。
+			// 复位 opsRunning/opsCancel 照抄下面 beginJournal 失败分支——
+			// 漏了会让应用永久卡在"操作执行中"（P2 死锁终防的教训）。
+			a.mu.Lock()
+			a.opsRunning = false
+			a.opsCancel = nil
+			a.mu.Unlock()
+			cancelOp()
+			return "", fmt.Errorf("%s", emptyIntersectionMsg(selectedCount, len(pout.UnmatchedDirs)))
+		}
+		op.FileIDs = kept
+		// 通知前端本次过滤的实际范围。用事件而不是改返回值：ExecuteOperation
+		// 的返回值是 opID，改签名会波及 Wails 绑定、TS 签名与一批后端测试。
+		// 事件在派发前发出，前端据此在执行完成横幅里说明"已选 M 项中 K 项未处理"。
+		if a.emit != nil && a.ctx != nil {
+			a.emit(a.ctx, "ops:filtered", map[string]any{
+				"matched":   len(kept),
+				"selected":  selectedCount,
+				"unmatched": pout.UnmatchedDirs,
+			})
+		}
+	}
+
 	// 2026-09-18 审查 C3：写前账本改为 fail-closed。原先 BeginOp 失败只发一条事件、
 	// journalID 保持 0 后照常移动文件（hist 为 nil 时更是零提示），与手册
 	// 09 §6.7「动手之前先把完整计划写入账本」的承诺相反——用户按界面预期
@@ -1430,8 +1588,8 @@ type UndoResult struct {
 
 // OpRecordDetail 单条清理记录（摘要 + 条目明细），供前端展开视图。
 type OpRecordDetail struct {
-	Meta  history.OpMeta   `json:"meta"`
-	Items []history.OpItem `json:"list"`
+	Meta  history.OpMeta `json:"meta"`
+	Items []OpRecordItem `json:"list"`
 }
 
 // ListOpRecords 清理记录列表（新→旧）。
@@ -1442,7 +1600,26 @@ func (a *App) ListOpRecords() ([]history.OpMeta, error) {
 	return a.hist.ListOps()
 }
 
+// OpRecordItem 条目明细视图（history.OpItem + 链接状态标注，2026-09-20）。
+//
+// 为什么在视图层加 IsSymlink/Dangling，而不是让前端自己 stat：
+// 前端拿不到文件系统，只能靠 kind 猜；而 kind 是**整笔操作**的属性——
+// 一笔 symlink 操作里的某一条可能根本没执行成功（state=failed），
+// 原位什么都没有。逐条 Lstat 才知道实情。
+//
+// 这两个字段是**展示用**的：Dangling 只影响标红提示，不阻断回撤
+// （悬空链接的回撤恰恰是最需要的场景，见 ops/undo.go undoSymlink）。
+type OpRecordItem struct {
+	history.OpItem
+	IsSymlink bool `json:"isSymlink"` // 原位当前是一个符号链接
+	Dangling  bool `json:"dangling"`  // 是链接且目标不可达（悬空）
+}
+
 // GetOpRecord 单条清理记录的条目明细。
+//
+// 逐条标注链接状态（2026-09-20）：只对**已成功执行**的 done 条目做检测——
+// 其余状态（failed/skipped/cancelled）本就没在文件系统上动手，
+// 原位可能有意料之外的第三方文件，检测它们只会产出误导性的标红。
 func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 	if a.hist == nil {
 		return OpRecordDetail{}, fmt.Errorf("历史库不可用")
@@ -1451,7 +1628,15 @@ func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 	if err != nil {
 		return OpRecordDetail{}, err
 	}
-	return OpRecordDetail{*m, items}, nil
+	list := make([]OpRecordItem, 0, len(items))
+	for _, it := range items {
+		view := OpRecordItem{OpItem: it}
+		if it.State == history.StateDone {
+			view.IsSymlink, view.Dangling = ops.SymlinkStatus(it.OrigPath)
+		}
+		list = append(list, view)
+	}
+	return OpRecordDetail{Meta: *m, Items: list}, nil
 }
 
 // ClearOpRecords 删除全部清理账本（不动已回收/已移动的文件本身）。

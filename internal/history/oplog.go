@@ -97,6 +97,20 @@ func (s *Store) FinishItem(opID int64, origPath, destPath, linkSrc, state, errMs
 
 // FinalizeOp 正常收尾：残留 planned（未派发，多为取消）置 cancelled，
 // 并冻结 done 计数与回收字节汇总。
+//
+// reclaimed 的统计范围（**不要按"释放空间"直觉去改**）：
+//
+//	reclaimed = SUM(size) WHERE state=done
+//
+// 这个口径对 trash/delete/move 成立（数据确实离开原位置），对 hardlink /
+// symlink 则**天然为零**收益——它们不改变任何条目的 size，却也不该被算成
+// "没省空间"。这是刻意的：链接类合并省下的是"文件不再重复存一份"，
+// 而活文档 09 的字段口径把它单列为 LinkedBytes / SymlinkedBytes
+// （见 internal/model.OpsResult），历史记录页的 reclaimed 只表达
+// "真正从磁盘上移除的数据量"。两处口径不同是设计如此，不是遗漏。
+//
+// 若将来要给历史页补上链接类统计，请**新增列**而不是改这里的 SUM——
+// 历史的账目一旦重算，旧记录的数字会随新代码变化，审计链就断了。
 func (s *Store) FinalizeOp(opID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,6 +159,7 @@ func (s *Store) MarkItemUndo(itemID int64, state, errMsg string) error {
 //   - Done = 执行成功过的条目（含其后被回撤/回撤失败的，回撤不冲销执行账目）；
 //     正在回撤中的 undoing 也计入，否则回撤进行中刷新明细会让 Done 凭空少 1
 //   - Undone = 已成功回撤；Failed = 执行失败（不含回撤失败，明细在条目状态）
+//   - Reclaimed 只在 FinalizeOp 冻结一次，此处取列值不重算（见下方注释）
 const opMetaCols = `r.id, r.op_kind, r.created_at, r.target_dir, r.hist_id, r.undoable,
 	r.reclaimed, COUNT(i.id),
 	COALESCE(SUM(i.state IN (?, ?, ?, ?)), 0),
@@ -190,7 +205,11 @@ func (s *Store) ListOps() ([]OpMeta, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []OpMeta
+	// 2026-09-20 缺陷：原先写作 `var out []OpMeta`，空表时返回 nil slice，
+	// 序列化成 JSON 是 null 而不是 []。前端拿到 null 后取 .length 抛 TypeError，
+	// 整个记录页渲染中断——连"暂无清理记录"的提示都不显示，用户看到一片空白。
+	// 空列表的正确形状是 []，不是 null（同 executor.go 的 OK: []string{}）。
+	out := make([]OpMeta, 0, 16)
 	for rows.Next() {
 		m, err := scanOpMeta(rows)
 		if err != nil {
@@ -225,7 +244,10 @@ func (s *Store) GetOp(opID int64) (*OpMeta, []OpItem, error) {
 		return nil, nil, err
 	}
 	defer rows.Close()
-	var items []OpItem
+	// 同 ListOps：空明细必须是 []，不能是 nil（→ JSON null）。
+	// 这处在"记录详情展开"时才会遇到：一笔操作若一条明细都没落账，
+	// 展开后同样是整块渲染中断。
+	items := make([]OpItem, 0, 8)
 	for rows.Next() {
 		var (
 			it OpItem

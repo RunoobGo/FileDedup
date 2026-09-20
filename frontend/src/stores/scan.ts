@@ -1,7 +1,7 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
 import { reactive, ref, computed } from 'vue'
 import { useToastStore } from './toast'
 
@@ -83,6 +83,21 @@ export const useScanStore = defineStore('scan', () => {
   const selection = ref<Set<number>>(new Set())
   // 保留策略「指定目录」的有序优先级列表（跨页面切换保持）
   const keepDirs = ref<string[]>([])
+  // 处理策略（2026-09-20 新增）：「优先处理的文件夹」。
+  //
+  // 与 keepDirs 的三点关键差异，别照着 keepDirs 改：
+  //   1. 语义是**并集**不是优先级——keepDirs 要在多个目录里挑一个（所以有序、
+  //      所以要 moveKeepDir），procDirs 是"这些目录里的都算"，无序，
+  //      因此这里**故意不提供** moveProcDir，界面上也不给排序按钮：
+  //      给了排序等于向用户暗示存在优先级，那是错的心理模型。
+  //   2. 它不改变勾选——只在执行时把勾选收窄成「勾选 ∩ 优先目录内的文件」。
+  //      显式勾选是用户的明确表达，不能被一个策略设置悄悄改写。
+  //   3. 仅本次结果集有效，不落 settings.json；结果集一变就清空
+  //      （与 keepDirs 同生命周期）。
+  const procDirs = ref<string[]>([])
+  // 最近一次执行的过滤结果，供结果页横幅说明「实际处理了几项」。
+  // 不持久化——它描述的是一次已经发生的操作。
+  const lastFilter = ref<{ matched: number; selected: number; unmatched: string[] } | null>(null)
   const opsRunning = ref(false)
   const opsProgress = ref<OpsProgress | null>(null)
   const opsResult = ref<OpsResult | null>(null)
@@ -149,6 +164,8 @@ export const useScanStore = defineStore('scan', () => {
     currentFileID.value = null
     opsResult.value = null
     resetSelection()
+    clearProcDirs() // 优先文件夹是"仅本次结果集"的，结果集作废即清空
+    lastFilter.value = null
   }
 
   function startScan() {
@@ -251,7 +268,11 @@ export const useScanStore = defineStore('scan', () => {
   async function refreshHistory() {
     if (!isBackendAvailable()) return
     try {
-      histList.value = await api.listScanHistory()
+      // `?? []` 兜底：Go 的 nil slice 序列化成 JSON 是 null 而非 []。
+      // 后端已保证返回 []（见 internal/history/emptyslice_test.go），
+      // 这里再兜一层——列表状态一旦是 null，模板里取 .length 就抛 TypeError，
+      // 整个页面渲染中断，用户看到一片空白。
+      histList.value = (await api.listScanHistory()) ?? []
     } catch {
       // 历史库不可用（如浏览器 dev 模式）：保持现有列表
     }
@@ -279,6 +300,8 @@ export const useScanStore = defineStore('scan', () => {
       currentFileID.value = null
       opsResult.value = null
       resetSelection()
+      clearProcDirs() // 结果集已换，优先文件夹不再对应当前内容
+      lastFilter.value = null
       hasResult.value = true
       histResult.value = histList.value.find((m) => m.id === id) ?? null
       await loadResultPage(false)
@@ -334,7 +357,11 @@ export const useScanStore = defineStore('scan', () => {
   async function refreshOps() {
     if (!isBackendAvailable()) return
     try {
-      opList.value = await api.listOpRecords()
+      // `?? []` 兜底：这是「清理记录页空白」缺陷的受害点。
+      // 后端返回 null 时 opList 变成 null，RecordsView 的
+      // `!store.opList.length` 抛 TypeError → 整页渲染中断 →
+      // 连"暂无清理记录"的提示都不显示，用户看到完全空白。
+      opList.value = (await api.listOpRecords()) ?? []
     } catch {
       // 历史库不可用：保持现有列表
     }
@@ -451,6 +478,72 @@ export const useScanStore = defineStore('scan', () => {
 
   const selectedBytes = computed(() => selectedFiles.value.reduce((s, f) => s + f.size, 0))
 
+  // ---------- 处理策略（执行时过滤器）的三层计数 ----------
+  //
+  // 「已选 40 项，实际处理 12 项」这个落差如果不显式说出来，用户会以为剩下
+  // 28 项也被处理了（或以为应用漏做了）。三层各有各的读者：
+  //   effectiveFiles  → 确认框（说"将处理 N 项"，必须是真会被动的数量）
+  //   procFiltering   → 结果页（决定要不要显示"正在收窄"的提示行）
+  //   procExcluded    → 灰化提示（哪些勾选项因为不在优先目录里而落空）
+  //
+  // 必须在**前端**算，不能等后端回包：
+  // 确认框要在用户点"确定"**之前**就说清数量，而 PreviewProcessPolicy 是
+  // 异步的，等它回来弹窗会闪一下再改数字。前端已经持有全部文件路径与勾选集，
+  // 这个交集的判据简单且必须与后端一致（见 dirContains 的注释）。
+
+  // dirContains 报告 path 是否位于 dir 之下（含子目录、含 dir 自身）。
+  // 与后端 ops.inDir 同语义：大小写按原样比（不折叠）——路径来自同一次扫描的
+  // 同一台机器，与用户手输的 dir 之间的大小写差异属于用户输入问题，
+  // 后端 inDirFold 会按卷的敏感性处理，前端这里保持简单，不做可能引入
+  // 假匹配的折叠。落空与否最终以 ops:filtered 事件为准。
+  function dirContains(dir: string, path: string): boolean {
+    const d = normDir(dir)
+    if (!d) return false
+    return path === d || path.startsWith(d + '/') || path.startsWith(d + '\\')
+  }
+
+  // normDir 归一优先级目录：去空白、去尾部分隔符。根目录 "/" 或 "C:\"
+  // 剥完仍保留（否则会退化成"前缀匹配一切"的意外行为）。
+  function normDir(dir: string): string {
+    let d = (dir ?? '').trim()
+    if (!d) return ''
+    if (d.length > 1) d = d.replace(/[/\\]+$/, '')
+    if (d.length === 1 && d === '/') return '/'
+    // "C:\" 剥完剩 "C:"，补回分隔符以免 "C:foo" 被误判为在 "C:" 下
+    if (/^[A-Za-z]:$/.test(d)) d += '\\'
+    return d
+  }
+
+  // procActive 是否启用了处理策略（列表里有非空白项）。
+  const procActive = computed(() => procDirs.value.some(d => (d ?? '').trim() !== ''))
+
+  // effectiveFiles 真正会被处理的那部分勾选项。
+  // 未启用时恒等于 selectedFiles——不做任何过滤，走与新增本功能前一致的路径。
+  const effectiveFiles = computed(() => {
+    if (!procActive.value) return selectedFiles.value
+    const dirs = procDirs.value.filter(d => (d ?? '').trim() !== '')
+    return selectedFiles.value.filter(f => dirs.some(d => dirContains(d, f.path)))
+  })
+
+  const effectiveBytes = computed(() => effectiveFiles.value.reduce((s, f) => s + f.size, 0))
+  const effectiveCount = computed(() => effectiveFiles.value.length)
+  // procExcluded 勾选了、却因为不在优先目录内而不会被处理的项数。
+  const procExcluded = computed(() =>
+    procActive.value ? selectedFiles.value.length - effectiveFiles.value.length : 0,
+  )
+  // procFiltering 是否需要提示"正在收窄"。只在真的收窄了东西时才提示：
+  // 勾选项全都在优先目录内时提示"已收窄"是噪音。
+  const procFiltering = computed(() => procExcluded.value > 0)
+
+  // addProcDir 去重追加。**不提供** moveProcDir——见 procDirs 的注释。
+  function addProcDir(dir: string) {
+    const d = (dir ?? '').trim()
+    if (!d || procDirs.value.includes(d)) return
+    procDirs.value.push(d)
+  }
+  function removeProcDir(i: number) { procDirs.value.splice(i, 1) }
+  function clearProcDirs() { procDirs.value = [] }
+
   async function applyKeep(kind: string, dirs: string[] = []) {
     if (!guard('应用保留策略')) return
     try {
@@ -480,16 +573,26 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
-  async function executeOp(kind: 'trash' | 'delete' | 'move' | 'hardlink', targetDir?: string, confirmDanger = false) {
+  // executeOp 提交清理操作。kind 用 OpKind 联合类型（而非 string）：
+  // 新增 'symlink' 时，所有需要同步处理的调用点（确认框文案、结果文案）
+  // 都会在编译期报错，而不是在运行时静默走到 default 分支。
+  async function executeOp(kind: OpKind, targetDir?: string, confirmDanger = false) {
     const ids = selectedFiles.value.map(f => f.id)
     if (ids.length === 0) return
+    // 优先目录为空时不传字段（而不是传空数组）：后端对两者都判为"未启用"，
+    // 但传 undefined 能让"这个请求没用到处理策略"在日志/抓包里一眼可见。
+    const dirs = procDirs.value.filter(d => (d ?? '').trim() !== '')
     if (!guard('执行清理操作')) return
     opsRunning.value = true
     opsResult.value = null
-    opsProgress.value = { Done: 0, Total: ids.length, Current: '' }
+    lastFilter.value = null
+    // Total 用生效数：进度条的分母若用勾选数，收窄后的操作会永远差一截走不满，
+    // 看起来像卡住了。
+    opsProgress.value = { Done: 0, Total: effectiveCount.value, Current: '' }
     try {
       await api.executeOperation({
         Kind: kind, FileIDs: ids, TargetDir: targetDir ?? '', ConfirmDanger: confirmDanger,
+        ProcessDirs: dirs.length > 0 ? dirs : undefined,
       })
     } catch (e: any) {
       opsRunning.value = false
@@ -515,7 +618,7 @@ export const useScanStore = defineStore('scan', () => {
   async function refreshFailed(gen = resultGen) {
     try {
       const list = await api.getFailedItems()
-      if (gen === resultGen) failed.value = list
+      if (gen === resultGen) failed.value = list ?? []
     } catch {
       // 后端暂不可用：保留现有清单
     }
@@ -529,6 +632,23 @@ export const useScanStore = defineStore('scan', () => {
       bound.push(name)
     }
     bind('ops:progress', (p: OpsProgress) => { opsProgress.value = p })
+    // 处理策略收窄了执行范围。后端只在真的启用了处理策略时发这个事件，
+    // 所以这里可以放心地把载荷当作"发生过收窄"的证据记下来。
+    // 用途有二：结果页横幅说明"已选 N / 实际处理 M"，以及点名未命中的目录
+    // （用户加了优先文件夹，但里面一个可处理的重复文件都没有 → 多半是写错了路径，
+    //  不说出来他会以为策略生效了）。
+    bind('ops:filtered', (f: { matched: number; selected: number; unmatched: string[] }) => {
+      lastFilter.value = {
+        matched: f?.matched ?? 0,
+        selected: f?.selected ?? 0,
+        unmatched: f?.unmatched ?? [],
+      }
+      const parts = [`已选 ${lastFilter.value.selected} 项，其中 ${lastFilter.value.matched} 项在优先文件夹内，本次只处理这些`]
+      if (lastFilter.value.unmatched.length > 0) {
+        parts.push(`这些优先文件夹内没有可处理的重复文件：${lastFilter.value.unmatched.join('、')}`)
+      }
+      toast().push(parts.join('。'), 'info')
+    })
     bind('ops:done', async (r: OpsResult) => {
       opsRunning.value = false
       opsResult.value = r
@@ -679,8 +799,12 @@ export const useScanStore = defineStore('scan', () => {
     selection, opsRunning, opsProgress, opsResult, currentFileID,
     busy, busyTip,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
+    // 处理策略只导出 add/remove/clear —— 没有 move 是有意的，见 procDirs 注释
+    procDirs, addProcDir, removeProcDir, clearProcDirs,
+    procActive, procFiltering, procExcluded, lastFilter,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
+    effectiveFiles, effectiveBytes, effectiveCount,
     groupSelState, toggleGroupSelection,
     applyKeep, clearKeep, executeOp, openTrash, cancelOp,
     running, startScan, pauseScan, resumeScan, cancelScan,
