@@ -281,9 +281,19 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 也让"总占用未变化"看起来像操作失败。
 				// 现在把硬链接的贡献单列（LinkedBytes），Reclaimed 只统计
 				// 真正从磁盘上消失的数据量（trash/delete/move 出卷）。
-				if op.Kind == "hardlink" {
+				//
+				// 2026-09-20：软链接同属"链接类"合并——磁盘上少了一份完整数据
+				// （dup 位置只剩一个几百字节的链接对象），但保留项的数据块并未
+				// 被共享；Reclaimed 记 e.Size 是**符合事实**的（磁盘占用确实少了
+				// 一整份文件）。不过为了与硬链接在 UI 上可区分、且在回撤语义上
+				// 不误导（回撤要重新占回这块空间），这里同样单列，不混进
+				// Reclaimed，让前端能分别表述。
+				switch op.Kind {
+				case "hardlink":
 					res.LinkedBytes += e.Size
-				} else {
+				case "symlink":
+					res.SymlinkedBytes += e.Size
+				default:
 					res.Reclaimed += e.Size
 				}
 				// 成功但有残留等情况：逐条收集，供上层提示（不改变成败判定）
@@ -315,7 +325,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 
 	// 先校验操作类型，未知类型不进入汇总（否则会为每个文件误报状态）
 	switch op.Kind {
-	case "trash", "delete", "move", "hardlink":
+	case "trash", "delete", "move", "hardlink", "symlink":
 	default:
 		res.Failed = append(res.Failed, model.FailedItem{Stage: "ops", Err: fmt.Sprintf("未知操作类型 %q", op.Kind)})
 		return res
@@ -466,10 +476,142 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 		}, onPanic)
 
+	case "symlink":
+		// 跨卷软链接合并（2026-09-20）。与 hardlink 分支的前置校验**完全一致**
+		// ——dup 与 keep 都必须复核身份、源必须重算内容——因为两者的安全前提
+		// 是同一个："执行时的对象还是校验时的对象"。
+		//
+		// 差异只在两点：
+		//   ① 不要求同卷（软链接能跨卷，这正是它的存在理由）；
+		//   ② 同卷时加一条**非阻断**提示（同卷用硬链接更安全）。
+		//
+		// 为什么同卷只提示不拒绝：软链接合并本身是安全的（复核齐全），
+		// 只是"同卷有更优解"。把用户的选择直接判为失败，是拿应用的偏好
+		// 去否决一个正确且无害的操作，代价大于收益。
+		//
+		// 并发安全性与 hardlink 相同：SymlinkMerge 使用的临时名是
+		// 「dup 路径 + .fdd-tmp」，每个 dup 各自独立，互不覆盖。
+		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
+			e := toProcess[i]
+			src := keepSrcByID[e.ID]
+			if src == nil || src.ID == e.ID {
+				settle(i, outcome{code: ocFailed, err: "未找到组内保留源"})
+				return
+			}
+			// H2：dup 在动作前仍须指向校验过的那份内容
+			if !identityStill(e.Path, procIDs[i]) {
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+				return
+			}
+			// S1 扩展：keep 源也须内容级校验（源被篡改时链接会指向被改过的
+			// 数据，用户以为"还是原来那份"——同样不可逆，必须拦截）。
+			v, srcID := VerifyFile(src, hashByID[src.ID], pool)
+			switch v {
+			case VerdictSkipped:
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"})
+				return
+			case VerdictFailed:
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"})
+				return
+			}
+			warn := ""
+			if sameVolume(src.Path, e.Path) {
+				warn = "这两个文件在同一卷上，使用「硬链接合并」更安全" +
+					"（硬链接不需要管理员权限，且删除任一名字数据都还在，不会出现链接失效）"
+			}
+			if err := SymlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
+				// 与 hardlink 一致：「已成功但有残留」不应判失败，否则用户
+				// 会以为没生效而反复重试（重试时 dup 已是链接，行为更费解）。
+				var residue *ResidueError
+				if errors.As(err, &residue) {
+					settle(i, outcome{code: ocOK, linkSrc: src.Path,
+						warn: joinWarn(warn, residue.Error())})
+				} else if isSymlinkNeedsPrivilege(err) {
+					// 权限不足是**环境级**问题（Windows 未提权且未开开发者模式）：
+					// 同一台机器上每个文件都会以同样方式失败。逐条重复长文案
+					// 会让结果页被同一句话淹没，故此处只留短标记，
+					// 完整指引由 AggregateWarnings 汇总成一条（见本文件尾部）。
+					settle(i, outcome{code: ocFailed, stage: symlinkPrivilegeStage, err: err.Error()})
+				} else {
+					settle(i, outcome{code: ocFailed, err: err.Error()})
+				}
+			} else {
+				settle(i, outcome{code: ocOK, linkSrc: src.Path, warn: warn})
+			}
+		}, onPanic)
+
 	default:
 		// 已在入口拦截未知类型，此处不可达（防御性保留）
 	}
 
 	aggregate()
+	if op.Kind == "symlink" {
+		AggregateWarnings(&res)
+	}
 	return res
+}
+
+// 权限失败的合并提示。为什么不在 worker 里逐条给出完整指引：
+// 「未提权 + 未开开发者模式」是**环境级**问题，同一台机器上每个文件都会以
+// 同样方式失败。8 个文件就是 8 条一模一样的数百字长文案，结果页被同一句话
+// 淹没，用户反而找不到真正的失败原因。
+//
+// 因此分两层：
+//   - 条目级（aggregate 里生成）：短句 + 文件路径，逐条可追；
+//   - 汇总级（本函数）：一条完整可操作的指引。
+//
+// 单独成函数而不是内联，是为了让它可被独立测试，也便于上层（如 app 层）
+// 在推送事件前做同样的归一化。
+const symlinkPrivilegeSummary = "软链接合并失败：当前程序没有创建符号链接的权限。" +
+	"Windows 要求 SeCreateSymbolicLinkPrivilege，普通权限下默认不具备。请任选其一后重试——" +
+	"① 右键程序图标选「以管理员身份运行」；" +
+	"② 在「设置 → 系统 → 开发者选项」中开启「开发者模式」（开启后普通权限即可创建）；" +
+	"③ 若这些文件在同一磁盘卷内，改用「硬链接合并」（不需要任何权限，且无链接失效风险）。"
+
+// AggregateWarnings 把「环境级、可一次性说清」的失败归一化成一条汇总提示。
+//
+// 目前只处理软链接的权限失败（stage == symlinkPrivilegeStage）。其余失败
+// 各文件原因不同（被篡改、路径冲突、卷不支持……），逐条保留原样才是对的，
+// 不做归并。
+//
+// 归一化后条目级 Error 仍留在 Failed 列表里（上层据此计数与定位），
+// 只是把重复的长文案换成短句，完整指引进 Warnings 供 UI 顶部展示。
+//
+// 设计取舍：这里**不修改** res.Failed 的条数——"有几个文件失败"是事实，
+// 不能因为原因相同就合并成一条，否则结果页的计数会与实际不符。
+func AggregateWarnings(res *model.OpsResult) {
+	if res == nil {
+		return
+	}
+	n := 0
+	for i := range res.Failed {
+		if res.Failed[i].Stage != symlinkPrivilegeStage {
+			continue
+		}
+		n++
+		// 统一为一句可读的中文，不再逐条重复平台层的长文案。
+		res.Failed[i].Err = "创建符号链接需要权限（详见下方汇总提示）"
+	}
+	if n == 0 {
+		return
+	}
+	res.Warnings = append(res.Warnings,
+		fmt.Sprintf("%s（本次 %d 个文件因此失败）", symlinkPrivilegeSummary, n))
+}
+
+// symlinkPrivilegeStage 「环境缺少创建符号链接的权限」的失败阶段标记。
+// worker 与 AggregateWarnings 共用同一常量，避免两处字面量漂移。
+const symlinkPrivilegeStage = "symlink-privilege"
+
+// joinWarn 合并两条提示（同卷建议 + 残留告警），空串自动略过。
+func joinWarn(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "；另外：" + b
+	}
 }

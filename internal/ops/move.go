@@ -145,7 +145,7 @@ type ResidueError struct {
 
 func (e *ResidueError) Error() string {
 	return fmt.Sprintf("合并已完成，但临时文件 %s 未能删除（可能被其他程序占用），"+
-		"请手动删除；它不会影响硬链接本身，扫描也已自动忽略该名字", e.Path)
+		"请手动删除；它不会影响链接本身，扫描也已自动忽略该名字", e.Path)
 }
 
 func (e *ResidueError) Unwrap() error { return e.Err }

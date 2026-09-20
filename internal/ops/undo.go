@@ -16,10 +16,12 @@ import (
 //   - trash：DestPath = 回收站实际落点（darwin/linux 映射；Windows 恒空 → 上层拦截）
 //   - move：DestPath = 移动后的新路径
 //   - hardlink：LinkSrc = 合并时指向的保留源路径
+//   - symlink：LinkSrc = 合并时指向的保留源路径（与 hardlink 同栏；
+//     OrigPath 位置上是链接，备份在 OrigPath + worktemp.SuffixOld）
 //
 // Hash/Size/MtimeNs 为扫描时的内容证据，回撤前据此复核现状未被第三方改动。
 type UndoItem struct {
-	Kind     string // trash / move / hardlink
+	Kind     string // trash / move / hardlink / symlink
 	OrigPath string
 	DestPath string
 	LinkSrc  string
@@ -69,6 +71,8 @@ func UndoOne(it UndoItem) (string, error) {
 		return undoMove(it)
 	case "hardlink":
 		return undoHardlink(it)
+	case "symlink":
+		return undoSymlink(it)
 	case "delete":
 		return "", fmt.Errorf("永久删除不可回撤")
 	default:
@@ -230,6 +234,99 @@ func undoHardlink(it UndoItem) (string, error) {
 	if err := hardlinkRename(tmp, it.OrigPath); err != nil {
 		os.Remove(tmp)
 		return "", fmt.Errorf("恢复独立文件失败: %w", err)
+	}
+	applyMtime(it.OrigPath, it.MtimeNs)
+	return it.OrigPath, nil
+}
+
+// undoSymlink 回撤软链接合并（2026-09-20）：拆除链接，把备份还原回原位。
+//
+// 三步，与 undoHardlink 的三重防线对齐但**判据不同**：
+//
+//	① OrigPath 必须仍是"指向 LinkSrc 的符号链接"
+//	   （用 verifySymlinked —— 软链接自身身份无意义，必须解析目标再比）
+//	② 备份（OrigPath + .fdd-old）必须存在
+//	③ 删链接 → 还原备份；任一步失败都不破坏现有数据
+//
+// 与 undoHardlink 的关键差异（决定了本函数反而**更安全**）：
+// OrigPath 位置上的链接是独立对象，它的内容就是"目标路径"这个字符串，
+// 数据本体一直在 LinkSrc 处。因此这里**不需要**从 LinkSrc 复制内容回来，
+// 也就没有"源被篡改导致恢复出错误内容"的风险面——直接改名备份即可，
+// 而备份是合并前就在磁盘上的那份原文件，内容天然正确。
+//
+// 但 ① 这一层不能省：用户可能在合并后把 OrigPath 位置上的链接删掉、
+// 换成自己的另一个文件。若不做校验就直接删 + 改名，就会把那个第三方文件
+// 删掉、把备份顶上去——用户会发现自己放进去的东西消失了。这是 R5
+// （回撤时误删第三方文件）的具体形态。
+//
+// 悬空链接（保留项已被删/移动）**仍可回撤**：数据在备份里，与链接是否
+// 有效无关。这种情况反而是最需要回撤的（用户想恢复原文件）。
+func undoSymlink(it UndoItem) (string, error) {
+	if it.LinkSrc == "" {
+		// 旧账本/异常记录：没有目标信息就无法校验 OrigPath 是不是我们建的链接
+		return "", fmt.Errorf("缺少链接目标记录，无法安全回撤（为避免误删第三方文件已拒绝）")
+	}
+
+	// ① 原位必须仍是本次创建的链接（指向 LinkSrc）
+	li, err := os.Lstat(it.OrigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("目标位置已不存在（可能被手动清理），回撤中止: %s", it.OrigPath)
+		}
+		return "", err
+	}
+	backup := it.OrigPath + FddOldSuffix
+
+	if li.Mode()&os.ModeSymlink == 0 {
+		// 原位已不是链接。可能是"用户把链接换成了自己的文件"（须拦截），
+		// 也可能是"上次回撤已删链接、只差改名备份"的崩溃残局——后者用
+		// 备份仍在 + 原位内容等于记录哈希来识别（与 undoHardlink 的自检同构）。
+		if _, berr := os.Lstat(backup); berr == nil && it.Hash != [32]byte{} {
+			if st, serr := os.Lstat(it.OrigPath); serr == nil &&
+				st.Mode().IsRegular() && uint64(st.Size()) == it.Size {
+				if h, herr := hashFile(it.OrigPath); herr == nil && h == it.Hash {
+					// 原位内容就是记录里那份数据 → 视为已还原（上次回撤未落账）
+					return it.OrigPath, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("目标位置已不是本次创建的软链接" +
+			"（可能被替换为其他文件），为避免覆盖或删除第三方文件已拦截")
+	}
+
+	// 悬空链接也允许继续：数据在备份里，链接有效性与此无关。
+	// 但若链接指向的目标已不是 LinkSrc（例如用户重建过链接指到别处），
+	// 说明现状已被改动，仍按"已非本次创建的链接"拦截。
+	if li2, lerr := os.Lstat(it.LinkSrc); lerr == nil && li2.Mode()&os.ModeSymlink == 0 {
+		if verr := verifySymlinked(it.LinkSrc, it.OrigPath); verr != nil {
+			// 目标不可达（悬空）时 verifySymlinked 会失败，那是**预期**的；
+			// 只有"目标可达但不是 LinkSrc"才需要拦截。
+			if _, serr := os.Stat(it.LinkSrc); serr == nil {
+				return "", fmt.Errorf("目标位置上的链接已不指向原保留源，"+
+					"为避免误删第三方文件已拦截: %w", verr)
+			}
+		}
+	}
+
+	// ② 备份必须在
+	if _, err := os.Lstat(backup); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("找不到合并前的原始备份 %s，无法回撤"+
+				"（链接保留未动，数据在保留源处）", backup)
+		}
+		return "", err
+	}
+
+	// ③ 删链接 → 还原备份。
+	// 顺序不能反：先删链接才能把备份改名到该路径（改名会覆盖，但显式删除
+	// 让语义更清楚，也避免某些平台上"改名覆盖已存在文件"的失败）。
+	// 万一"删链接成功但改名失败"，数据仍在 backup 处，报错里给出位置。
+	if err := os.Remove(it.OrigPath); err != nil {
+		return "", fmt.Errorf("删除软链接失败: %w", err)
+	}
+	if err := hardlinkRename(backup, it.OrigPath); err != nil {
+		return "", fmt.Errorf("链接已删除，但还原备份失败，原文件保留在 %s（数据未丢失）: %w",
+			backup, err)
 	}
 	applyMtime(it.OrigPath, it.MtimeNs)
 	return it.OrigPath, nil
