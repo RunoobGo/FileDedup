@@ -59,7 +59,10 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	// 用 dup + 后缀 作为临时名：与用户文件名同前缀，路径唯一，
 	// 并发处理同组多个 dup 时互不冲突（每个 dup 自己的后缀）。
 	tmp := dup + FddTempSuffix
-	_ = os.Remove(tmp) // 清理上次残留
+	// 槽位被占时先取证再决定：本路径的 tmp 是**链接**，取证方式与硬链接不同（M6）。
+	if err := claimSlot(tmp, func() bool { return slotProvesSymlink(keep, tmp) }); err != nil {
+		return err
+	}
 	if err := symlinkCreate(keep, tmp); err != nil {
 		// 权限不足等错误已在平台层翻译成可操作指引，直接透出。
 		return err
@@ -85,7 +88,12 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 
 	// ---- 步骤 3：备份原 dup（绝不先删）----
 	backup := dup + FddOldSuffix
-	_ = os.Remove(backup)
+	// backup 位上若有不属于本次操作的对象，下面的 rename 会把它静默覆盖掉（M6）。
+	// 硬链接路径的同位置守卫见 move.go。
+	if err := claimSlot(backup, func() bool { return slotProvesHardlink(backup, dupID) }); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := hardlinkRename(dup, backup); err != nil {
 		_ = os.Remove(tmp)
 		return err

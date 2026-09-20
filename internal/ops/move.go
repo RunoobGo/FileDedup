@@ -92,7 +92,10 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	// 先建指向 keep 的临时硬链接，再把原 dup 备份后原子替换为硬链接。
 	// 任一步失败都能把 dup 恢复为原始文件，杜绝「删 dup 后改名失败」导致的数据丢失。
 	tmp := dup + FddTempSuffix
-	_ = os.Remove(tmp) // 清理上次残留
+	// 槽位被占时先取证再决定：只有能证明是上次运行留下的才清（M6）。
+	if err := claimSlot(tmp, func() bool { return slotProvesHardlink(tmp, keepID) }); err != nil {
+		return err
+	}
 	if err := os.Link(keep, tmp); err != nil {
 		return fmt.Errorf("硬链接失败（可能跨卷或权限）: %w", err)
 	}
@@ -105,7 +108,11 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
 	}
 	backup := dup + FddOldSuffix
-	_ = os.Remove(backup)
+	// backup 位上若有不属于本次操作的对象，rename 会把它静默覆盖掉（M6）。
+	if err := claimSlot(backup, func() bool { return slotProvesHardlink(backup, dupID) }); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := hardlinkRename(dup, backup); err != nil {
 		// 无法把原 dup 移走（极罕见）：清理临时硬链接，dup 原样保留（安全）。
 		_ = os.Remove(tmp)

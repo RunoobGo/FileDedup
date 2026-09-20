@@ -44,6 +44,63 @@ func backupOwnershipStill(backup string, dupID fsid.ID) bool {
 	return identityStill(backup, dupID)
 }
 
+// claimSlot 认领合并要占用的一个临时名（tmp / backup）。
+//
+// 三档处置，方向由"错了会损失什么"决定：
+//   - 槽位不存在 → 直接放行；
+//   - 槽位被占且 ours() 能**正面证明**它就是我们上一次运行留下的对象 → 清掉再用
+//     （这些名字与 keep/dup 同一身份，删掉的只是一个名字，不丢任何字节）；
+//   - 证明不了 → 显式失败，一个字节都不碰。
+//
+// M6（2026-09-20 全仓审计 §五 6）：这里原先是两行无条件
+// `_ = os.Remove(tmp)` / `_ = os.Remove(backup)`——真以 .fdd-tmp/.fdd-old 结尾的
+// **用户**文件会被当成应用残留永久删除，而且这类名字扫描器还会忽略，删完连痕迹
+// 都找不到（用户只会觉得"文件自己没了"）。
+//
+// 残余窗口（已知、不可消除）：Lstat 与后面的改名之间第三方恰好新建同名文件。
+// Go 没有 O_EXCL 语义的改名原语（os.Rename 一律替换），所以这里不写无法证伪的
+// 守卫，只把"操作开始前就存在的文件"这一半确定性地保住。
+func claimSlot(path string, ours func() bool) error {
+	// 只做存在性判定；归属取证交给各路径的 ours()。
+	// 目录槽位天然过不了两种取证（身份与文件不同、也不是链接），于是走到
+	// "显式失败"分支——这正是想要的：绝不递归清空一个陌生目录。
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("无法确认 %s 是否空闲，已放弃本次操作: %w", path, err)
+	}
+	if ours != nil && ours() {
+		if rmErr := workTempRemove(path); rmErr != nil {
+			return fmt.Errorf("清理上次运行残留 %s 失败，已放弃本次操作: %w", path, rmErr)
+		}
+		return nil
+	}
+	return fmt.Errorf("%s 已存在一个不属于本次操作的文件（本应用不会删除它，已放弃本次操作）："+
+		"请先把该文件改名或移走再重试", path)
+}
+
+// slotProvesHardlink 判断槽位上的对象是否与 id 同一物理文件。
+//
+// ★ 与 identityStill 的 fail-open **刻意相反**：identityStill 用在"要不要放行一次
+// 合并"上，判错的代价是少检出一个替换；这里用在"要不要删掉一个文件"上，判错的
+// 代价是永久销毁一个从未授权我们处置的文件。卷不给稳定索引（FAT/exFAT）时
+// 无从证明，就按证明不了处理。
+func slotProvesHardlink(path string, id fsid.ID) bool {
+	return id.Resolved && identityStill(path, id)
+}
+
+// slotProvesSymlink 是软链接路径的对应取证：tmp 槽位只有"确实是指向 keep 的
+// 链接"才算我们留下的。不能照搬身份比对——链接自身身份与 keep 恒不相等
+// （同 SymlinkMerge 步骤 2 的口径）。
+func slotProvesSymlink(keep, path string) bool {
+	li, err := os.Lstat(path)
+	if err != nil || li.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	return verifySymlinked(keep, path) == nil
+}
+
 // abandonForeignBackup 处理「窗口 A 被第三方顶替」：放弃本次合并，
 // 把第三方文件放回它能被找到的位置，清理我们的临时链接，返回错误。
 //
