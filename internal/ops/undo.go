@@ -19,7 +19,9 @@ import (
 //   - symlink：LinkSrc = 合并时指向的保留源路径（与 hardlink 同栏；
 //     OrigPath 位置上是链接，备份在 OrigPath + worktemp.SuffixOld）
 //
-// Hash/Size/MtimeNs 为扫描时的内容证据，回撤前据此复核现状未被第三方改动。
+// Hash/Size/MtimeNs 为扫描时的内容证据，回撤前据此复核现状未被第三方改动：
+// trash/move/hardlink 三条路径都做**全量 BLAKE3** 比对（M4），零值 Hash（旧账本）
+// 只能比 size，此时按"无从比对"放行而不是拦死。
 type UndoItem struct {
 	Kind     string // trash / move / hardlink / symlink
 	OrigPath string
@@ -97,6 +99,22 @@ func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
 	}
 	if uint64(st.Size()) != it.Size {
 		return nil, fmt.Errorf("%s文件大小与记录不符（%d ≠ %d），可能已被替换，已拦截", where, st.Size(), it.Size)
+	}
+	// M4：尺寸相等不等于"还是那一份文件"。同长度改写（回收站里那份被写工具
+	// 原地更新、移动目标被同名文件顶替）只比 size 会一路放行，把错内容放回家，
+	// 紧接着 applyMtime 又把 mtime 拨回记录值——事后连时间戳都看不出动过。
+	// undoHardlink 一直做全量 BLAKE3，三条回撤路径的判据必须一致。
+	//
+	// it.Hash 为零值时**跳过而不是拦死**：升级前写入的旧账本没有内容证据，
+	// "无从比对"不等于"校验失败"，一律拦会让历史记录全都撤不回。
+	if it.Hash != ([32]byte{}) {
+		h, err := hashFile(it.DestPath)
+		if err != nil {
+			return nil, err
+		}
+		if h != it.Hash {
+			return nil, fmt.Errorf("%s中的文件内容与扫描记录不符（已被修改或替换），已拦截（S1）: %s", where, it.DestPath)
+		}
 	}
 	return st, nil
 }
