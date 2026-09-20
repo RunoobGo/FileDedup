@@ -70,3 +70,20 @@ func TestTrackerETA(t *testing.T) {
 		t.Fatalf("已知总量时 ETA 不应为 -1: %+v", ev)
 	}
 }
+
+// TestTrackerETAWithOvercountedBytes 钉住 M14：BytesDone 瞬时超过 BytesTotal 时
+// （阶段切换重设总量、缓存命中回填、重试重复计数都会造成这一瞬时），
+// `ev.BytesTotal - ev.BytesDone` 在 **uint64 域先减**再转 float64，
+// 回绕成 ~1.8e19，下一行的 `remain < 0` 因此是死代码，ETA 直接爆成天文数字。
+func TestTrackerETAWithOvercountedBytes(t *testing.T) {
+	tr := New(time.Hour, nil)
+	tr.Start(context.Background())
+	tr.SetTotal(0, 1000)
+	tr.AddBytes(1200) // 完成量超过总量：进度条语义上就是"已到头"
+	time.Sleep(50 * time.Millisecond)
+
+	ev := tr.Stop()
+	if ev.ETASeconds != 0 {
+		t.Fatalf("瞬时超额时 ETA 应夹到 0，实得 %d（uint64 先减回绕，M14 未修）", ev.ETASeconds)
+	}
+}

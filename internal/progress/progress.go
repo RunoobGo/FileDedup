@@ -129,7 +129,11 @@ func (t *Tracker) snapshotLocked(now time.Time) model.ProgressEvent {
 	if elapsed > 0 {
 		ev.SpeedBps = float64(ev.BytesDone) / elapsed
 		if ev.BytesTotal > 0 && ev.SpeedBps > 0 {
-			remain := float64(ev.BytesTotal - ev.BytesDone)
+			// 必须**先各自转 float64 再相减**：BytesDone 会瞬时超过 BytesTotal
+			// （阶段切换重设总量、缓存命中回填、重试重复计数都是这个时序），
+			// uint64 先减直接回绕成 ~1.8e19，后面那句 `remain < 0` 就成了死代码
+			// ——ETA 会显示成几十万年的天文数字（2026-09-20 审查 M14）。
+			remain := float64(ev.BytesTotal) - float64(ev.BytesDone)
 			if remain < 0 {
 				remain = 0
 			}
