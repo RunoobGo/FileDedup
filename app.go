@@ -539,8 +539,8 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		// v0.5.0 功能 3：扫描成功收尾自动写历史（锁外调用，见 App.hist 注释）。
 		// 保存失败不影响结果集可用，只失去本次记录的恢复/裁剪联动。
 		var histID int64
-		if a.hist != nil {
-			id, serr := a.hist.SaveScan(cfg, groups, failed)
+		if hs := a.histSnapshot(); hs != nil {
+			id, serr := hs.SaveScan(cfg, groups, failed)
 			if serr != nil {
 				// M7：本行曾是全仓唯一"双通道留痕"的写法，其余四处只写 stderr。
 				// 现在统一走 warnLedger（本函数即由此抽出）。
@@ -1236,10 +1236,11 @@ func (a *App) keepPathsLocked() []string {
 
 // persistKeepPaths 把保留决策同步进当前历史行（锁外调用；无历史联动则跳过）。
 func (a *App) persistKeepPaths(histID int64, paths []string) {
-	if a.hist == nil || histID == 0 {
+	hs := a.histSnapshot()
+	if hs == nil || histID == 0 {
 		return
 	}
-	if err := a.hist.UpdateKeepPaths(histID, paths); err != nil {
+	if err := hs.UpdateKeepPaths(histID, paths); err != nil {
 		a.warnLedger(fmt.Sprintf("保留决策保存失败：%v，恢复该条历史时保留项会回到上一次成功保存的状态", err))
 	}
 }
@@ -1263,10 +1264,11 @@ type HistoryMeta struct {
 
 // ListScanHistory 历史列表（新→旧）。
 func (a *App) ListScanHistory() ([]HistoryMeta, error) {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return nil, fmt.Errorf("历史库不可用")
 	}
-	ms, err := a.hist.ListScans()
+	ms, err := hs.ListScans()
 	if err != nil {
 		return nil, err
 	}
@@ -1286,7 +1288,8 @@ func (a *App) ListScanHistory() ([]HistoryMeta, error) {
 // 陈旧文件安全性由操作前的逐文件校验兜底（S1 篡改拦截 / S8 消失即跳过），
 // 载入时不做文件系统遍历。
 func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return ScanSummary{}, fmt.Errorf("历史库不可用")
 	}
 	a.mu.Lock()
@@ -1296,7 +1299,7 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 		return ScanSummary{}, fmt.Errorf("扫描/清理进行中，请稍后再打开历史")
 	}
 
-	meta, groups, err := a.hist.LoadScan(id)
+	meta, groups, err := hs.LoadScan(id)
 	if err != nil {
 		return ScanSummary{}, err
 	}
@@ -1351,10 +1354,11 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 // DeleteScanHistory 删除一条历史；若正是当前结果集的来源，仅断开联动
 // （内存结果仍可看可清，只是后续裁剪不再回写）。
 func (a *App) DeleteScanHistory(id int64) error {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return fmt.Errorf("历史库不可用")
 	}
-	if err := a.hist.DeleteScan(id); err != nil {
+	if err := hs.DeleteScan(id); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -1367,10 +1371,11 @@ func (a *App) DeleteScanHistory(id int64) error {
 
 // ClearScanHistory 清空全部扫描历史（当前结果集仅断开联动）。
 func (a *App) ClearScanHistory() error {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return fmt.Errorf("历史库不可用")
 	}
-	if err := a.hist.ClearScans(); err != nil {
+	if err := hs.ClearScans(); err != nil {
 		return err
 	}
 	a.mu.Lock()
@@ -1401,6 +1406,21 @@ func undoableReason(kind string) string {
 	}
 	return "永久删除不支持回撤：文件已从磁盘移除，没有任何可恢复的来源。" +
 		"若还需保留这些文件，请重新扫描后改用「移入回收站」或「移动」。"
+}
+
+// histSnapshot 在锁内取账本句柄（M9，2026-09-21 全仓审计 §五 9）。
+//
+// `a.hist` 是受 `a.mu` 保护的字段：`shutdown` 在锁内把它置 nil（Close 之后置空），
+// 而绑定层的 RPC 与扫描 goroutine 随时可能正在读它。直接 `if a.hist == nil` 再
+// `a.hist.X()` 是**解引用两次**且都在锁外——前者是数据竞争，后者还可能拿到刚被
+// 置空的值。取一次快照后所有调用都用 hs，字段本身只读一次、且在锁内读。
+//
+// 已经在大临界区里取过快照的调用点（ExecuteOperation / UndoOperation 等）不必
+// 走这里，注释里的「锁内快照」与此同源。
+func (a *App) histSnapshot() *history.Store {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hist
 }
 
 // warnLedger 是"账本没写进去"的统一出口（M7，2026-09-21）：stderr + app:error 双通道。
@@ -1696,10 +1716,11 @@ type OpRecordDetail struct {
 
 // ListOpRecords 清理记录列表（新→旧）。
 func (a *App) ListOpRecords() ([]history.OpMeta, error) {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return nil, fmt.Errorf("历史库不可用")
 	}
-	return a.hist.ListOps()
+	return hs.ListOps()
 }
 
 // OpRecordItem 条目明细视图（history.OpItem + 链接状态标注，2026-09-20）。
@@ -1723,10 +1744,11 @@ type OpRecordItem struct {
 // 其余状态（failed/skipped/cancelled）本就没在文件系统上动手，
 // 原位可能有意料之外的第三方文件，检测它们只会产出误导性的标红。
 func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return OpRecordDetail{}, fmt.Errorf("历史库不可用")
 	}
-	m, items, err := a.hist.GetOp(opID)
+	m, items, err := hs.GetOp(opID)
 	if err != nil {
 		return OpRecordDetail{}, err
 	}
@@ -1752,10 +1774,11 @@ func (a *App) ClearOpRecords() error {
 	if busy {
 		return fmt.Errorf("清理/回撤操作执行中，请等待结束后再清空记录")
 	}
-	if a.hist == nil {
+	hs := a.histSnapshot()
+	if hs == nil {
 		return fmt.Errorf("历史库不可用")
 	}
-	return a.hist.ClearOps()
+	return hs.ClearOps()
 }
 
 // UndoOperation 回撤一条清理记录：入口同步校验（历史库/互斥/记录可撤性），
