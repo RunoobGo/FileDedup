@@ -31,7 +31,14 @@ const (
 // os.Stat（跟随符号链接）+ 按路径重开哈希，校验对象与随后被删除/替换的
 // 对象之间可以隔着一次 rename。现在返回通过校验那一刻的 fsid.ID，
 // 执行器在破坏性动作前用它复核路径仍指向同一 inode（见 identityStill）。
-// 返回的 ID 在未解析平台（Windows）为零值，复核平凡通过。
+//
+// AS-H1（2026-09-20 全仓审计）：参照身份取自 **FromFile(f)（句柄查询）** 而非
+// FromFileInfo(st)。Windows 的 fromInfo 恒返回未解析 ID（卷号与文件索引只在
+// BY_HANDLE_FILE_INFORMATION 里有，Lstat 产物拿不到），于是修正前本函数在
+// Windows 上恒返回零值 ID → identityStill 开头即放行 → 执行器五处破坏性动作前
+// 复核与 symlink 的 keepID 守卫**全部空转**。句柄查询在两个平台都解析，
+// 且 f 已在此处打开，零额外开销。仅当卷不提供稳定索引（FAT/exFAT）时
+// 才返回未解析，由 identityStill 的放行分支接住。
 func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verdict, fsid.ID) {
 	f, err := os.Open(e.Path)
 	if err != nil {
@@ -48,7 +55,7 @@ func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verd
 	if uint64(st.Size()) != e.Size {
 		return VerdictFailed, fsid.ID{}
 	}
-	id := fsid.FromFileInfo(st)
+	id := fsid.FromFile(f) // 句柄查询：AS-H1，Windows 上唯一解析得动的口径
 	buf := pool.GetStreamBuf()
 	full, err := hasher.HashFull(f, st.Size(), buf)
 	pool.PutStreamBuf(buf)

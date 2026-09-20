@@ -370,7 +370,16 @@ func (a *App) authorizeDir(dir string) {
 }
 
 // moveTargetAllowed 校验 move 目标：必须位于某个授权目录内（含授权目录本身）。
-// 对已存在的路径同时校验符号链接解析后的形态，防经由链接逃逸。
+//
+// AS-H3（2026-09-20 全仓审计）：修正前把 `abs` 与 `EvalSymlinks(abs)` 并列成候选，
+// **任一**候选落在**任一**授权目录内即放行——与注释自述的"防经由链接逃逸"正好相反。
+// 授权目录内部的一个链接（root/esc → 外部）让 abs 命中授权，解析出的越界结果被无视，
+// 随后 move.go 的 MkdirAll + Rename 就经这条链接写到用户从未授权的位置。
+// 现在**只认解析后的真实路径**：目标不存在时对最近的已存在祖先求解，再接回尾段。
+//
+// 授权侧无需再解析：authorizeDir 已把 Clean 绝对路径与其 EvalSymlinks 变体一并登记，
+// 两者都是操作系统给出的同一真实大小写形态。
+//
 // 调用方须持 a.mu。
 func (a *App) moveTargetAllowed(dir string) bool {
 	if dir == "" {
@@ -380,18 +389,44 @@ func (a *App) moveTargetAllowed(dir string) bool {
 	if err != nil {
 		return false
 	}
-	candidates := []string{abs}
-	if ev, err := filepath.EvalSymlinks(abs); err == nil && ev != abs {
-		candidates = append(candidates, filepath.Clean(ev))
+	resolved, err := resolveTargetPath(abs)
+	if err != nil {
+		return false
 	}
 	for auth := range a.authDirs {
-		for _, c := range candidates {
-			if withinDir(c, auth) {
-				return true
-			}
+		if withinDir(resolved, auth) {
+			return true
 		}
 	}
 	return false
+}
+
+// resolveTargetPath 返回 path 的真实物理位置：对**最近的已存在祖先**求
+// EvalSymlinks，再把尚不存在的那段尾段原样接回（不存在的段谈不上链接）。
+//
+// 为什么不能只 EvalSymlinks(path)：move 目标常常还没创建（用户输入新目录名，
+// 或由 move.go 的 MkdirAll 建出来），整条路径直接求解会失败——若据此判否就是
+// 误拒合法目标，若据此放行"反正解析不了"就是本次要修的洞。逐级上溯到已存在的
+// 祖先才是两者都对的答案。
+//
+// 连根都解析不动（异常）时返回 error，调用方按拒绝处理（fail-closed）。
+func resolveTargetPath(path string) (string, error) {
+	var tail []string
+	cur := path
+	for {
+		if ev, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				ev = filepath.Join(ev, tail[i])
+			}
+			return filepath.Clean(ev), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fmt.Errorf("路径 %q 不存在任何可解析的祖先", path)
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 // withinDir target 是否等于 dir 或位于 dir 之下（按路径段边界比较）。

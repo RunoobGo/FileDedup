@@ -107,6 +107,13 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 		if !shortReadOK(err) {
 			return Result{}, err
 		}
+		// AS-H2：小文件一趟把「读满声明长度」当作「读完了整个文件」，
+		// Full 字段直接入组。文件在扫描后变长时这个前提不成立，与短读同等待遇。
+		if int64(n) == size {
+			if gerr := rejectGrowthBeyond(f, size); gerr != nil {
+				return Result{}, gerr
+			}
+		}
 		b := buf[:n]
 		h := xxhash.Sum64(b)
 		return Result{
@@ -179,6 +186,28 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 	return r, nil
 }
 
+// rejectGrowthBeyond 探测「声明长度之后是否还有可读字节」——即文件是否**变长**。
+//
+// AS-H2（2026-09-20 全仓审计）：2026-09-19 的短读修复只挡住了"实际比声明短"。
+// 反向不成立时 io.LimitReader 照样静默切尾、n == size 顺利通过，于是
+// 「前 size 字节相同 + 尾部是刚追加的数据」的两个文件会算出同一哈希、进同一组，
+// 用户删掉的正是含新数据的那一份。触发面是常见工况：断点续传、追加型日志、
+// 正在写入的镜像文件。
+//
+// 用 ReadAt 而非顺序 Read：不扰动调用方的读位置，且分段流水线（自行 ReadAt
+// 各段）与顺序路径共用同一探测口径。
+//
+// 只把 n>0 当作证据；探测读到的错误一律放过（EOF 是正常答案，其余 I/O 异常
+// 会在真正的读取里显形，此处不作为判据）。
+func rejectGrowthBeyond(f *os.File, size int64) error {
+	var probe [1]byte
+	if n, _ := f.ReadAt(probe[:], size); n > 0 {
+		return fmt.Errorf("hasher: 文件比声明长（声明 %d 字节，偏移 %d 之后仍可读）: %w",
+			size, size, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
+
 // HashFull 顺序流式全量 BLAKE3（默认路径）。
 //
 // 2026-09-19 修复：修正前用 io.LimitReader(f, size) 包一层，而 LimitReader 读
@@ -186,6 +215,9 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 // 长度"时，函数**静默**算出的是"较短那段内容"的哈希，调用方毫不知情，
 // 可能把截断后的内容与别的文件判成重复。现在改为显式计数：读到的字节数与
 // 声明的 size 不符即报错，把判断权交回调用方（宁可计入失败清单，也不静默出错）。
+//
+// AS-H2（2026-09-20）：同一条理由覆盖反向情形——变长时 LimitReader 同样静默切尾，
+// 故 n == size 之后还要探测「size 处是否仍可读到字节」。
 func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
 	h := blake3.New(32, nil)
 	n, err := io.CopyBuffer(h, io.LimitReader(f, size), buf)
@@ -194,6 +226,9 @@ func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
 	}
 	if n != size {
 		return [32]byte{}, fmt.Errorf("hasher: 文件短读（声明 %d 字节，实际可读 %d 字节）: %w", size, n, io.ErrUnexpectedEOF)
+	}
+	if err := rejectGrowthBeyond(f, size); err != nil {
+		return [32]byte{}, err
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
@@ -267,6 +302,11 @@ func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte)
 		}
 		// 归还缓冲（len 被截断，cap 仍为 seg；池容量恒够，归还不会阻塞）
 		free <- b.data[:cap(b.data)]
+	}
+	// AS-H2：本函数绕过 HashFull 的顺序读路径自行 ReadAt 各段，变长守卫必须
+	// 在这条路上也在场——否则 >512MiB 的追加型文件仍是假重复组的入口。
+	if err := rejectGrowthBeyond(f, size); err != nil {
+		return [32]byte{}, err
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))

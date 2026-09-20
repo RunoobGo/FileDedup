@@ -109,12 +109,23 @@ func TestIdentityStillDetectsSymlinkSwap(t *testing.T) {
 	}
 }
 
-// TestIdentityStillPassesWhenIDUnresolved 原身份未解析时放行。
+// TestIdentityStillPassesWhenVolumeLacksStableIndex **卷不提供稳定文件索引**时放行。
 //
-// 这是有意保留的行为：FAT/exFAT 不提供稳定文件索引，此时"原身份"本就未知，
-// 无从比对。强行判否会让这些卷上完全无法执行清理操作。
-// 这些平台上的实际防线是内容级校验（VerifyFile）。
-func TestIdentityStillPassesWhenIDUnresolved(t *testing.T) {
+// 适用范围要收窄（2026-09-20 全仓审计 AS-H1，04 §6.8.1）：本用例钉的是
+// FAT/exFAT 这类**卷本身给不出 (卷号, 文件索引)** 的场景——此时"原身份"本就
+// 未知，无从比对，强行判否会让这些卷上完全无法执行清理；实际防线退回内容级
+// 校验（VerifyFile 每次全量重算 BLAKE3）。
+//
+// ★ 它**不是**"未解析就放行"的通用许可证。NTFS/APFS/EXT4 等提供稳定索引的卷上
+// 参照身份必须解析得动：若因取身份的口径不对而恒为未解析，本放行分支就会把
+// 整条动作前复核变成空转（修正前 Windows 正是这个形态——FromFileInfo 在 Windows
+// 恒未解析）。那一侧的守卫由 verify_identity_windows_test.go 的
+// TestVerifyFileIdentityIsResolved / TestVerifyFileIdentityCatchesRenameSwap 钉住，
+// 二者配对成立，本用例只负责"卷确实给不出索引"这一条。
+//
+// 依 04 §6.8.0 约束 2，这是被允许的那类改动：论证"断言本身钉住了过宽的语义"
+// 后收窄其适用范围，并在断言旁写清理由与配对的用例位置。
+func TestIdentityStillPassesWhenVolumeLacksStableIndex(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "f.bin")
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
