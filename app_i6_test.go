@@ -128,7 +128,7 @@ func TestUndoRefusedWhenWriteAheadMarkFails(t *testing.T) {
 	undoOneFn = func(ops.UndoItem) (string, error) { called = true; return prev(ops.UndoItem{}) }
 
 	// 条目 ID 不存在 → 写前落账必然失败
-	_, err := undoExecuteItem(a.hist, "trash", history.OpItem{
+	_, err := a.undoExecuteItem(a.hist, "trash", history.OpItem{
 		ID: 987654, OrigPath: filepath.Join(dir, "home", "a.bin"),
 		DestPath: dest, Size: uint64(len(content)),
 	})

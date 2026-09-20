@@ -542,8 +542,9 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		if a.hist != nil {
 			id, serr := a.hist.SaveScan(cfg, groups, failed)
 			if serr != nil {
-				fmt.Fprintf(os.Stderr, "[history] 扫描历史保存失败: %v\n", serr)
-				a.emit(a.ctx, "app:error", map[string]string{"error": "历史保存失败（不影响当前结果）：" + serr.Error()})
+				// M7：本行曾是全仓唯一"双通道留痕"的写法，其余四处只写 stderr。
+				// 现在统一走 warnLedger（本函数即由此抽出）。
+				a.warnLedger(fmt.Sprintf("扫描历史保存失败（不影响当前结果）：%v", serr))
 			} else {
 				histID = id
 			}
@@ -1239,7 +1240,7 @@ func (a *App) persistKeepPaths(histID int64, paths []string) {
 		return
 	}
 	if err := a.hist.UpdateKeepPaths(histID, paths); err != nil {
-		fmt.Fprintf(os.Stderr, "[history] 保留决策保存失败: %v\n", err)
+		a.warnLedger(fmt.Sprintf("保留决策保存失败：%v，恢复该条历史时保留项会回到上一次成功保存的状态", err))
 	}
 }
 
@@ -1402,6 +1403,20 @@ func undoableReason(kind string) string {
 		"若还需保留这些文件，请重新扫描后改用「移入回收站」或「移动」。"
 }
 
+// warnLedger 是"账本没写进去"的统一出口（M7，2026-09-21）：stderr + app:error 双通道。
+//
+// 为什么必须发事件：打包后的 GUI 没有控制台，只写 stderr 等于没写。修正前
+// FinishItem/FinalizeOp/persistKeepPaths/MarkItemUndo 四处落账失败都只写 stderr，
+// 磁盘满时条目停在 planned、`ops:done` 横幅照报"成功"，用户按 09 §6.7
+// 「动手之前先写账本」预期可回撤，实际无账本可撤。
+//
+// 口径与 SaveScan 一致（本函数即从那里抽出），失败原因逐点由调用方写清"哪一笔、
+// 后果是什么"；这里只保证一件事：**绝不静默**。
+func (a *App) warnLedger(msg string) {
+	fmt.Fprintf(os.Stderr, "[history] %s\n", msg)
+	a.emit(a.ctx, "app:error", map[string]string{"error": "账本写入失败：" + msg})
+}
+
 // beginJournal 在任何文件系统动作之前把本次清理的完整计划落盘（写前账本）。
 // undoable 判定：delete 不可撤；Windows 回收站拿不到 src→dst 映射，
 // 回撤改由「打开系统回收站」引导；其余可撤。
@@ -1553,7 +1568,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		cancelOp()
 	}, func() {
-		res := ops.Execute(ops.Options{
+		res := opsExecuteFn(ops.Options{
 			Ctx:     opCtx,
 			Groups:  groups,
 			KeepIDs: keepIDs,
@@ -1570,7 +1585,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 					return
 				}
 				if err := hs.FinishItem(journalID, r.OrigPath, r.DestPath, r.LinkSrc, r.State, r.Err); err != nil {
-					fmt.Fprintf(os.Stderr, "[history] 条目收口失败 %s: %v\n", r.OrigPath, err)
+					a.warnLedger(fmt.Sprintf("条目收口失败 %s：%v，该条在历史记录中可能仍是「计划中」，回撤入口不完整", r.OrigPath, err))
 				}
 			},
 			// C7：worker 内 panic 兜底。runIndexed 已捕获 panic 并标记失败，
@@ -1584,7 +1599,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		if journalID != 0 {
 			// 残留 planned（取消未派发等）→ cancelled，并冻结 done 计数/回收字节
 			if err := hs.FinalizeOp(journalID); err != nil {
-				fmt.Fprintf(os.Stderr, "[history] 操作账本收尾失败: %v\n", err)
+				a.warnLedger(fmt.Sprintf("操作账本收尾失败：%v，残留的「计划中」条目未归位，回撤范围以历史记录为准", err))
 			}
 		}
 		// 失败/跳过并入统一失败清单
@@ -1795,7 +1810,7 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 				break // 剩余项保持 done，可再次回撤
 			}
 			a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: i, Total: total, Current: it.OrigPath})
-			restored, uerr := undoExecuteItem(hs, meta.Kind, it)
+			restored, uerr := a.undoExecuteItem(hs, meta.Kind, it)
 			if uerr != nil {
 				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
 				continue
@@ -1812,12 +1827,18 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 // undoOneFn 回撤执行入口的间接引用：测试据此断言"账本先落、文件后动"的先后顺序。
 var undoOneFn = ops.UndoOne
 
+// opsExecuteFn 执行器入口的间接引用（与 undoOneFn 同理由）。
+// M7 用它把"操作执行到一半账本变得不可写"这一现场（磁盘满 / 句柄失效）做成
+// 确定性场景：测试在 body 内先关掉 *history.Store，于是 OnItem 的 FinishItem
+// 与随后的 FinalizeOp 必然报错，从返回值上却完全观测不到。
+var opsExecuteFn = ops.Execute
+
 // undoExecuteItem 执行单条回撤并落账（批量/单项共用）。写前落账（2026-09-18
 // 审查 I6）：先把条目置为 undoing 再动文件系统——原先先移动后落账，中途被杀会让
 // 账本永久停在 done，文件其实已回家却显示"未回撤"，重试还必报"已不存在"。
 // 收口：成功置 undone，失败置 undo_failed 并保留原因供排查与重试；
 // 写前落账失败则拒绝执行（与 C3「无账本不动文件」同口径），调用方据 error 汇总成败。
-func undoExecuteItem(hs *history.Store, kind string, it history.OpItem) (string, error) {
+func (a *App) undoExecuteItem(hs *history.Store, kind string, it history.OpItem) (string, error) {
 	if err := hs.MarkItemUndo(it.ID, history.StateUndoing, ""); err != nil {
 		return "", fmt.Errorf("回撤写前落账失败，已放弃执行（文件系统未改动）: %w", err)
 	}
@@ -1834,12 +1855,12 @@ func undoExecuteItem(hs *history.Store, kind string, it history.OpItem) (string,
 	}
 	if uerr != nil {
 		if merr := hs.MarkItemUndo(it.ID, history.StateUndoFailed, uerr.Error()); merr != nil {
-			fmt.Fprintf(os.Stderr, "[history] 回撤失败态落库出错 %s: %v\n", it.OrigPath, merr)
+			a.warnLedger(fmt.Sprintf("回撤失败态落库出错 %s：%v，该条可能停留在「回撤中」，重试前请核对文件实际状态", it.OrigPath, merr))
 		}
 		return "", uerr
 	}
 	if merr := hs.MarkItemUndo(it.ID, history.StateUndone, ""); merr != nil {
-		fmt.Fprintf(os.Stderr, "[history] 回撤成功态落库出错 %s: %v\n", it.OrigPath, merr)
+		a.warnLedger(fmt.Sprintf("回撤成功态落库出错 %s：%v，文件已还原但记录未更新，历史页可能仍显示为可回撤", it.OrigPath, merr))
 	}
 	return restored, nil
 }
@@ -1906,7 +1927,7 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 	a.goTask("ops", release, func() {
 		res := UndoResult{OpID: opLogID, Restored: []string{}, Failed: []model.FailedItem{}}
 		if opCtx.Err() == nil {
-			restored, uerr := undoExecuteItem(hs, meta.Kind, it)
+			restored, uerr := a.undoExecuteItem(hs, meta.Kind, it)
 			if uerr != nil {
 				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
 			} else {
