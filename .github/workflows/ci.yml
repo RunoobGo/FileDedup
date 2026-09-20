@@ -29,6 +29,12 @@ jobs:
   check:
     name: gofmt / vet x3 / test -race / frontend / smoke
     runs-on: ubuntu-latest
+    # ★ AS-K5（2026-09-20 全仓审计）：没有 timeout-minutes 的作业，一旦某步卡住
+    # （挂载点半死、loop 设备等待、npm 网络挂起）会一直占到 GitHub 的 6 小时上限，
+    # 期间吃掉 runner 配额，且被平台杀掉时**没有可读的失败原因**。
+    # 作业级兜底 + 下面两处易阻塞调用的 step 级 timeout 双保险：后者只红那一步，
+    # 不至于把前面已跑完的步骤一起废掉。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -88,7 +94,10 @@ jobs:
       # CLI 冒烟：固定数据集上「冷扫 / 缓存首扫 / 缓存复扫」三次结果必须逐项一致，
       # 断言口径是分组路径集合与可释放字节（files_total 属阶段口径，见脚本说明）。
       - name: CLI 冒烟（benchgen C×0.02 + fdd-cli 三跑比对）
-        run: bash scripts/smoke-cli.sh
+        # 三跑各带一次全量哈希，慢盘上会明显变长；给足余量，但仍不许无限期占着。
+        # 外层 20 > 内层 900s：让**内层**先响，它才有"超时"这条可读的错误分支。
+        timeout-minutes: 20
+        run: timeout --signal=TERM --kill-after=30s 900s bash scripts/smoke-cli.sh
 
       # 跨卷软链接冒烟（2026-09-20）：挂一个独立文件系统，实证 7 条判据
       # （① 硬链接跨卷必失败——本功能存在的理由 ② 软链接跨卷成功且内容跟随
@@ -103,13 +112,26 @@ jobs:
       # 真实跨卷防线可以在无人察觉时失效。现在 rc=2 仍不阻断（环境受限不该
       # 怪代码），但会在作业摘要与日志里留下**醒目告警**，不再与全绿同形。
       - name: 跨卷软链接冒烟（独立卷 + 7 条判据）
+        timeout-minutes: 10
         run: |
           set +e
-          sudo bash scripts/smoke-symlink.sh
+          # step 级 timeout（AS-K5）：mount/losetup 坏的时候是**阻塞**而不是报错，
+          # 只靠作业级 timeout-minutes 会把整个 job 连日志一起废掉。
+          timeout --signal=TERM --kill-after=30s 420s \
+            sudo bash scripts/smoke-symlink.sh
           rc=$?
           set -e
           case "$rc" in
             0) echo "跨卷软链接 7 条判据全部成立" ;;
+            124|137|143) msg="跨卷软链接冒烟超时（420s 未完成，rc=$rc）——多半是 mount/losetup 阻塞"
+               echo "::error::$msg"
+               {
+                 echo '## ⏱ 跨卷软链接冒烟超时'
+                 echo
+                 echo "$msg"
+                 echo "超时按失败处理：阻塞与判据不成立都需要人来看。"
+               } >>"$GITHUB_STEP_SUMMARY"
+               exit 1 ;;
             2) msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过"
                echo "::warning title=冒烟未执行::$msg"
                {
@@ -131,6 +153,8 @@ jobs:
   windows:
     name: go test (windows)
     runs-on: windows-latest
+    # AS-K5：Go 编译 + 前端构建 + 全量测试，无上限时会静默占满 runner 配额
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
