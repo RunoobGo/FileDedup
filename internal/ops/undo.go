@@ -121,15 +121,25 @@ func undoTrash(it UndoItem) (string, error) {
 		name := strings.TrimSuffix(base, ext) + FddRestoreMark + ext
 		target = uniqueDst(filepath.Dir(it.OrigPath), name)
 	}
-	if err := os.Rename(it.DestPath, target); err != nil {
+	if err := renameFile(it.DestPath, target); err != nil {
 		if !isCrossDevice(err) {
 			return "", fmt.Errorf("恢复失败: %w", err)
 		}
-		if err := copyVerify(it.DestPath, target, st); err != nil {
+		// AS-H4 同型（2026-09-20 全仓审计）：回收站侧文件在复制窗口内同样可能被
+		// 第三方以 rename 顶替，而这里原先按路径盲删。复制前取身份、删前复核。
+		srcID, err := pathIdentity(it.DestPath)
+		if err != nil {
+			return "", err
+		}
+		if err := copyVerifyFile(it.DestPath, target, st); err != nil {
 			os.Remove(target)
 			return "", err
 		}
-		if err := os.Remove(it.DestPath); err != nil {
+		if !identityStill(it.DestPath, srcID) {
+			return target, fmt.Errorf("已恢复到 %s，但回收站侧文件在复制期间被替换（inode 已变化）："+
+				"为避免误删第三方文件**未清理回收站侧**，两份并存，请核对后自行处理其一: %s", target, it.DestPath)
+		}
+		if err := removeSrc(it.DestPath); err != nil {
 			return target, fmt.Errorf("已复制但清理回收站侧失败（两份并存）: %w", err)
 		}
 	}

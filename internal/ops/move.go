@@ -28,7 +28,7 @@ func MoveFile(src, targetDir string) (string, error) {
 	}
 	dst := uniqueDst(targetDir, filepath.Base(src))
 
-	if err := os.Rename(src, dst); err == nil {
+	if err := renameFile(src, dst); err == nil {
 		return dst, nil // 同卷快路径
 	} else if !isCrossDevice(err) {
 		return "", fmt.Errorf("移动失败: %w", err)
@@ -39,11 +39,25 @@ func MoveFile(src, targetDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := copyVerify(src, dst, st); err != nil {
+	// AS-H4（2026-09-20 全仓审计）：复制可持续数秒到数分钟，是全部已加固点里
+	// **窗口最大**的一个，而删源用的是按路径的 os.Remove——窗口内第三方以 rename
+	// 顶替 src（同步盘、下载器的原子写入正是这个时序）时，删掉的是别人的新文件，
+	// 账本还记 done。因此复制前经已开句柄取身份，删源前复核路径仍指向同一文件。
+	srcID, err := pathIdentity(src)
+	if err != nil {
+		return "", err
+	}
+	if err := copyVerifyFile(src, dst, st); err != nil {
 		os.Remove(dst) // 清理半成品
 		return "", err
 	}
-	if err := os.Remove(src); err != nil {
+	if !identityStill(src, srcID) {
+		// 不删源，也不把这次算成功：两份并存交给用户核对，
+		// 代价远小于替用户删掉一个他没打算删的第三方文件。
+		return dst, fmt.Errorf("已复制到 %s，但源文件在复制期间被替换（inode 已变化）："+
+			"为避免误删第三方文件**未删除源**，两份并存，请核对后自行处理其一: %s", dst, src)
+	}
+	if err := removeSrc(src); err != nil {
 		return dst, fmt.Errorf("已复制但删除源失败（两份并存）: %w", err)
 	}
 	return dst, nil
@@ -285,3 +299,20 @@ var hardlinkRename = os.Rename
 // 「原副本删除失败」（Windows 上杀软/索引器占用句柄时的高频路径），
 // 用于验证残留会被如实回报而不是被静默吞掉（缺陷 6）。
 var workTempRemove = cleanupWorkTemp
+
+// —— 跨卷「复制 + 删源」的三个接缝（AS-H4，2026-09-20 全仓审计）——
+//
+// 该路径的危害窗口在「复制完成」与「删源」之间，可持续数秒到数分钟，
+// 不加接缝就无法在测试里稳定构造，只能靠 sleep 赌时序。
+
+// renameFile 默认 os.Rename：测试用它让首次改名稳定失败于 EXDEV，
+// 从而确定性地进入跨卷分支（本机造不出第二个真实挂载卷）。
+var renameFile = os.Rename
+
+// copyVerifyFile 默认等于 copyVerify：测试用它在「复制已完成、源尚未删除」
+// 这一刻构造第三方以 rename 顶替源路径。
+var copyVerifyFile = copyVerify
+
+// removeSrc 默认 os.Remove：测试据此断言「守卫生效时一次都不该删」。
+// 抽成 var 本身不改变行为，但把"是否真的动手"变成可观测的事实。
+var removeSrc = os.Remove

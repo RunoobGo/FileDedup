@@ -71,6 +71,17 @@ func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verd
 	return VerdictFailed, fsid.ID{}
 }
 
+// pathIdentity 取路径身份，供「手上只有路径、还没开文件」的动作在动手前留底
+// （如跨卷复制的删源前复核，AS-H4）。
+//
+// 用 FromPathNoFollow 而不是 os.Open + FromFile：与复核侧 identityStill 的
+// 取身份口径**完全一致**，否则「取底跟随链接、复核不跟随」会在链接对象上
+// 恒判否；且它只需属性读权限，不因数据读权限被拒而误报不可达（见 fsid_windows 注释）。
+// 同样不走 FromFileInfo(Lstat(...))——Windows 上那条恒未解析，复核会平凡通过（AS-H1）。
+func pathIdentity(path string) (fsid.ID, error) {
+	return fsid.FromPathNoFollow(path)
+}
+
 // identityStill 复核 path 当前指向的物理文件仍是 id 记录的那一个。
 // 不跟随符号链接：路径被换成链接/目录/另一文件时，身份必不同。
 //
