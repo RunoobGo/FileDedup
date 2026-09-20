@@ -103,6 +103,27 @@ type Options struct {
 	// 注意：已在途的单个 syscall 无法抢占，取消保证的是「不再派发新条目」，
 	// 配合 app 层的代际校验共同消除永久锁死。
 	Ctx context.Context
+
+	// TrashVerifiesRecycle 声明本平台的 trash 实现能否**可靠地验证**
+	// "文件确实进了回收站"。
+	//
+	// 该标志存在的原因（2026-09-20 缺陷：跨盘移入回收站被静默永久删除）：
+	//
+	// 批量 trash 失败后回退逐文件时，若某个源路径已不存在，代码需要判断
+	// 这是"已被批量执行成功移走"还是"被静默永久删除"。两种情况在
+	// 文件系统层面**完全同形**（都是 os.Stat 返回 ENOENT），唯一能区分的
+	// 依据是平台有没有报告过落点（dstMap）。
+	//
+	//   true  —— 平台承诺"若没报告落点，就不算成功"。
+	//            Windows 走此分支：defaultTrash 内部会复核回收站条目数，
+	//            验不过即返回 error，因此"源消失 + 无落点"必须按**失败**上报，
+	//            否则会把数据丢失伪装成无害的跳过。
+	//   false —— 平台按 C6/S8 旧契约：源消失即视为目标达成，记 Skipped。
+	//            darwin 的 Finder 落点解析可能配对失败而返回空 dstMap，
+	//            此时文件确实已进回收站，记 Failed 是误报。
+	//
+	// 默认 false 以保持既有平台行为不变；Windows 由 app 层显式置为 true。
+	TrashVerifiesRecycle bool
 }
 
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
@@ -366,19 +387,50 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 入站文件记成去向为空的 Skipped，而 Skipped 永不进回撤
 				// （app.go UndoOperation 只认 done）→ 这批文件永久失去应用内
 				// 回撤。故先收下已知去向，命中者按 done+dst 落账。
+				//
+				// ★ 2026-09-20 修复「跨盘移入回收站被静默永久删除」时的重要修正：
+				//
+				// 上面那条「源已不在 → 记 Skipped」的推断，在**静默永久删除**的
+				// 场景下会变成帮凶：Windows 的 defaultTrash 现在会用 verifyRecycled
+				// 检出「文件消失但回收站条目数未增加」并返回错误，而回退逻辑随即
+				// 看到 os.IsNotExist(p) 成立，就把这项记成 Skipped——**刚亮起的
+				// 数据丢失警报被重新按了下去**，用户看到的仍是一个无害的「跳过」。
+				//
+				// 判据缺陷在于：os.Stat 只能证明「文件不在了」，无法区分
+				// 「进了回收站」与「被永久删除」。因此必须结合两个信息判定：
+				//
+				//   1. 平台是否**能**验证回收站（opts.TrashVerifiesRecycle）
+				//   2. 平台本次是否**报告过**该文件的落点（known[p]）
+				//
+				// 能验证 + 无落点 → 无法证明进过回收站，按**失败**上报（Windows）
+				// 不能验证        → 保持 C6/S8 旧契约，记 Skipped（darwin 等）
+				//
+				// 把「无法证明成功」升级为失败，是本缺陷的修复要点：宁可让用户
+				// 看到一条需要核实的错误，也不能让他以为文件好好地躺在回收站里。
 				known := dstMap
 				if known == nil {
 					known = map[string]string{}
 				}
+				strict := opts.TrashVerifiesRecycle
 				runIndexed(ctx, len(usable), opWorkers, func(k int) {
 					i := usable[k]
 					p := toProcess[i].Path
-					if _, err := os.Stat(p); os.IsNotExist(err) {
+					if _, statErr := os.Stat(p); os.IsNotExist(statErr) {
 						if d, ok := known[p]; ok {
 							settle(i, outcome{code: ocOK, dst: d})
-						} else {
-							settle(i, outcome{code: ocSkipped})
+							return
 						}
+						if !strict {
+							settle(i, outcome{code: ocSkipped})
+							return
+						}
+						// 源已消失，但平台有能力验证却未报告任何落点 →
+						// 无法证明进了回收站。这正是「疑似被直接删除」的形状，
+						// 绝不能记成 Skipped。
+						settle(i, outcome{code: ocFailed, stage: "trash",
+							err: "文件已从原路径消失，但未能确认其进入回收站；" +
+								"可能已被直接删除，请立即到回收站核实" +
+								"（若不在回收站，请停止后续操作并考虑用数据恢复工具找回）"})
 						return
 					}
 					if m, err := trash([]string{p}); err != nil {

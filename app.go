@@ -1479,6 +1479,9 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			Ctx:     opCtx,
 			Groups:  groups,
 			KeepIDs: keepIDs,
+			// 平台能力声明：Windows 的回收站实现会独立复核落位，
+			// 故"源消失但无落点"必须按失败上报（见 ops.TrashVerifiesRecycle）。
+			TrashVerifiesRecycle: ops.TrashVerifiesRecycle(),
 			OnProgress: func(done, total int, current string) {
 				a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: done, Total: total, Current: current})
 			},
