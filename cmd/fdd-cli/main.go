@@ -40,6 +40,9 @@ type report struct {
 		Groups         int    `json:"groups"`
 		ReclaimableSum uint64 `json:"reclaimable_bytes"`
 		DuplicateFiles int    `json:"duplicate_files"`
+		// CacheHits：本轮在哈希缓存里查到记录的候选文件数（AS-K1）。
+		// 冒烟脚本据此断言"复扫必须真命中"——三跑结论一致并不能证明缓存生效。
+		CacheHits int `json:"cache_hits"`
 	} `json:"stats"`
 	Groups []*groupJSON       `json:"groups"`
 	Failed []model.FailedItem `json:"failed"`
@@ -120,6 +123,7 @@ func main() {
 	// FilesTotal 是阶段口径（预筛/哈希阶段会重设为该阶段处理量），缓存命中
 	// 复扫时远小于语料数，双跑比对会误报漂移。
 	r.Stats.FilesTotal = int(p.ScannedFiles())
+	r.Stats.CacheHits = int(p.CacheHits())
 
 	var w io.Writer = os.Stdout
 	if *out != "" {

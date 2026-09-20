@@ -37,6 +37,12 @@ type Pipeline struct {
 	// 因此需要"本轮共扫描多少文件"这一稳定口径的调用方（fdd-cli 报告）走这里。
 	scannedFiles atomic.Uint64
 
+	// cacheHits 本轮预筛阶段在缓存里查到记录的次数（AS-K1）。
+	// 单独立一个数的理由：冒烟脚本原先只把三跑结论互比，那证明不了"缓存真的
+	// 被用上"——UseCache 一旦断线，三跑就等价于三次冷扫，门禁照样全绿。
+	// 有了这个正向信号，"没命中"才第一次会变成红。
+	cacheHits atomic.Uint64
+
 	OnProgress func(model.ProgressEvent) // 可选：进度回调
 	OnStage    func(model.StageEvent)    // 可选：阶段回调
 }
@@ -58,6 +64,11 @@ func New() *Pipeline {
 // 不复用进度事件的 FilesTotal：那是阶段口径（R2），进入预筛/哈希阶段后会被
 // 重设为该阶段的处理量，缓存命中扫下远小于语料数，作为报告统计会误导。
 func (p *Pipeline) ScannedFiles() uint64 { return p.scannedFiles.Load() }
+
+// CacheHits 返回本轮 Run 在哈希缓存里查到记录的候选文件数（Run 结束后读取）。
+// 与 ScannedFiles 同为"按轮归零"的口径：跨轮累加会让"这一跑到底有没有吃到
+// 缓存"看不出来（AS-K1）。
+func (p *Pipeline) CacheHits() uint64 { return p.cacheHits.Load() }
 
 // Status 当前状态。
 func (p *Pipeline) Status() model.TaskStatus {
@@ -187,6 +198,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	p.afterResume = ""
 	p.mu.Unlock()
 	p.scannedFiles.Store(0)
+	p.cacheHits.Store(0) // AS-K1：按轮归零，见 CacheHits 注释
 	// 闸门复位：上一轮若在 Paused 下被取消（父 ctx 直接取消、未走 CancelScan），
 	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
 	p.gate.Resume()
@@ -417,6 +429,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			if cacheOn {
 				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime, ids[i]); hit {
 					localHits = append(localHits, e.Path)
+					p.cacheHits.Add(1) // AS-K1：正向信号，"查到记录"即计一次
 					var full [32]byte
 					fullValidNow := false
 					// 四点采样全一致 → 内容极可能未变，信任缓存 full；否则内容已变，full 须重算。

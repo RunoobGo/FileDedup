@@ -63,7 +63,7 @@ def sig(tag):
         groups.append((int(g["reclaimable"]), "\n".join(paths)))
     groups.sort(key=lambda x: x[1])
     blob = "\x1e".join(f"{c}\x1f{p}" for c, p in groups).encode()
-    return {
+    cmp = {
         "groups": s["groups"],
         "reclaimable": s["reclaimable_bytes"],
         "dup_files": s["duplicate_files"],
@@ -71,10 +71,20 @@ def sig(tag):
         "failed": len(r["failed"] or []),
         "digest": hashlib.sha256(blob).hexdigest()[:16],
     }
+    # cache_hits **不进比较键**：冷扫/首扫/复扫三者的命中数本就应不同
+    # （0 / 0 / >0），把它并进一致性比对会把脚本钉死成永远红。
+    # 它单独走下面的正向断言。
+    if "cache_hits" not in s:
+        print("\nFAIL: stats 缺 cache_hits 字段（AS-K1 断言依赖它；改字段名请同步本脚本）",
+              file=sys.stderr)
+        sys.exit(1)
+    return cmp, int(s["cache_hits"])
 
-vals = {t: sig(t) for t in tags}
+vals, hits = {}, {}
 for t in tags:
-    print(f"    {t:7s} {vals[t]}")
+    vals[t], hits[t] = sig(t)
+for t in tags:
+    print(f"    {t:7s} {vals[t]} cache_hits={hits[t]}")
 
 base = vals[tags[0]]
 bad = [t for t in tags if vals[t] != base]
@@ -83,6 +93,24 @@ if bad:
     sys.exit(1)
 if base["groups"] == 0:
     print("\nFAIL: 数据集未产生任何重复组，冒烟失去意义", file=sys.stderr)
+    sys.exit(1)
+
+# AS-K1：上面那些只能发现"三跑不一致"，发现不了"缓存压根没生效"——
+# UseCache 断线时三跑等价于三次冷扫，逐项照样一致、门禁照样全绿。
+# 所以要一个**正向**信号：复扫必须报出命中。
+if hits["cold"] != 0:
+    print(f"\nFAIL: 冷扫（未挂 -cache）命中数 = {hits['cold']}，应为 0"
+          "（cacheOn=false 时一次 Lookup 都不该发生）", file=sys.stderr)
+    sys.exit(1)
+if hits["cache1"] != 0:
+    print(f"\nFAIL: 首扫（空库）命中数 = {hits['cache1']}，应为 0"
+          "（非 0 说明命中计数被接到了别的东西上，本批断言全部失真）", file=sys.stderr)
+    sys.exit(1)
+if hits["cache2"] <= 0:
+    print(f"\nFAIL: 复扫命中数 = {hits['cache2']}，必须 > 0"
+          "——零命中即缓存断线（cfg.UseCache / WithCache(nil) / cacheOn 条件任一处）。"
+          "\n      负控制验证：把 cache2 那行的 -cache 参数去掉重跑本脚本，必须红在这里。",
+          file=sys.stderr)
     sys.exit(1)
 
 # 与 benchgen 的 manifest 对账：漏报（缓存/预筛收敛过头）在此暴露，
@@ -98,6 +126,7 @@ if base["files_total"] != want_total:
     print(f"\nFAIL: files_total={base['files_total']}，manifest 语料={want_total}"
           "（语料口径回归，见 B3-6）", file=sys.stderr)
     sys.exit(1)
-print(f"\nOK: 三跑一致且与 manifest 对账通过"
-      f"（{base['groups']} 组 / 可释放 {base['reclaimable']} B / 语料 {base['files_total']} 文件）")
+print(f"\nOK: 三跑一致、缓存命中生效且与 manifest 对账通过"
+      f"（{base['groups']} 组 / 可释放 {base['reclaimable']} B / 语料 {base['files_total']} 文件 / "
+      f"复扫命中 {hits['cache2']}）")
 PY
