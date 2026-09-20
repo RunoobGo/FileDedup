@@ -179,7 +179,7 @@ func TestVerifyRecycledDetectsExtantSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 文件存在 + 空快照（无卷信息可查）
-	err := verifyRecycled([]string{p}, RBState{})
+	err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{})
 	if err == nil {
 		t.Fatalf("源仍存在却未报错——「返回成功但没删掉」会被漏过")
 	}
@@ -193,7 +193,7 @@ func TestVerifyRecycledDetectsExtantSource(t *testing.T) {
 func TestVerifyRecycledGoneSourceNoSnapshotOK(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "already-gone.bin") // 从未创建
-	if err := verifyRecycled([]string{p}, RBState{}); err != nil {
+	if err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{}); err != nil {
 		t.Fatalf("无快照时不应报错（判据 2 应跳过），got %v", err)
 	}
 }

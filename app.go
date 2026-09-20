@@ -676,6 +676,14 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 func (a *App) buildSortedGroupsLocked(key sortKey) []*model.DuplicateGroup {
 	var gs []*model.DuplicateGroup
 	for _, g := range a.groups {
+		// 防御：空组直接剔除，不进入排序与分页。
+		// size 排序分支读 gs[i].Files[0].Size，空组会越界 panic；count 与
+		// reclaimable 分支虽不读 Files[0]，但把空组展示成"0 个文件"的行同样
+		// 无意义（既不能勾选也没有可释放空间）。畸形组只可能来自历史库被
+		// 外部改写（扫描流水线输出前有 len<2 过滤），这里统一挡掉。
+		if len(g.Files) == 0 {
+			continue
+		}
 		if key.ext != "" && !groupHasExt(g, key.ext) {
 			continue
 		}
@@ -746,6 +754,13 @@ func groupHasExt(g *model.DuplicateGroup, ext string) bool {
 
 // toGroupView 转换为 UI 视图：保留标记 = 当前决策（若有）否则路径最短建议（01 §9）。
 func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
+	// 防御：空组没有成员可展示，`g.Files[0].Size` 会越界 panic。走到这里就说明
+	// 上游已经把畸形组放进了结果集（扫描流水线输出前有 len<2 过滤，故只可能来自
+	// history.LoadScan 读到被外部改写/损坏的历史库）。视图层不该因此崩掉整页
+	// ——返回一个成员为空的视图，前端 `g.files.length` 为 0，不显示任何行。
+	if len(g.Files) == 0 {
+		return GroupView{GroupID: g.GroupID, Files: []FileView{}}
+	}
 	v := GroupView{
 		GroupID:     g.GroupID,
 		Reclaimable: g.Reclaimable,

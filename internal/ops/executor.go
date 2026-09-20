@@ -150,6 +150,16 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	hashByID := make(map[uint64][32]byte, len(op.FileIDs)*2)
 	keepSrcByID := make(map[uint64]*model.FileEntry, len(op.FileIDs)*2) // 冗余ID → 组保留者
 	for _, g := range opts.Groups {
+		// 防御：空组没有任何成员，`g.Files[0]` 与 pickShortest 都会越界 panic。
+		// 扫描流水线自身不可能产空组（internal/dedup/pipeline.go 输出前有
+		// `len(g) < 2 { continue }`），但 **Groups 是调用方传入的**：历史恢复
+		// （history.LoadScan 读 hist_groups/hist_files 两张表）在其数据被外部
+		// 工具改写或库影像损坏时，完全可能交出一个没有任何 hist_files 行的组。
+		// 执行器是"后端最后防线"，不该因为上游给了畸形输入就把整个进程带走
+		// （执行发生在 goroutine 里，panic 会连带丢掉整批清理的收尾落账）。
+		if len(g.Files) == 0 {
+			continue
+		}
 		var keep *model.FileEntry
 		for _, f := range g.Files {
 			if opts.KeepIDs != nil && opts.KeepIDs[f.ID] {

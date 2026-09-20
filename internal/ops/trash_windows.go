@@ -210,8 +210,10 @@ func defaultTrash(paths []string) (map[string]string, error) {
 	// 注意：SHFileOperation 不支持 \\?\ 前缀，使用普通路径
 	from := buildPathList(paths)
 
-	// 事后复核基准：记录操作前每个受影响卷的回收站条目数。
+	// 事后复核基准：记录操作前每个受影响卷的回收站条目数，
+	// 以及每个卷**预期**入站的条目数（供 checkRecycled 的判据 2 比对增量）。
 	before := snapshotRecycleBinCounts(paths)
+	expected := expectedRecycledPerVolume(paths)
 
 	op := shFileOpStruct{
 		wFunc:  foDelete,
@@ -226,7 +228,8 @@ func defaultTrash(paths []string) (map[string]string, error) {
 		return dst, fmt.Errorf("操作被系统中止")
 	}
 	// ★ 关键：r0==0 **不足以**判定文件进了回收站。复核，否则可能是静默永久删除。
-	if err := verifyRecycled(paths, before); err != nil {
+	// 同时比对"每卷预期入站数"，否则同卷内**部分**文件被静默删除会被漏检。
+	if err := verifyRecycled(paths, expected, before); err != nil {
 		return dst, err
 	}
 	return dst, nil
@@ -370,7 +373,7 @@ func snapshotRecycleBinCounts(paths []string) RBState {
 // 本函数只负责**采集平台数据**（哪些源还在、各卷回收站条目数），
 // 判定逻辑全部委托给 recycle_policy.go 的 checkRecycled——那里是纯函数，
 // 可在 Linux 上跑测试，确保这道防线进入 CI 主门禁。
-func verifyRecycled(paths []string, before RBState) error {
+func verifyRecycled(paths []string, expected, before RBState) error {
 	// 判据 1 的数据：源是否还在。
 	var still []string
 	for _, p := range paths {
@@ -380,7 +383,7 @@ func verifyRecycled(paths []string, before RBState) error {
 	}
 	// 判据 2 的数据：操作后各卷回收站条目数。
 	after := snapshotRecycleBinCounts(paths)
-	return checkRecycled(still, before, after)
+	return checkRecycled(still, expected, before, after)
 }
 
 // driveRoot 从路径提取卷根（`F:\`）；无法识别时返回 ""。
@@ -390,6 +393,11 @@ func driveRoot(p string) string {
 	}
 	return p[:2] + `\`
 }
+
+// init 把 Windows 的卷根解析挂到平台无关判定层（见 recycle_policy.volRootFn）。
+// 不挂的话 expectedRecycledPerVolume 恒返回空表 → checkRecycled 判据 2
+// 退化成"条目不得减少"，部分丢失就检不出来了。
+func init() { volRootFn = driveRoot }
 
 // buildPathList 构造 SHFileOperation 的 pFrom：**以单个 \0 分隔的路径列表，
 // 末尾再补一个 \0**（即整体双 \0 结尾）。
