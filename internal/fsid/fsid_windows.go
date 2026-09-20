@@ -124,6 +124,43 @@ func FromPathNoFollow(path string) (ID, error) {
 // 布局禁止在别处复制（复制一份精简版就会把卷号读成文件属性、把索引读成时间戳）。
 func FromHandle(h uintptr) ID { return fromHandle(h) }
 
+// FromPath 取 path **所指向对象**的物理身份，**跟随**符号链接。
+//
+// 与 FromPathNoFollow 的唯一差异是 CreateFileW 的 flags 里**不带**
+// FILE_FLAG_OPEN_REPARSE_POINT：带则停在重解析点（拿到链接自身），
+// 不带则由 I/O 管理器穿透到目标。
+//
+// 2026-09-20（跨卷软链接合并）：这是软链接终局复核的必需能力。
+// 若照搬 FromPathNoFollow 去校验"链接是否指向保留源"，取到的会是链接自身
+// 的 (卷序列号, 文件索引)，与保留源恒不相等——每次合并都会被误判为失败。
+//
+// 悬空链接：CreateFileW 直接失败（ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND），
+// 返回 error；调用方据此报"目标不可达"。
+//
+// 注：FILE_FLAG_BACKUP_SEMANTICS 保留——目标可能是目录（虽然本应用只处理
+// 普通文件），且该标志对普通文件无副作用。
+func FromPath(path string) (ID, error) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return ID{}, err
+	}
+	h, _, callErr := procCreateFileW.Call(
+		uintptr(unsafe.Pointer(p)),
+		uintptr(genericRead),
+		uintptr(fullShare),
+		0,
+		uintptr(openExisting),
+		// 有意**不加** fileFlagOpenRepars：要的就是穿透链接取目标。
+		uintptr(fileAttrNormal|fileFlagBackupSem),
+		0,
+	)
+	if h == invalidHandleValue {
+		return ID{}, callErr
+	}
+	defer syscall.CloseHandle(syscall.Handle(h))
+	return fromHandle(h), nil
+}
+
 // fromFile 句柄查询 (卷号, 文件索引[, change time])。
 // 主查询失败、或卷不给稳定索引（FAT/exFAT 恒 0）都返回未解析：
 // 宁可用旧的采样兜底，也不用一个可能人人都相同的"身份"去放行命中。
