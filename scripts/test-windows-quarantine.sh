@@ -51,7 +51,64 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-# 当前隔离清单：空。若需新增，请逐条写清症状与判定依据，并在修复后删除。
-SKIP=''
+# 当前隔离清单：空。若需新增，**每行一条用例全名**（不带子测试路径），
+# 并在同行注释里写清症状与判定依据，修复后删除。
+#
+# ★ AS-K2（2026-09-20 全仓审计）：清单条目的匹配语义从"子串"改为"整名锚定"，
+# 并且每条都必须命中至少一个现存用例，否则本脚本直接红。两个理由：
+#
+#   ① go test 的 -skip 是**未锚定**的正则子串匹配。旧写法把条目写成裸名字，
+#      TestCache 会连带跳过 TestCacheSecondScan、TestCacheMtimeContentChanged
+#      以及**将来新增的任何同族用例**——隔离范围悄悄扩大，没人会察觉。
+#   ② 命中 0 个用例的条目**永不过期**：用例改名/删除后清单还留着它，
+#      于是"当前有多少测试被隔离"这件事永久失真，白名单变成暗坑。
+QUARANTINE=()
 
-exec go test -count=1 -skip "$SKIP" ./...
+# 新增条目时的形状（示例，勿解注释）：
+# QUARANTINE=(
+#   'TestPipelinePauseResume' # 暂停恢复后组数偏少，见 2026-09-19 说明
+# )
+
+if [ "${#QUARANTINE[@]}" -eq 0 ]; then
+	exec go test -count=1 ./...
+fi
+
+# 1) 条目语法自检：只允许合法用例名（字母数字下划线，可含 . 与 / 之外的
+#    Go 用例名字符）。掺进正则元字符会让"锚定"这件事失效或误伤一片。
+for entry in "${QUARANTINE[@]}"; do
+	if [[ ! "$entry" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+		printf 'FAIL: 隔离条目 %q 不是合法用例全名（只允许字母数字下划线；正则元字符一律不许，本脚本自己负责锚定）\n' "$entry" >&2
+		exit 1
+	fi
+done
+
+# 2) 编译并列出全部现存用例（不执行），逐条断言"至少命中 1 个"。
+#    `go test -list` 只列举不跑；输出里 "ok  <pkg>" 之类的行不以 Test 开头，
+#    用 ^Test 过滤即得用例名集合。
+ALL_TESTS="$( { go test -list '.*' ./... 2>/dev/null || true; } | sed -n 's/^\(Test[A-Za-z0-9_]*\)$/\1/p')"
+if [ -z "$ALL_TESTS" ]; then
+	echo "FAIL: go test -list 没列出任何用例（构建失败？先跑 go vet ./...）" >&2
+	exit 1
+fi
+
+patterns=''
+for entry in "${QUARANTINE[@]}"; do
+	n=$(printf '%s\n' "$ALL_TESTS" | grep -c "^${entry}\$" || true)
+	if [ "$n" -eq 0 ]; then
+		printf 'FAIL: 隔离条目 %q 命中 0 个现存用例——它已失效（用例改名/删除/从未存在），' \
+			"$entry" >&2
+		printf '请从清单删除；留着只会让"被隔离了多少测试"永久失真（AS-K2）。\n' >&2
+		exit 1
+	fi
+	printf '    隔离 %-42s 命中 %s 个用例\n' "$entry" "$n"
+	if [ -z "$patterns" ]; then
+		patterns="^${entry}\$"
+	else
+		patterns="${patterns}|^${entry}\$"
+	fi
+done
+
+# 3) 锚定后的正则交给 go test：`^(A|B)$` 只会整名匹配，
+#    前缀相同的兄弟用例不受影响（AS-K2 的理由 ①）。
+echo "==> go test -count=1 -skip '${patterns}' ./..."
+exec go test -count=1 -skip "$patterns" ./...
