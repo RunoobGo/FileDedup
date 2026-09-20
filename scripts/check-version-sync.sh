@@ -54,23 +54,42 @@ for pair in "wails.json:$WAILS_VER" "package.json:$PKG_VER" "package-lock.json:$
 	[ -n "$val" ] && [ "$val" != "$APP_VER" ] && fail "$name=$val 与 app.go AppVersion=$APP_VER 不一致"
 done
 
-# tag 比对：优先命令行参数，其次 GITHUB_REF_NAME / GITHUB_REF
+# tag 比对：★ AS-K4（2026-09-20 全仓审计）——"是不是 tag 触发"必须看**触发类型**，
+# 不能看 tag 的拼写。修正前这里用 `case $TAG in v[0-9]*)` 来识别 tag，而
+# build.yml 的触发条件是 `v*`：`vBeta`、`vRelease` 这类标签**会触发整条发布流水线**，
+# 却在门禁里被认成"普通分支 push"而跳过比对，于是 0.5.0 的产物顶着 vBeta 的名字
+# 发出去，Release 资产名与"关于"里读到的版本各说各话。
+#
+# 现在三处信号任一成立即按 tag 触发处理：GITHUB_REF_TYPE=tag、
+# ref 形如 refs/tags/…、或命令行显式传了参数。是 tag 却对不上 v<AppVersion> 即红。
 REF="${1:-${GITHUB_REF_NAME:-${GITHUB_REF:-}}}"
-if [ -n "$REF" ]; then
-	TAG=${REF##refs/tags/}
-	case "$TAG" in
-		v[0-9]*) ;;
-		*) TAG="" ;;   # 普通分支 push / workflow_dispatch：不比对 tag
-	esac
+REF_TYPE="${GITHUB_REF_TYPE:-}"
+
+TAG=''
+TAG_WHY=''
+case "$REF" in
+	refs/tags/*)
+		TAG="${REF#refs/tags/}"
+		TAG_WHY='ref 形如 refs/tags/'
+		;;
+esac
+if [ "$REF_TYPE" = 'tag' ] && [ -z "$TAG" ] && [ -n "$REF" ]; then
+	TAG="${REF##*/}" # GITHUB_REF_NAME 在 tag 触发时就是裸 tag 名
+	TAG_WHY='GITHUB_REF_TYPE=tag'
 fi
-if [ -n "${TAG:-}" ]; then
-	if [ "${TAG#v}" != "$APP_VER" ]; then
-		fail "tag $TAG 与 AppVersion $APP_VER 不一致（发布物名字与 GetVersion 会各说各话）"
+if [ "$#" -ge 1 ] && [ -n "$1" ]; then
+	TAG="${1#refs/tags/}"
+	TAG_WHY='命令行显式指定 tag'
+fi
+
+if [ -n "$TAG" ]; then
+	if [ "$TAG" != "v$APP_VER" ]; then
+		fail "tag $TAG 与 AppVersion $APP_VER 不一致（按 tag 触发处理，依据：$TAG_WHY）。发布物名字与 GetVersion/「关于」会各说各话——要么改 tag，要么先同步版本号再打 tag"
 	else
-		printf '\033[32m✓ tag %s 与版本号一致\033[0m\n' "$TAG"
+		printf '\033[32m✓ tag %s 与版本号一致（依据：%s）\033[0m\n' "$TAG" "$TAG_WHY"
 	fi
 else
-	echo "  （非 tag 触发，跳过 tag 比对）"
+	echo "  （非 tag 触发，跳过 tag 比对。若本次确是 tag 触发，请确认 GITHUB_REF_TYPE / GITHUB_REF 已传入环境）"
 fi
 
 if [ "$BAD" -ne 0 ]; then
