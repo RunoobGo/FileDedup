@@ -71,6 +71,37 @@ func TestWalkSkipsWorkTempResidue(t *testing.T) {
 	}
 }
 
+// TestWalkDoesNotPruneUserDirsNamedLikeTempMarkers 名字以标记结尾的**目录**
+// 不是我们的产物（我们只生成文件），不得连整棵子树一起剪掉。
+//
+// 修正前：IsTempName(de.Name()) 在 IsDir 分支**之前**执行且用 Contains，
+// 用户目录 `album.fdd-old-collection/`（乃至任何内嵌标记的目录名）会被
+// 静默整树排除——漏扫其中全部文件，比漏单个文件严重。
+func TestWalkDoesNotPruneUserDirsNamedLikeTempMarkers(t *testing.T) {
+	root := t.TempDir()
+	payload := strings.Repeat("k", 100)
+	for _, dirName := range []string{"album.fdd-old-collection", "album.fdd-old"} {
+		dir := filepath.Join(root, dirName)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []string{"p1.jpg", "p2.jpg"} {
+			if err := os.WriteFile(filepath.Join(dir, n), []byte(payload), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	res := Walk(context.Background(), []string{root}, &model.Filters{}, 4)
+	if len(res.Files) != 4 {
+		var names []string
+		for _, f := range res.Files {
+			names = append(names, f.Path)
+		}
+		t.Fatalf("目录名内嵌/等同临时标记都不得剪树，应收集 4 个文件，实际 %d: %v", len(res.Files), names)
+	}
+}
+
 // TestWalkSkipsWorkTempInSubdirectories 残留可能出现在任意层级，
 // 判定必须与目录深度无关。
 func TestWalkSkipsWorkTempInSubdirectories(t *testing.T) {

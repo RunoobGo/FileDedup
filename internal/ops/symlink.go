@@ -70,6 +70,14 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("保留源在校验后被替换，已拦截（S1）: %w", err)
 	}
+	// verifySymlinked 的两侧身份都沿 keep 这条路径字符串解析，恒相等——它证明
+	// 的是"链接建对了"，检不出"keep 本身被换"。与 HardlinkMerge 的
+	// identityStill(tmp, keepID) 同构的守卫必须由 keepID 承担（2026-09-20 审查：
+	// 修正前 keepID 参数收而不用，S1 提示形同虚设）。
+	if !identityStill(keep, keepID) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("保留源在校验后被替换（inode 已变化），已拦截（S1）")
+	}
 	if !identityStill(dup, dupID) {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
@@ -94,17 +102,25 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	// 与硬链接同理：os 层的"没报错"不等于"链接已按预期建立"
 	// （卷不支持重解析点、安全软件把链接改写/拦截等都可能悄悄发生）。
 	// 证据是"解析后确为 keep 的数据"，而非"调用没报错"。
-	if err := verifySymlinked(keep, dup); err != nil {
+	// keepID 复核同样要做——步骤 2 与此刻之间 keep 仍可能被换；若带着被换的
+	// keep 走到删备份，原始内容的最后一份副本就没了。
+	step5Err := verifySymlinked(keep, dup)
+	if step5Err == nil && !identityStill(keep, keepID) {
+		step5Err = errors.New("保留源在合并期间被替换（inode 已变化）")
+	}
+	if step5Err != nil {
 		// 未真正建立：把 dup 还原成原来的独立文件，不留"假成功"的账。
 		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
 			if berr := hardlinkRename(backup, dup); berr != nil {
-				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）",
-					err, backup+".undo")
+				// 真原文件在 backup；backup+".undo" 里是被挪开的假链接。
+				// 恢复现场必须指向 backup（2026-09-20 修正：此前说反）。
+				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失；假链接残留在 %s，可自行删除）",
+					step5Err, backup, backup+".undo")
 			}
 			_ = os.Remove(backup + ".undo")
-			return err
+			return step5Err
 		}
-		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", err, backup)
+		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", step5Err, backup)
 	}
 
 	// ---- 成功：删除备份 ----

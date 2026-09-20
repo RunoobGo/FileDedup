@@ -66,9 +66,24 @@ const (
 	fileBasicInfoClass = 1
 
 	// CreateFileW 参数常量（取自 Win32 头文件）。
-	genericRead        = 0x80000000
+	//
+	// ★ 2026-09-20（ocr M4）：身份查询只要 FILE_READ_ATTRIBUTES，不用
+	// GENERIC_READ。GetFileInformationByHandle / …ByHandleEx 读的是**元数据**
+	// （卷号、文件索引、change time），按 Win32 契约只需属性读权限；
+	// GENERIC_READ 额外要求 FILE_READ_DATA，于是在这两类正常路径上白白失败：
+	//   - 另一进程以「共享写但不共享读」占用文件；
+	//   - ACL/EFS 拒绝读数据却允许读属性。
+	// 失败本身还算轻的——调用方会把它**误读成存在性问题**：
+	// identityStill 见 error 即判"路径已被换"，verifySymlinked 报"目标不可达
+	// （悬空链接？）"。权限事实被说成文件不存在，排查方向整个偏掉。
+	fileReadAttributes = 0x80 // FILE_READ_ATTRIBUTES（winbase.h）
+	// identityAccessMask 是身份查询用的 DesiredAccess——语义上就是
+	// FILE_READ_ATTRIBUTES，单独命名是为了让两处 Call 的意图自解释。
+	identityAccessMask = fileReadAttributes
 	fullShare          = syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE | syscall.FILE_SHARE_DELETE
 	openExisting       = 3
+	// fileAttrNormal 传给 dwFlagsAndAttributes（与 FILE_READ_ATTRIBUTES 同为
+	// 0x80，但作用于**不同参数**——这也是上面单独命名 identityAccessMask 的原因）。
 	fileAttrNormal     = 0x80
 	fileFlagBackupSem  = 0x02000000
 	fileFlagOpenRepars = 0x00200000 // FILE_FLAG_OPEN_REPARSE_POINT：不跟随重解析点
@@ -102,7 +117,7 @@ func FromPathNoFollow(path string) (ID, error) {
 	}
 	h, _, callErr := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(p)),
-		uintptr(genericRead),
+		uintptr(identityAccessMask),
 		uintptr(fullShare),
 		0,
 		uintptr(openExisting),
@@ -146,7 +161,7 @@ func FromPath(path string) (ID, error) {
 	}
 	h, _, callErr := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(p)),
-		uintptr(genericRead),
+		uintptr(identityAccessMask),
 		uintptr(fullShare),
 		0,
 		uintptr(openExisting),

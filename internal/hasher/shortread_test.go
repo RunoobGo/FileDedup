@@ -156,6 +156,38 @@ func TestHashHeadTailNormalNotFlagged(t *testing.T) {
 	}
 }
 
+// TestHashHeadTailTruncatedToEmpty 声明 1MiB、实际 0 字节（截空/完全不可读）：
+// ActualSize 必须是 0——pipeline 靠 `actual == 0` 判定"截空/不可读"并剔除条目。
+//
+// 缺陷（2026-09-20 ocr 审查证实）：还原循环用 `best == 0` 同时充当
+// "未设值"哨兵与真值 0，首个采样点确立 best=0 后条件仍恒真，
+// 后续更大偏移（mid1=512KiB…）把 0 覆盖成虚构长度 → 守卫永不触发，
+// 空文件按假尺寸重新分桶，阶段 3 HashFull 必然短读失败。
+func TestHashHeadTailTruncatedToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	p := writeNamed(t, dir, "empty.bin", nil) // 0 字节
+
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	declared := int64(1 << 20) // 谎报 1MiB
+	buf := make([]byte, SmallFileMax)
+	r, err := HashHeadTail(f, declared, buf)
+	if err != nil {
+		t.Fatalf("截空文件的短读被当成错误: %v", err)
+	}
+	if !r.Short {
+		t.Fatalf("截空未标记 Short")
+	}
+	if r.ActualSize != 0 {
+		t.Fatalf("ActualSize = %d, want 0（0 字节被虚构出长度，pipeline 的 actual==0 守卫将失效）",
+			r.ActualSize)
+	}
+}
+
 // TestHashFullReportsShortRead HashFull 不得静默吞掉短读。
 //
 // 修正前用 io.LimitReader 包一层，读不满即 io.EOF，io.CopyBuffer 视其为

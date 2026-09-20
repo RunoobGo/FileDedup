@@ -88,12 +88,15 @@ cd frontend && npm ci && npm run build                       # 先产 dist（go 
 go test -race -count=2 ./...                                 # 全包
 go test -race -count=4 .                                     # 根包（App 层状态机多压两轮）
 bash scripts/smoke-cli.sh                                    # 数据集 C×0.02 三跑比对
+bash scripts/smoke-symlink-assert.sh                         # 自证跨卷冒烟的判据本身有效
 bash scripts/check-version-sync.sh                           # 6 个取值位 / 5 个文件版本号对齐
 ```
 
 | 脚本 | 作用 |
 |---|---|
 | `scripts/smoke-cli.sh` | benchgen 生成固定数据集 → `fdd-cli` 冷扫 / 缓存首扫 / 缓存复扫，逐项比对分组集合、可释放字节、语料数，并与 manifest 对账 |
+| `scripts/smoke-symlink.sh` | 挂真实独立卷（loop+ext4，退到 tmpfs）验证软链接合并赖以成立的 7 条文件系统语义；退出码 0=通过、2=**合法跳过**（无 root / 挂不上卷）、1=失败——跳过绝不伪装成通过 |
+| `scripts/smoke-symlink-assert.sh` | 用 stub 打桩 `id`/`mount`/`losetup`，断言上一条脚本在"应跳过"时真的返回 2 并写明原因、在正常路径上确实释放了 loop 设备。冒烟脚本本身也是代码，没人测它的判据就等于判据可以静默失效 |
 | `scripts/check-version-sync.sh` | 6 个取值位 / 5 个文件的版本号对齐（`package-lock.json` 贡献 2 处）；tag 触发时再比对 `v<版本>` |
 | `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因），其余用例一律阻断 |
 

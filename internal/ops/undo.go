@@ -297,14 +297,23 @@ func undoSymlink(it UndoItem) (string, error) {
 	// 悬空链接也允许继续：数据在备份里，链接有效性与此无关。
 	// 但若链接指向的目标已不是 LinkSrc（例如用户重建过链接指到别处），
 	// 说明现状已被改动，仍按"已非本次创建的链接"拦截。
-	if li2, lerr := os.Lstat(it.LinkSrc); lerr == nil && li2.Mode()&os.ModeSymlink == 0 {
-		if verr := verifySymlinked(it.LinkSrc, it.OrigPath); verr != nil {
-			// 目标不可达（悬空）时 verifySymlinked 会失败，那是**预期**的；
-			// 只有"目标可达但不是 LinkSrc"才需要拦截。
-			if _, serr := os.Stat(it.LinkSrc); serr == nil {
-				return "", fmt.Errorf("目标位置上的链接已不指向原保留源，"+
-					"为避免误删第三方文件已拦截: %w", verr)
-			}
+	//
+	// 2026-09-20 审查修正：原先整块检查以 Lstat(LinkSrc) 成功为前提，
+	// 而"保留源被删除 → 链接悬空 → 用户在同一位置建了指向别处的链接"恰好
+	// 绕开全部校验，回撤会把用户的链接当成我们的删掉。现改为无条件比对。
+	if verr := verifySymlinked(it.LinkSrc, it.OrigPath); verr != nil {
+		// 目标不可达（悬空）时 verifySymlinked 会失败，那是**预期**的；
+		// 只有"目标可达但不是 LinkSrc"才需要拦截。
+		if _, serr := os.Stat(it.LinkSrc); serr == nil {
+			return "", fmt.Errorf("目标位置上的链接已不指向原保留源，"+
+				"为避免误删第三方文件已拦截: %w", verr)
+		}
+		// 目标不可达 → 身份无从比对，但链接的字面目标必须正是 LinkSrc
+		// 才算"我们还是我们建的那个链接"。
+		if tgt, rerr := os.Readlink(it.OrigPath); rerr != nil ||
+			filepath.Clean(tgt) != filepath.Clean(it.LinkSrc) {
+			return "", fmt.Errorf("目标位置上的链接不指向原保留源 %s，"+
+				"为避免误删第三方文件已拦截", it.LinkSrc)
 		}
 	}
 

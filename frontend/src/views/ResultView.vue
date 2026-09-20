@@ -7,6 +7,7 @@ import GroupCard from '../components/GroupCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import Icon from '../components/Icon.vue'
 import { humanBytes, formatCount } from '../utils/format'
+import { isGroupCrossVolume } from '../utils/pathpolicy'
 import type { OpKind } from '../wails'
 
 const store = useScanStore()
@@ -29,23 +30,19 @@ const confirmKind = ref<OpKind | null>(null)
 const crossVolumeGroups = computed(() => {
   let n = 0
   for (const g of store.groups) {
-    if (isGroupCrossVolume(g)) n++
+    if (isGroupCrossVolume(g.files)) n++
   }
   return n
 })
 const hasCrossVolume = computed(() => crossVolumeGroups.value > 0)
 
-// isGroupCrossVolume 判断一个重复组是否跨卷。
+// isGroupCrossVolume 判断一个重复组是否跨卷 —— 实现收在 utils/pathpolicy.ts，
+// 保守语义（任一成员缺可信卷身份即按同卷处理）在那里说明。
 //
-// 保守优先：任何成员缺少可信卷标识 → 返回 false（按同卷处理，不显示入口）。
-// 理由：跨卷判错的代价不对称——假阳性让用户点进一个必然失败的流程
-// （未提权时全部报"需要权限"），假阴性只是少一个入口，用户仍可先移动再处理。
-function isGroupCrossVolume(g: { files: { volume: string; volumeResolved: boolean }[] }): boolean {
-  if (g.files.length < 2) return false
-  const first = g.files[0]
-  if (!first.volumeResolved) return false
-  return g.files.some(f => !f.volumeResolved || f.volume !== first.volume)
-}
+// ★ 2026-09-20（审查 M7）：修正前的本地实现写作
+// `some(f => !f.volumeResolved || f.volume !== first.volume)`，
+// 于是**其他**成员未解析时反而判成跨卷，正好做出注释禁止的假阳性——
+// 用户点进一个必然失败的流程。
 
 const keepKind = ref('shortest')
 const keepDirInput = ref('')
@@ -146,9 +143,20 @@ function addKeepDirInput() {
 // 那就是"界面说的"和"实际做的"分叉，正是本功能最该避免的一类缺陷。
 // 因此启用判据只有一个：store.procActive（= store.procDirs 里有非空白项）。
 // 这个下拉框只是 store.procDirs 的一个视图，选"全部"就等于清空列表。
+//
+// 2026-09-20 审查修正：原先 get 直接绑 procActive，形成死锁——
+// 添加目录的面板是 v-if="procKind === 'dirs'"，而 procKind 只有在
+// procDirs 已非空时才是 'dirs'，且 setter 忽略 'dirs' → 用户永远打不开
+// 面板，功能整条不可达。现拆成两层：面板开合是本组件的 UI 状态，
+// 是否生效仍以 store.procActive 为准（下面的命中数展示即为证据）。
+const procPanelOpen = ref(store.procActive)
+watch(() => store.procActive, (v) => { if (v) procPanelOpen.value = true })
 const procKind = computed<'all' | 'dirs'>({
-  get: () => (store.procActive ? 'dirs' : 'all'),
-  set: (v) => { if (v === 'all') store.clearProcDirs() },
+  get: () => (procPanelOpen.value ? 'dirs' : 'all'),
+  set: (v) => {
+    procPanelOpen.value = v === 'dirs'
+    if (v === 'all') store.clearProcDirs()
+  },
 })
 const procDirInput = ref('')
 

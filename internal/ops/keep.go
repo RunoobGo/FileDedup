@@ -175,7 +175,11 @@ func inDir(p, dir string) bool {
 	if d == "" {
 		return false
 	}
-	return inDirFold(p, d, fscase.Sensitive(d))
+	sensitive := fscase.Sensitive(d)
+	// inDirFold 的契约是接收**已折叠**的路径（见其注释）；此处不折叠的话，
+	// 不敏感卷上 inDir 与 pickInDirectory 会对同一输入给出相反答案——
+	// TestInDirAgreesWithPickInDirectory 在大小写不敏感文件系统上必红。
+	return inDirFold(fscase.Fold(p, sensitive), d, sensitive)
 }
 
 // inDirFold 是 inDir 的内核，接收已折叠好的敏感性与已归一化的目录。

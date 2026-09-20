@@ -303,3 +303,42 @@ func TestUndoOneDispatchIncludesSymlink(t *testing.T) {
 		t.Fatalf("❌ symlink 未在 UndoOne 中注册: %v", err)
 	}
 }
+
+// TestUndoSymlinkDanglingRejectsForeignLink 悬空现场的第三方链接必须拦截。
+//
+// 09 §6.7.4 承诺："目标位置必须仍是指向原保留源的符号链接"。
+// 修正前该承诺只在 **LinkSrc 存在且不是链接** 时执行——保留源被删（链接悬空）
+// 后，用户把原位的悬空链接换成自己的（指向别处），校验整段被跳过，
+// 回撤会删掉用户的链接来还原备份。LinkSrc 不存在时身份无从比对，
+// 但链接的**字面目标**仍可比：Readlink(OrigPath) 必须等于 LinkSrc。
+func TestUndoSymlinkDanglingRejectsForeignLink(t *testing.T) {
+	keep, dup, content := symlinkUndoFixture(t)
+
+	elsewhere := filepath.Join(filepath.Dir(dup), "user-own-link-target.bin")
+	if err := os.WriteFile(elsewhere, []byte("USER-OWN"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keep); err != nil { // 我们的链接悬空
+		t.Fatal(err)
+	}
+	if err := os.Remove(dup); err != nil { // 用户删掉悬空链接
+		t.Fatal(err)
+	}
+	if err := symlinkCreate(elsewhere, dup); err != nil { // 换成自己的链接
+		t.Fatal(err)
+	}
+
+	_, err := UndoOne(UndoItem{Kind: "symlink", OrigPath: dup, LinkSrc: keep, Size: uint64(len(content))})
+	if err == nil {
+		t.Fatal("❌ 原位的链接已不是我们建的那个，回撤却删了用户的链接")
+	}
+	if !strings.Contains(err.Error(), "保留源") {
+		t.Fatalf("错误应指出链接不再指向原保留源，实得: %v", err)
+	}
+	if tgt, lerr := os.Readlink(dup); lerr != nil || filepath.Clean(tgt) != filepath.Clean(elsewhere) {
+		t.Fatalf("❌ 用户的链接被破坏: %q err=%v", tgt, lerr)
+	}
+	if _, berr := os.Lstat(dup + FddOldSuffix); berr != nil {
+		t.Fatalf("❌ 拦截后备份应原样保留: %v", berr)
+	}
+}

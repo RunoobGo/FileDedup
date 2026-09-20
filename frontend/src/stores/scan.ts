@@ -4,6 +4,7 @@ import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
 import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
 import { reactive, ref, computed } from 'vue'
 import { useToastStore } from './toast'
+import { dirContains, fsCaseSensitiveForPath } from '../utils/pathpolicy'
 
 // 错误提示统一走 toast（Y6：替代阻塞式 alert，且可堆叠查看多条）
 const toast = () => useToastStore()
@@ -489,30 +490,13 @@ export const useScanStore = defineStore('scan', () => {
   // 必须在**前端**算，不能等后端回包：
   // 确认框要在用户点"确定"**之前**就说清数量，而 PreviewProcessPolicy 是
   // 异步的，等它回来弹窗会闪一下再改数字。前端已经持有全部文件路径与勾选集，
-  // 这个交集的判据简单且必须与后端一致（见 dirContains 的注释）。
-
-  // dirContains 报告 path 是否位于 dir 之下（含子目录、含 dir 自身）。
-  // 与后端 ops.inDir 同语义：大小写按原样比（不折叠）——路径来自同一次扫描的
-  // 同一台机器，与用户手输的 dir 之间的大小写差异属于用户输入问题，
-  // 后端 inDirFold 会按卷的敏感性处理，前端这里保持简单，不做可能引入
-  // 假匹配的折叠。落空与否最终以 ops:filtered 事件为准。
-  function dirContains(dir: string, path: string): boolean {
-    const d = normDir(dir)
-    if (!d) return false
-    return path === d || path.startsWith(d + '/') || path.startsWith(d + '\\')
-  }
-
-  // normDir 归一优先级目录：去空白、去尾部分隔符。根目录 "/" 或 "C:\"
-  // 剥完仍保留（否则会退化成"前缀匹配一切"的意外行为）。
-  function normDir(dir: string): string {
-    let d = (dir ?? '').trim()
-    if (!d) return ''
-    if (d.length > 1) d = d.replace(/[/\\]+$/, '')
-    if (d.length === 1 && d === '/') return '/'
-    // "C:\" 剥完剩 "C:"，补回分隔符以免 "C:foo" 被误判为在 "C:" 下
-    if (/^[A-Za-z]:$/.test(d)) d += '\\'
-    return d
-  }
+  // 这个交集的判据必须与后端一致 —— 实现收在 utils/pathpolicy.ts，
+  // 与 internal/ops/keep.go 的 inDir 同语义（折叠分隔符 + 按卷大小写语义）。
+  //
+  // ★ 2026-09-20（审查 M3）：修正前这里是本地的一份"按原样比大小写"的实现，
+  // 注释却声称与后端同语义。macOS/Windows 默认的大小写不敏感卷上，
+  // 用户手输 `C:\Users\Dups` 匹配不到扫描结果的 `c:\users\dups\a.bin`：
+  // 后端会处理它，前端却报成"已排除"——计数说假话。
 
   // procActive 是否启用了处理策略（列表里有非空白项）。
   const procActive = computed(() => procDirs.value.some(d => (d ?? '').trim() !== ''))
@@ -522,7 +506,10 @@ export const useScanStore = defineStore('scan', () => {
   const effectiveFiles = computed(() => {
     if (!procActive.value) return selectedFiles.value
     const dirs = procDirs.value.filter(d => (d ?? '').trim() !== '')
-    return selectedFiles.value.filter(f => dirs.some(d => dirContains(d, f.path)))
+    return selectedFiles.value.filter(f => {
+      const sensitive = fsCaseSensitiveForPath(f.path)
+      return dirs.some(d => dirContains(d, f.path, sensitive))
+    })
   })
 
   const effectiveBytes = computed(() => effectiveFiles.value.reduce((s, f) => s + f.size, 0))

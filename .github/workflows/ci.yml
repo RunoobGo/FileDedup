@@ -90,14 +90,43 @@ jobs:
       - name: CLI 冒烟（benchgen C×0.02 + fdd-cli 三跑比对）
         run: bash scripts/smoke-cli.sh
 
-      # 跨卷软链接冒烟（2026-09-20）：挂一个独立文件系统，实证
-      # ① 硬链接跨卷必失败（本功能存在的理由）② 软链接跨卷成功且内容跟随
-      # ③ 删除链接不影响保留源 ④ 保留源移动后链接悬空 ⑤ 悬空仍可回撤。
+      # 跨卷软链接冒烟（2026-09-20）：挂一个独立文件系统，实证 7 条判据
+      # （① 硬链接跨卷必失败——本功能存在的理由 ② 软链接跨卷成功且内容跟随
+      # ③ 链接自身占用远小于数据 ④ 删除链接不影响保留源 ⑤ 保留源移动后链接悬空
+      # ⑥ 回撤还原为独立文件 ⑦ 悬空仍可回撤）。
       # 单测里的"跨卷"其实是同卷模拟（两个 t.TempDir 在同一设备上），
-      # 真实跨设备语义只有这一步能覆盖。runner 上 loop 设备可用，
-      # 脚本会在无 loop 时退到 tmpfs 并在两者都不可用时**跳过而非静默通过**。
+      # 真实跨设备语义只有这一步能覆盖。
+      #
+      # ★ 2026-09-20（审查 M8）：脚本的跳过退出码由 0 改为 2，这里必须**按码分流**。
+      # 修正前脚本跳过也 exit 0，而本步骤只 `sudo bash …` 看退出码——于是
+      # "runner 挂不上任何文件系统"与"7 条判据全部成立"都是绿：这条唯一的
+      # 真实跨卷防线可以在无人察觉时失效。现在 rc=2 仍不阻断（环境受限不该
+      # 怪代码），但会在作业摘要与日志里留下**醒目告警**，不再与全绿同形。
       - name: 跨卷软链接冒烟（独立卷 + 7 条判据）
-        run: sudo bash scripts/smoke-symlink.sh
+        run: |
+          set +e
+          sudo bash scripts/smoke-symlink.sh
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "跨卷软链接 7 条判据全部成立" ;;
+            2) msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过"
+               echo "::warning title=冒烟未执行::$msg"
+               {
+                 echo '## ⚠️ 跨卷软链接冒烟未执行'
+                 echo
+                 echo "$msg"
+                 echo
+                 echo "判据 ①「硬链接跨卷必失败」只能在真实独立卷上实证，"
+                 echo "同卷环境下无法降级验证。请检查 runner 的 loop/tmpfs 可用性。"
+               } >>"$GITHUB_STEP_SUMMARY" ;;
+            *) echo "::error::跨卷软链接冒烟失败（rc=$rc）"; exit "$rc" ;;
+          esac
+
+      # 冒烟脚本自身的判据（退出码契约 + loop 设备不泄漏 + 失败信息可排查）。
+      # 不需要 root：它用桩命令驱动 smoke-symlink.sh 的各分支。
+      - name: 冒烟脚本判据自证（smoke-symlink-assert）
+        run: bash scripts/smoke-symlink-assert.sh
 
   windows:
     name: go test (windows)

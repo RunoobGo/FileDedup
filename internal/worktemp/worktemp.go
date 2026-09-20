@@ -39,16 +39,37 @@ var markers = []string{
 	MarkRestored,
 }
 
+// suffixMarkers 为「后缀式」生成形态的子集（MarkRestored 是插入式，单列判定）。
+var suffixMarkers = []string{
+	SuffixTmp,
+	SuffixOld,
+	SuffixUndo,
+}
+
 // IsTempName 判定一个「文件名」（不含目录部分）是否为应用自身的工作临时名。
 // 扫描阶段应据此忽略，避免残留污染重复分组。
 //
-// 采用「包含」而非「后缀结尾」判定：因为 .fdd-old 还存在 .fdd-old.undo 这种
-// 二次后缀，而 .fdd-restored 是插在扩展名之前的（name.fdd-restored.ext）。
+// 2026-09-20（ocr 审查 M1）：由 Contains 收紧为**生成形态**判定。
+// Contains 会把 `notes.fdd-old-summary.txt`、`build.fdd-tmp-dir` 这类
+// 只是内嵌标记的用户名（含目录名）判为临时名——扫描器在 IsDir 分支之前
+// 调用它，一个目录名就能让整棵子树静默漏扫。生成形态只有两种：
+//   - 后缀式：用户文件名 + .fdd-tmp/.fdd-old/.fdd-undo-tmp（回滚暂存会再叠
+//     一层 .undo）；
+//   - 插入式：仅 .fdd-restored，插在扩展名之前，即标记之后要么到名尾、
+//     要么以 "." 开头接扩展名。
+//
 // 判定大小写敏感：我们生成时固定用小写 ".fdd-"；用户若真有 "x.FDD-old"，
 // 那不是我们产生的，不应替他忽略。
 func IsTempName(name string) bool {
-	for _, m := range markers {
-		if strings.Contains(name, m) {
+	// 回滚失败暂存的二次后缀：X.fdd-old.undo → 先剥掉 .undo 再按后缀判定
+	n := strings.TrimSuffix(name, ".undo")
+	for _, s := range suffixMarkers {
+		if strings.HasSuffix(n, s) {
+			return true
+		}
+	}
+	if i := strings.Index(n, MarkRestored); i >= 0 {
+		if rest := n[i+len(MarkRestored):]; rest == "" || strings.HasPrefix(rest, ".") {
 			return true
 		}
 	}

@@ -104,8 +104,11 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
 			if berr := hardlinkRename(backup, dup); berr != nil {
 				// 还原失败：至少保证两份都存在（数据不丢），并明确指出残留位置。
-				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）",
-					err, backup+".undo")
+				// 注意路径归属：真原文件在 backup；backup+".undo" 里是刚被
+				// 挪开的**假链接**。恢复现场必须指向 backup（2026-09-20 修正：
+				// 此前消息把两者说反）。
+				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失；假链接残留在 %s，可自行删除）",
+					err, backup, backup+".undo")
 			}
 			_ = os.Remove(backup + ".undo")
 			return err

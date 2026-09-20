@@ -1083,15 +1083,19 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 		return pv, nil
 	}
 
+	// 全程持锁：ApplyProcessPolicy 是纯内存计算（无 I/O、不回调整个 App），
+	// 耗时与组数成正比，锁住它不伤害交互。此前"锁内浅快照、锁外遍历"的写法
+	// 挡不住**元素级**竞争——a.groups 是 []*DuplicateGroup，浅拷贝共享指针，
+	// 执行器收尾会在锁内就地改写 g.Files（app.go 结果集清理段 g.Files = files），
+	// 无锁遍历即构成数据竞争（2026-09-20 -race 实测复现，TestPreviewProcessPolicyConcurrentWithCleanupNoRace）。
 	a.mu.Lock()
 	groups := a.groups
 	keepIDs := a.keepIDs
+	out := ops.ApplyProcessPolicy(groups, dirs, keepIDs)
 	a.mu.Unlock()
 
 	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，
 	// 正是最需要提示的场景），所以不在这里提前返回。
-	out := ops.ApplyProcessPolicy(groups, dirs, keepIDs)
-
 	for _, id := range selectedIDs {
 		if out.MatchIDs[id] {
 			pv.EffectiveIDs = append(pv.EffectiveIDs, id)

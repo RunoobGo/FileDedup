@@ -96,26 +96,78 @@ func queryRecycleBin(root string) (sizeBytes int64, numItems int64, ok bool) {
 	return sizeBytes, numItems, true
 }
 
-// recycleBinDisabledByPolicy 判断回收站是否被策略整体禁用。
+// recycleBinDisabledByPolicy 读**全局** BitBucket\NukeOnDelete。
 //
 // 注册表：HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket
-// 下 NukeOnDelete=1 时，**所有**删除都不进回收站（等价于永久 Shift+Delete）。
-// 该键不存在是正常情况（用户没动过设置），按"未禁用"处理。
+// 下 NukeOnDelete=1 时，该范围内**所有**删除都不进回收站
+// （等价于永久 Shift+Delete）。
 //
-// 返回 (nukeOnDelete, ok)。ok=false 表示无法判定，调用方应保守处理。
-func recycleBinDisabledByPolicy() (bool, bool) {
-	k, err := registryOpenKey(
-		`Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket`)
+// ★ 2026-09-20（ocr M5）：修正前签名是 (bool, bool) 且**永不**返回
+// ok=false——文档承诺的"无法判定应保守处理"形同虚设，读不到（ACL 拒绝、
+// 类型不符）与「键/值不存在=未禁用」被混为同一个 false。现在明确三态，
+// 并且**只有 nukeOn 才拒绝**：
+//
+//	nukeOff     键或值确实不存在 → 用户没改过设置（正常路径）
+//	nukeUnknown 打开/读取失败    → 无法判定。**刻意不据此拒绝**——
+//	      未知≠已知禁用，误拒会让正常用户一个文件都删不掉；这种情形由
+//	      verifyRecycled 的事后复核兜底（预检的职责是拦可枚举的降级路径）。
+func recycleBinDisabledByPolicy() nukeStatus {
+	return winNukeStatusOf(
+		`Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket`, "NukeOnDelete")
+}
+
+// recycleBinVolumeNuke 读**该卷**的 NukeOnDelete。
+//
+// ★ 2026-09-20（ocr M2，数据丢失级）：回收站属性对话框里对单个盘勾
+// 「不将文件移入回收站」时，写的是
+// `BitBucket\Volume\{卷GUID}\NukeOnDelete`，**全局键看不到**。修正前只查
+// 全局，于是这类卷上整批文件被 Shell 永久删除后只剩事后复核报警——
+// 数据已经没了。现在按卷一并检查，可在动手前拒绝。
+//
+// 卷 GUID 解析不出来时返回 nukeUnknown（交事后复核），不返回 nukeOff：
+// 那与"注册表读不到"同性质，不是"确认未禁用"。
+func recycleBinVolumeNuke(root string) nukeStatus {
+	guid, ok := volumeGUID(toWinRoot(root))
+	if !ok {
+		return nukeUnknown
+	}
+	sub, value := splitRegPath(volumeNukeKey(guid))
+	return winNukeStatusOf(sub, value)
+}
+
+// splitRegPath 把 volumeNukeKey 的产物切回「键 + 值名」两段
+// （按卷键把值名拼进路径只为让形状可被 Linux 侧测试断言）。
+func splitRegPath(full string) (sub, value string) {
+	for i := len(full) - 1; i >= 0; i-- {
+		if full[i] == '\\' {
+			return full[:i], full[i+1:]
+		}
+	}
+	return full, ""
+}
+
+// winNukeStatusOf 读一个 NukeOnDelete DWORD 并映射为三态。
+func winNukeStatusOf(subKey, value string) nukeStatus {
+	k, err := registryOpenKey(subKey)
 	if err != nil {
-		return false, true // 键不存在 = 用户没改过 = 未禁用
+		if regIsNotFound(err) {
+			return nukeOff // 键不存在 = 没设过 = 未禁用
+		}
+		return nukeUnknown // 打不开（ACL 等）= 无法判定
 	}
 	defer registryCloseKey(k)
 
-	v, err := registryGetDWORD(k, "NukeOnDelete")
+	v, err := registryGetDWORD(k, value)
 	if err != nil {
-		return false, true // 值不存在 = 未禁用
+		if regIsNotFound(err) {
+			return nukeOff // 值不存在 = 没设过
+		}
+		return nukeUnknown // 类型不符 / 读失败 = 无法判定
 	}
-	return v != 0, true
+	if v != 0 {
+		return nukeOn
+	}
+	return nukeOff
 }
 
 // unsafeDriveReason 判定路径所在卷能否保证「回收站可还原」（H3）。
@@ -140,11 +192,15 @@ func unsafeDriveReason(p string) string {
 	// 该字面量是「反斜杠 + 右括号」两个字符，拼出的实参是 `F:\)`——
 	// 不是合法盘根，GetDriveTypeW 返回 DRIVE_NO_ROOT_DIR(1)，
 	// 于是**所有**盘符都被判成「根目录不存在」而拒绝回收站操作。
-	root, err := syscall.UTF16PtrFromString(p[:2] + `\`)
+	root := toWinRoot(p)
+	if root == "" {
+		return "无法识别所在卷"
+	}
+	winRoot, err := syscall.UTF16PtrFromString(root)
 	if err != nil {
 		return "路径编码失败"
 	}
-	r, _, _ := procGetDriveType.Call(uintptr(unsafe.Pointer(root)))
+	r, _, _ := procGetDriveType.Call(uintptr(unsafe.Pointer(winRoot)))
 	switch int(r) {
 	case driveFixed:
 		return "" // 有回收站，可撤销
@@ -239,19 +295,21 @@ func defaultTrash(paths []string) (map[string]string, error) {
 //
 // 返回 "" 表示可回收；非空为拒绝原因（直接呈现给用户）。
 //
-// 相较原先的 unsafeDriveReason，本函数在其之上补了两个此前会导致
-// 静默永久删除的判据：回收站策略禁用、单文件超出回收站容量。
+// 相较原先的 unsafeDriveReason，本函数在其之上补了三个此前会导致
+// 静默永久删除的判据（2026-09-20 ocr M2 把"策略禁用"从只看全局
+// 补成"全局 + 该卷"）。
 func recyclableReason(p string) string {
 	if why := unsafeDriveReason(p); why != "" {
 		return why
 	}
-	// 策略层：NukeOnDelete=1 时所有删除都不进回收站。
-	if nuked, ok := recycleBinDisabledByPolicy(); ok && nuked {
-		return "回收站已被系统策略禁用（NukeOnDelete），此操作会直接永久删除"
+	// 策略层：全局或该卷的 NukeOnDelete=1 时删除都不进回收站。
+	root := driveRoot(p)
+	if why := recycleNukeReason(recycleBinDisabledByPolicy(), recycleBinVolumeNuke(root)); why != "" {
+		return why
 	}
 	// 容量层：单文件 > 该卷回收站配额时，Shell 会静默永久删除。
 	// 这里能做的是"尽力"判断——拿不到配额时保守放行，交由事后复核兜底。
-	if why := recycleBinCapacityReason(p); why != "" {
+	if why := recycleBinCapacityReason(p, root); why != "" {
 		return why
 	}
 	return ""
@@ -270,13 +328,12 @@ func recyclableReason(p string) string {
 // 卷 GUID 通过 GetVolumeNameForVolumeMountPointW(`F:\`) 取得。任一环节
 // 拿不到就返回 ""（放行），交由 verifyRecycled 的事后复核兜底——
 // 宁可漏判也不误拒。
-func recycleBinCapacityReason(p string) string {
+func recycleBinCapacityReason(p, root string) string {
 	size, err := fileSizeOf(p)
 	if err != nil {
 		// 文件不存在/不可读：交给上游的身份校验与执行器按 S8 语义处理。
 		return ""
 	}
-	root := driveRoot(p)
 	if root == "" {
 		return ""
 	}
@@ -286,6 +343,25 @@ func recycleBinCapacityReason(p string) string {
 	}
 	// 判定逻辑在 recycle_policy.go（平台无关，Linux CI 可测）。
 	return capacityReason(size, limit)
+}
+
+// toWinRoot 把任意 `x:/` 或 `x:\` 形状规范化为 `X:\`。
+//
+// GetDriveTypeW、GetVolumeNameForVolumeMountPointW 与注册表路径都要求
+// 反斜杠盘根；而 driveRoot 的产物保留盘符原大小写（`f:\` 也可能出现）。
+// 大小写对注册表本身无害，但**同一卷会因拼写不同产生两个 map 键**——
+// snapshotRecycleBinCounts / expectedRecycledPerVolume 的按卷比对因此
+// 错位，事后复核的判据 2 就检不出部分丢失。故所有卷根一律经此规范化。
+func toWinRoot(p string) string {
+	root := driveRoot(p)
+	if root == "" {
+		return ""
+	}
+	d := root[0]
+	if 'a' <= d && d <= 'z' {
+		root = string(d-32) + root[1:]
+	}
+	return root
 }
 
 // recycleBinCapBytes 取某卷回收站的容量上限（字节）。ok=false 表示未知。
@@ -354,7 +430,7 @@ func fileSizeOf(p string) (int64, error) {
 func snapshotRecycleBinCounts(paths []string) RBState {
 	out := RBState{}
 	for _, p := range paths {
-		root := driveRoot(p)
+		root := toWinRoot(p)
 		if root == "" {
 			continue
 		}
@@ -397,7 +473,10 @@ func driveRoot(p string) string {
 // init 把 Windows 的卷根解析挂到平台无关判定层（见 recycle_policy.volRootFn）。
 // 不挂的话 expectedRecycledPerVolume 恒返回空表 → checkRecycled 判据 2
 // 退化成"条目不得减少"，部分丢失就检不出来了。
-func init() { volRootFn = driveRoot }
+//
+// 挂 toWinRoot 而非 driveRoot：后者保留盘符原大小写，同一卷会得出两个
+// 不同的卷根字符串，与 snapshotRecycleBinCounts 的键对不上号。
+func init() { volRootFn = toWinRoot }
 
 // buildPathList 构造 SHFileOperation 的 pFrom：**以单个 \0 分隔的路径列表，
 // 末尾再补一个 \0**（即整体双 \0 结尾）。

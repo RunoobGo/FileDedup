@@ -220,7 +220,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					// 「做过硬链接合并的文件重扫仍被识别为重复」。
 					// 判定集中在 worktemp.IsTempName，与产生处（internal/ops）
 					// 共用同一份定义，避免日后新增临时名时漏掉忽略规则。
-					if worktemp.IsTempName(de.Name()) {
+					//
+					// 2026-09-20（ocr 审查 M1）：仅对**文件**生效。我们从不
+					// 生成临时命名的目录（ops 的全部临时名都挂在用户文件名
+					// 之后），而此处在 IsDir 分支之前执行——修正前一个名为
+					// "album.fdd-old-collection" 的用户目录会让整棵子树静默
+					// 漏扫。目录名含标记时按其内容逐项判定即可。
+					if !typ.IsDir() && worktemp.IsTempName(de.Name()) {
 						continue
 					}
 					if typ.IsDir() {

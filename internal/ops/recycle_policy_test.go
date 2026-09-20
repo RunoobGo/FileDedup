@@ -384,3 +384,68 @@ func TestSortedKeysIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// ★ 2026-09-20（ocr 审查 M2/M5/M6）回收站 NukeOnDelete 策略预检。
+//
+// 修正前的三个洞（合并为一条回归）：
+//   - recycleBinDisabledByPolicy 只读**全局** BitBucket\NukeOnDelete。用户在
+//     回收站属性里对**单个数据盘**勾「不放入回收站」时，写的是
+//     BitBucket\Volume\{GUID}\NukeOnDelete——全局键看不到，预检放行，
+//     整批文件被永久删除后只剩事后复核报警（数据已经没了）。
+//   - 文档承诺 ok=false 表示"无法判定应保守"，实现却永不返回 false：
+//     注册表读不到（ACL 拒绝）与「键不存在=未禁用」被混为一谈。
+//   - registryGetDWORD 不校验值类型，REG_SZ 会被当 DWORD 读出垃圾。
+//
+// 本测试覆盖下沉后的纯决策逻辑（Linux CI 可见）；Windows 侧的注册表读取
+// 正确性由 trash_windows_recycle_test.go 覆盖，判定表在此钉死。
+func TestRecycleBinNukeDecision(t *testing.T) {
+	cases := []struct {
+		name    string
+		global  nukeStatus
+		volume  nukeStatus
+		wantErr bool
+	}{
+		{"全局开_任何卷都直删", nukeOn, nukeOff, true},
+		{"全局开_卷状态未知仍须拒绝", nukeOn, nukeUnknown, true},
+		{"仅该卷开_属性对话框按卷勾的", nukeOff, nukeOn, true},
+		{"都关_正常放行", nukeOff, nukeOff, false},
+		{"全局未知_交事后复核_不误拒", nukeUnknown, nukeOff, false},
+		{"卷未知_交事后复核_不误拒", nukeOff, nukeUnknown, false},
+		{"全未知_交事后复核_不误拒", nukeUnknown, nukeUnknown, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			why := recycleNukeReason(c.global, c.volume)
+			if c.wantErr {
+				if why == "" {
+					t.Fatalf("global=%v volume=%v 应拒绝，却被放行——"+
+						"这些文件的删除会绕过回收站", c.global, c.volume)
+				}
+				if !strings.Contains(why, "NukeOnDelete") {
+					t.Fatalf("拒绝原因应点明 NukeOnDelete: %q", why)
+				}
+				return
+			}
+			if why != "" {
+				t.Fatalf("global=%v volume=%v 不应拒绝（未知≠已知禁用；"+
+					"误拒会让正常用户删不掉文件，未知情形由事后复核兜底），got %q",
+					c.global, c.volume, why)
+			}
+		})
+	}
+}
+
+// TestVolumeNukeKeyIsVolumeScoped 按卷键路径必须由「Volume\{GUID}」定位：
+// GUID 用错或退化成全局键，整条按卷预检会静默失效（查不到 ≠ 未禁用）。
+func TestVolumeNukeKeyIsVolumeScoped(t *testing.T) {
+	g := "{D1E2F3A4-1111-2222-3333-444455556666}"
+	got := volumeNukeKey(g)
+	for _, kw := range []string{`\Volume\`, g, "NukeOnDelete"} {
+		if !strings.Contains(got, kw) {
+			t.Fatalf("按卷键 %q 缺少 %q（GUID 必须由 volumeGUID(卷根) 现取）", got, kw)
+		}
+	}
+	if got == volumeNukeKey("{OTHER-GUID}") {
+		t.Fatal("不同卷必须拼出不同键路径，否则按卷判定实为全局判定")
+	}
+}

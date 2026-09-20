@@ -108,3 +108,43 @@ func identityOfPath(t *testing.T, p string) ID {
 	defer f.Close()
 	return FromFile(f)
 }
+
+// ★ 2026-09-20（ocr M4）身份查询只要求**属性读**权限。
+//
+// 修正前 FromPath / FromPathNoFollow 都带 GENERIC_READ(0x80000000)：它额外
+// 要求 FILE_READ_DATA。于是「另一进程正以FILE_SHARE_READ|WRITE（不含 READ）
+// 持有该文件」「ACL/EFS 允许读属性但拒绝读数据」这两类路径上 CreateFileW
+// 本可成功拿到 (卷号, 索引)，却因权限要得过多而失败。更糟的是调用方把
+// 这个 error 解读成"路径变了/链接悬空"（identityStill 一律拒绝、
+// verifySymlinked 报「目标不可达」），把一个权限事实说成了存在性事实。
+func TestIdentityAccessMaskIsMinimal(t *testing.T) {
+	const fileReadAttributes = 0x80 // 唯一需要的权限：读属性
+	if m := identityAccessMask; m != fileReadAttributes {
+		t.Fatalf("身份查询的 DesiredAccess = %#x，应恰为 FILE_READ_ATTRIBUTES(%#x)；"+
+			"含 GENERIC_READ 会在「数据被拒读/被无共享读占用」的路径上误报不可达",
+			m, fileReadAttributes)
+	}
+}
+
+// TestIdentitySurvivesWriteLockedFile 上面的契约在真机上的体现：
+// 另一进程以「只允许写、不允许再有人读数据」的方式占用文件时，
+// 身份查询仍须成功——因为只有属性读是必需的。
+//
+// 这是回归的**行为**证明；上一用例是常量契约（本机无法构造占用时兜底）。
+func TestIdentitySurvivesWriteLockedFile(t *testing.T) {
+	dir := t.TempDir()
+	p := mkTempFile(t, dir, "locked.bin")
+	f, err := os.OpenFile(p, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// Go 的 O_WRONLY 映射为 GENERIC_WRITE | FILE_SHARE_READ|WRITE|DELETE，
+	// 恰好**不**授予后来者 FILE_READ_DATA 的共享权。
+	if _, err := FromPathNoFollow(p); err != nil {
+		t.Fatalf("写占用下的身份查询失败（修正前 GENERIC_READ 即在此误报）: %v", err)
+	}
+	if _, err := FromPath(p); err != nil {
+		t.Fatalf("FromPath 同样只需属性读，失败: %v", err)
+	}
+}

@@ -227,3 +227,67 @@ func capacityReason(fileSize, capBytes int64) string {
 	}
 	return ""
 }
+
+// ★ 2026-09-20（ocr 审查 M2/M5）回收站 NukeOnDelete 策略预检。
+//
+// 修正前的三个洞：
+//  1. 只读**全局** HKCU\...\Explorer\BitBucket\NukeOnDelete。用户在回收站
+//     属性对话框里对单个数据盘勾「不将文件移入回收站」时，写下的其实是
+//     BitBucket\Volume\{GUID}\NukeOnDelete——全局键看不到，预检放行，
+//     整批文件被 Shell 永久删除后**才**由事后复核报警：数据已经没了。
+//  2. 文档承诺「ok=false 表示无法判定」，实现却永不返回 false：
+//     「键/值不存在（正常，未禁用）」与「注册表读不到（ACL/异常）」
+//     被混为同一个"未禁用"。
+//  3. 状态若混合，拒绝文案分不清是全局还是按卷禁用。
+//
+// 修复：读取端（trash_windows.go）产出三态 nukeStatus，本文件只做纯决策，
+// Linux CI 能跑到判定表。
+
+// nukeStatus 是注册表 NukeOnDelete 的三态读数。
+type nukeStatus uint8
+
+const (
+	// nukeUnknown 读不到/无法判定（键被 ACL 拒绝、类型不是 REG_DWORD 等）。
+	// ★ 刻意**不**据此拒绝：未知≠已知禁用，误拒会让正常用户删不掉任何文件；
+	// 该情形由 verifyRecycled 的事后复核兜底——它把"静默"变成"响亮的错误"，
+	// 虽然为时已晚，但预检层的职责是拦下**可枚举**的降级路径。
+	nukeUnknown nukeStatus = iota
+	// nukeOff 键或值确实不存在 = 用户未启用该删除策略（全新账户的常态）。
+	nukeOff
+	// nukeOn NukeOnDelete != 0：该范围内的删除一律不进回收站。
+	nukeOn
+)
+
+// volumeNukeKey 拼按卷 NukeOnDelete 的注册表路径（HKEY_CURRENT_USER 下）：
+// `...\BitBucket\Volume\{GUID}\NukeOnDelete`。
+//
+// GUID 必须由 volumeGUID(卷根) 现取——它是路径能否命中的唯一变量，
+// 从别处缓存来拼就会在换盘/重格式化后静默失配（按卷预检退化为查不到）。
+// 值名也拼在路径里，只是为了让形状可被测试断言；实际查询时
+// Windows 侧按 `\` 切回「键 + 值名」两段。
+func volumeNukeKey(guid string) string {
+	return recycleBinPolicyBase + `\Volume\` + guid + `\` + nukeValueName
+}
+
+// recycleBinPolicyBase 全局 BitBucket 键（HKEY_CURRENT_USER 下相对路径）。
+const recycleBinPolicyBase = `Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket`
+
+// nukeValueName 是 BitBucket（全局与按卷）下的策略值名。
+const nukeValueName = "NukeOnDelete"
+
+// recycleNukeReason 由「全局」与「该卷」两个三态读数得出拒绝原因。
+//
+// 判定表（"卷"指本次操作所在盘）：
+//
+//	全局 on   → 拒绝（全局禁用覆盖所有卷，与卷读数无关）
+//	卷   on   → 拒绝（属性对话框按盘勾的"不放入回收站"）
+//	其余组合   → 放行（off=确认未禁用；unknown=无法判定，交事后复核）
+func recycleNukeReason(global, volume nukeStatus) string {
+	switch {
+	case global == nukeOn:
+		return "回收站已被系统策略禁用（NukeOnDelete），此操作会直接永久删除"
+	case volume == nukeOn:
+		return "该卷的回收站已被单独禁用（Volume\\NukeOnDelete），此操作会直接永久删除"
+	}
+	return ""
+}

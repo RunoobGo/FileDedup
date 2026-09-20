@@ -14,14 +14,17 @@
 #   ④ 删除链接**不影响**保留源数据
 #   ⑤ 保留源被移动后，链接变为悬空（Lstat 是链接、Stat 失败）
 #   ⑥ 回撤（概念等价操作）：删链接 + 还原备份 → 原路径恢复为独立文件
+#   ⑦ 悬空链接仍可回撤（备份是数据本体，与链接有效性无关）
 #
-# 需要 root（mount）；无 root 时自动跳过并说明，**不**静默通过。
+# 退出码契约（调用方必须按此区分，勿只看"非零即红、零即绿"）：
+#   0 = 7 条判据全部成立；2 = 环境无法构造独立卷的**合法跳过**（stdout/stderr
+#   带 "SKIP:" 前缀）；1 = 真失败。跳过**不**算通过，见 skip() 的说明。
 #
 # 独立卷的构造方式（按可用性降级，两条路径都提供真正的跨设备语义）：
 #   优先 loop + ext4（更接近真实磁盘：有真实 inode、真实空间限制）；
 #   loop 不可用时退到 tmpfs——它是**独立的内存文件系统**，设备号不同，
 #   `ln` 同样返回 EXDEV，因此"硬链接跨卷必失败"这一核心判据依旧成立。
-#   两者都不行才跳过（不静默通过）。
+#   两者都不行才跳过（以 2 跳过，绝不静默通过）。
 #
 # 不依赖 fdd-cli / 应用二进制：直接编排 shell 层面的文件系统语义，
 # 因此它验证的是"这个功能赖以成立的内核行为"，而非应用代码——
@@ -31,12 +34,21 @@ set -euo pipefail
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
+# skip 以退出码 2 + "SKIP:" 前缀标记**自证**，绝不与全绿（0）同形。
+#
+# ★ 2026-09-20（审查 M8）：修正前跳过走 `exit 0`。门禁只看退出码，于是
+# "环境挂不上独立卷"与"7 条判据全部成立"在 CI 里长得一模一样——哪天
+# runner 收紧（无 loop 设备、无 tmpfs、sudo 策略变化），这条唯一的真实跨卷
+# 防线会**静默消失**而流水线仍是绿的。
+# 现在跳过必须由调用方**显式认领**（见 .github/workflows/ci.yml：
+# 只接受 "SKIP:" 前缀 + 退出码 2，其余非零一律红）。
+skip() {
+	printf 'SKIP（跳过，非通过）: %s\n' "$*" >&2
+	exit 2
+}
 
 if [ "$(id -u)" -ne 0 ]; then
-	echo "跳过：需要 root 才能挂载独立文件系统（当前 uid=$(id -u)）。"
-	echo "      本脚本不降级为「同卷模拟」——那样就失去了它存在的意义。"
-	echo "      请在容器/normal root shell 中运行，或接受本项未验证。"
-	exit 0
+	skip "需要 root 才能挂载独立文件系统（当前 uid=$(id -u)）。本脚本不降级为「同卷模拟」——那样就失去了它存在的意义；请在容器/普通 root shell 中运行，或接受本项未验证。"
 fi
 
 WORK="$(mktemp -d /tmp/fdd-symlink-smoke.XXXXXX)"
@@ -66,6 +78,13 @@ if command -v mkfs.ext4 >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1; t
 		MOUNTED_BY_US=loop
 		echo "    ✓ 已挂载 ext4（$LOOP）"
 	else
+		# ★ 2026-09-20（审查 M8）：修正前这里直接 LOOP=""。losetup 已建立的
+		# 设备就此泄漏（cleanup 见 LOOP 为空便不 losetup -d）——反复运行会
+		# 耗尽 /dev/loop*，症状是**后续作业**挂不上设备然后跳过，很难归因到这里。
+		# 顺序不能反：必须先按旧值释放，再清空变量。
+		if [ -n "$LOOP" ]; then
+			losetup -d "$LOOP" 2>/dev/null || true
+		fi
 		LOOP=""
 		echo "    loop/ext4 不可用（容器常见：无 /dev/loop*），退到 tmpfs"
 	fi
@@ -74,9 +93,7 @@ fi
 if [ -z "$MOUNTED_BY_US" ]; then
 	say "使用 tmpfs 作为独立卷"
 	if ! mount -t tmpfs -o size=32M tmpfs "$MNT" 2>/dev/null; then
-		echo "跳过：无法挂载任何独立文件系统（loop 与 tmpfs 均不可用）。"
-		echo "      核心判据「硬链接跨卷必失败」无法在纯同卷环境验证。"
-		exit 0
+		skip "无法挂载任何独立文件系统（loop 与 tmpfs 均不可用）。核心判据「硬链接跨卷必失败」无法在纯同卷环境验证。"
 	fi
 	MOUNTED_BY_US=tmpfs
 	echo "    ✓ 已挂载 tmpfs"
@@ -85,7 +102,9 @@ fi
 # 卷 A（宿主）与卷 B（挂载点）确实是两个不同的文件系统
 A_DEV="$(stat -c %d "$WORK")"
 B_DEV="$(stat -c %d "$MNT")"
-[ "$A_DEV" != "$B_DEV" ] || fail "两个目录仍在同一设备（%d）上，测试前提不成立"
+# 设备号必须真打出来：fail() 以 %s 渲染，直接传 "%d" 会原样输出字面量，
+# 排查时恰恰看不到想知道的两个设备号。
+[ "$A_DEV" != "$B_DEV" ] || fail "$(printf '两个目录仍在同一设备（A=%s B=%s）上，测试前提不成立' "$A_DEV" "$B_DEV")"
 echo "    卷 A dev=$A_DEV ｜ 卷 B dev=$B_DEV"
 
 KEEP="$WORK/keep.bin"

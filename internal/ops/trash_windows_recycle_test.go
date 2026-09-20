@@ -197,3 +197,84 @@ func TestVerifyRecycledGoneSourceNoSnapshotOK(t *testing.T) {
 		t.Fatalf("无快照时不应报错（判据 2 应跳过），got %v", err)
 	}
 }
+
+// ★ 2026-09-20（ocr M2/M5）：以下覆盖 Windows 侧的 NukeOnDelete 读取。
+// 判定表本身在 recycle_policy_test.go（Linux CI 主门禁）钉死；
+// 这里验证的是「读取端能否把三种状态区分出来」——修正前读不到与不存在
+// 都返回"未禁用"，按卷键更是从未查过。
+
+// TestWinNukeStatusOfDistinguishesAbsentFromUnreadable 「键/值不存在」与
+// 「打开被拒」必须给出不同状态：前者是正常情形（未设置=未禁用），
+// 后者是判定失败（未知）。修正前两者都坍缩成"未禁用"。
+func TestWinNukeStatusOfDistinguishesAbsentFromUnreadable(t *testing.T) {
+	// 必然存在、但绝无 NukeOnDelete 值的键 → off（确实读到了"没设"）
+	k, err := registryOpenKey(`Software\Microsoft\Windows\CurrentVersion\Explorer`)
+	if err != nil {
+		t.Skipf("本机连 Explorer 键都打不开（%v），注册表不可用，跳过", err)
+	}
+	registryCloseKey(k)
+	if got := winNukeStatusOf(`Software\Microsoft\Windows\CurrentVersion\Explorer`, "NukeOnDelete"); got != nukeOff {
+		t.Fatalf("Explorer 键下无 NukeOnDelete 值，应判 off（未禁用），got %v", got)
+	}
+
+	// 必然不存在的深层键 → unknown（无法判定）。它可能被父键的 ACL 挡住，
+	// 那种情形"未知"恰恰是正确答案——不能当作"未禁用"。
+	ghost := `Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{00000000-0000-0000-0000-000000000000}`
+	if got := winNukeStatusOf(ghost, "NukeOnDelete"); got == nukeOn {
+		t.Fatalf("不存在的键不可能判出「策略已禁用」，got %v", got)
+	}
+}
+
+// TestRecycleBinVolumeNukeSystemDrive 系统盘的按卷状态必须**真的去查**
+// 注册表：修正前按卷键从未参与判定。GUID 解析失败属于代码缺陷
+// （与 TestVolumeGUIDShape 同口径，环境无关）。
+func TestRecycleBinVolumeNukeSystemDrive(t *testing.T) {
+	sysDrive, ok := syscall.Getenv("SystemDrive")
+	if !ok || sysDrive == "" {
+		sysDrive = "C:"
+	}
+	root := strings.ToUpper(sysDrive[:1]) + `:\`
+	guid, ok := volumeGUID(root)
+	if !ok {
+		t.Fatalf("无法解析 %s 的卷 GUID——按卷 NukeOnDelete 与配额预检全程失效", root)
+	}
+	if !strings.HasPrefix(guid, "{") || !strings.HasSuffix(guid, "}") {
+		t.Fatalf("卷 GUID 形状不对: %q", guid)
+	}
+	switch got := recycleBinVolumeNuke(root); got {
+	case nukeOff, nukeUnknown, nukeOn:
+		t.Logf("%s 按卷 NukeOnDelete = %v", root, got)
+	default:
+		t.Fatalf("非法状态 %v", got)
+	}
+}
+
+// TestRegistryGetDWORDRejectsWrongType M6：HKCU 用户可写，同名 REG_SZ
+// （如 "1"，恰好容得下 4 字节）此前会被当作 DWORD 读出 0x31 而判成"已禁用"，
+// 或其它字符串误判"未禁用"。类型必须校验。
+func TestRegistryGetDWORDRejectsWrongType(t *testing.T) {
+	const sub = `Software\qoder-fdd-test-key`
+	const name = "StringValue"
+	k, disp, err := registryCreateKey(sub)
+	if err != nil {
+		t.Skipf("无法创建测试键（%v），跳过", err)
+	}
+	defer registryDeleteKey(sub)
+	if disp == regValueExists {
+		t.Skip("测试键已存在，跳过")
+	}
+	if err := registrySetString(k, name, "1"); err != nil {
+		t.Fatalf("写入测试 REG_SZ 失败: %v", err)
+	}
+	registryCloseKey(k)
+
+	k2, err := registryOpenKey(sub)
+	if err != nil {
+		t.Fatalf("重开测试键失败: %v", err)
+	}
+	defer registryCloseKey(k2)
+	if v, err := registryGetDWORD(k2, name); err == nil {
+		t.Fatalf("同名 REG_SZ %q 被当作 DWORD 读出 %d——NukeOnDelete 判定会跟着出错，"+
+			"必须校验类型", name, v)
+	}
+}

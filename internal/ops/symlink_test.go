@@ -588,3 +588,46 @@ func TestSymlinkStatusDoesNotFollowRegularFileChain(t *testing.T) {
 		}
 	}
 }
+
+// TestSymlinkMergeDetectsKeepReplacement 步骤 2/5 必须真正比对 keepID。
+//
+// 修正前 SymlinkMerge 收下的 keepID 从头到尾没用过：verifySymlinked(keep, tmp)
+// 里 tmp 是**指向 keep 路径字符串**的链接，两侧沿同一条路径解析，恒相等——
+// "保留源在校验后被替换（S1）"这道与 HardlinkMerge 同构的防线形同虚设。
+// 后果：VerifyFile 之后 keep 路径被整体替换（新 inode、异内容）时合并照常
+// 成功，步骤 5 删掉备份——而备份是两份相同内容在世上最后的原件副本。
+func TestSymlinkMergeDetectsKeepReplacement(t *testing.T) {
+	dir := t.TempDir()
+	requireSymlinkSupport(t, dir)
+	keep, dup := writePair(t, dir, "ORIGINAL-COPY-ONLY-LEFT-IN-DUP")
+
+	kid, err := fsid.FromPath(keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	did, err := fsid.FromPath(dup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !kid.Resolved || !did.Resolved {
+		t.Skipf("本平台/卷不提供稳定文件身份，无法校验 keep 身份：kid=%+v did=%+v", kid, did)
+	}
+
+	// 模拟 TOCTOU 窗口：校验返回后、合并复核前，keep 路径被整体替换。
+	if err := os.Remove(keep); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("ATTACKER-REPLACEMENT-DATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = SymlinkMerge(keep, dup, kid, did)
+	if err == nil {
+		t.Fatal("❌ keep 已被替换仍合并成功：dup 的备份（原始内容最后副本）会被当残留删掉")
+	}
+	if !strings.Contains(err.Error(), "保留源") {
+		t.Fatalf("应以 keep 保留源被替换拦截，实得: %v", err)
+	}
+	assertDupIsPlainFileWithContent(t, dup, "ORIGINAL-COPY-ONLY-LEFT-IN-DUP")
+	assertNoSymlinkResidue(t, dup)
+}
