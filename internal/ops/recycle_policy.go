@@ -266,7 +266,41 @@ const (
 // 值名也拼在路径里，只是为了让形状可被测试断言；实际查询时
 // Windows 侧按 `\` 切回「键 + 值名」两段。
 func volumeNukeKey(guid string) string {
-	return recycleBinPolicyBase + `\Volume\` + guid + `\` + nukeValueName
+	return volumePolicyKey(guid) + `\` + nukeValueName
+}
+
+// volumePolicyKey 拼按卷策略**键**（不含值名）：`...\BitBucket\Volume\{GUID}`。
+//
+// ★ AS-R4 同源问题：NukeOnDelete 与 MaxCapacity 两项预检读的是同一个键，
+// 修正前 Windows 侧为 MaxCapacity 又抄了一遍整条前缀字面量。漂移后
+// registryOpenKey 报错 → 返回 "未知" → 放行，同样是 fail-open。
+// 前缀因此只许由 recycleBinPolicyBase 拼一次。
+func volumePolicyKey(guid string) string {
+	return recycleBinPolicyBase + `\Volume\` + guid
+}
+
+// globalNukeKey 拼**全局** NukeOnDelete 的注册表路径（HKEY_CURRENT_USER 下）。
+//
+// ★ AS-R4（2026-09-20 全仓审计）：修正前 Windows 侧把这条路径又抄了一遍
+// 字面量（连同值名）。两处一旦漂移，winNukeStatusOf 读到的是一个不存在的键
+// → regIsNotFound → nukeOff →「确认未禁用」，方向是 **fail-open**：用户开了
+// 永久删除策略，预检却说没事，整批文件直接消失。故键的拼接只许有这里一份。
+func globalNukeKey() string {
+	return recycleBinPolicyBase + `\` + nukeValueName
+}
+
+// splitRegPath 把 volumeNukeKey/globalNukeKey 的产物切回「键 + 值名」两段
+// （键里带值名只是为了让形状可被 Linux 侧测试断言）。
+//
+// 放在本文件而非 trash_windows.go：切分约定与拼接约定是**同一份契约的两端**，
+// 分处两个 build tag 两侧就没法用一条平台无关的往返测试钉住（AS-R4 需要）。
+func splitRegPath(full string) (sub, value string) {
+	for i := len(full) - 1; i >= 0; i-- {
+		if full[i] == '\\' {
+			return full[:i], full[i+1:]
+		}
+	}
+	return full, ""
 }
 
 // recycleBinPolicyBase 全局 BitBucket 键（HKEY_CURRENT_USER 下相对路径）。

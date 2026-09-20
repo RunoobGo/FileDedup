@@ -449,3 +449,44 @@ func TestVolumeNukeKeyIsVolumeScoped(t *testing.T) {
 		t.Fatal("不同卷必须拼出不同键路径，否则按卷判定实为全局判定")
 	}
 }
+
+// TestGlobalNukeKeyRoundTripsToConst AS-R4：全局键必须由常量拼出，不得在
+// Windows 侧再抄一份字面量。两处一旦漂移，winNukeStatusOf 读到的是不存在
+// 的键 → regIsNotFound → nukeOff →「确认未禁用」，即 fail-open：用户明明开了
+// 永久删除策略，预检却说没事，文件直接消失。
+//
+// 这里同时钉住往返：拼出的路径要能被切回「常量键 + 常量值名」两段，
+// 否则说明拼接形状与读取端的切分约定不一致。
+func TestGlobalNukeKeyRoundTripsToConst(t *testing.T) {
+	got := globalNukeKey()
+	if want := recycleBinPolicyBase + `\` + nukeValueName; got != want {
+		t.Fatalf("全局键应完全由常量拼出\n got %q\nwant %q", got, want)
+	}
+	sub, value := splitRegPath(got)
+	if sub != recycleBinPolicyBase || value != nukeValueName {
+		t.Fatalf("全局键往返失配：sub=%q value=%q（应为 %q / %q）",
+			sub, value, recycleBinPolicyBase, nukeValueName)
+	}
+	// 负例：按卷键与全局键必须可区分，否则「按卷禁用」会被读成全局读数。
+	if got == volumeNukeKey("{GUID-x}") {
+		t.Fatal("全局键不得等于按卷键")
+	}
+}
+
+// TestVolumePolicyKeyIsSharedPrefix NukeOnDelete 与 MaxCapacity 读同一个按卷
+// 键，必须共用 volumePolicyKey 一份前缀（AS-R4）：各抄一遍时漂移的方向是
+// registryOpenKey 报错 → "未知" → 放行，即 fail-open。
+func TestVolumePolicyKeyIsSharedPrefix(t *testing.T) {
+	g := "{GUID-1}"
+	key := volumePolicyKey(g)
+	if !strings.HasPrefix(key, recycleBinPolicyBase+`\Volume\`) {
+		t.Fatalf("按卷键 %q 必须挂在 %s\\Volume\\ 下", key, recycleBinPolicyBase)
+	}
+	if volumeNukeKey(g) != key+`\`+nukeValueName {
+		t.Fatalf("按卷 NukeOnDelete 键必须由 volumePolicyKey 拼出，got %q", volumeNukeKey(g))
+	}
+	sub, value := splitRegPath(volumeNukeKey(g))
+	if sub != key || value != nukeValueName {
+		t.Fatalf("按卷键往返失配：sub=%q value=%q", sub, value)
+	}
+}

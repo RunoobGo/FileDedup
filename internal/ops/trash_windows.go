@@ -112,8 +112,10 @@ func queryRecycleBin(root string) (sizeBytes int64, numItems int64, ok bool) {
 //	      未知≠已知禁用，误拒会让正常用户一个文件都删不掉；这种情形由
 //	      verifyRecycled 的事后复核兜底（预检的职责是拦可枚举的降级路径）。
 func recycleBinDisabledByPolicy() nukeStatus {
-	return winNukeStatusOf(
-		`Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket`, "NukeOnDelete")
+	// ★ AS-R4：路径与值名一律取自 recycle_policy.go 的常量/纯函数，
+	// 这里不再写字面量——写第二份就迟早漂第二份，而漂移的方向是 fail-open。
+	sub, value := splitRegPath(globalNukeKey())
+	return winNukeStatusOf(sub, value)
 }
 
 // recycleBinVolumeNuke 读**该卷**的 NukeOnDelete。
@@ -133,17 +135,6 @@ func recycleBinVolumeNuke(root string) nukeStatus {
 	}
 	sub, value := splitRegPath(volumeNukeKey(guid))
 	return winNukeStatusOf(sub, value)
-}
-
-// splitRegPath 把 volumeNukeKey 的产物切回「键 + 值名」两段
-// （按卷键把值名拼进路径只为让形状可被 Linux 侧测试断言）。
-func splitRegPath(full string) (sub, value string) {
-	for i := len(full) - 1; i >= 0; i-- {
-		if full[i] == '\\' {
-			return full[:i], full[i+1:]
-		}
-	}
-	return full, ""
 }
 
 // winNukeStatusOf 读一个 NukeOnDelete DWORD 并映射为三态。
@@ -370,8 +361,8 @@ func recycleBinCapBytes(root string) (int64, bool) {
 	if !ok {
 		return 0, false
 	}
-	k, err := registryOpenKey(
-		`Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\` + guid)
+	// ★ AS-R4：键路径取自 volumePolicyKey，不再抄第二份前缀字面量。
+	k, err := registryOpenKey(volumePolicyKey(guid))
 	if err != nil {
 		return 0, false
 	}
