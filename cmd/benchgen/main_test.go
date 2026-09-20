@@ -41,11 +41,6 @@ func buildCorpus(t *testing.T, dataset string, scale float64, seed int64) (strin
 	return out, generate(out, dataset, scale, seed)
 }
 
-// corpusDigest 压平目录内容：相对路径 + 类型 + 内容摘要（符号链接取其目标串）。
-//
-// 只取**相对**路径：t.TempDir() 每次不同，绝对路径会把无关差异算进摘要。
-// 符号链接不跟随（记目标字符串），否则同一条链接的目标内容会算两次，
-// 摘要对"链接被换成实体文件"这类变化反而不敏感。
 // rootRelative 把符号链接目标折成语料根内的相对路径。
 //
 // 必要而非洁癖：目标写的是绝对路径，而每个用例的 t.TempDir() 都不同——
@@ -63,6 +58,11 @@ func rootRelative(root, target string) string {
 	return filepath.ToSlash(rel)
 }
 
+// corpusDigest 压平目录内容：相对路径 + 类型 + 内容摘要（符号链接取其目标串）。
+//
+// 只取**相对**路径：t.TempDir() 每次不同，绝对路径会把无关差异算进摘要。
+// 符号链接不跟随（记目标字符串），否则同一条链接的目标内容会算两次，
+// 摘要对"链接被换成实体文件"这类变化反而不敏感。
 func corpusDigest(t *testing.T, root string) string {
 	t.Helper()
 	var lines []string
@@ -273,6 +273,36 @@ func TestManifestCountsOnlyCollectibleFiles(t *testing.T) {
 	if got != m.TotalFiles {
 		t.Fatalf("manifest.total_files=%d，按扫描器口径应为 %d："+
 			"benchgen 把不该计数的形态（链接/临时名/隐藏）算进了语料，或漏算了", m.TotalFiles, got)
+	}
+}
+
+// ---- 4. 重复生成到同一目录必须仍可用（AS-R6：README 文档化的 `-out ./benchdata` 复跑） ----
+
+func TestRegenerateIntoSameDirectory(t *testing.T) {
+	out, first := buildCorpus(t, "A", testScale, 42)
+	if _, err := os.Stat(filepath.Join(out, shapeSubdir, hardBName)); err != nil {
+		t.Fatalf("前置条件不成立（第一次生成没铺出形态）: %v", err)
+	}
+
+	// 修正前（AS-K6 落地时自引入）：第二次跑在 os.Link 处 "file exists" 直接退出。
+	// 数据集部分一直是"重写同名文件"的语义，形态部分却要求目录干净，
+	// 于是 README 里那条 `-out ./benchdata` 的复跑命令第二次必炸。
+	second := generate(out, "A", testScale, 42)
+	if second.TotalFiles != first.TotalFiles || len(second.Groups) != len(first.Groups) {
+		t.Fatalf("复跑到同一目录后口径漂移：%+v vs %+v", second, first)
+	}
+	// 形态必须还在，且硬链接依旧成对（复跑若退化成两个独立副本，
+	// 阶段 1.5 的去重形态就静默消失了）
+	ha, err := os.Lstat(filepath.Join(out, shapeSubdir, hardAName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb, err := os.Lstat(filepath.Join(out, shapeSubdir, hardBName))
+	if err != nil {
+		t.Fatalf("复跑后硬链接对丢失: %v", err)
+	}
+	if !os.SameFile(ha, hb) {
+		t.Fatal("复跑后 hard_a/hard_b 不再是同一 inode：被降级成了普通副本")
 	}
 }
 

@@ -11,6 +11,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	mrand "math/rand"
@@ -258,7 +259,11 @@ func genShapes(out string, rng *mrand.Rand, m *manifest) {
 	if err := writeRandom(hardA, shapeSize, rng); err != nil {
 		fail(err)
 	}
-	if err := os.Link(hardA, filepath.Join(dir, hardBName)); err != nil {
+	hardB := filepath.Join(dir, hardBName)
+	if err := clearForRecreate(hardB); err != nil {
+		fail(err)
+	}
+	if err := os.Link(hardA, hardB); err != nil {
 		fail(fmt.Errorf("建立硬链接失败（阶段 1.5 去重形态无法覆盖，不做静默跳过）: %w", err))
 	}
 	m.TotalFiles += 2
@@ -273,6 +278,9 @@ func genShapes(out string, rng *mrand.Rand, m *manifest) {
 	}
 	m.TotalFiles++
 	link := filepath.Join(dir, symLinkName)
+	if err := clearForRecreate(link); err != nil {
+		fail(err)
+	}
 	if err := os.Symlink(symTarget, link); err != nil {
 		fmt.Fprintf(os.Stderr, "benchgen: 本环境无法建立符号链接（%v）——该形态本轮未覆盖，"+
 			"结果已记入 manifest.shapes.symlink=false\n", err)
@@ -320,6 +328,19 @@ func genShapes(out string, rng *mrand.Rand, m *manifest) {
 			Files: []string{rel(out, lower), rel(out, upper)},
 		})
 	}
+}
+
+// clearForRecreate 删掉形态位置上的一次产物，让"重复生成到同一个 -out"仍然可用。
+//
+// ★ 2026-09-20（AS-R6，自查发现，AS-K6 自引入）：数据集部分一直是覆盖写
+// （os.Create / os.WriteFile 都截断重建），而 Link 与 Symlink 遇到已存在的
+// 目标会直接 "file exists" 失败——README 里那条 `-out ./benchdata` 是条复跑
+// 命令，第二次就炸了。删的只是本工具在 shapes/ 下固定使用的这几个名字。
+func clearForRecreate(p string) error {
+	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func copyFile(dst, src string) error {
