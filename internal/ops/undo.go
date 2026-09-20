@@ -249,6 +249,11 @@ func undoHardlink(it UndoItem) (string, error) {
 	return it.OrigPath, nil
 }
 
+// readlinkTarget 是 symlinkTarget 的测试接缝：让"读链接这一步自己失败"
+// 可确定性构造（真机上 Lstat 已判定是链接之后再让 readlink 出错，造不出来）。
+// 生产路径就是跨平台访问器本身，不改变行为。
+var readlinkTarget = symlinkTarget
+
 // undoSymlink 回撤软链接合并（2026-09-20）：拆除链接，把备份还原回原位。
 //
 // 三步，与 undoHardlink 的三重防线对齐但**判据不同**：
@@ -320,10 +325,20 @@ func undoSymlink(it UndoItem) (string, error) {
 		}
 		// 目标不可达 → 身份无从比对，但链接的字面目标必须正是 LinkSrc
 		// 才算"我们还是我们建的那个链接"。
-		if tgt, rerr := os.Readlink(it.OrigPath); rerr != nil ||
-			filepath.Clean(tgt) != filepath.Clean(it.LinkSrc) {
-			return "", fmt.Errorf("目标位置上的链接不指向原保留源 %s，"+
-				"为避免误删第三方文件已拦截", it.LinkSrc)
+		//
+		// ★ 顺带项（2026-09-20 全仓审计）：修正前这里直接 os.Readlink，
+		// 绕过了包内跨平台访问器 symlinkTarget（其注释明写"调用方无需分平台"），
+		// 并把"读链接失败"与"目标不符"合并成同一句拦截理由——I/O 故障被
+		// 说成"存在一个指向别处的第三方链接"，用户去找根本不存在的东西，
+		// 真实原因反倒被吞掉。现在两者分开报，且 I/O 原因用 %w 包出。
+		tgt, rerr := readlinkTarget(it.OrigPath)
+		if rerr != nil {
+			return "", fmt.Errorf("无法读取 %s 的链接目标，现状未知，"+
+				"为避免误删第三方文件已拦截: %w", it.OrigPath, rerr)
+		}
+		if filepath.Clean(tgt) != filepath.Clean(it.LinkSrc) {
+			return "", fmt.Errorf("目标位置上的链接不指向原保留源 %s（实际指向 %s），"+
+				"为避免误删第三方文件已拦截", it.LinkSrc, tgt)
 		}
 	}
 
