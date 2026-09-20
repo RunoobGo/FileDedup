@@ -136,22 +136,147 @@ func HasUsableDir(dirs []string) bool {
 // I4（2026-09-18 审查）：比较前按 dir 所在卷的大小写语义折叠，并统一分隔符。
 // 修正前是裸的字符串前缀比较：APFS 不敏感卷上用户写 /users/x/docs、实际路径
 // /Users/X/Docs，整组匹配不上 → 整组不受保护；Windows 上 "\" 与 "/" 混用同理。
+//
+// 路径归属判据统一走 inDir——本函数只负责"取最深的那一个"。
 func pickInDirectory(g *model.DuplicateGroup, dir string) int {
 	if dir == "" {
 		return -1
 	}
 	sensitive := fscase.Sensitive(dir)
-	// 归一后剥掉尾分隔符；根目录（"/"）剥完为空串，此时 HasPrefix(p, ""+"/")
-	// 恰好命中全部绝对路径，语义仍是「该卷下全部保留」。
-	prefix := strings.TrimSuffix(fscase.Fold(filepath.Clean(dir), sensitive), "/")
 	best, bestLen := -1, 0
 	for i, f := range g.Files {
 		p := fscase.Fold(f.Path, sensitive)
-		if p == prefix || strings.HasPrefix(p, prefix+"/") {
-			if l := len(p); l > bestLen {
-				best, bestLen = i, l // 深层匹配更精确
-			}
+		if !inDirFold(p, dir, sensitive) {
+			continue
+		}
+		if l := len(p); l > bestLen {
+			best, bestLen = i, l // 深层匹配更精确
 		}
 	}
 	return best
+}
+
+// inDir 报告路径 p 是否位于 dir 之下（含 dir 自身）。
+//
+// ★ 这是本包内**唯一**的「路径属于目录」判据。保留策略的 pickInDirectory 与
+// 处理策略的 ApplyProcessPolicy 都必须经由它，不得另写前缀比较。
+//
+// 为什么必须唯一（I5 的教训，见 SuggestKeepIndex 上方注释）：本项目曾出现过
+// 两份独立的路径比较实现，在含隐藏目录的组上选出不同的文件——界面上被星标
+// 的那一份，正是应用默认策略后要被清掉的那一份。多一份实现就多一次这种事故。
+//
+// 语义：
+//   - 按 dir 所在卷的大小写语义折叠（不敏感卷上 /Users/X 与 /users/x 等价）
+//   - 统一分隔符后再比较（Windows 上 "\" 与 "/" 混用不误判）
+//   - 目录根（"/"、"C:\"）剥掉尾分隔符后命中该卷下全部绝对路径
+//   - dir 为空或纯空白返回 false（调用方自行 TrimSpace）
+func inDir(p, dir string) bool {
+	d := strings.TrimSpace(dir)
+	if d == "" {
+		return false
+	}
+	return inDirFold(p, d, fscase.Sensitive(d))
+}
+
+// inDirFold 是 inDir 的内核，接收已折叠好的敏感性与已归一化的目录。
+//
+// 拆出来是为了让 pickInDirectory 复用：它需要对组内每个路径用**同一个**
+// sensitive 反复判定，没必要每次都重算 fscase.Sensitive(dir)。
+func inDirFold(foldedPath, dir string, sensitive bool) bool {
+	// 归一后剥掉尾分隔符；根目录（"/"）剥完为空串，此时 HasPrefix(p, ""+"/")
+	// 恰好命中全部绝对路径，语义仍是「该卷下全部保留」。
+	prefix := strings.TrimSuffix(fscase.Fold(filepath.Clean(dir), sensitive), "/")
+	return foldedPath == prefix || strings.HasPrefix(foldedPath, prefix+"/")
+}
+
+// ProcessPolicyOutcome 处理策略（优先处理的文件夹）的匹配结果。
+type ProcessPolicyOutcome struct {
+	// MatchIDs 位于任一优先目录下、且**不是保留项**的可处理文件 ID 集合。
+	//
+	// ★ 这里剔除保留项，**不是**「保留策略优先」的兑现点。那句话的兑现点是
+	// 执行器的硬拒绝（executor.go：`保留文件不可操作`）——那是一道与 UI、
+	// 与调用顺序都无关的兜底，谁也绕不过去（把 app.go 里的 KeepIDs 传参改成
+	// nil 会让 TestProcessPolicyNeverOverridesKeepPolicy 立刻失败，已验证）。
+	//
+	// 本处在引擎里再剔一次，目的是**让计数说真话**：若把保留项放进集合，
+	// 界面「将处理 N 项」就会虚高——用户看到 N，实际只处理 < N 项，
+	// 差额还被当成"失败"记一笔。同一个数字有两个来源就会有两个答案，
+	// 引擎给出的必须是那个能直接展示的。
+	MatchIDs map[uint64]bool
+	// UnmatchedDirs 在当前结果集里一个可处理文件都没命中的优先目录。
+	//
+	// 存的是**用户输入的原文**，不做大小写归一、不剥尾分隔符。
+	// 理由：提示信息要给用户指出"你加的这一条没起作用"，
+	// 回显他输入的原文他才找得到自己加的是哪条。
+	UnmatchedDirs []string
+	// MatchedFiles 命中文件数（= len(MatchIDs)），供调用方直接展示。
+	MatchedFiles int
+}
+
+// ApplyProcessPolicy 计算「优先处理的文件夹」在本次结果集内的实际生效范围。
+//
+// 语义是**并集**，不是优先级：文件只要落在 dirs 中任意一个之下即命中。
+// 这一点与保留策略的 directory 完全不同——那个要在多个目录里挑出**一个**，
+// 所以必须有顺序；本函数是"这些目录里的都算"，没有优先级概念，
+// 因此 dirs 无序，界面上也不提供排序（给了排序反而暗示存在优先级，是错误的心理模型）。
+//
+// keepIDs 为当前保留决策；命中的保留项会被剔除（见 ProcessPolicyOutcome.MatchIDs）。
+// dirs 为空或全部为空白时返回空结果——调用方据此判定「未启用处理策略」，
+// 走与新增本功能之前完全一致的代码路径。
+func ApplyProcessPolicy(groups []*model.DuplicateGroup, dirs []string,
+	keepIDs map[uint64]bool) ProcessPolicyOutcome {
+
+	out := ProcessPolicyOutcome{MatchIDs: map[uint64]bool{}}
+
+	// 归一目录列表，同时按"当前结果集内是否有可处理文件"逐条判定未命中。
+	// 用 seen 记已处理过的目录（折叠后比较），避免用户重复添加同一目录时
+	// UnmatchedDirs 里出现重复条目。
+	type dirEntry struct {
+		raw       string // 用户原文，用于回显
+		sensitive bool
+		hit       bool
+	}
+	entries := make([]*dirEntry, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		raw := strings.TrimSpace(d)
+		if raw == "" {
+			continue // 与 HasUsableDir 同口径：空白项忽略，不计入未命中
+		}
+		norm := fscase.Fold(filepath.Clean(raw), fscase.Sensitive(raw))
+		if seen[norm] {
+			continue // 重复目录只留第一条
+		}
+		seen[norm] = true
+		entries = append(entries, &dirEntry{raw: raw, sensitive: fscase.Sensitive(raw)})
+	}
+	if len(entries) == 0 {
+		return out
+	}
+
+	for _, g := range groups {
+		for _, f := range g.Files {
+			if keepIDs != nil && keepIDs[f.ID] {
+				continue // 保留项不可处理，也不计入命中数
+			}
+			for _, e := range entries {
+				// 按该目录的敏感性折叠文件路径：目录与文件在同一卷，
+				// 敏感性一致；以目录的探测结果为准，是为了在"目录写错
+				// 大小写"时仍能命中（I4 的核心场景）。
+				if inDirFold(fscase.Fold(f.Path, e.sensitive), e.raw, e.sensitive) {
+					out.MatchIDs[f.ID] = true
+					e.hit = true
+					break // 落在多个目录下也只计一次
+				}
+			}
+		}
+	}
+
+	for _, e := range entries {
+		if !e.hit {
+			out.UnmatchedDirs = append(out.UnmatchedDirs, e.raw)
+		}
+	}
+	out.MatchedFiles = len(out.MatchIDs)
+	return out
 }

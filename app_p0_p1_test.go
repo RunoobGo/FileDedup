@@ -19,12 +19,22 @@ import (
 type eventRecorder struct {
 	mu     sync.Mutex
 	events []string
-	done   chan string
+	// payloads 按事件名记录**最后一次**载荷。
+	// 只记名字是不够的：`ops:filtered` 这类事件的价值全在载荷里
+	// （过滤前后计数、未命中目录），不校验载荷就等于没测。
+	payloads map[string]any
+	done     chan string
 }
 
-func (e *eventRecorder) emit(_ context.Context, name string, _ ...interface{}) {
+func (e *eventRecorder) emit(_ context.Context, name string, args ...interface{}) {
 	e.mu.Lock()
 	e.events = append(e.events, name)
+	if len(args) > 0 {
+		if e.payloads == nil {
+			e.payloads = map[string]any{}
+		}
+		e.payloads[name] = args[0]
+	}
 	e.mu.Unlock()
 	switch name {
 	case "scan:done", "scan:error", "scan:cancelled", "ops:done", "ops:error", "ops:undo:done":
@@ -33,6 +43,33 @@ func (e *eventRecorder) emit(_ context.Context, name string, _ ...interface{}) {
 		default:
 		}
 	}
+}
+
+// has 报告某事件是否已发出（不消费终止队列）。
+func (e *eventRecorder) has(name string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, n := range e.events {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// lastWith 取出某事件最后一次携带的载荷。
+func (e *eventRecorder) lastWith(name string) (any, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.payloads[name]
+	return p, ok
+}
+
+// names 已发出的事件名快照（失败信息里用得到）。
+func (e *eventRecorder) names() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.events...)
 }
 
 func (e *eventRecorder) waitTerminal(t *testing.T, tag string) string {
