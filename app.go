@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -692,6 +693,16 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	for _, g := range gs {
 		totalReclaim += g.Reclaimable
 	}
+	// M10a（2026-09-21 全仓审计 §五 10）：起点必须**溢出安全**。
+	// q.Page/q.PageSize 是绑定层入参（int），前端能给任意值：修正前直接
+	// `q.Page * q.PageSize`，乘积回绕成负数会让下面的 `start >= len(gs)`
+	// 判不出来、`gs[start:end]` 当场 panic；回绕成正数则会拿出错误的一页。
+	// 溢出只有一种含义（起点远在结果集之外），先用除法查出来。
+	// 用 math.MaxInt 而非 MaxInt64：切片下标是平台 int，32 位目标上
+	// 天花板是 MaxInt32，按 64 位判会把"已经回绕"的乘积放过去。
+	if q.Page > 0 && q.PageSize > math.MaxInt/q.Page {
+		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
+	}
 	start := q.Page * q.PageSize
 	if start >= len(gs) {
 		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
@@ -1036,11 +1047,27 @@ func startCmd(cmd *exec.Cmd) error {
 
 func (a *App) settingsPath() string { return filepath.Join(a.cfgDir, "settings.json") }
 
-// GetSettings 读取设置。
+// GetSettings 读取设置：要么完整解析的配置，要么**纯**默认值。
 func (a *App) GetSettings() Settings {
+	path := a.settingsPath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return defaultSettings() // 首次运行/读不到：磁盘上没有证据，静默回默认
+	}
 	s := defaultSettings()
-	if b, err := os.ReadFile(a.settingsPath()); err == nil {
-		_ = json.Unmarshal(b, &s)
+	if jerr := json.Unmarshal(b, &s); jerr != nil {
+		// M10b（2026-09-21 全仓审计 §五 10）：修正前是 `_ = json.Unmarshal`，
+		// 坏文件被无声吞掉、返回一份"解析到哪算哪"的半成品配置；界面上看不出
+		// 异常，下一次保存又把它写回磁盘，原始证据就此消失。
+		// 现在改名为 .corrupt 留证（用户仍可手工恢复），并把失败原因报给界面。
+		msg := "设置文件无法解析，本次使用默认设置"
+		if rerr := os.Rename(path, path+".corrupt"); rerr == nil {
+			msg += "，损坏文件已留证为 settings.json.corrupt"
+		}
+		if a.emit != nil {
+			a.emit(a.ctx, "app:error", map[string]string{"error": msg + "（" + jerr.Error() + "）"})
+		}
+		s = defaultSettings()
 	}
 	return s
 }
@@ -1112,18 +1139,15 @@ type ProcessPreview struct {
 // 因此它**不受 opsRunning 互斥限制**（预览是只读的，不该被正在进行的清理挡住）。
 func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (ProcessPreview, error) {
 	pv := ProcessPreview{EffectiveIDs: []uint64{}, UnmatchedDirs: []string{}}
-	if len(dirs) == 0 {
-		// 未启用处理策略：生效范围就是全部勾选。前端据此走原路径。
-		pv.EffectiveIDs = append(pv.EffectiveIDs, selectedIDs...)
-		pv.EffectiveCount = len(pv.EffectiveIDs)
-		return pv, nil
-	}
 
 	// ★ AS-R3（2026-09-20 全仓审计）：卷语义探测要**往用户目录写探测文件**，
 	// 属于 I/O，必须在取锁之前做完——死挂载（网络盘拔走后 stat 挂死）时，
 	// 锁内一次写盘就能把 a.mu 连同全部 Wails 绑定一起卡住，而预览本应是只读操作。
 	// 预热之后（结论按目录缓存），锁内那次调用是纯查表 + 纯比较。
-	resolve := ops.WarmSensitivity(dirs)
+	var resolve ops.SensResolver
+	if len(dirs) > 0 {
+		resolve = ops.WarmSensitivity(dirs)
+	}
 
 	// 全程持锁：这里只剩纯内存计算（无 I/O、不回调整个 App），
 	// 耗时与组数成正比，锁住它不伤害交互。此前"锁内浅快照、锁外遍历"的写法
@@ -1131,19 +1155,36 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 	// 执行器收尾会在锁内就地改写 g.Files（app.go 结果集清理段 g.Files = files），
 	// 无锁遍历即构成数据竞争（2026-09-20 -race 实测复现，TestPreviewProcessPolicyConcurrentWithCleanupNoRace）。
 	a.mu.Lock()
-	groups := a.groups
-	keepIDs := a.keepIDs
-	out := ops.ApplyProcessPolicyWith(groups, dirs, keepIDs, resolve)
-	a.mu.Unlock()
+	defer a.mu.Unlock()
 
-	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，
-	// 正是最需要提示的场景），所以不在这里提前返回。
+	var out ops.ProcessPolicyOutcome
+	if len(dirs) > 0 {
+		out = ops.ApplyProcessPolicyWith(a.groups, dirs, a.keepIDs, resolve)
+	}
+	seen := make(map[uint64]bool, len(selectedIDs))
 	for _, id := range selectedIDs {
-		if out.MatchIDs[id] {
-			pv.EffectiveIDs = append(pv.EffectiveIDs, id)
+		// M10c（2026-09-21 全仓审计 §五 10）：修正前"未启用处理策略"这一路直接
+		// `append(EffectiveIDs, selectedIDs...)`，把**保留项**与**结果集外的 id**
+		// 都算进生效范围——与执行侧 planOpItems（"在结果集内且未被标为保留"）和
+		// ApplyProcessPolicyWith（保留项 continue）口径相反，界面上的"将处理 N"
+		// 比真正会动的文件多，等于对保留项许了假承诺。现在两条分支共用同一内核，
+		// 并按 selectedIDs 顺序去重（同 planOpItems 的 seen）。
+		if len(dirs) == 0 {
+			if _, ok := a.byID[id]; !ok || a.keepIDs[id] {
+				continue
+			}
+		} else if !out.MatchIDs[id] {
+			continue
 		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		pv.EffectiveIDs = append(pv.EffectiveIDs, id)
 	}
 	pv.EffectiveCount = len(pv.EffectiveIDs)
+	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，
+	// 正是最需要提示的场景），所以不在这里提前返回。
 	if out.UnmatchedDirs != nil {
 		pv.UnmatchedDirs = append(pv.UnmatchedDirs, out.UnmatchedDirs...)
 	}
