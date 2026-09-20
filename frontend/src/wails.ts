@@ -62,6 +62,13 @@ export interface FileView {
   size: number
   mtime: number
   isKeep: boolean
+  // 所在卷标识（app.go FileView.Volume）。前端只做相等比较，不解释内容。
+  // 用途：判断重复组是否跨卷，从而决定显不显示「软链接合并」。
+  volume: string
+  // volume 是否来自真实卷身份。false 时不可用于跨卷判定——
+  // Windows 盘符不等于卷（挂载点会把别的卷挂到某目录下），
+  // 拿路径前缀猜会把用户引向注定失败的按钮。见 isGroupCrossVolume。
+  volumeResolved: boolean
 }
 
 export interface GroupView {
@@ -117,6 +124,16 @@ export interface OpsProgress {
   Current: string
 }
 
+// OpsResult 清理操作聚合结果（Go 侧 model.OpsResult）。
+//
+// 三个字节口径互不重叠，UI 必须分别表述（见 ResultView.vue 结果条）：
+//   Reclaimed      真正从磁盘移除的数据量（trash / delete / move 出卷）
+//   LinkedBytes    硬链接合并：数据未释放，只是不再重复存第二份
+//   SymlinkedBytes 软链接合并：磁盘上少了一整份数据（dup 位置只剩链接对象），
+//                  但保留项的数据块并未共享，且回撤要重新占回这块空间
+//
+// 为什么软链接不并进 Reclaimed：数值上它确实"释放了一整份文件"，
+// 但把它与 trash/delete 混在一起，UI 就再也无法单独提示"链接有悬空风险"。
 export interface OpsResult {
   OK: string[]
   Failed: { Path: string; Stage: string; Err: string }[]
@@ -124,14 +141,39 @@ export interface OpsResult {
   Cancelled: string[] // P2：取消后未派发的条目（未处理，仍在结果集中）
   Reclaimed: number // 已从磁盘真正释放的字节（trash/delete/move 出卷）
   LinkedBytes?: number // 硬链接合并涉及的字节：当期不释放空间，仅变为共享
+  SymlinkedBytes?: number // 软链接合并涉及的字节（2026-09-20）
   Warnings?: string[] // 操作已成功、但需告知用户的情况（如临时文件残留未删净）
 }
 
+// OpKind 清理操作类型。'symlink' 为跨卷软链接合并（2026-09-20 新增），
+// 与 'hardlink' 同为"链接类"合并，但可跨卷、需要权限、有悬空风险。
+export type OpKind = 'trash' | 'delete' | 'move' | 'hardlink' | 'symlink'
+
 export interface OpRequest {
-  Kind: string
+  Kind: OpKind
   FileIDs: number[]
   TargetDir?: string
   ConfirmDanger?: boolean
+  // ProcessDirs 处理策略（2026-09-20 新增）：仅本次操作生效的
+  // 「优先处理的文件夹」。非空时实际处理范围 = FileIDs ∩ {位于这些目录下的文件}。
+  //
+  // 留空/不传 = 未启用，后端走与新增本字段之前完全一致的代码路径。
+  // 注意它**不会**改变用户的勾选状态：显式勾选是用户的明确表达，
+  // 一个策略设置不该悄悄改写它——后端也只收窄本次操作，不回写 selection。
+  ProcessDirs?: string[]
+}
+
+// OpsFiltered 处理策略收窄了实际执行范围（后端事件 ops:filtered）。
+//
+// selected 是过滤**前**的勾选数，matched 是真正会处理的项数，两者之差就是
+// 因为不在优先文件夹内而落空的项。UI 必须把这两个数都摆出来——
+// 只说 matched，用户会以为剩下的没被选上；只说 selected，用户会以为都处理了。
+export interface OpsFiltered {
+  matched: number
+  selected: number
+  // unmatched 一个可处理文件都没命中的优先文件夹（回显用户输入的原文）。
+  // 多半是路径写错，必须点名，否则用户以为策略已生效。
+  unmatched: string[]
 }
 
 // ---------- v0.5.0 功能 4：清理记录与回撤 ----------
@@ -140,7 +182,7 @@ export interface OpRequest {
 // done 为「曾执行成功」口径（含其后被回撤的项），剩余可撤 = done - undone。
 export interface OpRecord {
   id: number
-  kind: string // trash/delete/move/hardlink
+  kind: string // trash/delete/move/hardlink/symlink
   createdAt: number // Unix 秒
   targetDir: string
   histId: number
@@ -161,6 +203,17 @@ export interface OpRecordItem {
   err: string
   size: number
   mtimeNs: number
+  // 软链接条目专用（历史记录页展示用，2026-09-20）。
+  //
+  // 为什么放在历史条目上而不是实时查询文件系统：历史记录页要展示**当时**
+  // 那次操作的结果，而链接可能早已因为保留项被删/盘被拔出而悬空。
+  // 实时查询会把"当时是好的"显示成"坏的"，用户无法理解发生了什么。
+  //
+  // 后端在 GetOpRecord 时对该条目做一次检测：
+  //   isSymlink = true 表示 OrigPath 当时/现在是一个符号链接（链接类条目）
+  //   dangling  = true 表示链接的目标当前不可达（悬空，需用户处理）
+  isSymlink?: boolean
+  dangling?: boolean
 }
 
 export interface OpRecordDetail {
