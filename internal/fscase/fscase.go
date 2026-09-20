@@ -14,12 +14,16 @@
 package fscase
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"filededup/internal/worktemp"
 )
 
 // Fold 归一化路径用于「同一目录/前缀」比较：按所在卷语义折叠大小写，
@@ -90,28 +94,68 @@ func fireProbeHook(dir string) {
 	}
 }
 
+// probeAttempts 单次探测最多换几个名字。撞名不再让探测退化为平台默认（M13），
+// 但也不能无限重试：目录里被人放了一串同名文件时如实退回默认，行为与改动前一致。
+const probeAttempts = 8
+
+// probeNames 第 n 号探测用到的文件名（小写=实际写入名，大写=反向核对名）。
+//
+// 序号必须是**纯数字**：worktemp 的忽略规则按「前缀 + 全数字」判定，
+// 掺进 pid 或随机量就没法在不放宽成 Contains 的前提下认出来（放宽成 Contains
+// 会连带忽略 `x.fdd-case-probe-notes.txt` 这类用户文件——M1 的漏扫形态）。
+// 跨进程撞名靠"换号重试"解决，不靠名字唯一。
+func probeNames(dir string, n uint64) (lower, upper string) {
+	base := worktemp.MarkCaseProbe + strconv.FormatUint(n, 10)
+	return filepath.Join(dir, strings.ToLower(base)), filepath.Join(dir, strings.ToUpper(base))
+}
+
 // probe 实际探测。任何一步不确定都退回默认值，不猜测。
+//
+// M13（2026-09-20 全仓审计）：修正前这里有一行"`Lstat(upper)` 已存在 → return
+// Default()"，而 probeNo 每个进程都从 1 重启，上次被 kill 留下的残留因此与首轮
+// 探测恒撞名 → 该目录**永久**拿不到实测结论，静默退回平台默认。
+// 现在换号重试；并且用 os.SameFile 判定"是否同一个对象"来归因，
+// 不再依赖"另一种写法事先必须不存在"这一脆弱前提。
 func probe(dir string) bool {
 	fireProbeHook(dir)
-	base := fmt.Sprintf(".fdd-case-probe-%d", probeNo.Add(1))
-	lower := filepath.Join(dir, strings.ToLower(base))
-	upper := filepath.Join(dir, strings.ToUpper(base))
-	// 先确认另一种大小写形式当前不存在，否则"存在"就不能归因于本次写入
-	if _, err := os.Lstat(upper); err == nil {
-		return Default()
-	}
-	f, err := os.OpenFile(lower, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return Default() // 只读卷 / 无写权限 / 目录不存在
-	}
-	_ = f.Close()
-	defer func() {
-		if err := os.Remove(lower); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "[fscase] 探测文件残留 %s: %v\n", lower, err)
+	for i := 0; i < probeAttempts; i++ {
+		lower, upper := probeNames(dir, probeNo.Add(1))
+		f, err := os.OpenFile(lower, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			// 只读卷 / 无写权限 / 目录不存在 → 退回默认；
+			// EEXIST（别的进程或残留占了这个名字）→ 换号再试。
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return Default()
 		}
-	}()
-	if _, err := os.Lstat(upper); err == nil {
-		return false // 换一种大小写仍命中同一文件 → 卷不敏感
+		_ = f.Close()
+		v, ok := verdictFrom(lower, upper)
+		// 本次创建的文件一定由本次清掉：无论判出结论还是归因失败要换号，都不能留残片。
+		if rmErr := os.Remove(lower); rmErr != nil && !os.IsNotExist(rmErr) {
+			fmt.Fprintf(os.Stderr, "[fscase] 探测文件残留 %s: %v\n", lower, rmErr)
+		}
+		if ok {
+			return v
+		}
 	}
-	return true
+	return Default()
+}
+
+// verdictFrom 用刚创建的 lower 与另一种大小写的 upper 作判据。
+// ok=false 表示"upper 位置上另有其文件"，这次的结果不可归因，应换号重来。
+//
+// ★ 只删自己创建的 lower：upper 可能是上次运行的残留，也可能是用户放的同名文件，
+// 我们无从分辨，因此一个字节都不碰（与 ops 侧 claimSlot 同一口径）。
+func verdictFrom(lower, upper string) (v bool, ok bool) {
+	li, lerr := os.Lstat(lower)
+	ui, uerr := os.Lstat(upper)
+	switch {
+	case uerr != nil:
+		return true, true // 换一种大小写看不见 → 卷区分大小写
+	case lerr == nil && os.SameFile(li, ui):
+		return false, true // 命中同一个对象 → 卷不区分
+	default:
+		return false, false // upper 是另一个文件：撞名，换号
+	}
 }

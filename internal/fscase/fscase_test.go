@@ -69,3 +69,64 @@ func TestSensitiveIsCached(t *testing.T) {
 		}
 	}
 }
+
+// staleProbeAt 在 dir 里放下"上一次进程被 kill 在 create 与 remove 之间"
+// 留下的探测文件（大写形式），返回其路径。n 是本次探测将要使用的序号。
+func staleProbeAt(t *testing.T, dir string, n uint64) string {
+	t.Helper()
+	_, upper := probeNames(dir, n)
+	if err := os.WriteFile(upper, []byte("stale-from-previous-run"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(upper) })
+	return upper
+}
+
+// TestProbeNotDegradedByStaleCollision（M13，2026-09-20 全仓审计）：
+// 修正前 probe 的预检查"另一种大小写形式必须当前不存在"一旦撞上残留就直接
+// `return Default()`，而 probeNo 每次进程从 1 重启 → 残留名与首轮探测恒撞名 →
+// **该目录的探测永久静默退化为平台默认**。在 macOS 自建的大小写敏感卷上
+// Default()=false，折叠会把 A/ 与 a/ 当同一棵目录整棵漏扫——恰是本包立项要修的场景。
+//
+// 断言用"与干净目录同结论"而不是"等于某个固定值"：真实卷语义在各平台不同，
+// 但**残留绝不能改变结论**这一条是平台无关的。
+func TestProbeNotDegradedByStaleCollision(t *testing.T) {
+	clean := t.TempDir()
+	baseline := probe(clean)
+
+	dir := t.TempDir()
+	before := probeNo.Load()
+	stale := staleProbeAt(t, dir, before+1)
+	if got := probe(dir); got != baseline {
+		t.Fatalf("撞上残留后结论从 %v 变成 %v：探测被静默降级", baseline, got)
+	}
+	// ★ 这条才是与卷语义无关的可观测证据：撞名后必须**换号继续测**。
+	// 只断言"结论没变"在 CI 上是空的——默认值恰好等于本地卷的真值时，
+	// 退化和正确在返回值上看不出差别（本包的受害场景恰恰是"默认 ≠ 现实"的卷）。
+	if probeNo.Load() < before+2 {
+		t.Fatalf("撞上残留后没有换号重试（序号只走到 %d）：预检查直接 return Default() 即为退化", probeNo.Load())
+	}
+	// 两种卷上占位文件都必须还在：不敏感卷上 O_EXCL 直接撞 EEXIST（根本没建过文件），
+	// 敏感卷上本次只清自己创建的 lower。任何一条路径都不许去删不是本次建的东西。
+	if _, err := os.Lstat(stale); err != nil {
+		t.Fatalf("probe 删掉了不是本次创建的文件: %v", err)
+	}
+}
+
+// TestProbeGivesUpWithoutTouchingStrangers 钉住重试的上界与"不替陌生人删文件"：
+// 连续 probeAttempts 个名字全被占时退回默认值，而且一个占位文件都不许消失。
+func TestProbeGivesUpWithoutTouchingStrangers(t *testing.T) {
+	dir := t.TempDir()
+	var stales []string
+	for i := 0; i < probeAttempts; i++ {
+		stales = append(stales, staleProbeAt(t, dir, probeNo.Load()+1))
+	}
+	if got := probe(dir); got != Default() {
+		t.Fatalf("重试用尽后应退回平台默认，实得 %v", got)
+	}
+	for _, p := range stales {
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("占位文件 %s 被删除: %v", filepath.Base(p), err)
+		}
+	}
+}

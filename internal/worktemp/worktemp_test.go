@@ -20,7 +20,8 @@ func TestIsTempNameRecognizesEveryRegisteredMarker(t *testing.T) {
 	for _, f := range forms {
 		for _, stem := range stems {
 			var names []string
-			if f.inserted {
+			switch f.kind() {
+			case kindInserted:
 				// 插入式：标记在扩展名之前，并覆盖 claimDst 的 _N 递增档
 				ext := extOf(stem)
 				base := strings.TrimSuffix(stem, ext)
@@ -29,7 +30,11 @@ func TestIsTempNameRecognizesEveryRegisteredMarker(t *testing.T) {
 					base + f.mark + "_1" + ext,
 					base + f.mark + ext + ".undo", // 回撤暂存叠在扩展名之后
 				}
-			} else {
+			case kindPrefix:
+				// 前缀式：标记在开头、其后只剩序号——与 stem 无关，
+				// 三个 stem 生成同一批名字，各测一次即可。
+				names = []string{f.mark + "1", f.mark + "42"}
+			default:
 				names = []string{
 					stem + f.mark,           // 追加式
 					stem + f.mark + ".undo", // 回滚暂存产生的二次后缀
@@ -130,6 +135,30 @@ func TestMarkersAreAllLowercaseFddPrefixed(t *testing.T) {
 		m := f.mark
 		if len(m) < 5 || m[:5] != ".fdd-" {
 			t.Errorf("标记 %q 应形如 \".fdd-xxx\"（小写前缀）", m)
+		}
+	}
+}
+
+// TestIsTempNameCaseProbePrefixForm M13（2026-09-20 全仓审计）：fscase 的探测文件
+// 是本包注册表里第一条**前缀式**形态，判定必须能认出它（注册表完备性；
+// 它与 SuffixTmp 等不同，平时靠隐藏规则挡着，见 worktemp.go 里 MarkCaseProbe 的注释）。
+//
+// 只认「前缀 + 纯数字」：`.fdd-case-probe-notes.txt` 一类用户文件必须照常参与扫描
+// （M1 的教训——判定放宽一格，漏扫就静默一分）。
+func TestIsTempNameCaseProbePrefixForm(t *testing.T) {
+	positives := []string{".fdd-case-probe-1", ".fdd-case-probe-42", ".fdd-case-probe-7.undo"}
+	negatives := []string{
+		".fdd-case-probe-", ".fdd-case-probe-notes", ".fdd-case-probe-1-notes",
+		"x.fdd-case-probe-1", ".FDD-CASE-PROBE-1", "fdd-case-probe-1",
+	}
+	for _, n := range positives {
+		if !IsTempName(n) {
+			t.Errorf("应识别为临时名: %q", n)
+		}
+	}
+	for _, n := range negatives {
+		if IsTempName(n) {
+			t.Errorf("不应识别为临时名（会把用户文件静默漏掉）: %q", n)
 		}
 	}
 }
