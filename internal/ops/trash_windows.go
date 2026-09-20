@@ -138,22 +138,20 @@ func recycleBinVolumeNuke(root string) nukeStatus {
 }
 
 // winNukeStatusOf 读一个 NukeOnDelete DWORD 并映射为三态。
+//
+// 错误分类一律交给 classifyRegErr（regstatus.go，平台无关、Linux CI 有断言）：
+// 这里原本自己写 regIsNotFound + 泛化 fall-through，类型不符与 ACL 拒绝混在
+// 一支里，新增错误类别时不会有任何测试提醒（AS-R5）。
 func winNukeStatusOf(subKey, value string) nukeStatus {
 	k, err := registryOpenKey(subKey)
 	if err != nil {
-		if regIsNotFound(err) {
-			return nukeOff // 键不存在 = 没设过 = 未禁用
-		}
-		return nukeUnknown // 打不开（ACL 等）= 无法判定
+		return classifyRegErr(err)
 	}
 	defer registryCloseKey(k)
 
 	v, err := registryGetDWORD(k, value)
 	if err != nil {
-		if regIsNotFound(err) {
-			return nukeOff // 值不存在 = 没设过
-		}
-		return nukeUnknown // 类型不符 / 读失败 = 无法判定
+		return classifyRegErr(err)
 	}
 	if v != 0 {
 		return nukeOn

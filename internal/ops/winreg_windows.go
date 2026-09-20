@@ -3,8 +3,6 @@
 package ops
 
 import (
-	"errors"
-	"fmt"
 	"syscall"
 	"unsafe"
 )
@@ -28,30 +26,14 @@ const (
 	regDWORD = 4
 	regSZ    = 1
 
-	// regErrNotFound = ERROR_FILE_NOT_FOUND：RegOpenKeyExW（键不存在）与
-	// RegQueryValueExW（值不存在）都返回它。★ 这是「用户没设过」这一**正常
-	// 情形**与「读不到」（ACL 拒绝、类型不符）的唯一分界，必须与后者区分：
-	// 前者可判 nukeOff，后者只能判 nukeUnknown。
-	regErrNotFound = syscall.Errno(2)
-
-	// RegCreateKeyExW 的 DISPOSITION 取值（winreg.h）。
-	regValueNewlyCreated = 1
-	regValueExists       = 2
+	// regValueExists 是 RegCreateKeyExW 的 DISPOSITION 取值之一（winreg.h：
+	// 1=新建、2=已存在）。只留 2：测试脚手架用它判断"键是否本来就有"。
+	// AS-R5 删掉了 regValueNewlyCreated——有定义无引用即死代码。
+	regValueExists = 2
 )
 
-// errRegTypeMismatch 值类型不是 REG_DWORD（registryGetDWORD 专用）。
-var errRegTypeMismatch = errors.New("注册表值类型不是 REG_DWORD")
-
-// regIsNotFound 判定注册表错误是否为「键/值不存在」。
-// 注：ERROR_PATH_NOT_FOUND(3) 在父键不存在时出现，同样属于"没有这个设置"。
-func regIsNotFound(err error) bool {
-	return errors.Is(err, regErrNotFound) || errors.Is(err, syscall.Errno(3))
-}
-
-// regIsMismatch 判定 registryGetDWORD 是否因值类型不符而失败。
-func regIsMismatch(err error) bool {
-	return errors.Is(err, errRegTypeMismatch)
-}
+// regIsNotFound / regIsMismatch / errRegTypeMismatch / regErrNotFound 见
+// regstatus.go：错误分类是纯逻辑，放在带 build tag 的文件里就进不了 Linux CI。
 
 var (
 	advapi32           = syscall.NewLazyDLL("advapi32.dll")
@@ -117,7 +99,7 @@ func registryGetDWORD(h syscall.Handle, name string) (uint32, error) {
 		return 0, syscall.Errno(r0)
 	}
 	if typ != regDWORD {
-		return 0, fmt.Errorf("%w: 期望 REG_DWORD(4)，实际类型 %d", errRegTypeMismatch, typ)
+		return 0, regTypeErrorf(regDWORD, typ)
 	}
 	return data, nil
 }
