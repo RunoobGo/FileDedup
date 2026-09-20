@@ -90,6 +90,15 @@ jobs:
       - name: CLI 冒烟（benchgen C×0.02 + fdd-cli 三跑比对）
         run: bash scripts/smoke-cli.sh
 
+      # 跨卷软链接冒烟（2026-09-20）：挂一个独立文件系统，实证
+      # ① 硬链接跨卷必失败（本功能存在的理由）② 软链接跨卷成功且内容跟随
+      # ③ 删除链接不影响保留源 ④ 保留源移动后链接悬空 ⑤ 悬空仍可回撤。
+      # 单测里的"跨卷"其实是同卷模拟（两个 t.TempDir 在同一设备上），
+      # 真实跨设备语义只有这一步能覆盖。runner 上 loop 设备可用，
+      # 脚本会在无 loop 时退到 tmpfs 并在两者都不可用时**跳过而非静默通过**。
+      - name: 跨卷软链接冒烟（独立卷 + 7 条判据）
+        run: sudo bash scripts/smoke-symlink.sh
+
   windows:
     name: go test (windows)
     runs-on: windows-latest

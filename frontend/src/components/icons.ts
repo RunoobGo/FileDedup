@@ -23,6 +23,7 @@ export type IconName =
   | 'chevron-down' // 折叠指示
   | 'history' // 记录（导航）—— 扫描历史 / 清理记录
   | 'undo' // 回撤（清理记录）
+  | 'filter' // 处理范围已收窄（处理策略的过滤提示）—— 漏斗，语义直白
 
 export interface IconDef {
   /** 一段或多段 path 的 d 属性 */
@@ -101,6 +102,11 @@ export const ICONS: Record<IconName, IconDef> = {
   undo: {
     viewBox: ICON_SIZE,
     d: ['M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8', 'M3 3v5h5'],
+  },
+  filter: {
+    viewBox: ICON_SIZE,
+    // 漏斗（Lucide filter）：上宽下窄，表达"从全集里筛出子集"。
+    d: ['M22 3H2l8 9.46V19l4 2v-8.54L22 3z'],
   },
 }
 

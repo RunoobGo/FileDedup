@@ -16,6 +16,7 @@ import (
 	"filededup/internal/filter"
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/worktemp"
 )
 
 // dirQueue 无界目录队列：worker 既是消费者也是生产者，
@@ -209,6 +210,18 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					typ := de.Type()
 					if typ&fs.ModeSymlink != 0 {
 						continue // 符号链接：不跟随
+					}
+					// 2026-09-19（缺陷：残留临时文件被当作重复文件）：
+					// 应用自身的中间产物以「用户文件名 + .fdd-*」命名，
+					// **不以 "." 开头**，因此下面的隐藏文件规则拦不住它。
+					// 其中 *.fdd-old 是合并前的完整独立副本，内容与被保留的
+					// 文件逐字节相同——若因进程中断/杀软占用句柄而残留，
+					// 每次扫描都会把它配成一个"重复组"，用户看到的现象就是
+					// 「做过硬链接合并的文件重扫仍被识别为重复」。
+					// 判定集中在 worktemp.IsTempName，与产生处（internal/ops）
+					// 共用同一份定义，避免日后新增临时名时漏掉忽略规则。
+					if worktemp.IsTempName(de.Name()) {
+						continue
 					}
 					if typ.IsDir() {
 						if !f.IncludeHidden && strings.HasPrefix(de.Name(), ".") {

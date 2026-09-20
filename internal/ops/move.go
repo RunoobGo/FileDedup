@@ -55,13 +55,23 @@ func MoveFile(src, targetDir string) (string, error) {
 // H2：keepID/dupID 来自 VerifyFile 通过校验那一刻的 fstat。临时硬链接建立后
 // 复核 tmp 的 inode == keepID（窗口内 keep 路径被替换时，链接会指向非预期
 // 文件）；替换 dup 前复核 dup 路径仍指向 dupID。零值 ID（未解析平台）跳过。
+//
+// 2026-09-19（缺陷：Windows 上"显示已执行但链接未生效"）：
+// 此前本函数**只要有一步没报错就返回 nil**，从不确认链接真的建立了。
+// 而 Windows 上 os.Link → CreateHardLinkW **仅 NTFS 支持**（MSDN 原文：
+// "only supported on the NTFS file system"，且 ReFS 不支持、exFAT/FAT 完全不支持），
+// 跨卷也一律失败。一旦平台/卷不支持，上层却把它记为 done 并累加"已释放空间"，
+// 用户看到"执行成功"但文件夹总占用不变、改一个文件另一个不跟着变。
+// 现在收尾处**强制复核**：dup 与 keep 必须真的互为同一文件（同 inode /
+// 同 64 位文件索引）。对不上就回滚成原独立文件并报错——宁可显式失败，
+// 也不留下"假装成功"的假账。
 func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	if keep == dup {
 		return fmt.Errorf("同一路径")
 	}
 	// 先建指向 keep 的临时硬链接，再把原 dup 备份后原子替换为硬链接。
 	// 任一步失败都能把 dup 恢复为原始文件，杜绝「删 dup 后改名失败」导致的数据丢失。
-	tmp := dup + ".fdd-tmp"
+	tmp := dup + FddTempSuffix
 	_ = os.Remove(tmp) // 清理上次残留
 	if err := os.Link(keep, tmp); err != nil {
 		return fmt.Errorf("硬链接失败（可能跨卷或权限）: %w", err)
@@ -74,7 +84,7 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
 	}
-	backup := dup + ".fdd-old"
+	backup := dup + FddOldSuffix
 	_ = os.Remove(backup)
 	if err := hardlinkRename(dup, backup); err != nil {
 		// 无法把原 dup 移走（极罕见）：清理临时硬链接，dup 原样保留（安全）。
@@ -87,7 +97,89 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	_ = os.Remove(backup) // 合并成功：删除原独立副本
+	// 收尾复核（见函数头注释）：确认 dup 现在真的是 keep 的那个文件。
+	// 这里的证据是「同文件」而非「无错误」——两者在 Windows 上不等价。
+	if err := verifyHardlinked(keep, dup); err != nil {
+		// 未真正建立链接：把 dup 还原为原来的独立文件，不留假成功的账。
+		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
+			if berr := hardlinkRename(backup, dup); berr != nil {
+				// 还原失败：至少保证两份都存在（数据不丢），并明确指出残留位置。
+				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）",
+					err, backup+".undo")
+			}
+			_ = os.Remove(backup + ".undo")
+			return err
+		}
+		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", err, backup)
+	}
+	// 合并成功：删除原独立副本。
+	//
+	// 2026-09-19（缺陷：残留 .fdd-old 污染后续扫描）：此处原先写作
+	// `_ = os.Remove(backup)`，把删除失败**静默吞掉**。而 Windows 上
+	// 该失败很常见：杀软/索引器/资源管理器预览持有句柄时删除会返回
+	// ERROR_SHARING_VIOLATION。此时链接虽已建立，但一份与原文件逐字节
+	// 相同的 .fdd-old 被永久留在用户目录里；由于它以用户文件名开头、
+	// 不以 "." 开头，扫描器的隐藏跳过规则对它无效 → 下次扫描必然把它
+	// 与被保留的文件配成一个"重复组"。用户看到的就是
+	// 「明明做过硬链接合并，重扫还是有一堆重复文件」。
+	//
+	// 处置：链接已成立，不把整个操作判失败（那会让用户以为没合并）；
+	// 但把残留如实回报，由上层提示用户，且扫描侧已同步忽略该名字
+	// （IsWorkTempName），双重兜底。
+	if err := workTempRemove(backup); err != nil {
+		_ = os.Remove(tmp) // 确保临时硬链接不残留（本已不指向任何用户可见名）
+		return &ResidueError{Path: backup, Err: err}
+	}
+	return nil
+}
+
+// ResidueError 表示「操作已成功，但有一个应用工作临时文件未能清除」。
+//
+// 之所以单独成类型：调用方需要区分「操作失败」与「操作成功但有残留」。
+// 前者要回滚、要计失败；后者文件已经合并到位，多留了一个内部临时文件，
+// 属于需要提示但不应推翻结果的情况。
+type ResidueError struct {
+	Path string
+	Err  error
+}
+
+func (e *ResidueError) Error() string {
+	return fmt.Sprintf("合并已完成，但临时文件 %s 未能删除（可能被其他程序占用），"+
+		"请手动删除；它不会影响链接本身，扫描也已自动忽略该名字", e.Path)
+}
+
+func (e *ResidueError) Unwrap() error { return e.Err }
+
+// verifyHardlinked 确认 dup 与 keep 现在指向同一份物理文件。
+//
+// 这是**平台无关**的终局判据，不依赖 fsid.ID 是否解析得出来：
+//   - os.SameFile 比较 os.FileInfo 的 (dev, ino)，在 unix 上是 inode、
+//     在 Windows 上由 Go 用文件索引填充——正是硬链接成立的定义。
+//
+// 之所以必须显式复核：os.Link/os.Rename 系列在 Windows 上有若干"语义近似但不等价"的
+// 成功路径（卷不支持、重定向、Filter 驱动介入），仅凭"没返回错误"不足以断言
+// 链接已建立。这里补上唯一的、可证伪的终态检查。
+func verifyHardlinked(keep, dup string) error {
+	ki, err := os.Stat(keep)
+	if err != nil {
+		return fmt.Errorf("硬链接复核失败：无法读取保留源 %s: %w", keep, err)
+	}
+	di, err := os.Stat(dup)
+	if err != nil {
+		return fmt.Errorf("硬链接复核失败：无法读取目标 %s: %w", dup, err)
+	}
+	if !ki.Mode().IsRegular() || !di.Mode().IsRegular() {
+		return fmt.Errorf("硬链接复核失败：keep/dup 不都是普通文件")
+	}
+	if !os.SameFile(ki, di) {
+		return fmt.Errorf("硬链接未生效：%s 与 %s 仍是两个独立文件"+
+			"（该卷可能不支持硬链接，如 exFAT/FAT/ReFS，或两者不在同一卷）", dup, keep)
+	}
+	// 尺寸一致（同文件必然一致，这里防的是竞态下的诡异状态）
+	if ki.Size() != di.Size() {
+		return fmt.Errorf("硬链接复核失败：%s(%d) 与 %s(%d) 尺寸不一致",
+			dup, di.Size(), keep, ki.Size())
+	}
 	return nil
 }
 
@@ -185,3 +277,8 @@ func isCrossDevice(err error) bool {
 // hardlinkRename 默认等于 os.Rename，测试可临时替换以模拟重命名失败，
 // 用于验证 HardlinkMerge 的回滚路径不会丢失数据。
 var hardlinkRename = os.Rename
+
+// workTempRemove 默认等于 cleanupWorkTemp，测试可临时替换以模拟
+// 「原副本删除失败」（Windows 上杀软/索引器占用句柄时的高频路径），
+// 用于验证残留会被如实回报而不是被静默吞掉（缺陷 6）。
+var workTempRemove = cleanupWorkTemp

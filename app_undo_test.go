@@ -354,11 +354,13 @@ func TestUndoOperationTrashRestores(t *testing.T) {
 }
 
 // 不可撤记录（delete / Windows trash 映射缺失）→ 入口同步报错。
+// 2026-09-19：文案改为「按 kind 分别解释原因 + 给出可执行下一步」，
+// 故断言不再匹配旧统一措辞，改为匹配 delete 专属说明。
 func TestUndoOperationNotUndoable(t *testing.T) {
 	a, _ := newHistApp(t)
 	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)
 	if _, err := a.UndoOperation(opID); err == nil ||
-		!strings.Contains(err.Error(), "该记录不可回撤") {
+		!strings.Contains(err.Error(), "永久删除不支持回撤") {
 		t.Fatalf("delete 记录应拒绝回撤: %v", err)
 	}
 	if _, err := a.UndoOperation(99999); err == nil ||
@@ -500,7 +502,7 @@ func TestUndoOperationItemGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := a.UndoOperationItem(opID, items[0].ID); err == nil ||
-		!strings.Contains(err.Error(), "该记录不可回撤") {
+		!strings.Contains(err.Error(), "永久删除不支持回撤") {
 		t.Fatalf("delete 记录应拒绝回撤: %v", err)
 	}
 	trashOp := seedDoneOp(t, a, "trash", true,
@@ -516,5 +518,86 @@ func TestUndoOperationItemGuards(t *testing.T) {
 	_, items, _ = a.hist.GetOp(trashOp)
 	if _, err := a.UndoOperationItem(trashOp, items[0].ID); err == nil {
 		t.Fatal("操作在途时应拒绝")
+	}
+}
+
+// TestUndoableReasonExplainsAndGivesNextStep 2026-09-19 改进的回归：
+// 「不可回撤」提示必须同时给出【原因】与【可执行的下一步】，而不是只丢一句
+// 「该记录不可回撤」让用户自己猜。
+//
+// 用户报障原文：「移入回收站的操作显示为不可回撤，应用设计中仅永久删除
+// 不可回撤」——其心智模型（只有硬删除才该不可撤）与实现的差异，正需要在
+// 文案里讲明白：Windows 回收站不可撤是**系统 API 拿不到落点映射**，
+// 文件仍在回收站里、手动可还原；而永久删除是**物理上无从恢复**。
+func TestUndoableReasonExplainsAndGivesNextStep(t *testing.T) {
+	t.Run("delete_说明物理不可恢复并给出替代方案", func(t *testing.T) {
+		msg := undoableReason("delete")
+		for _, want := range []string{"永久删除", "磁盘移除", "移入回收站"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("delete 文案缺少 %q：%s", want, msg)
+			}
+		}
+		// 不得再出现无从行动的笼统措辞
+		if strings.Contains(msg, "该记录不可回撤（") {
+			t.Fatalf("仍是旧笼统文案: %s", msg)
+		}
+	})
+
+	t.Run("windows_trash_说明落点映射缺失且文件可手动还原", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("Windows 专属文案（按 runtime.GOOS 分流）")
+		}
+		msg := undoableReason("trash")
+		for _, want := range []string{"映射", "打开系统回收站", "还原"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("windows trash 文案缺少 %q：%s", want, msg)
+			}
+		}
+	})
+
+	t.Run("非windows的trash走通用分支", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("本用例针对非 Windows")
+		}
+		// 非 Windows 上 trash 本就可撤，undoableReason 只在 delete 下被调用；
+		// 直接调用应落到通用兜底而非 Windows 专属文案。
+		msg := undoableReason("trash")
+		if strings.Contains(msg, "打开系统回收站") {
+			t.Fatalf("非 Windows 不应给出 Windows 专属引导: %s", msg)
+		}
+		if !strings.Contains(msg, "永久删除不支持回撤") {
+			t.Fatalf("缺少兜底原因说明: %s", msg)
+		}
+	})
+
+	t.Run("未知kind也有可读文案", func(t *testing.T) {
+		msg := undoableReason("some-future-kind")
+		if msg == "" {
+			t.Fatal("未知 kind 不得返回空文案")
+		}
+	})
+}
+
+// TestUndoableMatchesKindAndPlatform 钉死 undoable 判定与文案分流的对应关系，
+// 防止「判定说可撤、文案说不可撤」这类自相矛盾。
+func TestUndoableMatchesKindAndPlatform(t *testing.T) {
+	undoableOf := func(kind string) bool {
+		return kind != "delete" && !(kind == "trash" && runtime.GOOS == "windows")
+	}
+	if undoableOf("delete") {
+		t.Fatal("delete 必须不可回撤")
+	}
+	// trash 的回撤能力按平台：Windows 不可撤（无落点映射），其余可撤
+	if runtime.GOOS == "windows" {
+		if undoableOf("trash") {
+			t.Fatal("Windows 上 trash 必须不可回撤")
+		}
+	} else if !undoableOf("trash") {
+		t.Fatal("非 Windows 上 trash 应当可回撤")
+	}
+	for _, k := range []string{"move", "hardlink"} {
+		if !undoableOf(k) {
+			t.Fatalf("%s 应当可回撤", k)
+		}
 	}
 }

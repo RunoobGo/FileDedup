@@ -3,6 +3,7 @@ package hasher
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -38,6 +39,19 @@ type Result struct {
 	Partial Partial
 	Full    [32]byte // BLAKE3-256
 	Small   bool     // 小文件路径：一趟已完成全量哈希
+	// Short 短读标记：实际可读字节数 < 调用方传入的 size。
+	//
+	// 触发场景：目录遍历（ReadDir/Info 取 size）与本次 open 之间，文件被截断、
+	// 被并发改写，或所在卷（exFAT/FAT32/SMB 网络盘、OneDrive 云占位文件、
+	// 稀疏/压缩文件）报出的逻辑大小与真实可读长度不一致。
+	//
+	// 语义约定：短读**不是错误**。本 Result 里的哈希一律对应「实际读到的字节」，
+	// 调用方必须据 Short 用实际长度重建条目，不得继续沿用失真的 size——
+	// 否则两个不同内容的文件可能因截断被算成同一哈希，造出假重复组。
+	Short bool
+	// ActualSize 实际读到的字节数（= 各个采样点实际读到量的上界口径）。
+	// Short 为 false 时等于传入的 size。
+	ActualSize int64
 }
 
 // ErrClosed 由上层注入文件句柄失败时使用。
@@ -45,6 +59,25 @@ var ErrClosed = errors.New("hasher: file handle closed")
 
 // PrefilterMax 单文件预筛最大读量：4 个采样点 × HeadTailChunk。
 const PrefilterMax = 4 * HeadTailChunk
+
+// shortReadOK 判定读错误是否属于「短读」——即文件比元数据声明的短。
+//
+// 2026-09-19 修复（Windows 首扫 0 组 / 未保存缓存）：
+// 修正前一律写作 `err != nil && err != io.EOF`，而 io.ReadFull 在「读满前
+// 遇到文件尾」时返回的是 io.ErrUnexpectedEOF，**不是** io.EOF，于是短读被
+// 当成真实故障返回。调用方（pipeline 阶段 2）据此把该文件标记 skip 并
+// 整个剔除出预筛分组，后果是：
+//   - 它与任何文件都不可能同桶 → 整组重复静默消失（用户：扫不到重复）
+//   - 它永远走不到 pending 入队那一行 → 缓存里永远没有它（用户：未保存缓存）
+//
+// windows CI 实测（scripts/test-windows-quarantine.sh 的隔离清单）已记录该
+// 现象家族的原文：「子目录里的副本文件在 prefilter 阶段报 unexpected EOF
+// （记录 size 大于实际可读长度）……首扫 0 组」。
+//
+// io.EOF 同样放过：ReadAt 在偏移恰好落在文件尾时也可能返回纯 io.EOF。
+func shortReadOK(err error) bool {
+	return err == nil || err == io.EOF || err == io.ErrUnexpectedEOF
+}
 
 // sampleOffsets 预筛采样偏移（升序、仅由 size 决定，两次计算必然一致）：
 // 头 0、中点 size/2、3size/4、尾 size-chunk；中点越界时钳制到 size-chunk
@@ -66,39 +99,95 @@ func sampleOffsets(size int64) [4]int64 {
 // HashHeadTail 预筛哈希（一次 open 已由调用方完成）：
 //   - size ≤ SmallFileMax：读全文件，同趟完成 xxHash64 + BLAKE3（小文件捷径，决策 8）
 //   - size >  SmallFileMax：按 sampleOffsets 读 4×64KiB 各自 xxHash64
+//
+// 短读语义见 Result.Short：读不满不算错误，用实际读到的字节算哈希并如实标记。
 func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 	if size <= SmallFileMax {
 		n, err := io.ReadFull(f, buf[:size])
-		if err != nil && err != io.EOF {
+		if !shortReadOK(err) {
 			return Result{}, err
 		}
 		b := buf[:n]
 		h := xxhash.Sum64(b)
 		return Result{
 			// 全文件被单点覆盖：四个指纹相同
-			Partial: Partial{Head: h, Tail: h, Mid1: h, Mid2: h},
-			Full:    blake3.Sum256(b),
-			Small:   true,
+			Partial:    Partial{Head: h, Tail: h, Mid1: h, Mid2: h},
+			Full:       blake3.Sum256(b),
+			Small:      true,
+			Short:      int64(n) != size,
+			ActualSize: int64(n),
 		}, nil
 	}
 	var r Result
 	offs := sampleOffsets(size)
+	reads := [4]int{}
 	dst := []*uint64{&r.Partial.Head, &r.Partial.Mid1, &r.Partial.Mid2, &r.Partial.Tail}
+	short := false
 	for i, off := range offs {
 		n, err := f.ReadAt(buf[:HeadTailChunk], off)
-		if err != nil && err != io.EOF {
+		if !shortReadOK(err) {
 			return Result{}, err
 		}
+		if n < HeadTailChunk {
+			// 该采样点没读满：文件比声明的短（或该偏移已越界）。
+			// 不视为错误——该点按实际读到的字节算指纹；整份结果标记 Short
+			// 让调用方知道 size 不可信。
+			short = true
+		}
+		reads[i] = n
 		*dst[i] = xxhash.Sum64(buf[:n])
 	}
+	r.Short = short
+	if !short {
+		r.ActualSize = size
+		return r, nil
+	}
+	// 短读：把「采样点读到的字节数」还原成实际文件长度。
+	//
+	// 采样点按偏移升序是 [0, mid1, mid2, tail]。若某点读满 HeadTailChunk，
+	// 说明该偏移之后至少还有 chunk 字节可读，即 实际长度 >= off+chunk；
+	// 若某点读不满 n（含 n=0），说明该偏移处只剩 n 可读，即 实际长度 = off+n。
+	//
+	// 取**全部读不满的点里最小的 off+n**——那是唯一能直接读出真值的证据，
+	// 且越靠前的点给出的上界越紧。任何「读满了」的点都只能给下界，不能用来
+	// 定长度（否则会把长度高估，分桶键失真）。
+	//
+	// 边界：若四个点全部读满却仍被判 short（不可能，short 的定义就是有读不满的
+	// 点），此处 best 保持 0，由调用方按"不可读"处理。
+	best := int64(0)
+	for i, off := range offs {
+		if reads[i] == HeadTailChunk {
+			continue // 读满了：只提供下界，不能定真值
+		}
+		if v := off + int64(reads[i]); v < best || best == 0 {
+			best = v
+		}
+	}
+	// 头部采样点（off=0）读满时，实际长度至少 chunk；此时 best 只能来自
+	// 后面读不满的点。若那个点算出 v < chunk，说明与头部矛盾（并发改写），
+	// 取下界 chunk 保证不小于已确证可读的量。
+	if reads[0] == HeadTailChunk && best < HeadTailChunk {
+		best = HeadTailChunk
+	}
+	r.ActualSize = best
 	return r, nil
 }
 
 // HashFull 顺序流式全量 BLAKE3（默认路径）。
+//
+// 2026-09-19 修复：修正前用 io.LimitReader(f, size) 包一层，而 LimitReader 读
+// 不满就返回 io.EOF，io.CopyBuffer 视其为正常结束——于是"记录 size 大于实际可读
+// 长度"时，函数**静默**算出的是"较短那段内容"的哈希，调用方毫不知情，
+// 可能把截断后的内容与别的文件判成重复。现在改为显式计数：读到的字节数与
+// 声明的 size 不符即报错，把判断权交回调用方（宁可计入失败清单，也不静默出错）。
 func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
 	h := blake3.New(32, nil)
-	if _, err := io.CopyBuffer(h, io.LimitReader(f, size), buf); err != nil {
+	n, err := io.CopyBuffer(h, io.LimitReader(f, size), buf)
+	if err != nil {
 		return [32]byte{}, err
+	}
+	if n != size {
+		return [32]byte{}, fmt.Errorf("hasher: 文件短读（声明 %d 字节，实际可读 %d 字节）: %w", size, n, io.ErrUnexpectedEOF)
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
@@ -148,7 +237,13 @@ func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte)
 				return
 			}
 			b := full[:int(end-off)]
-			_, err := f.ReadAt(b, off)
+			n, err := f.ReadAt(b, off)
+			if err == nil && int64(n) != int64(end-off) {
+				// ReadAt 契约上「读满才返回 nil」——真读不满必带 io.EOF/
+				// io.ErrUnexpectedEOF。这里只是把该不变式钉死，防底层实现异常时
+				// 把未填充的零字节当内容喂进哈希。
+				err = fmt.Errorf("hasher: 分段读短读（段 [%d,%d) 实际 %d 字节）: %w", off, end, n, io.ErrUnexpectedEOF)
+			}
 			select {
 			case ch <- block{data: b, err: err}:
 			case <-done:

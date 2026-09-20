@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -69,12 +70,14 @@ func runIndexed(ctx context.Context, n, workers int, fn func(i int), onPanic ...
 // ItemResult 单个文件走完校验/执行阶段的终态（v0.5.0 写前日志收口用）。
 // State ∈ done / failed / skipped；DestPath 为 trash/move 的实际去向
 // （回收站映射缺失时为空），LinkSrc 为 hardlink 指向的保留源。
+// Warn 为「操作已成功、但有需要告知用户的情况」（如临时文件残留未能删除）。
 type ItemResult struct {
 	OrigPath string
 	DestPath string
 	LinkSrc  string
 	State    string
 	Err      string
+	Warn     string
 }
 
 // Options 执行器配置。
@@ -100,6 +103,27 @@ type Options struct {
 	// 注意：已在途的单个 syscall 无法抢占，取消保证的是「不再派发新条目」，
 	// 配合 app 层的代际校验共同消除永久锁死。
 	Ctx context.Context
+
+	// TrashVerifiesRecycle 声明本平台的 trash 实现能否**可靠地验证**
+	// "文件确实进了回收站"。
+	//
+	// 该标志存在的原因（2026-09-20 缺陷：跨盘移入回收站被静默永久删除）：
+	//
+	// 批量 trash 失败后回退逐文件时，若某个源路径已不存在，代码需要判断
+	// 这是"已被批量执行成功移走"还是"被静默永久删除"。两种情况在
+	// 文件系统层面**完全同形**（都是 os.Stat 返回 ENOENT），唯一能区分的
+	// 依据是平台有没有报告过落点（dstMap）。
+	//
+	//   true  —— 平台承诺"若没报告落点，就不算成功"。
+	//            Windows 走此分支：defaultTrash 内部会复核回收站条目数，
+	//            验不过即返回 error，因此"源消失 + 无落点"必须按**失败**上报，
+	//            否则会把数据丢失伪装成无害的跳过。
+	//   false —— 平台按 C6/S8 旧契约：源消失即视为目标达成，记 Skipped。
+	//            darwin 的 Finder 落点解析可能配对失败而返回空 dstMap，
+	//            此时文件确实已进回收站，记 Failed 是误报。
+	//
+	// 默认 false 以保持既有平台行为不变；Windows 由 app 层显式置为 true。
+	TrashVerifiesRecycle bool
 }
 
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
@@ -115,6 +139,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	}
 	res := model.OpsResult{
 		OK: []string{}, Failed: []model.FailedItem{}, Skipped: []string{}, Cancelled: []string{},
+		Warnings: []string{},
 	}
 	if len(op.FileIDs) == 0 {
 		return res
@@ -125,6 +150,16 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	hashByID := make(map[uint64][32]byte, len(op.FileIDs)*2)
 	keepSrcByID := make(map[uint64]*model.FileEntry, len(op.FileIDs)*2) // 冗余ID → 组保留者
 	for _, g := range opts.Groups {
+		// 防御：空组没有任何成员，`g.Files[0]` 与 pickShortest 都会越界 panic。
+		// 扫描流水线自身不可能产空组（internal/dedup/pipeline.go 输出前有
+		// `len(g) < 2 { continue }`），但 **Groups 是调用方传入的**：历史恢复
+		// （history.LoadScan 读 hist_groups/hist_files 两张表）在其数据被外部
+		// 工具改写或库影像损坏时，完全可能交出一个没有任何 hist_files 行的组。
+		// 执行器是"后端最后防线"，不该因为上游给了畸形输入就把整个进程带走
+		// （执行发生在 goroutine 里，panic 会连带丢掉整批清理的收尾落账）。
+		if len(g.Files) == 0 {
+			continue
+		}
 		var keep *model.FileEntry
 		for _, f := range g.Files {
 			if opts.KeepIDs != nil && opts.KeepIDs[f.ID] {
@@ -218,6 +253,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		err     string
 		dst     string // trash/move 实际去向（未知时空）
 		linkSrc string // hardlink 指向的保留源
+		warn    string // 成功但有需要告知用户的情况（如临时文件残留）
 	}
 	outcomes := make([]outcome, len(toProcess))
 	// C6（2026-09-18 审查）：账本收口必须紧跟每次 syscall，而不是等全批走完
@@ -236,7 +272,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		switch o.code {
 		case ocOK:
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, DestPath: o.dst,
-				LinkSrc: o.linkSrc, State: "done"})
+				LinkSrc: o.linkSrc, State: "done", Warn: o.warn})
 		case ocSkipped:
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "skipped"})
 		case ocFailed:
@@ -270,7 +306,32 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			switch outcomes[i].code {
 			case ocOK:
 				res.OK = append(res.OK, e.Path)
-				res.Reclaimed += e.Size
+				// 2026-09-19：硬链接合并**不立即释放空间**，只把数据块变为共享。
+				// 修正前此处对 hardlink 也累加 e.Size，UI 于是显示"释放 X"，
+				// 而用户去资源管理器一看文件夹占用丝毫未变——与事实不符的假账，
+				// 也让"总占用未变化"看起来像操作失败。
+				// 现在把硬链接的贡献单列（LinkedBytes），Reclaimed 只统计
+				// 真正从磁盘上消失的数据量（trash/delete/move 出卷）。
+				//
+				// 2026-09-20：软链接同属"链接类"合并——磁盘上少了一份完整数据
+				// （dup 位置只剩一个几百字节的链接对象），但保留项的数据块并未
+				// 被共享；Reclaimed 记 e.Size 是**符合事实**的（磁盘占用确实少了
+				// 一整份文件）。不过为了与硬链接在 UI 上可区分、且在回撤语义上
+				// 不误导（回撤要重新占回这块空间），这里同样单列，不混进
+				// Reclaimed，让前端能分别表述。
+				switch op.Kind {
+				case "hardlink":
+					res.LinkedBytes += e.Size
+				case "symlink":
+					res.SymlinkedBytes += e.Size
+				default:
+					res.Reclaimed += e.Size
+				}
+				// 成功但有残留等情况：逐条收集，供上层提示（不改变成败判定）
+				if outcomes[i].warn != "" {
+					res.Warnings = append(res.Warnings,
+						fmt.Sprintf("%s：%s", e.Path, outcomes[i].warn))
+				}
 			case ocSkipped:
 				res.Skipped = append(res.Skipped, e.Path)
 			case ocNone:
@@ -295,7 +356,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 
 	// 先校验操作类型，未知类型不进入汇总（否则会为每个文件误报状态）
 	switch op.Kind {
-	case "trash", "delete", "move", "hardlink":
+	case "trash", "delete", "move", "hardlink", "symlink":
 	default:
 		res.Failed = append(res.Failed, model.FailedItem{Stage: "ops", Err: fmt.Sprintf("未知操作类型 %q", op.Kind)})
 		return res
@@ -336,19 +397,50 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 入站文件记成去向为空的 Skipped，而 Skipped 永不进回撤
 				// （app.go UndoOperation 只认 done）→ 这批文件永久失去应用内
 				// 回撤。故先收下已知去向，命中者按 done+dst 落账。
+				//
+				// ★ 2026-09-20 修复「跨盘移入回收站被静默永久删除」时的重要修正：
+				//
+				// 上面那条「源已不在 → 记 Skipped」的推断，在**静默永久删除**的
+				// 场景下会变成帮凶：Windows 的 defaultTrash 现在会用 verifyRecycled
+				// 检出「文件消失但回收站条目数未增加」并返回错误，而回退逻辑随即
+				// 看到 os.IsNotExist(p) 成立，就把这项记成 Skipped——**刚亮起的
+				// 数据丢失警报被重新按了下去**，用户看到的仍是一个无害的「跳过」。
+				//
+				// 判据缺陷在于：os.Stat 只能证明「文件不在了」，无法区分
+				// 「进了回收站」与「被永久删除」。因此必须结合两个信息判定：
+				//
+				//   1. 平台是否**能**验证回收站（opts.TrashVerifiesRecycle）
+				//   2. 平台本次是否**报告过**该文件的落点（known[p]）
+				//
+				// 能验证 + 无落点 → 无法证明进过回收站，按**失败**上报（Windows）
+				// 不能验证        → 保持 C6/S8 旧契约，记 Skipped（darwin 等）
+				//
+				// 把「无法证明成功」升级为失败，是本缺陷的修复要点：宁可让用户
+				// 看到一条需要核实的错误，也不能让他以为文件好好地躺在回收站里。
 				known := dstMap
 				if known == nil {
 					known = map[string]string{}
 				}
+				strict := opts.TrashVerifiesRecycle
 				runIndexed(ctx, len(usable), opWorkers, func(k int) {
 					i := usable[k]
 					p := toProcess[i].Path
-					if _, err := os.Stat(p); os.IsNotExist(err) {
+					if _, statErr := os.Stat(p); os.IsNotExist(statErr) {
 						if d, ok := known[p]; ok {
 							settle(i, outcome{code: ocOK, dst: d})
-						} else {
-							settle(i, outcome{code: ocSkipped})
+							return
 						}
+						if !strict {
+							settle(i, outcome{code: ocSkipped})
+							return
+						}
+						// 源已消失，但平台有能力验证却未报告任何落点 →
+						// 无法证明进了回收站。这正是「疑似被直接删除」的形状，
+						// 绝不能记成 Skipped。
+						settle(i, outcome{code: ocFailed, stage: "trash",
+							err: "文件已从原路径消失，但未能确认其进入回收站；" +
+								"可能已被直接删除，请立即到回收站核实" +
+								"（若不在回收站，请停止后续操作并考虑用数据恢复工具找回）"})
 						return
 					}
 					if m, err := trash([]string{p}); err != nil {
@@ -432,9 +524,82 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// HardlinkMerge 使用「dup 路径 + .fdd-tmp」临时名，路径互不冲突 → 并发安全
 			if err := HardlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
-				settle(i, outcome{code: ocFailed, err: err.Error()})
+				// 2026-09-19：区分「真失败」与「已成功但有临时文件残留」。
+				// 后者链接已经建好，若计为失败，用户会以为合并没生效，进而
+				// 反复重试——而重试时 dup 与 keep 已是同一文件，行为更费解。
+				var residue *ResidueError
+				if errors.As(err, &residue) {
+					settle(i, outcome{code: ocOK, linkSrc: src.Path, warn: residue.Error()})
+				} else {
+					settle(i, outcome{code: ocFailed, err: err.Error()})
+				}
 			} else {
 				settle(i, outcome{code: ocOK, linkSrc: src.Path})
+			}
+		}, onPanic)
+
+	case "symlink":
+		// 跨卷软链接合并（2026-09-20）。与 hardlink 分支的前置校验**完全一致**
+		// ——dup 与 keep 都必须复核身份、源必须重算内容——因为两者的安全前提
+		// 是同一个："执行时的对象还是校验时的对象"。
+		//
+		// 差异只在两点：
+		//   ① 不要求同卷（软链接能跨卷，这正是它的存在理由）；
+		//   ② 同卷时加一条**非阻断**提示（同卷用硬链接更安全）。
+		//
+		// 为什么同卷只提示不拒绝：软链接合并本身是安全的（复核齐全），
+		// 只是"同卷有更优解"。把用户的选择直接判为失败，是拿应用的偏好
+		// 去否决一个正确且无害的操作，代价大于收益。
+		//
+		// 并发安全性与 hardlink 相同：SymlinkMerge 使用的临时名是
+		// 「dup 路径 + .fdd-tmp」，每个 dup 各自独立，互不覆盖。
+		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
+			e := toProcess[i]
+			src := keepSrcByID[e.ID]
+			if src == nil || src.ID == e.ID {
+				settle(i, outcome{code: ocFailed, err: "未找到组内保留源"})
+				return
+			}
+			// H2：dup 在动作前仍须指向校验过的那份内容
+			if !identityStill(e.Path, procIDs[i]) {
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+				return
+			}
+			// S1 扩展：keep 源也须内容级校验（源被篡改时链接会指向被改过的
+			// 数据，用户以为"还是原来那份"——同样不可逆，必须拦截）。
+			v, srcID := VerifyFile(src, hashByID[src.ID], pool)
+			switch v {
+			case VerdictSkipped:
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源已消失，无法合并（S1 拦截）"})
+				return
+			case VerdictFailed:
+				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"})
+				return
+			}
+			warn := ""
+			if sameVolume(src.Path, e.Path) {
+				warn = "这两个文件在同一卷上，使用「硬链接合并」更安全" +
+					"（硬链接不需要管理员权限，且删除任一名字数据都还在，不会出现链接失效）"
+			}
+			if err := SymlinkMerge(src.Path, e.Path, srcID, procIDs[i]); err != nil {
+				// 与 hardlink 一致：「已成功但有残留」不应判失败，否则用户
+				// 会以为没生效而反复重试（重试时 dup 已是链接，行为更费解）。
+				var residue *ResidueError
+				if errors.As(err, &residue) {
+					settle(i, outcome{code: ocOK, linkSrc: src.Path,
+						warn: joinWarn(warn, residue.Error())})
+				} else if isSymlinkNeedsPrivilege(err) {
+					// 权限不足是**环境级**问题（Windows 未提权且未开开发者模式）：
+					// 同一台机器上每个文件都会以同样方式失败。逐条重复长文案
+					// 会让结果页被同一句话淹没，故此处只留短标记，
+					// 完整指引由 AggregateWarnings 汇总成一条（见本文件尾部）。
+					settle(i, outcome{code: ocFailed, stage: symlinkPrivilegeStage, err: err.Error()})
+				} else {
+					settle(i, outcome{code: ocFailed, err: err.Error()})
+				}
+			} else {
+				settle(i, outcome{code: ocOK, linkSrc: src.Path, warn: warn})
 			}
 		}, onPanic)
 
@@ -443,5 +608,72 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	}
 
 	aggregate()
+	if op.Kind == "symlink" {
+		AggregateWarnings(&res)
+	}
 	return res
+}
+
+// 权限失败的合并提示。为什么不在 worker 里逐条给出完整指引：
+// 「未提权 + 未开开发者模式」是**环境级**问题，同一台机器上每个文件都会以
+// 同样方式失败。8 个文件就是 8 条一模一样的数百字长文案，结果页被同一句话
+// 淹没，用户反而找不到真正的失败原因。
+//
+// 因此分两层：
+//   - 条目级（aggregate 里生成）：短句 + 文件路径，逐条可追；
+//   - 汇总级（本函数）：一条完整可操作的指引。
+//
+// 单独成函数而不是内联，是为了让它可被独立测试，也便于上层（如 app 层）
+// 在推送事件前做同样的归一化。
+const symlinkPrivilegeSummary = "软链接合并失败：当前程序没有创建符号链接的权限。" +
+	"Windows 要求 SeCreateSymbolicLinkPrivilege，普通权限下默认不具备。请任选其一后重试——" +
+	"① 右键程序图标选「以管理员身份运行」；" +
+	"② 在「设置 → 系统 → 开发者选项」中开启「开发者模式」（开启后普通权限即可创建）；" +
+	"③ 若这些文件在同一磁盘卷内，改用「硬链接合并」（不需要任何权限，且无链接失效风险）。"
+
+// AggregateWarnings 把「环境级、可一次性说清」的失败归一化成一条汇总提示。
+//
+// 目前只处理软链接的权限失败（stage == symlinkPrivilegeStage）。其余失败
+// 各文件原因不同（被篡改、路径冲突、卷不支持……），逐条保留原样才是对的，
+// 不做归并。
+//
+// 归一化后条目级 Error 仍留在 Failed 列表里（上层据此计数与定位），
+// 只是把重复的长文案换成短句，完整指引进 Warnings 供 UI 顶部展示。
+//
+// 设计取舍：这里**不修改** res.Failed 的条数——"有几个文件失败"是事实，
+// 不能因为原因相同就合并成一条，否则结果页的计数会与实际不符。
+func AggregateWarnings(res *model.OpsResult) {
+	if res == nil {
+		return
+	}
+	n := 0
+	for i := range res.Failed {
+		if res.Failed[i].Stage != symlinkPrivilegeStage {
+			continue
+		}
+		n++
+		// 统一为一句可读的中文，不再逐条重复平台层的长文案。
+		res.Failed[i].Err = "创建符号链接需要权限（详见下方汇总提示）"
+	}
+	if n == 0 {
+		return
+	}
+	res.Warnings = append(res.Warnings,
+		fmt.Sprintf("%s（本次 %d 个文件因此失败）", symlinkPrivilegeSummary, n))
+}
+
+// symlinkPrivilegeStage 「环境缺少创建符号链接的权限」的失败阶段标记。
+// worker 与 AggregateWarnings 共用同一常量，避免两处字面量漂移。
+const symlinkPrivilegeStage = "symlink-privilege"
+
+// joinWarn 合并两条提示（同卷建议 + 残留告警），空串自动略过。
+func joinWarn(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "；另外：" + b
+	}
 }

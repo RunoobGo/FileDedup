@@ -143,7 +143,9 @@ func (s *Store) ListScans() ([]ScanMeta, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ScanMeta
+	// 同 oplog.ListOps：空列表必须是 []，不能是 nil（→ JSON null）。
+	// 否则扫描历史页在"一条历史都没有"时同样整页空白。
+	out := make([]ScanMeta, 0, 16)
 	for rows.Next() {
 		m, err := scanMeta(rows)
 		if err != nil {
@@ -223,6 +225,20 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 			return m, nil, err
 		}
 		frows.Close()
+		// 防御：hist_files 为空说明这个 hist_groups 行没有对应文件——
+		// 正常写入路径（SaveScan）有 `len(g.Files) == 0 { continue }` 守卫，
+		// 因此空组只可能来自外部工具改写或库影像异常。此时若不剔除：
+		//   - app.toGroupView 会读 g.Files[0].Size → 索引越界 panic（结果页整页崩）
+		//   - ops.Execute 的 keep 选取同样越界（清理操作中途崩溃，落账中断）
+		// 载入侧是本文件的职责边界，就在这里挡掉并计入失败清单：
+		// 用户看得到"这条历史里有个空组被跳过"，而不是应用直接消失。
+		if len(g.Files) == 0 {
+			m.Failed = append(m.Failed, model.FailedItem{
+				Stage: "history",
+				Err:   fmt.Sprintf("历史记录中存在没有任何文件的重复组（组 id=%d），已跳过该组", gr.id),
+			})
+			continue
+		}
 		groups = append(groups, g)
 	}
 	return m, groups, nil
