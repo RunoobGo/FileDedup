@@ -16,7 +16,7 @@ import (
 //   - 同卷：os.Rename 原子完成
 //   - 跨卷（EXDEV）：复制（校验 size + fsync + 还原元数据）后删源；
 //     任何失败保留源文件不删（安全优先）
-//   - 目标重名：name_1.ext 递增（file-deduplicator 风格）
+//   - 目标重名：O_EXCL 原子抢占 + name_1.ext 递增（见 claimDst）
 //
 // 返回目标完整路径。
 func MoveFile(src, targetDir string) (string, error) {
@@ -26,17 +26,22 @@ func MoveFile(src, targetDir string) (string, error) {
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return "", err
 	}
-	dst := uniqueDst(targetDir, filepath.Base(src))
+	dst, err := claimDst(targetDir, filepath.Base(src))
+	if err != nil {
+		return "", err
+	}
 
-	if err := renameFile(src, dst); err == nil {
-		return dst, nil // 同卷快路径
+	if err := renameFile(src, dst.path); err == nil {
+		return dst.path, nil // 同卷快路径
 	} else if !isCrossDevice(err) {
+		dst.release()
 		return "", fmt.Errorf("移动失败: %w", err)
 	}
 
 	// 跨卷：复制 → 校验 → 还原元数据 → 删源
 	st, err := os.Stat(src)
 	if err != nil {
+		dst.release()
 		return "", err
 	}
 	// AS-H4（2026-09-20 全仓审计）：复制可持续数秒到数分钟，是全部已加固点里
@@ -45,22 +50,23 @@ func MoveFile(src, targetDir string) (string, error) {
 	// 账本还记 done。因此复制前经已开句柄取身份，删源前复核路径仍指向同一文件。
 	srcID, err := pathIdentity(src)
 	if err != nil {
+		dst.release()
 		return "", err
 	}
-	if err := copyVerifyFile(src, dst, st); err != nil {
-		os.Remove(dst) // 清理半成品
+	if err := copyVerifyFile(src, dst.path, st); err != nil {
+		dst.release() // 清理半成品（仅当占位仍属于我们）
 		return "", err
 	}
 	if !identityStill(src, srcID) {
 		// 不删源，也不把这次算成功：两份并存交给用户核对，
 		// 代价远小于替用户删掉一个他没打算删的第三方文件。
-		return dst, fmt.Errorf("已复制到 %s，但源文件在复制期间被替换（inode 已变化）："+
-			"为避免误删第三方文件**未删除源**，两份并存，请核对后自行处理其一: %s", dst, src)
+		return dst.path, fmt.Errorf("已复制到 %s，但源文件在复制期间被替换（inode 已变化）："+
+			"为避免误删第三方文件**未删除源**，两份并存，请核对后自行处理其一: %s", dst.path, src)
 	}
 	if err := removeSrc(src); err != nil {
-		return dst, fmt.Errorf("已复制但删除源失败（两份并存）: %w", err)
+		return dst.path, fmt.Errorf("已复制但删除源失败（两份并存）: %w", err)
 	}
-	return dst, nil
+	return dst.path, nil
 }
 
 // HardlinkMerge 硬链接合并（M3-T05）：冗余路径替换为指向 keep 的硬链接。
@@ -105,11 +111,11 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if !backupOwnershipStill(backup, dupID) {
+		return abandonForeignBackup(backup, dup, tmp)
+	}
 	if err := hardlinkRename(tmp, dup); err != nil {
-		// 替换失败：尽力把备份恢复回 dup 路径，并清理临时硬链接。
-		_ = hardlinkRename(backup, dup)
-		_ = os.Remove(tmp)
-		return err
+		return rollbackAfterSwapFailure(backup, dup, tmp, err)
 	}
 	// 收尾复核（见函数头注释）：确认 dup 现在真的是 keep 的那个文件。
 	// 这里的证据是「同文件」而非「无错误」——两者在 Windows 上不等价。
@@ -129,23 +135,11 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		}
 		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", err, backup)
 	}
-	// 合并成功：删除原独立副本。
-	//
-	// 2026-09-19（缺陷：残留 .fdd-old 污染后续扫描）：此处原先写作
-	// `_ = os.Remove(backup)`，把删除失败**静默吞掉**。而 Windows 上
-	// 该失败很常见：杀软/索引器/资源管理器预览持有句柄时删除会返回
-	// ERROR_SHARING_VIOLATION。此时链接虽已建立，但一份与原文件逐字节
-	// 相同的 .fdd-old 被永久留在用户目录里；由于它以用户文件名开头、
-	// 不以 "." 开头，扫描器的隐藏跳过规则对它无效 → 下次扫描必然把它
-	// 与被保留的文件配成一个"重复组"。用户看到的就是
-	// 「明明做过硬链接合并，重扫还是有一堆重复文件」。
-	//
-	// 处置：链接已成立，不把整个操作判失败（那会让用户以为没合并）；
-	// 但把残留如实回报，由上层提示用户，且扫描侧已同步忽略该名字
-	// （IsWorkTempName），双重兜底。
-	if err := workTempRemove(backup); err != nil {
+	// 合并成功：删除原独立副本的备份。删除失败与"backup 位被第三方顶替"
+	// 都不推翻结果，但必须如实回报残留（理由见 removeOwnBackup 与 merge_guard.go）。
+	if err := removeOwnBackup(backup, dupID); err != nil {
 		_ = os.Remove(tmp) // 确保临时硬链接不残留（本已不指向任何用户可见名）
-		return &ResidueError{Path: backup, Err: err}
+		return err
 	}
 	return nil
 }
@@ -158,9 +152,15 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 type ResidueError struct {
 	Path string
 	Err  error
+	// Note 覆盖默认文案。用于残留**不是我们的文件**的场合（M1：backup 位被
+	// 第三方顶替）——默认文案"请手动删除"在这种情况下会引导用户删掉别人的文件。
+	Note string
 }
 
 func (e *ResidueError) Error() string {
+	if e.Note != "" {
+		return e.Note
+	}
 	return fmt.Sprintf("合并已完成，但临时文件 %s 未能删除（可能被其他程序占用），"+
 		"请手动删除；它不会影响链接本身，扫描也已自动忽略该名字", e.Path)
 }
@@ -254,27 +254,71 @@ func restoreMeta(dst string, st os.FileInfo) error {
 	return os.Chtimes(dst, time.Now(), st.ModTime())
 }
 
-// uniqueDst 目标重名递增：name.ext → name_1.ext → name_2.ext ...
-func uniqueDst(dir, name string) string {
-	dst := filepath.Join(dir, name)
-	if !dstExists(dst) {
-		return dst
-	}
+// claimedDst 是一个**已经抢到**的目标位置：路径 + 我们在该路径上创建的
+// 0 字节占位文件的身份。
+type claimedDst struct {
+	path string
+	id   fsid.ID
+}
+
+// claimDst 原子抢占目标名：O_CREATE|O_EXCL 建 0 字节占位，抢到即拥有；
+// EEXIST 才递增到 name_1.ext → name_2.ext ...
+//
+// 取代原先 uniqueDst + dstExists 的"先查后用"组合（M2），一并修掉两个窗口：
+//   - 查询与使用之间第三方把文件放进那个名字 → 我们的 rename / 复制的 O_TRUNC
+//     会**静默覆盖**它；
+//   - dstExists 用 os.Stat 判断占用，而 Stat 会跟随链接、且把所有非 nil 错误
+//     一律当作"不存在"——悬空符号链接在 Stat 眼里等于空位，在 rename 眼里却是一个
+//     有主的位置。
+//
+// 抢占失败的真错误（目录不可写、只读卷）如实返回，不再"放行这个名字、
+// 赌下一步的破坏性动作会报错"——赌输的代价是别人的文件。
+//
+// 仍留一个不可消除的残余窗口：第三方先删掉我们的占位、再在同一位置建自己的文件，
+// 随后我们改名覆盖。那需要主动针对本次操作做删除+重建，不属于同步盘/下载器
+// 被动落子的形态；Go 标准库没有 NOREPLACE 改名原语，加一次身份复核也只是把
+// 微秒级窗口缩成微秒级窗口，故不写这道无法证伪的守卫。
+func claimDst(dir, name string) (claimedDst, error) {
 	ext := filepath.Ext(name)
 	base := name[:len(name)-len(ext)]
-	for i := 1; ; i++ {
-		dst = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, i, ext))
-		if !dstExists(dst) {
-			return dst
+	for i := 0; ; i++ {
+		n := name
+		if i > 0 {
+			// 序号插在扩展名**之前**（a.fdd-restored_1.bin）：扫描侧按同一
+			// 形态识别应用工作临时名，改动会让两边判据脱钩（AS-R1）。
+			n = fmt.Sprintf("%s_%d%s", base, i, ext)
+		}
+		p := filepath.Join(dir, n)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		switch {
+		case err == nil:
+			_ = f.Close()
+			id, ierr := pathIdentity(p)
+			if ierr != nil {
+				// 占位已经抢到（名字归我们处置），只是取不到身份：
+				// 按"未解析"返回，与全仓 identityStill 的 fail-open 口径一致。
+				return claimedDst{path: p}, nil
+			}
+			return claimedDst{path: p, id: id}, nil
+		case errors.Is(err, os.ErrExist):
+			continue
+		default:
+			return claimedDst{}, fmt.Errorf("无法占用目标名 %s: %w", p, err)
 		}
 	}
 }
 
-// dstExists 仅 ENOENT 视为不存在；其他 Stat 错误（权限等）也放行该名——
-// 后续 Create/Rename 会暴露真实错误，避免持续错误导致无限递增死循环。
-func dstExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
+// stillOurs 占位是否仍是我们创建的那一个。
+func (c claimedDst) stillOurs() bool { return identityStill(c.path, c.id) }
+
+// release 放弃时清掉占位。两种情况必须不动手：没抢到（零值）、
+// 抢到的位置已被第三方换掉。原实现在复制失败分支里无条件 `os.Remove(target)`，
+// 而"原位被占→另名恢复"分支的 target 可能等于用户已有的 OrigPath——那一下删的是别人的文件。
+func (c claimedDst) release() {
+	if c.path == "" || !c.stillOurs() {
+		return
+	}
+	_ = os.Remove(c.path)
 }
 
 // isCrossDevice 仅把真实的 EXDEV 判定为跨卷。

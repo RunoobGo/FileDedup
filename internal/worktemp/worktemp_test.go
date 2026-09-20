@@ -21,7 +21,7 @@ func TestIsTempNameRecognizesEveryRegisteredMarker(t *testing.T) {
 		for _, stem := range stems {
 			var names []string
 			if f.inserted {
-				// 插入式：标记在扩展名之前，并覆盖 uniqueDst 的 _N 递增档
+				// 插入式：标记在扩展名之前，并覆盖 claimDst 的 _N 递增档
 				ext := extOf(stem)
 				base := strings.TrimSuffix(stem, ext)
 				names = []string{
@@ -52,13 +52,13 @@ func extOf(name string) string {
 }
 
 // TestIsTempNameRecognizesDedupNumberedForms AS-R1（2026-09-20 全仓审计）：
-// uniqueDst 的重名递增会把 `_N` 插在扩展名**之前**，于是
+// claimDst（原 uniqueDst）的重名递增会把 `_N` 插在扩展名**之前**，于是
 // `a.fdd-restored.bin` 的第二次恢复落成 `a.fdd-restored_1.bin`——
 // 判定收紧为"生成形态"后这一档不再被认出，恢复产物重新参与重复分组，
 // 正是缺陷 6 的复发形态（用户看到"刚恢复的文件又变重复"）。
 func TestIsTempNameRecognizesDedupNumberedForms(t *testing.T) {
 	positives := []string{
-		"a.fdd-restored_1.bin",         // uniqueDst 对 a.fdd-restored.bin 递增
+		"a.fdd-restored_1.bin",         // claimDst 对 a.fdd-restored.bin 递增
 		"a.fdd-restored_12.jpg",        // 序号多位
 		"中文名.fdd-restored_3.docx",      // 非 ASCII
 		"a_1.fdd-restored",             // 无扩展名时序号落在标记之前（现形即认得）

@@ -114,7 +114,7 @@ func TestUndoTrashOrigOccupiedUsesRestoredName(t *testing.T) {
 }
 
 // TestUndoTrashSecondOccupiedLandsAsWorkTemp AS-R1（2026-09-20 全仓审计）端到端：
-// 原位与 a.fdd-restored.bin 都被占时，第二次恢复经 uniqueDst 落到
+// 原位与 a.fdd-restored.bin 都被占时，第二次恢复经 claimDst 落到
 // a.fdd-restored_1.bin —— 序号插在扩展名**之前**，把标记与扩展名隔开了。
 // 这个名字必须仍被 worktemp 认出来，否则恢复产物会重新参与重复分组，
 // 用户看到的还是缺陷 6 那句「刚恢复的文件重扫又变重复」。

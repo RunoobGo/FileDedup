@@ -38,7 +38,7 @@ func TestWalkSkipsWorkTempResidue(t *testing.T) {
 	mk("dup.bin.fdd-tmp", "identical-payload")      // 中断留下的临时硬链接
 	mk("dup.bin.fdd-old.undo", "identical-payload") // 回滚暂存
 	mk("photo.jpg.fdd-restored.jpg", "identical-payload")
-	// AS-R1：原位与 a.fdd-restored.jpg 都被占时，uniqueDst 把 _N 插在扩展名之前
+	// AS-R1：原位与 a.fdd-restored.jpg 都被占时，claimDst 把 _N 插在扩展名之前
 	mk("photo.jpg.fdd-restored_2.jpg", "identical-payload")
 
 	// 用户正常文件：必须仍被收集，绝不能被误忽略

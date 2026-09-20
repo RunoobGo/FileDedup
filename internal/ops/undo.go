@@ -114,25 +114,32 @@ func undoTrash(it UndoItem) (string, error) {
 		return "", err
 	}
 	target := it.OrigPath
+	var claim claimedDst
 	if _, err := os.Lstat(it.OrigPath); err == nil || !os.IsNotExist(err) {
 		// Lstat 报非 ENOENT 的错误时同样另名恢复：rename 会静默覆盖已存在目标
 		base := filepath.Base(it.OrigPath)
 		ext := filepath.Ext(base)
 		name := strings.TrimSuffix(base, ext) + FddRestoreMark + ext
-		target = uniqueDst(filepath.Dir(it.OrigPath), name)
+		c, err := claimDst(filepath.Dir(it.OrigPath), name)
+		if err != nil {
+			return "", err
+		}
+		claim, target = c, c.path
 	}
 	if err := renameFile(it.DestPath, target); err != nil {
 		if !isCrossDevice(err) {
+			claim.release()
 			return "", fmt.Errorf("恢复失败: %w", err)
 		}
 		// AS-H4 同型（2026-09-20 全仓审计）：回收站侧文件在复制窗口内同样可能被
 		// 第三方以 rename 顶替，而这里原先按路径盲删。复制前取身份、删前复核。
 		srcID, err := pathIdentity(it.DestPath)
 		if err != nil {
+			claim.release()
 			return "", err
 		}
 		if err := copyVerifyFile(it.DestPath, target, st); err != nil {
-			os.Remove(target)
+			claim.release()
 			return "", err
 		}
 		if !identityStill(it.DestPath, srcID) {

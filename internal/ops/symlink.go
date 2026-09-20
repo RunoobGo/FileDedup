@@ -90,12 +90,13 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if !backupOwnershipStill(backup, dupID) {
+		return abandonForeignBackup(backup, dup, tmp)
+	}
 
 	// ---- 步骤 4：临时链接原子顶替 dup 位置 ----
 	if err := hardlinkRename(tmp, dup); err != nil {
-		_ = hardlinkRename(backup, dup) // 还原原文件
-		_ = os.Remove(tmp)
-		return err
+		return rollbackAfterSwapFailure(backup, dup, tmp, err)
 	}
 
 	// ---- 步骤 5：终局复核 ----
@@ -124,12 +125,10 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	}
 
 	// ---- 成功：删除备份 ----
-	// 删除失败不推翻结果（链接已建立、数据只剩一份），但必须如实回报残留：
-	// 备份与保留项逐字节相同，若被留在用户目录里，下次扫描会把它与保留项
-	// 配成一个"重复组"——正是缺陷 6「做过合并的文件重扫又变重复」的成因。
-	// 扫描侧已同步忽略该名字（worktemp.IsTempName），此处如实回报形成双重兜底。
-	if err := workTempRemove(backup); err != nil {
-		return &ResidueError{Path: backup, Err: err}
+	// 删除失败与"backup 位被第三方顶替"都不推翻结果，但必须如实回报残留
+	// （理由见 removeOwnBackup 与 merge_guard.go）。
+	if err := removeOwnBackup(backup, dupID); err != nil {
+		return err
 	}
 	return nil
 }

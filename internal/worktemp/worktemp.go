@@ -68,8 +68,8 @@ var forms = []form{
 //     一层 .undo）；
 //   - 插入式：仅 .fdd-restored，插在扩展名之前，即标记之后要么到名尾、
 //     要么以 "." 开头接扩展名；
-//   - ★ AS-R1：以上形态再经 ops.uniqueDst 的重名递增后，`_N` 会插在扩展名
-//     之前（a.fdd-restored.bin → a.fdd-restored_1.bin）。这一档以前漏登记，
+//   - ★ AS-R1：以上形态再经 ops.claimDst（原 uniqueDst）的重名递增后，`_N` 会插在
+//     扩展名之前（a.fdd-restored.bin → a.fdd-restored_1.bin）。这一档以前漏登记，
 //     恢复产物因此重新参与重复分组——缺陷 6 的复发形态。
 //
 // 判定大小写敏感：我们生成时固定用小写 ".fdd-"；用户若真有 "x.FDD-old"，
@@ -100,7 +100,7 @@ func IsTempName(name string) bool {
 // isExtStart 标记之后直接接扩展名（".jpg"、无扩展名时为空串）。
 func isExtStart(rest string) bool { return rest == "" || rest[0] == '.' }
 
-// isNumberedExt 标记之后是 uniqueDst 的递增序号再接扩展名："_1.jpg"、"_12"。
+// isNumberedExt 标记之后是 claimDst 的递增序号再接扩展名："_1.jpg"、"_12"。
 //
 // 必须**纯数字 + 可选的 .扩展名**，否则 "a.fdd-restored_backup.txt"
 // 这类用户文件会被连带忽略（漏扫比残留更难被发现）。

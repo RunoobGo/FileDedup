@@ -474,9 +474,9 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		}, onPanic)
 
 	case "move":
-		// 串行（安全优先）：MoveFile 的目标重名递增（uniqueDst）是「先查后用」，
-		// 并发处理同目录同基名文件时两个 worker 会选中同一目标名，后写者覆盖前者
-		// → 静默数据丢失。该风险高于并发收益，故此处不做并发（01 §9 安全语义）。
+		// 串行。历史上这里的理由是「uniqueDst 先查后用，两个 worker 会挑到同一目标名，
+		// 后写者覆盖前者」（M2）；该缺陷已随 claimDst 的原子抢占修掉，串行不再是为了
+		// 正确性，只是为了保留逐项取消检查与既有落位顺序。放开并发属独立优化，本批不做。
 		for i, e := range toProcess {
 			if ctx.Err() != nil {
 				break // move 串行执行，取消后立即停止派发（P2）
