@@ -15,7 +15,7 @@
 | 1 | 系统保护清单 + Windows 保留名 | §2.4 | C 组 4 | §2 | ✅ | ✅（划账见 04 §6.9.1） |
 | 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ✅（含 §3.0 实测证据） | ✅（划账见 04 §6.9.3） |
 | 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ✅（含 §4.0 取证，并**推翻总纲两条判据前提**） | ✅（划账见 04 §6.9.4；§4.4 末尾有本稿首版预测的两处修正） |
-| 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ⬜ | ⬜ |
+| 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ✅（含 §5.0 取证，E7 纠正了本稿动手前的结构布局印象） | ⬜ |
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ⬜ | ⬜ |
 
 ## 1. 适用于全部四项的通用约束
@@ -599,3 +599,165 @@ blob，`history/scan.go:20`）、前端 `emptyFilters()` 缺字段，三种情�
   `Filters` 类型字段与默认值（`wails.ts:4-11`、`scan.ts:13-20`），理由是**防止
   settings 往返静默丢字段**（前端把整个 `filtersDefault` 写回），这不是呈现层改动。
   结果页"已跳过 N 个云端占位文件"横幅与 `AllowCloudHydration` 的复选框属 **M8**。
+
+---
+
+## 5. M6-P3：Windows 备用数据流（ADS）防护（总纲 §2.3 / 04 §6.7 C 组 3）
+
+> 修的是什么：NTFS 上一个文件可以挂多条数据流（`report.txt` + `report.txt:note:$DATA`）。
+> 本产品的**全部判据只看默认流**（扫描按逻辑大小、哈希按默认流内容），于是两个"默认流
+> 逐字节相同、备用流完全不同"的文件会被判成重复；把其中一份移走/删除/换成链接，它自己
+> 那些命名流就**永久消失**。这不是"少省一点空间"，是**静默丢用户数据**。
+
+### 5.0 动手前取证（2026-09-21，MSDN 原文 + GOROOT 读数）
+
+| # | 取证项 | 读数 | 出处 |
+|---|---|---|---|
+| E1 | 无 cgo / 无 x/sys 的前提下调 Win32 的既有路子 | 仓库已有 **5 个文件**在用 `syscall.NewLazyDLL(...).NewProc(...)`：`internal/fsid/fsid_windows.go:56-59`、`internal/realbytes/realbytes_windows.go:29-30`、`internal/ops/winreg_windows.go:39-45`、`internal/ops/trash_windows.go:48-53`、`internal/ops/symlink_windows.go:34` | 本机 grep |
+| E2 | 需要的三个 stdlib 支撑点是否齐 | `syscall.FindClose(handle Handle) error` **已导出**；`syscall.InvalidHandle = ^Handle(0)`；`syscall.UTF16PtrFromString` | GOROOT `src/syscall/zsyscall_windows.go:607`、`syscall_windows.go:265,23,113` |
+| E3 | 枚举 API 签名 | `HANDLE FindFirstStreamW(LPCWSTR lpFileName, STREAM_INFO_LEVELS InfoLevel, LPVOID lpFindStreamData, DWORD dwFlags)`；`FindStreamInfoStandard = 0` 是**唯一**取值；`dwFlags` 保留、必须为 0；失败返回 `INVALID_HANDLE_VALUE`，扩展错误看 `GetLastError` | MSDN `fileapi/nf-fileapi-findfirststreamw` |
+| E4 | 两个"必须放行"的错误码 | **无流可找 → `ERROR_HANDLE_EOF`(38)**；**文件系统不支持流 → `ERROR_INVALID_PARAMETER`(87)** | 同上（Return value 段两条原文） |
+| E5 | 默认流长什么样 | Remarks 原文："For files, this is **always** the default, unnamed data stream, `::$DATA`"；目录没有默认无名流，但可以有命名流 | 同上 |
+| E6 | 流名字符串格式 | Members 原文：`The name of the stream. The string name format is ":streamname:$streamtype"` | 同上 + `ns-fileapi-win32_find_stream_data` |
+| E7 | ★ 缓冲区结构的**真实**布局（本项最容易写错的一处） | `typedef struct _WIN32_FIND_STREAM_DATA { LARGE_INTEGER StreamSize; WCHAR cStreamName[MAX_PATH + 36]; }` → **8 + 296×2 = 600 字节，名字在 offset 8** | MSDN `ns-fileapi-win32_find_stream_data` |
+| E8 | 循环终止条件 | `BOOL FindNextStreamW(HANDLE, LPVOID)`：成功非零、失败零；**"If no more streams can be found, GetLastError returns `ERROR_HANDLE_EOF` (38)"** → 终止靠 **38**，不是 `ERROR_NO_MORE_FILES`(18) | MSDN `nf-fileapi-findnextstreamw` |
+| E9 | **接入点只有一处**（总纲 §2.3 写"`ops/verify.go` 执行前"，实测更精确） | 五种 `op.Kind`（`trash`/`delete`/`move`/`hardlink`/`symlink`，`executor.go:359`）**全部**只处理进了 `toProcess` 的项，而 `toProcess` 唯一来源是 `:213-241` 那道校验循环 → 守卫加在这一处即覆盖全部破坏性动作，不必五处各加一遍 | 读码 |
+| E10 | 到底哪一侧会丢流（决定"守 dup 还是守 keep"） | 被操作的 dup：`trash`/`delete` 连文件记录一起消失；跨卷 `move` 走"复制+删源"，复制只覆盖默认流；`hardlink`/`symlink` merge 把 dup 路径换成指向 keep 的链接，**dup 自己的文件记录连同其命名流一起被替换**。keep 侧：合并后 dup 路径即 keep 的文件记录，keep 的全部流原样在 → **只守 dup**（`executor.go:516` 那次 `VerifyFile(src,…)` 是内容校验，不涉及销毁） | 读码 |
+
+**E7 值得单独记一笔**：动手前我对这个结构的印象是"内嵌一份 `WIN32_FIND_DATAW`"
+（那样 `cStreamName` 在 offset 52，且总尺寸是 8+592=600 的另一套算法碰巧同值）。查文档
+才确认它是**扁平**的 `{LARGE_INTEGER; WCHAR[296]}`。两种猜法的差别只在偏移，而**猜错偏移
+的表现恰好是最坏的一种**：从 offset 52 读到的是零长字符串 → "没有任何命名流" →
+守卫在 Windows 上**恒放行**，全套门禁全绿（判据层是纯函数，测的是名字列表，
+不知道胶水递上来的是一串空）。所以本项除尺寸钉（照 `fsid_windows.go:41-53` 的
+`_ [600 - unsafe.Sizeof(...)]byte` 手法）之外，还必须有一条"真机上枚举到的第一个名字
+必须是 `::$DATA`"的钉（§5.4 V8），否则 E7 这类错在 Linux 上无从暴露。
+
+### 5.1 分层与 API 形状（对齐 §1 约束 1）
+
+`internal/ads/`，与 `sysguard`/`realbytes`/`cloudfile` 同族：**全部判定在无 tag 文件里**，
+带 tag 的文件只 `proc.Call` 一次并把 `errno` 交给无 tag 层分类。
+
+```go
+// ads.go（无 tag）——判据与分类表，Linux 主门禁里全部可执行
+func StreamIsNonDefault(name string) bool          // E6 格式：":<名字>:$<型别>"，中段非空即是
+func HasNonDefault(names []string) bool             // 任一为真
+type ErrKind int                                     // ErrNone/ErrNoStreams/ErrFSNoStreams/
+                                                     // ErrMissing/ErrDenied/ErrOther
+func Classify(errno uintptr) ErrKind                 // 38/87/2,3/5/其余——E4 的表在**这一层**
+func Decide(names []string, k ErrKind) Outcome       // Allow / Reject(reason)，fail-closed 表在此
+const ( errHandleEOF = 38; errInvalidParameter = 87; errFileNotFound = 2
+        errPathNotFound = 3; errAccessDenied = 5 )   // 本地抄录并附出处（同 crossdevice_windows.go）
+
+// probe_windows.go（//go:build windows）：FindFirstStreamW + FindNextStreamW 循环，
+//   命中非默认流即提前停（不必枚举完）；FindClose 收尾；只把 names 与 errno 交上去。
+// probe_other.go（!windows）：不枚举，直接 (nil, ErrNone) + 一条"本平台无 ADS 语义"的注释。
+```
+
+三层分离的理由：**"哪些错误码要放行"是安全决策，不是平台细节**。把它放在无 tag 层，
+`ErrDenied → Reject` 这条在 Linux CI 里就是可断言的（M-P3-e 变异专门打它）；放在
+windows 文件里就等于"这条决策只有 Windows runner 能测"，而本仓没有。
+
+`Decide` 返回带**原因文案**的 `Outcome`，两档文案（总纲给的是第一条）：
+
+- 命中备用流：`文件含备用数据流，去重会丢失备用流内容，已拒绝操作`
+- 无法确定（`ErrDenied`/`ErrOther`）：`无法确认文件是否存在备用数据流（%s），为避免丢失其内容已拒绝操作`
+
+**fail-closed 表**（这是本项最需要写清楚的取舍）：
+
+| `ErrKind` | 处置 | 为什么 |
+|---|---|---|
+| `ErrNone`（枚举成功） | 按 `names` 判 | 正常路径。文件的第一个流恒为 `::$DATA`（E5） |
+| `ErrNoStreams`(38) | **Allow** | 一个 `$DATA` 流都没有 = 无从谈起备用流。文件侧罕见（E5 说恒有默认流），主要出现在目录与竞态 |
+| `ErrFSNoStreams`(87) | **Allow** | **文件系统不支持流**：exFAT/FAT U 盘、部分网络盘。判拒绝等于让这些卷上"每次清理都被拒"，而它们本来根本不可能有 ADS |
+| `ErrMissing`(2/3) | **Allow** | 文件已消失。既有语义里这属 `VerdictSkipped` 的邻居（S8：目标已达成），且紧接着的 `MoveFile`/`Trash` 会给出自己的真实错误。**不放行**就会把"文件不见了"报成"有备用流"，属于说谎 |
+| `ErrDenied`(5) | **Reject** | 无法确定。与 `identityStill` 的同族决策一致（`verify.go:104-108` 注释原文："宁可拦一次让用户重扫，也不放行一次可能覆盖他人文件的操作"） |
+| `ErrOther` | **Reject** | 未知即不赌。丢数据不可回撤，多拦一次可重扫 |
+
+长路径：`FindFirstStreamW` 的 `lpFileName` 文档写"fully qualified file name"，而
+`\\?\` 之外的路径是否受 MAX_PATH 限制**未文档化**（本仓 `realbytes_windows.go:46` 已经把
+"超过 MAX_PATH 且未加前缀"列为已知失败形态，且 `longPathAware` 真机未复测，见 01 勘误表）。
+处置：**不改判据**，让 2/3 走 `ErrMissing → Allow`，并在划账里明写"长路径上这条守卫可能
+静默失效（fail-open），与 M29/`longPathAware` 同一兑现缺口"。刻意**不**在此处加
+`\\?\` 重试：那会引入"前缀规范化对不对"这一整块新面积（UNC、相对段、`..`），
+而本项的动机场景（NTFS 备用流）与 >260 路径的交集很小，赌错的代价是放行——
+与"多加一层未验证的字符串处理"相比，前者更可接受。**这条判断本身登记为开放项**（M33），
+不当成已解决。
+
+### 5.2 接入点与计数
+
+`internal/ops/executor.go` 校验循环的 `default:` 分支（`:236` 旁）之前插一道守卫，
+即"内容校验已通过、正要进 `toProcess`"的那一刻：
+
+```go
+default:
+    if oc := adsCheck(e.Path); oc.Reject {      // 接缝 var adsCheck = ads.Check（测试注入）
+        res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ads", Err: oc.Reason})
+        emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: oc.Reason})
+        report(e.Path)
+        continue
+    }
+    toProcess = append(toProcess, e)
+```
+
+- **记 `Failed` 而不是新增计数**：这里与 M6-P1 相反，因为语境不同——扫描期的"跳过"
+  是引擎替用户省流量（用户没要求操作），执行期的"拒绝"是**用户已经点了清理、这一项
+  没做成**。后者必须进失败抽屉，且 `Stage` 用新值 `"ads"` 而非复用 `"verify"`，
+  否则"文件被改过"与"有备用流"两种处置建议完全不同的原因会被并成一条。
+- 不 `emitItem` 就等于说谎：写前日志（`OnItem`）是回撤账本的来源，拒绝项不入账。
+- `res.Reclaimed` 天然不受影响（没进 `toProcess` 就不参与落账），但**必须有用例钉住**
+  （M-P3-h：把拒绝记成 `Skipped` 会污染释放口径）。
+- 下发面零改动：`OpsResult.Failed` 与 `ItemResult.Err` 已经透传到界面（M15/M18 的
+  `utils/opdisplay` 只格式化字节数，文案原样显示）。
+- **不加扫描期计数**（"这个盘上有 N 个文件带备用流"）：`FindFirstStreamW` 每文件一次
+  枚举不是免费的（`realbytes` 那次额外查询已经登记为 M29），而 ADS 只在**动手时**才致命。
+  登记为 M34，不当成本项已交付。
+
+### 5.3 与既有判据的关系（不改的东西，写清楚免得将来被当漏写）
+
+- **不改哈希判据**：备用流内容不参与 BLAKE3，所以"默认流相同即重复"这一条**今天仍然成立**，
+  本项只在动手前拦一道。真要把备用流算进身份属另一个量级的工作（每文件两次枚举 + 
+  判据重做），登记 M35。
+- **不改 `!IsRegular()`**：NTFS 上目录也可能有命名流（E5），但目录进不了语料，无从操作。
+- **macOS 的资源分叉 / Linux 的 xattr 不在本项范围**：HFS 时代的 `._` AppleDouble 是
+  **独立文件**（会被当普通文件参与去重，那是另一个问题）；xattr 随 inode 走，硬链接共享、
+  删除才消失，与 NTFS"命名流随文件记录一起替换"的语义不同。`probe_other.go` 明确写
+  "本平台无此语义"，不猜。
+
+### 5.4 探针（修前必红清单）与变异表
+
+| # | 用例 | 断言 | 修前为什么红 |
+|---|---|---|---|
+| V1 | `ads`：`StreamIsNonDefault` / `HasNonDefault` | `::$DATA`→假；`:note:$DATA`、`:Zone.Identifier::$DATA`、`:report:$BITMAP`→真；空串/无冒号/只有尾部 `:$DATA` 的畸形串→假（**宽判据但不误伤默认流**） | 包不存在 → 编译红 |
+| V2 | `ads`：`Classify` 六个 errno | 38→`ErrNoStreams`、87→`ErrFSNoStreams`、2 与 3→`ErrMissing`、5→`ErrDenied`、997→`ErrOther` | 同上 |
+| V3 | `ads`：`Decide` 的 fail-closed 表（**逐格**） | Allow/Reject 两两不混；`ErrDenied`/`ErrOther` 必须 Reject 且文案含"已拒绝" | 同上 |
+| V4 | `executor`：注入"有备用流"→ 该项 `Failed`、`Stage=="ads"`、文案精确、**文件仍在原位** | 拦得住且真不动手 | 无 `adsCheck` 接缝 → 编译红 |
+| V5 | `executor`：注入 `Allow` → 照常执行（反向对照，证明 V4 不是恒拒） | 文件被移走/进回收站 | 同上 |
+| V6 | `executor`：**五种 Kind 逐个跑**（`trash`/`delete`/`move`/`hardlink`/`symlink`），每种都必须被拦 | 钉住 E9"接入点只有一处"的结论 | 同上 |
+| V7 | `executor`：拒绝项不进 `res.Reclaimed`/`res.LinkedBytes`，且 `OnItem` 收到 `State:"failed"` | 释放口径与回撤账本不被污染 | 同上 |
+| V8 | `//go:build windows`：真机 NTFS 上 `StreamIsNonDefault(第一个流名) == false`，且**名字以 `::$DATA` 结尾** | 钉住 E7 的偏移：读错偏移会拿到空串而全绿，这一条专门不让它绿 | 无 runner → 只到 `GOOS=windows go vet`，**未兑现** |
+
+| # | 变异 | 应变红 |
+|---|---|---|
+| M-P3-a | `StreamIsNonDefault` 恒 false（判据失效） | V1、V4、V6 |
+| M-P3-b | 恒 true（默认流也算备用流） | V1、V5 |
+| M-P3-c | 默认流识别改成大小写敏感（`::$data` 不再认作默认） | V1 的大小写用例 |
+| M-P3-d | `Classify(87)` 归 `ErrOther`（"该卷不支持流"当成异常） | V2、V3（exFAT 上恒拒就是这条） |
+| M-P3-e | `Classify(5)` 归 `ErrNoStreams`（拒绝读权限时**放行**） | V2、V3 —— 数据丢失方向，必须有独立杀手用例 |
+| M-P3-f | `Decide` 对 `ErrMissing` 改为拒绝 | V3 |
+| M-P3-g | 守卫只写在 `case "trash"` 分支里（即"接入点唯一"这个结论是错的） | V6 的 `move`/`hardlink`/`symlink` 三条 |
+| M-P3-h | 拒绝记成 `res.Skipped`（把"没做成"报成"已达成"） | V4 的 `Failed` 断言、V7 的落账断言 |
+
+### 5.5 未兑现与边界
+
+- **Windows 真机全部未兑现**（V8 与 `probe_windows.go` 本体）：无 runner，且**造夹具本身
+  也需要 NTFS**（`echo x > f.txt:note` 在 APFS/exFAT 上不会创建命名流）。兑现方式与
+  §3.4、§4.5 同档：`GOOS=windows go vet` + 无 tag 层的参数化断言，划账写"代码已改、
+  验证未兑现" → 登记 **M32**。
+- **长路径上可能 fail-open**（§5.1 末段）：>260 且未加 `\\?\` 时枚举报 2/3，按 `ErrMissing`
+  放行。刻意接受这个缺口，登记 **M33** 与 `longPathAware`（01 勘误表）同一兑现族。
+- **备用流不进身份判据**：本项只拦"动手那一步"，两个默认流相同、备用流不同的文件
+  仍会被**报成重复组**（用户看到"重复"，只是清理被拒）。登记 **M35**。
+- **不做扫描期 ADS 普查**：理由见 §5.2 末条，登记 **M34**。
+- **UI 文案未定制**（裁定③）：`Stage=="ads"` 会随既有失败抽屉原样显示中文原因，
+  但界面上没有"什么是备用数据流 / 怎么办"的解释位，属 M8。
