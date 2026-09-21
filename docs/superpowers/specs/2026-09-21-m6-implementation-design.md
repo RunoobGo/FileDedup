@@ -2349,3 +2349,109 @@ G1~G11 全部由本轮 grep/读码现取，无一条来自上一轮的记忆。�
 7. **等价性锁（P-3）无红可取这一点照旧成立**，且其价值在 M-M64-b 下被反向兑现：
    `TestSlashBackslashLegMatchesOldThreeCopies` 与 `TestTrimTailKeepRootMatchesSysguardNormalize`
    正是那批先红的用例——锁里的 `gold*` 独立基准不依赖被测实现，所以实现一变形它必然红。
+
+## 17. 第六批：登记表内五条本机可验证项（M66/M68 根侧/M70/M52/M54）+ 两条复核后转待裁定（M62/M56；2026-09-21）
+
+范围来源：04 §6.11 登记表里标"✓ 本机可验证"且**未标"需裁定"**的后端项。挑了七条开码复核，
+结果是 **五条实施、两条转待裁定、一条拆半**——拆与转的理由全部写在 17.0，不在实施后补。
+
+### 17.0 动手前取证（登记原文 → 实际读到的代码 → 判定）
+
+| 登记 | 登记原文的关键断言 | 开码读到的现状 | 判定 |
+|---|---|---|---|
+| M66（SCN-4） | `sort.Strings` 排原样串、去重只回看 `kept` | `scanner.go:545` 排原样串，`:549-552` 的 `sens` 在排序**之后**算（所以按下标对齐没坏），`:553-577` 单向回看 `kept` | **成立**，且形状比登记多一步：排序早于 sens 计算 ⇒ 修法必须把 sens 上移，不能只换排序键 |
+| M68（SCN-6） | 根只 `Abs`+`Clean`，`ReadDir` 会跟随，"保护清单挡不住" | `:539-543` 确实无 `EvalSymlinks`；**但遍历内符号链接一律 `continue`（`:303-305`）⇒ 能被跟随的只有"根"这一处**。真后果只有两条：(a) `startUnprot:224-228` 按链接名判 ⇒ 界面**不警示**"这一片已脱离系统保护"；(b) 清单里 `eAbsPath` 型条目（按绝对路径匹配）在链接根下永不命中 | **拆半**：(a) 本轮修（一次 `EvalSymlinks`/根，零热路径）；(b) 不修 ⇒ 新登记 **M84** |
+| M70（FLT-2） | "`Compile(nil)` 承诺 Apply 恒 true"与 `f` 无条件解引用矛盾 | 承诺兑现得好好的：`filter.go:119-121` 有 nil 分支，`Apply:141`、`ExcludeDir:187` 各自先 `if m == nil` 短路 ⇒ **Matcher 侧没说谎**。真凶是 `scanner.go:349 !f.IncludeHidden` 与 `:394 !f.AllowCloudHydration` 解引用 `f *model.Filters`，而 `WalkWithGate` 的签名**从没承诺**可空；panic 被 `:273-281` 逐目录 recover 吞成一条 Failed | **成立但归因要改**：不是"文档与实现冲突"，是"遍历器自己吃下 nil 又靠 recover 兜"。修法因此落在 `WalkWithGate` 起首，不动 filter 的承诺 |
+| M52（OPS-11） | 三类"无从判定"被折进 `VerdictFailed`，一律套"文件在扫描后被修改" | `verify.go:43-56` open 非 ENOENT / `f.Stat` 失败 / **非普通文件与 stat 失败同在 `:52` 一个分支** / `HashFull` I/O 错 `:63` ⇒ 四处全折 Failed；"确实变了"只有 `:55`（size）与 `:71`（哈希）；文案在 `executor.go:239-240` | **成立且多一处分类**（非普通文件）。并发现一条**必须一起做的加固**：`executor.go:242` 的 `default:` 是"通过"分支，`:559`/`:613` 两个 keep 源 switch **无 default** ⇒ 新增枚举值只要有一处忘列，"无从判定"会被当"通过"放行破坏性动作 |
+| M54（OPS-13） | `identityStill` 分不出"已消失"与"被替换" | `verify.go:101-104` 的 `err != nil → false` 确实不分；六个调用点 `:403/:483/:502/:526/:547/:606` 逐字吻合；`gone` 集合在 `app.go:1898-1901`，**`res.Skipped` 与 `res.OK` 同路进 gone** ⇒ 改记 Skipped 就能同时清结果集与 `a.byID`；`delete` 分支 `:507-513` 已有 `os.IsNotExist → ocSkipped` 的可抄形状 | **成立** |
+| M62（FC-1） | "兜底不敏感" ⇒ 探测失败按敏感处理 | `probe` 的 `:134`/`:146` 返回的是 `Default()` = `defaultSensitive`，**只在 darwin/windows 为 false**（`default_insensitive.go:7`）⇒ "兜底不敏感"不是全平台性质。更要命的是反向危害：不可写**且真的不敏感**的卷（只读挂载的 exFAT/FAT 移动盘、无写权限的共享目录）改判"敏感"后，`/A` 与 `/a` 两种拼写不再合并 ⇒ 同一棵树走两遍 ⇒ 重复组与可释放空间虚高，正是包注释 `:7-9` 立项目标要防的方向 | **转待裁定**（不是缺陷修复而是取向选择）：两条路各有真危害，且修法必然改两条既有断言（`fscase_test.go:57`、`:124` 都断言 `== Default()`）。反向危害登记为 **M85** |
+| M56（OPS-14） | 回撤走 `claimExact(OrigPath)` | `undo.go:192` 走 `MoveFile(dst, dir(OrigPath))`：**原位空闲时本来就精确落回 OrigPath**，唯一差别在"原位被占时"的落点选择；而现有递增名是**安全**的（宁另名不覆盖），问题只是"记录显示的 OrigPath ≠ 实际落点"。登记的 `claimExact` 只解决"抢名"，抢不到仍要三选一（保持递增 / 改 `.fdd-restored` 与 `undoTrash:148-155` 同形 / 显式失败）。附带读到：`app.go:2166-2171` 见 `uerr != nil` 即丢弃 `restored` ⇒ 回撤侧没有"成功但告警"出口，而 `undo.go:173-176` 的 EXDEV 分支**已经在**返回 `(target, err)` 双值——那条告警同样把路径丢了 | **转待裁定**（落点契约）；"成功但告警丢路径"是新缺陷 ⇒ 登记 **M86** |
+
+**M66 的可测性取证（决定探针形状，比登记乐观）**：`dedupeRoots` 只做字符串工作 + `probeCaseSensitive`
+（已是包级变量注入点，`scanner.go:138`），**不碰盘**。所以探针直接调
+`dedupeRoots([]string{"/data/B/A", "/data/b"})` 并扮演"两卷都不敏感"，在 darwin 与 Linux CI
+上给出**同一个确定读数**——不需要真造两棵只差大小写的目录（那是 M36 V2 只能 `t.Skipf` 的形状）。
+
+**M54 的跨平台判据取证**：`fsid.FromPathNoFollow` unix 腿（`fsid_unix.go:27-33`）返回 `os.Lstat`
+的 `*PathError`，Windows 腿（`fsid_windows.go:128-130`）返回 `syscall.Errno`；两侧
+`errors.Is(err, os.ErrNotExist)` 都成立（Errno 自带 `Is`）。⇒ "已消失"判据是**一个纯函数、
+参数注入错误值**的 H6 形状，不需要真机。
+
+**M68(b) 为什么不做（M84 的理由）**：修它要在遍历期同时携带"展示路径"与"真实路径"两个键空间
+（队列元素从 `string` 变结构体、`visited`、`rootsUnder` 判据都要分叉）。而"干脆把 emitted
+Path 换成真实路径"这一条看似省事，实测代价是本机**全部** `t.TempDir()` 夹具：darwin 上
+`/var` 是 `/private/var` 的链接，`EvalSymlinks` 会把每个测试路径都改写 ⇒ 数十条既有断言变红。
+⇒ 属改动面裁定，登记不实施。
+
+### 17.1 判据（本批立的五条）
+
+1. **判重集合的入集顺序必须按比较键排序**（M66）。折叠后 `X` 是 `Y` 的前缀 ⇒ `fold(X) < fold(Y)`
+   恒成立，所以"按折叠键排序 + 单向回看"是充分的；按原样串排序则把判据交给码位（`'B' < 'b'`）。
+2. **根级"已脱离系统保护"的留痕判据要看穿符号链接**（M68-a），但**不改写 emitted 路径**：
+   留痕与展示是两件事，本轮只补前者。
+3. **`WalkWithGate` 的 `f == nil` 等于"全默认"**（M70），与 `filter.Compile(nil)` 的语义对齐；
+   兜底放在解引用侧而不是承诺侧，因为承诺已经兑现且被两处 nil 短路守着。
+4. **"无从判定"与"确认已变"分开成文，未知枚举值一律落 Failed**（M52）。第二半是第一半的
+   防线：`switch v` 的 `default:` 当前是放行分支，任何新增结论都会先命中它。
+5. **复核失败要分"已消失"与"被替换"**（M54）：前者按 S8 记 Skipped（与 `VerifyFile` 的
+   `VerdictSkipped`、`delete` 分支的 `os.IsNotExist` 同一口径），后者按 S1 记 Failed 拦截。
+   `identityStill` 的签名与 15 个调用点**一个都不动**，改为走 `identityStatus`（I5：一处判定）。
+
+### 17.2 改动面（生产文件）
+
+| 文件 | 改法 |
+|---|---|
+| `internal/scanner/scanner.go` | **M66**：`sens` 计算上移到排序之前，排序键改 `fscase.Fold`（同键再按原样串定序），`out`/`sens` 一并置换；判重循环 `:553-577` 一字不动。**M70**：`WalkWithGate` 起首 `if f == nil { f = &model.Filters{} }`。**M68-a**：`startUnprot` 循环内对每个根做一次 `filepath.EvalSymlinks`，解析成功且原样串不同 ⇒ 用**真实路径**再过一次 `guard.Dir`，命中则把**用户给的那条路径**记进 `startUnprot`（展示与警示仍用原样串） |
+| `internal/ops/verify.go` | **M52**：新增 `VerdictUnverifiable`；`verify.go:48`（open 非 ENOENT）/`:52`（stat 失败、非普通文件）/`:63`（`HashFull` I/O 错）三处改判它；`VerdictFailed` **语义与名字都不动**（= 确认内容已变）。**M54**：新增 `identityStatus(path, id) (still, gone bool)`，`identityStill` 改为 `still, _ := identityStatus(...)` |
+| `internal/ops/executor.go` | **M52**：`:233` switch 的 `default:` 换成显式 `case VerdictPass:` + 兜底 `default:`（记 Failed "未知校验结论"）；新增 `case VerdictUnverifiable:` 文案"无从判定（打不开/读不了/不是普通文件），已拦截"；`:559`/`:613` 各补 `case VerdictUnverifiable:`。**M54**：六处 `identityStill` 改 `identityStatus`，`gone` 走 `settle(ocSkipped)`；新增 `var verifyFileFn = VerifyFile` 测试接缝（与 `symlinkCreateFn`、`volumeIDOf` 同族） |
+| 新登记 | **M84**（M68-b：双键空间）、**M85**（M62 的反向危害）、**M86**（回撤侧成功但告警丢 `restored`）；M62/M56 两行加"转待裁定"括注（**原结论不改写**） |
+| `docs/04` | §6.11 登记表：M66/M68/M70/M52/M54 行标注本批处置，M62/M56 行加括注；新增 **§6.13** 划账 |
+
+测试文件新增（不改任何既有断言）：`internal/scanner/scanner_m66_m70_m68_test.go`、
+`internal/ops/verify_m52_m54_test.go`。
+
+### 17.3 探针（修前必红）
+
+| 探针 | 首轮预期 | 说明 |
+|---|---|---|
+| P-1 M66 排序键 | **红**：`dedupeRoots(["/data/B/A","/data/b"])` 在"两卷不敏感"扮演下返回 2 条 | 修后 1 条（宽根 `/data/b` 胜）。纯字符串 + 注入，两端同读数 |
+| P-2 M70 nil Filters | **红**：`Walk(ctx, []string{dir}, nil, 2)`（dir 内一子目录 + 一文件）得到 `len(res.Failed)==1`、`len(res.Files)==0` | 修后 Failed 0、Files 全收。这条同时钉住"panic 被 recover 吞成整目录漏扫"的形状 |
+| P-3 M68-a 链接根留痕 | **红**：根 = `base/link` → `base/lost+found`，`res.UnprotectedRoots` 为空 | 修后含 `base/link` 一条（原样串）。真夹具、真 `EvalSymlinks`，darwin/Linux 都能造 |
+| P-4 M52 三类分开成文 | **红**：目录当 `e.Path` 传入 → 现为 `VerdictFailed`；`chmod 0` 的文件 → 现为 `VerdictFailed`（后者需 `Geteuid()!=0` 守卫，照 `fscase_test.go:48` 形状） | 修后两条均为 `VerdictUnverifiable`；端到端断言 `res.Failed[0].Err` **不含**"被修改"二字 |
+| P-5 M52 未知枚举兜底 | **红**：把 `verifyFileFn` 接缝换成返回一个越界 `Verdict(99)` ⇒ 现状**落进 `default:` 放行**，文件被真删 | 修后记 Failed "未知校验结论"。这条是 17.1-4 第二半的门禁，不修则 M52 的加固等于没做 |
+| P-6 M54 已消失 vs 被替换 | **红**：接缝内 `VerifyFile` 返回 Pass 后把文件删掉 ⇒ 现状 `res.Failed` 含"已被替换、已拦截"，`res.Skipped` 空 | 修后 `res.Skipped` 命中、`res.Failed` 空；另两条 `identityStatus` 直测（删除 → `gone=true`；rename 顶替 → `gone=false`），并钉住"被替换"仍记 Failed |
+
+**既有钉子反向要求（改后必须仍绿、断言一字不动）**：`identity_still_test.go:153`
+（"路径已不存在 → identityStill 判否"）、`ops_test.go:346`/`:381`（篡改与 size 变化 → `VerdictFailed`）、
+`scanner_m36_test.go` 两条（遍历键不折）、`scanner_i2_i3_test.go` 的 M26 钉子。
+
+### 17.4 变异（每条：改坏 → 跑目标用例 → 抄原文 → 还原 → `shasum -c`）
+
+| # | 变异 | 目标 | 预期 |
+|---|---|---|---|
+| M17-a | 排序键换回 `sort.Strings`（sens 仍前置） | P-1 | 红（回到 M66 原状） |
+| M17-b | `WalkWithGate` 的 nil 兜底删掉 | P-2 | 红（回到 panic→Failed） |
+| M17-c | 根侧 `guard.Dir` 只用原样串（即修前形态） | P-3 | 红 |
+| M17-d | `executor.go` 的 `case VerdictPass:` 换回 `default:` 放行 | P-5 | 红 |
+| M17-e | 六处 `identityStatus` 里任一处把 `gone` 当"未消失"处理（只判 `!still`） | P-6 | 红（该处所在 op.Kind 的用例） |
+| M17-f | `identityStill` 改成"still 为真**或** gone 为真都算没被动过"（把"已消失"放行） | 全量 `go test ./internal/ops` | 红——必须被 `identity_still_test.go:153` 与 `symlink_test.go` 那批钉子杀掉；这条测的是"新函数没有悄悄放松旧判据" |
+
+预测允许被实测推翻；推翻时按 §16.6 的做法把"预测的包名表 vs 实测的包名表"的差集写进 17.6。
+
+### 17.5 交付判据
+
+每条一个"修前必红"真读数 + 修后真绿；全套 15 行门禁 rc 记录；不新增计数、不动前端
+（P-4 的文案改只影响 `FailedItem.Err` 字符串，前端 `FailedDrawer.vue:55` 原样渲染，无需配套改动）。
+
+### 17.6 边界与未兑现（写在动手前）
+
+1. **M68 只修一半**：链接根下的 `eAbsPath` 型条目依旧不命中（M84），本批不改遍历核心。
+2. **M62/M56 不实施**：取向与契约裁定（17.0 最后两行），等裁定后另起设计段。
+3. **Windows 腿零新增真机读数**：M52/M54 的分类判据走 `errors.Is`，Windows 侧只有
+   `go vet windows` rc=0 + 既有用例面的形态覆盖，**不写"Windows 已验证"**。
+4. **`identityStatus` 只服务 executor 六处**：`move.go:60/102/106`、`symlink.go:80/84/117`、
+   `merge_guard.go:44/90`、`undo.go:173` 十处**继续用 `identityStill`**——它们各自的处置语义
+   与"要不要区分已消失"并不一致（如 `merge_guard.go:90` 是刻意 fail-closed 的删文件侧），
+   统一改判属扩大改动面，不做。
+5. **P-4 的 `chmod 0` 用例在 root 下自动 skip**（`Geteuid()==0` 无权限拒绝语义），
+   非 root 腿才是真读数；目录那条不依赖权限，两端都跑。
