@@ -3099,3 +3099,173 @@ M65（需真夹具）、M87（需状态机配合）、M77/M79/M80/M81/M83（前�
 5. **M61 的 `opID` 前缀 `ops-`** 说明它由时间生成，历史页看到一条 `cancelled` 的 delete 记录
    本身就是"什么都没动"的语义 —— 本批把它**不再产生**，但**没有**清理既有库里已经留下的那类记录
    （用户手上可能有）。这条不属于 M61 判据，未做，也未登记为新 ID（属数据清理策略，M8 界面面一并看）。
+
+---
+
+## 20. 第九批：前端 FE 面四条 + move 侧同型文案（M77 / M80 / M81 / M83 / M88；2026-09-22）
+
+**范围**：§6.11 六张登记表里**"本机可验证"且不需用户裁定**的剩余条目就是这五条
+（M77/M80/M81/M83 在前端、M88 在 `internal/ops`）。其余全部卡在硬条件上：M57 要先有性能基准、
+M65 要先造"根在 `/System` 型 absPath 条目内部"的真夹具、M72 无 Windows 真机、M87 要跨三层换句柄、
+M79 的登记修法属接口扩面（取证见 §20.0-6，本批改判为需裁定）；M48/M82/M75(b)/M62/M56/M84 六条等裁定。
+⇒ 本批做完，**§6.11 表内可自动推进的条目清零**，下一批只能进 M7/M8/M9 或先要那六条裁定。
+
+### 20.0 动手前取证（登记原文 → 实际读到的代码 → 判定）
+
+**20.0-1（M77，FE-4）** 登记说 `scan.ts:707-712` "guard 与上锁之间隔了一次 await"。实读：
+`executeOp` 起于 `:710`，`:716` `if (!guard('执行清理操作')) return`，`:720` `await ensureProcCounts()`，
+`:721` `opsRunning.value = true` ⇒ 窗口**确实存在**，而且不只是一个 microtask：
+`ensureProcCounts` → `refreshProcCounts`（`:600-621`）在"启用了处理策略且真值未到位"时会真发一次
+`FilterInDirs` RPC，那是一次完整的异步往返。
+对照：另两个上锁入口 `undoOperation:446`、`undoOperationItem:460` 都是函数第一句就上锁，**没有**窗口
+⇒ 全仓只有 `executeOp` 一条。
+后果取证（比登记说的"两个入口都通过 guard"更具体）：第二个入口通过 guard 后会照常走
+`:722 opsResult.value = null`、`:726 opsProgress.value = {...}`，并在自己的 catch（`:733-734`）里
+**把 `opsRunning` 置回 false**——而此时第一次操作还在途。于是前端的互斥标记被一次"注定被后端回绝"的
+调用提前解开，后续点击一路畅通（后端 `app.go:1848` 自己的守卫仍然拦得住，所以不是双跑，
+而是**界面在操作在途时重新变成可点**＋横幅与进度被第二次的形状改写）。
+判定：**真缺陷，本机可验证**（node 用例同 tick 调两次即可）。
+
+**20.0-2（M80，FE-7）** 实读 `src/stores/toast.ts`：`:15 const MAX_TOASTS = 5`，
+`:38 while (toasts.value.length > MAX_TOASTS) dismiss(toasts.value[0].id)` ⇒ 溢出**丢最旧**。
+`src/views/ResultView.vue:63-68` 的 `showWarnings` 顺序是：摘要行 → 至多 5 条明细 → 溢出行，
+最多 7 次 `push` ⇒ 当 `Warnings.length >= 5` 时摘要行**必定**是第一个被自己投出的明细挤掉的。
+判定：**真缺陷**。修法取登记两案中的"摘要行不占池"（`push` 加 `head` 选项，淘汰时先丢非 head 里最旧的）。
+**为什么不取"提高上限"**：7 只是这一次的上界，`Warnings` 条数由后端决定（权限汇总可以更多），
+把常量从 5 改成 7 只是把翻车点往后推一格，明细照样淹掉摘要；而"丢最旧"这个策略本身是对的
+（新到的信息更该被看见），所以只该为摘要破例。
+
+**20.0-3（M81，FE-8）** 四个开抽屉的入口：`App.vue:74-75`（页签徽标）、`ResultView.vue:223`（统计条）、
+`:481`（空态按钮）三处都取 `store.failed.length`，**只有** `:459`（结果横幅）取
+`store.opsResult.Failed.length`；抽屉的标题、正文与"复制全部"全都吃 `store.failed`
+（`FailedDrawer.vue:19/39/46/52`）。
+两个数的**语义差别**取证到 Go 侧：`app.go:1960` 是
+`a.failed = append(append([]model.FailedItem{}, failed...), res.Failed...)`，
+`failed` 是操作开始前的快照（`:1845`）⇒ `GetFailedItems` 回的是**并集**（扫描期失败 ∪ 本次操作失败），
+`opsResult.Failed` 是**本次**。
+⇒ **登记的修法（"都取 `opsResult.failed` 长度"）不采纳**：那样抽屉标题会与自己列出的正文不同源，
+并把扫描期失败项从清单计数里抹掉。与 §18.7 的 M73 同类——**登记的修法被真读数否决**，
+原结论不视为已验证可行。
+本批改判为"各说各的范围"：横幅那条在两个数不等时**必须限定为"本次失败"**，其余三处与抽屉仍报全量。
+判据收进 `src/utils/opdisplay.ts` 一份（`opFailedLabel(opFailed, listTotal)`），组件只引用 ⇒ 与 M15/M18
+"文案判据收在 utils、组件不得自拼"同形（I5）。
+
+**20.0-4（M83，FE-10）** `FailedDrawer.vue:18-24`：
+`navigator.clipboard?.writeText(text).catch((e) => toast.notifyError('复制失败', e))` ——
+可选链短路时整个表达式是 `undefined`，`.catch` 从未挂上 ⇒ **无剪贴板的环境**
+（非安全上下文、无授权、部分 Linux WebKit 后端）点「复制全部」完全静默，比"报了失败"更糟。
+判定：**真缺陷**。修法：把写入收进 `src/utils/clipboard.ts` 的 `copyText(text, clip?)`，
+剪贴板缺失与写入 reject 一律抛人话错误，组件 catch 后 `notifyError`；成功路径不加呈现
+（登记只要求失败路径有反馈）。
+测试接缝取证：Node 24 的全局 `navigator` 是 **getter-only**（实测
+`Object.getOwnPropertyDescriptor(globalThis, "navigator")` → `{get: true, set: false, configurable: true}`），
+直接赋值在 ESM 严格模式下会抛 ⇒ `copyText` 用**可选参数注入** `clip`，不碰全局。
+
+**20.0-5（M88，OPS-14c）** `internal/ops/move.go:66-67` 与 M86 修好的 `undo.go:177-183` 同型：
+`"已复制但删除源失败（两份并存）: %w"` 说了两份并存却不给落点；同函数 `:63-64` 的兄弟分支是带落点写的。
+更要紧的一格（本批新证）：`executor.go:568-572` 拿到 `MoveFile` 的 `(dst, err)` 后，
+`err != nil` 直接 `settle(i, outcome{code: ocFailed, err: err.Error()})`，**把 dst 丢掉**
+⇒ 这份孤儿副本在整条链路上**只有错误文本一个留痕处**（账本记 failed、无 DestPath，历史页与回撤都看不见它）。
+判定：**真缺陷，本机可验证**——夹具与接缝现成：`forceCrossVolumeRename`（`move_crossvolume_identity_test.go:28`）
+造出 EXDEV，`removeSrc`（`move.go:411 var removeSrc = os.Remove`）可注错，`undo_m86_test.go:71-74` 就是这么做的。
+**顺带新登记 M89**（见 §20.6-2）：上面那条"部分成功的 move 只在错误文本里留痕"不属 M88 判据，
+本批不修，只登记。
+
+**20.0-6（M79，FE-6，取证后转裁定）** 登记的修法（后端把 reason 文本随 `OpRecord` 下发、前端只渲染）
+经开码复核成立但**改动面跨接口**：`RecordsView.vue:73-79` 的 `noUndoTitle` 确实是
+`app.go:1690 undoableReasonFor` 的第二实现且少了平台条件（它无条件把 `trash` 说成"Windows 回收站"）。
+取证另找到一条**纯前端**替代：`m.undoable` 取自后端落账列（已含平台条件），
+于是 `kind === 'trash' && !m.undoable` 可反推出"此刻必然是 Windows"。
+但这条反推本身就是又一份跨语言的第二实现（判据从后端漂到前端），不优于原修法 ⇒ 两种都要动接口契约或
+判据归属，属裁定③ 相邻的界面/契约面，与 M8 一并裁定。本批**不做**。
+
+### 20.1 判据（五条，每条都可证伪）
+
+1. **M77**：`executeOp` 的 `opsRunning.value = true` 必须出现在该函数**第一个 await 之前**；
+   第二次同 tick 调用必须在 `guard` 处返回，**不得**多发一次 `ExecuteOperation`、
+   **不得**改写 `opsResult` / `opsProgress`、**不得**在自己失败的收口里解开第一次操作还占着的锁。
+2. **M80**：`push` 的溢出淘汰**先丢非 head 里最旧的**；全是 head 时才丢最旧的 head。
+   由此 `showWarnings` 的摘要行（head）在任何明细条数下都留在池内，可见总数仍 ≤ `MAX_TOASTS`。
+3. **M81**：`opFailedLabel(opFailed, listTotal)` 是唯一出口——`opFailed <= 0` 返回空串；
+   `listTotal > opFailed` 返回以「本次失败」开头的文案；两数相等时**不**出现「本次」限定。
+   组件模板只许引用它，不得自己拼 `store.opsResult.Failed.length` 那句。
+4. **M83**：`copyText` 在"没有剪贴板"与"写入被拒"两条路径上都**必须抛**（改前形状是静默返回）；
+   写入成功时不抛、不把内容改动。组件的 catch 必须把错误交给 `notifyError`。
+5. **M88**：`move.go:67` 的错误文本必须同时含**副本落点 `dst.path`** 与**残留源路径 `src`**，
+   且仍 `errors.Is` 得到底层原因（`%w` 不丢）。
+
+### 20.2 改动面（只这些文件）
+
+| 文件 | 动作 |
+|---|---|
+| `frontend/src/stores/scan.ts` | `executeOp` 上锁前置（M77） |
+| `frontend/src/stores/toast.ts` | `push` 增 `head` 选项与淘汰优先级（M80） |
+| `frontend/src/utils/opdisplay.ts` | 新增 `opFailedLabel`（M81） |
+| `frontend/src/utils/clipboard.ts` | **新增**，`copyText`（M83） |
+| `frontend/src/views/ResultView.vue` | 摘要行标 head；失败按钮改引用 `opFailedLabel`（M80/M81） |
+| `frontend/src/components/FailedDrawer.vue` | `copyAll` 走 `copyText` + 失败 toast（M83） |
+| `internal/ops/move.go` | `:67` 文案补两个落点（M88） |
+| `frontend/tests/*.test.ts` | 新增 4 个探针文件（P-20-1/2/3/4） |
+| `internal/ops/move_m88_test.go` | **新增**（P-20-5） |
+| `scripts/test-frontend-logic.sh` | 追加 3 条接线断言（P-20-6） |
+
+不动：`app.go`、`executor.go`（M88 只改文案，`dst` 丢弃那一格转 M89）、`RecordsView.vue`（M79 待裁定）、
+`wails.ts` / `wailsjs`（无契约变化 ⇒ 不碰 M46 那半）。
+
+### 20.3 探针（每项先看它红过一次；改前树跑不了的必须点名由哪条变异顶）
+
+| 探针 | 位置 | 断言的那一格 | 改前能否真跑 |
+|---|---|---|---|
+| P-20-1 | `frontend/tests/scan-execute-lock.test.ts` | 同 tick 两次 `executeOp`：`invoked('executeOperation')===1`；第一次的 RPC 用 `deferred()` 挂住时，第二次回包报错后 `store.opsRunning` **仍为 true** | ✓ 能（只引用改前就有的 `executeOp`） |
+| P-20-2 | `frontend/tests/toast-head.test.ts` | 投 1 条 head + 7 条普通 ⇒ head 仍在 `toasts` 里、`length <= 5`；连投 head 时仍 ≤5 且丢的是最旧 head | ✓ 能（改前多传的第 4 个参数被 JS 忽略 ⇒ 摘要被挤掉，正是缺陷格） |
+| P-20-3 | `frontend/tests/op-failed-label.test.ts` | `opFailedLabel(2,5)` 以「本次失败」开头、`(5,5)` 不含「本次」、`(0,5)` 空串 | ✗ **不能**（函数改前不存在，import 失败是"红在错误的格子上"）⇒ 修前必红由 **M20-c** 提供，另加一条复刻改前形状的自检 |
+| P-20-4 | `frontend/tests/clipboard-copy.test.ts` | 无剪贴板 / `writeText` reject / 成功 三格 | △ **复刻格能真跑**：文件里另写一条不 import 新模块的用例，内联复刻改前那一行（`navigator.clipboard?.writeText(t)?.catch(...)`）并断言"缺剪贴板时必须产出一错误上报"⇒ 改前当场红；新模块的三格由 **M20-d** 兜 |
+| P-20-5 | `internal/ops/move_m88_test.go` | 跨卷 + `removeSrc` 注错后，`err.Error()` 同时含 `dst.path` 与 `src`；`errors.Is(err, 底层哨兵)` 仍真；前提自检：两份都还在盘上 | ✓ 能 |
+| P-20-6 | 接线断言 3 条 | 组件必须引用 `opFailedLabel(` / `copyText(`，`ResultView` 禁含被禁写法 `失败 {{ formatCount(store.opsResult.Failed.length) }}` | 负控制走 `FRONTEND_DIR`（脚本已支持）⇒ 见 M20-f/M20-g |
+
+**★ 取红必须验"红的是不是那一格"**（§18.7 一口径继续适用）：P-20-1 的失败信息必须落在
+"第二次调用把 `opsRunning` 解回了 false"或"RPC 发了两次"这两格上，若报成 `ids.length === 0`
+提前返回之类的形状错误，判为探针无效、重做夹具。
+
+### 20.4 变异计划（预测"该红的用例/包名表"，跑完与实测表相减）
+
+| 变异 | 回退的动作 | 预测红在 |
+|---|---|---|
+| M20-a | `scan.ts` 上锁挪回 `await ensureProcCounts()` 之后 | `tests/scan-execute-lock.test.ts`（且仅这条） |
+| M20-b | `toast.ts` 淘汰退回 `dismiss(toasts.value[0].id)`（不看 head） | `tests/toast-head.test.ts` |
+| M20-c | `opdisplay.ts` 的 `opFailedLabel` 去掉 `listTotal > opFailed` 分岔（恒返回「失败 N」） | `tests/op-failed-label.test.ts` |
+| M20-d | `clipboard.ts` 缺剪贴板时 `return`（不抛） | `tests/clipboard-copy.test.ts` |
+| M20-e | `move.go:67` 退回原文案（只说"两份并存"） | `internal/ops` 的 `TestMoveFilePartialDeleteSourceNamesBothSides`；`### 6 test -v` 出现 top_FAIL≥1 |
+| M20-f | `ResultView.vue` 模板退回内联拼串（不用 `opFailedLabel`） | `### 11 frontend-logic` 接线断言 rc=1（`FRONTEND_DIR` 负控制） |
+| M20-g | `FailedDrawer.vue` 退回 `navigator.clipboard?.writeText(...)` | 同上，锚 `copyText(` 的那条 |
+
+预测的差集来源先说明：node 用例之间互不相干，理论上每条变异只红自己那条；
+但 `test -v` 的 Go 面里 `move.go` 文案可能被既有断言引用（`grep 已复制但` 实测只有 `undo_m86_test.go:137`
+引用 undo 侧，move 侧零引用）⇒ M20-e 若红出第二条，就是**覆盖比预测更宽**，如实记。
+
+### 20.5 交付判据
+
+- 五条各有"修前必红"：P-20-1/2/4/5 必须在改前树真跑并红在预测那格；P-20-3 跑不了的必须点名 M20-c 顶。
+- 七条变异逐条跑，预测集 − 实测集的差集**逐条解释**（不许只记"杀了几条"）。
+- 全套 15 行门禁重跑，fresh 读数进 04 §6.16；`smoke-symlink` rc=2 仍按 SKIP 记，**绝不读作通过**。
+- 用例重数现跑现取：Go 侧 `grep -rh '^func Test' --include='*_test.go' --exclude-dir=.workbuddy . | wc -l`
+  = **698**（改前基线）。★ 口径修正：`.workbuddy`（`.gitignore:24`，本机备份/探针残留，非源码）里有 5 个
+  `*_test.go`，**裸命令会读到 715** ⇒ 历次划账的 678/698 都是排除该目录的读数，将来别把 715 当成"涨了 17 条"。
+  node 侧与接线项以 `### 11` 那行的三个数为准（改前 29 + 6 = 35）。
+- 04 §6.11 表内这五行各加〔2026-09-22 已实施〕括注，**原句一字不动**；M79 行加"取证后转裁定"括注。
+- 三提交（设计段 / 实施 / 划账），**绝不 push**。
+
+### 20.6 本批不做 / 转登记（写在动手前）
+
+1. **M79 转需裁定**（§20.0-6）：登记修法与新找到的纯前端反推修法都要动"判据归谁"，属接口/契约面，
+   与裁定③ 与 M8 一并处理。本批不碰 `RecordsView.vue`、不扩 `OpRecord`。
+2. **新登记 M89（OPS-14d）**：`executor.go:568-572` 在 `MoveFile` 部分成功（返回 `dst` 且 `err != nil`）时
+   丢弃 `dst`、只记 `ocFailed` ⇒ 盘上多出的那份副本在账本里没有任何条目，历史页与回撤都不知道它存在，
+   唯一留痕是错误文本（M88 只让这句文本说实话，**没有**改变"文本是唯一留痕"这件事）。
+   修法要动 `outcome`/`FailedItem` 形状或账本状态机（与 M40「`MoveFile` 不回三态」同族），
+   本批不修，只登记。
+3. **`rescanHistory` 那类"guard 之后仍有 await"的形状**：本批只钉 `executeOp` 一条
+   （取证确认全仓只有它有上锁窗口），不做"所有 async 入口一律先上锁"的泛化——那是改架构，不是修假话。
+4. **toast 的"多条同因提示"（M42）**：M80 改的是淘汰优先级，不新增去重/合并策略，M42 仍挂账。
+5. **空清单点「复制全部」**：改前是"复制一个空串、静默成功"。登记只要求失败路径有反馈，
+   本批按判据 4 的范围做；这条既不在 M83 判据里、也不另开 ID（属 M8 界面面的措辞项）。
