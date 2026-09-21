@@ -102,8 +102,9 @@ bash scripts/check-version-sync.sh                           # 6 个取值位 / 
 | `scripts/test-frontend-logic.sh` | 前端纯逻辑行为探针（`frontend/tests/*.test.ts`）+ 组件接线静态断言。vue-tsc 只证明"能编译"，这里证明"界面上的句子是真的"——例如 hardlink 的确认框不得写"空间可释放"（磁盘占用其实不变）、组内冗余项数必须取自 `store.groupSelCount` 而不许组件自算。用 Node 自带的 TS 类型剥离与 test runner，**不引入测试框架依赖**；退出码 0=通过、2=本机跑不了（无 node / 版本过旧 / 目录不存在，CI 判失败）、1=断言失败 |
 | `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因；**当前清单为空**，即该平台任何失败都阻断），清单外用例一律阻断，条目命中 0 个测试时脚本自身变红 |
 
-CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runner 上跑隔离后的
-`go test`；`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
+CI 门禁：`ci.yml`（PR 与 main push）三条腿——ubuntu 跑上述全套、windows runner 跑隔离后的
+`go test`（白名单清单现为空）、macOS runner 跑本机 `go vet` + `go test -race` + CLI 冒烟
+（D-2，2026-09-21 新增；该腿首跑待一次 push 兑现）；`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
 真实回收站 / GUI 端到端仍需人工，平台 checklist 见 docs/04 §3.5。
 
 ## 发布

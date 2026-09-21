@@ -1,7 +1,11 @@
 # CI 流水线（04 §4：PR 检查阶段）
 #
-# 覆盖本地已认可的回归配方（docs/archive/里程碑开发与测试报告.md 第 4 篇 §7.5，原 docs/08）：gofmt + 跨平台 vet + go test -race
-# （全包 count=2 / 根包 count=4）+ 前端 typecheck 与 build + CLI 冒烟双跑比对。
+# 三条腿（2026-09-21 起）：
+#   check   ubuntu —— gofmt + 跨平台 vet + go test -race（全包 count=2 / 根包 count=4）
+#                   + 前端 typecheck/build/逻辑探针 + CLI 冒烟三跑比对 + 跨卷软链接冒烟
+#   windows windows —— 隔离清单后的 go test（含 fsid 句柄身份用例）
+#   macos   macos-latest —— 本机 vet + go test -race（同 ubuntu 配方）+ CLI 冒烟
+#                       （D-2：darwin 专属代码此前只有交叉 vet，从没真跑过一次）
 #
 # 顺序约束（勿调换）：main.go 使用 `//go:embed frontend/dist`，
 # 而 frontend/dist 属构建产物（.gitignore 排除），因此必须先构建前端，
@@ -13,6 +17,7 @@
 #   - eslint：前端未配置 lint 规则集
 #   - 契约 diff 检查：需专门的"Go json tag ↔ TS 接口"校验器（尚未实现）
 #   - macOS/Linux 真实回收站与 GUI 端到端：需人工或桌面会话
+#   - macOS 侧跨卷冒烟：harness 依赖 losetup/mount -o loop，仅 Linux 可用
 
 name: CI
 
@@ -194,3 +199,66 @@ jobs:
       # Windows 句柄身份用例，I7 的真实验证入口）
       - name: go test（隔离清单见 scripts/test-windows-quarantine.sh）
         run: bash scripts/test-windows-quarantine.sh
+
+  # D-2（2026-09-21）：此前 CI 只有 `GOOS=darwin go vet`——**交叉 vet 只证明能编译**，
+  # darwin 专属代码（internal/ops/trash_darwin.go、internal/media/probe_darwin.go、
+  # internal/fsid/fsid_darwin.go 及其 15 个 *_darwin_test.go）从没有在真实 macOS 上
+  # 跑过一次。与 windows 腿同一逻辑：该平台是**交付目标**，就必须有一条真跑的腿。
+  #
+  # 本地（darwin/arm64，与 macos-latest 同 GOOS/GOARCH）先行取证：
+  #   go vet ./...                          → rc=0
+  #   go test -race -count=2 ./...          → 17 包全 ok
+  #   go test -list '^Test' ./...           → 471（与 §3.2 交叉核对表的 darwin 值一致）
+  #   bash scripts/smoke-cli.sh             → rc=0，205 组 / 90,522,243 B / 2,360 文件 /
+  #                                            复扫命中 532，三跑一致
+  # 首跑仍需一次真实 push 才能确认 runner 侧（Xcode/CGO、配额、时长）成立。
+  macos:
+    name: go test (macos)
+    runs-on: macos-latest
+    # 与 windows 腿同档：编译 + 前端构建 + 全量测试。给 35 分钟，超时即红，
+    # 不靠脚本自带 timeout（见下一步注释）。
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 与 check job 同一条 embed 约束：根包的 go test 需要 frontend/dist 已存在。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 前端构建（go:embed 前置）
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: go vet（本机 darwin，非交叉）
+        run: go vet ./...
+
+      - name: go test -race -count=2
+        run: go test -race -count=2 ./...
+
+      # 根包（App 层）与事件/互斥状态机耦合最紧，多跑两轮压竞态窗口（与 linux 腿同配方）
+      - name: go test -race -count=4（根包）
+        run: go test -race -count=4 .
+
+      # 确定性 E2E 三跑对账。刻意**不加** `timeout …` 前缀：GNU timeout 不在 macOS
+      # 默认环境里，命令不存在时这一步会以 127 红在"缺工具"上而不是红在"结果不一致"上。
+      # 时长保护由上面的 step 级 timeout-minutes 承担。
+      - name: CLI 冒烟（benchgen C×0.02 + fdd-cli 三跑比对）
+        timeout-minutes: 20
+        run: bash scripts/smoke-cli.sh
+
+      # 刻意不跑 smoke-symlink*.sh：整套 harness 是 Linux 专属（losetup/mount -o loop/
+      # stat -c/sha256sum），在 macOS 上会以"环境受限" rc=2 收尾。按 AS-K2 的口径，
+      # 一条恒为"跳过"的步骤不叫覆盖，写在这里只会被读成 mac 侧验过跨卷语义。
+
