@@ -3529,3 +3529,11 @@ gofmt / vet x3 / test -race / frontend / smoke=success`。整份 job 日志里 `
 
 **本轮没有做的两件事，如实记下**：① 没动 `scripts/test-windows-quarantine.sh` 的隔离清单（仍为空），
 W3 走的是自探环境 `t.Skipf`，不是白名单遮掩；② 没实施 M91 的任何一条修法（三选一属裁定面）。
+
+**这一跑的副产品：step13 修好之前，ubuntu 腿的 step14~17 一直是 `skipped`**（GitHub 的步骤在前置
+步骤失败后不执行）⇒ 根包 `-count=4`、CLI 冒烟、**跨卷软链接冒烟**、冒烟判据自证这四步
+此前从未有过 CI 读数。修好后两条值得留档的读数到手：**跨卷软链接 7 条判据在 loop 卷上真跑通**
+（`OK: 跨卷软链接的 7 条核心判据全部成立`），以及 **CLI 冒烟两腿组数不同（linux 206 / macos 205）
+是 benchgen `case_pair` 的设计内平台差、不是缺陷**。两条的逐格取证与增量对账记在 04 §6.17 七，
+不在这里重复。★ 一句要紧的限定：CI 绿**不改变本机第 15 行 `rc=2 SKIP` 的记法**，
+只是把"完全无读数"变成"Linux 侧有读数、Windows 侧仍无"。
