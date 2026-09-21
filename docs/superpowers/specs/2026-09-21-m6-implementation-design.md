@@ -13,7 +13,7 @@
 | 序 | 项 | 总纲编号 | 04 §6.7 | 本文小节 | 设计 | 实施 |
 |---|---|---|---|---|---|---|
 | 1 | 系统保护清单 + Windows 保留名 | §2.4 | C 组 4 | §2 | ✅ | ✅（划账见 04 §6.9.1） |
-| 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ⬜ | ⬜ |
+| 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ✅（含 §3.0 实测证据） | ⬜ |
 | 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ⬜ | ⬜ |
 | 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ⬜ | ⬜ |
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ⬜ | ⬜ |
@@ -297,3 +297,90 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
   该窗口由 `ops/verify.go` 的身份复核兜着，不为它另加判据。
 - Windows 保留名的**尾随空格/尾点变体**（`"CON "`、`"NUL."`）与 `$I`/`$R` 回收站
   元数据文件：登记为 M7 真机清单项，本机无法实证其 Win32 行为，不做纸面修复。
+
+---
+
+## 3. M6-P2：实占口径（总纲 §2.2 / 04 §6.7 C 组 2）
+
+### 3.0 前置实验（动手前必须拿到的证据，2026-09-21 本机实测）
+
+环境：macOS 26.6.2（darwin/arm64），夹具在 `/tmp`（APFS 卷）。参照系是 `df -k /tmp`
+的 `avail` 逐步差值（真实磁盘占用），被测口径是 `os.stat().st_blocks * 512`。
+
+| # | 夹具 | `st_size` | `st_blocks×512` | `df` 实测差值 | 判读 |
+|---|---|---|---|---|---|
+| 1 | `dd if=/dev/urandom bs=1m count=32`（实写） | 33,554,432 | 33,554,432 | 与 size 同量级 | 相等 |
+| 2 | `cp -c` 克隆 #1 | 33,554,432 | 33,554,432 | **4 KB** | **虚高约 8000 倍**（extents 共享却各自报满额） |
+| 3 | `mkfile -n 8m`（不写数据） | 8,388,608 | 8,388,608 | 8,196 KB | 相等（预留即计入） |
+| 4 | `cp -c` 克隆 #3 | 8,388,608 | 8,388,608 | **8 KB** | 同 #2 |
+| 5 | `mkfile -n 32m` | 33,554,432 | **16,384** | 16 KB | 相等，但**未预留**——与 #3 同工具不同结果 |
+| 6 | `dd bs=1m count=1 seek=64`（稀疏 65 MiB） | 68,157,440 | 1,048,576 | ≈1 MiB | 相等（洞不计） |
+| 7 | `head -c 1024`（1 KiB 实写） | 1,024 | **4,096** | — | **实占大于逻辑**（4 KiB 块粒度） |
+| 8 | 0 字节 | 0 | 0 | — | 扫描器本就跳过 0 字节，不入账 |
+
+由此定下三条，缺一条就不该动手：
+
+1. **`st_blocks×512` 除"共享 extent"一类外都等于真实占用**（#1/#3/#5/#6 全部与 `df` 对得上）。
+   所以总纲选它作实占代理成立；而今天用 `Size` 计账在稀疏文件上虚高 **65 倍**（#6：
+   报 65 MiB，实际 1 MiB），这一类是实打实的收益。
+2. **CoW 克隆是本口径修不掉的残余**（#2/#4）：`st_nlink` 仍为 1、inode 各异，
+   所以现有硬链接防线（按 FileID 去重、单列 `LinkedBytes`）**看不见它**，
+   `st_blocks` 同样看不见。识别它要读 extent 映射（FIEMAP / `fclist` 一类），
+   代价与平台面都不在本轮范围内 → 新增 ID 登记，不假装解决。
+3. **实占可以大于逻辑大小**（#7 块粒度）。因此任何"`min(实占, 逻辑)`"式的封顶都是错的，
+   会计上必须允许 `Actual > Size`，并在文案里说清"含块对齐"。
+   另：#3 与 #5 说明"预分配"在同一系统上都不一致，进一步支持"不许拿 `Size` 当实占"。
+
+### 3.1 采集分层（对齐 §1 约束 1）
+
+新增叶子包 `internal/realbytes`，形状与 `internal/worktemp`、`internal/sysguard` 同族：
+
+| 文件 | tag | 内容 |
+|---|---|---|
+| `realbytes.go` | 无 | `From(size, reported uint64, ok bool) (actual uint64, known bool)` 纯函数：`!ok` 或 `reported==0 && size>0` → 回退 `size` 且 `known=false`；否则原样返回。**不做封顶**（§3.0 结论 3） |
+| `realbytes_unix.go` | `!windows` | 从 `os.FileInfo.Sys().(*syscall.Stat_t)` 取 `Blocks*512`。零额外 syscall：遍历期已经 `de.Info()` 过 |
+| `realbytes_windows.go` | `windows` | `GetCompressedFileSizeW`，挂在 `internal/fsid` 已打开的句柄上；句柄不可用则返回 `ok=false` 走回退 |
+
+带 tag 的两个文件只做"读一个数"，判定与回退规则全部在无 tag 层——这样
+`From` 的回退分支在 Linux 主门禁里就是可执行断言，Windows 的 NTFS 压缩语义虽然
+只能在真机验证，但"读不到就回退并标记"这一条不需要真机就能钉住。
+
+### 3.2 会计改动面
+
+1. `model.FileEntry` 增 `Actual uint64` 与 `ActualKnown bool`（**不进缓存表**，与总纲一致：
+   与正确性无关，加列只会让缓存 DB 迁移无谓变大）。
+2. `model.DuplicateGroup` 增 `ReclaimableActual uint64`（= 组内冗余成员的 `Actual` 之和），
+   **保留** `Reclaimable`（逻辑口径）不动。
+   > 为什么不按总纲说的"改用实占"直接把 `Reclaimable` 换掉：它是**已下发过清理的
+   > 数字**，也是历史表 `reclaimable` 列的既有语义。同一个字段名在升级前后指向两种
+   > 口径，会让"上次扫出 8 GB 这次只剩 300 MB"看起来像回归——而 §6.8 这一整轮
+   > 就是在修这类"数字与事实不符"。所以本轮做的是**双口径并存 + 明确谁是权威**：
+   > `Reclaimable` 仍是逻辑口径（历史可比），`ReclaimableActual` 是实占（新增、只增不改），
+   > M8 的 UI 双数呈现直接读这两个字段。总纲那句"改用实占"在实现层落为
+   > "新增实占字段并让界面以它为主"，语义目标一致，风险面小得多。
+3. `ScanSummary` 增 `reclaimableActual`；`fdd-cli` 的 `stats` 增 `reclaimable_bytes_actual`。
+4. 历史表**不加列**：旧记录没有实占来源，恢复时如实显示"未统计"（与 §2 的
+   `ProtectedDirs` 同一处置），不拿逻辑值冒充。
+
+### 3.3 探针（修前必红清单）
+
+| # | 用例 | 断言 | 修前为什么红 |
+|---|---|---|---|
+| U1 | `realbytes.From` 回退规则（无 tag） | `ok=false` → `(size,false)`；`reported=0 && size>0` → 回退；`reported>size` → **原样返回不封顶** | 包不存在 → 编译红 |
+| U2 | 稀疏文件端到端（`os.Truncate` 造 8 MiB 洞 + 尾部写 1 KiB） | `Actual < Size`（实占远小于逻辑），组级 `ReclaimableActual < Reclaimable` | 修前无 `Actual` 字段 → 编译红 |
+| U3 | 普通文件两数关系 | `Actual >= Size`（块粒度）且 `Actual <= Size + 4096×len(extents)` 级别；核心断言只写"相等或略大"，不把块大小钉进断言（不同卷 512/4096 都会出现） | 同上 |
+| U4 | 组会计 | 3 成员组（1 保留 + 2 冗余）→ `Reclaimable = 2×Size`、`ReclaimableActual = 2×Actual` | 同上 |
+| U5 | 平台读数的"只登记不测"边界 | 克隆场景（#2/#4）在 CI 上不可造（Go 无 `clonefile` 绑定） → 不写断言，只在 04 记 ID | 不适用 |
+
+**变异验证方向**（实施后逐条跑，读数进划账）：把封顶写进 `From` → U1 红；
+把 `known=false` 当成 `actual=0` → U1/U2 红；`ReclaimableActual` 误用保留项参与求和
+（应当只有冗余成员）→ U4 红；把 `Actual` 写进缓存表迁移 → 现有缓存用例红（钉住"不加列"）。
+
+### 3.4 未兑现与边界
+
+- **Windows 的 NTFS 压缩/稀疏**：`GetCompressedFileSizeW` 那条腿在 darwin/linux 上
+  只能到 `go vet` 交叉编译，真机读数一律记为"代码已改、验证未兑现"。
+- **APFS/btrfs/ReFS 克隆与块级去重**：本口径系统性高估（§3.0 结论 2），只登记不修。
+- **UI 双数呈现属 M8**（裁定 ③）：本轮只到 JSON 与 CLI 字段为止。
+- 若某卷 `st_blocks` 语义不可信（部分 FUSE/NFS 报 0）→ 走 `known=false` 回退，
+  界面须能区分"实占未知"与"实占=0"，这一点写进字段注释而不是靠猜。
