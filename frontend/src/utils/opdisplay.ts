@@ -7,8 +7,9 @@
 // 口径来源是后端 `internal/ops/executor.go` 的 aggregate()：
 //   hardlink → LinkedBytes（数据块变共享，用户看到的文件夹占用不变）
 //   symlink  → SymlinkedBytes（磁盘上确实少一整份，但保留项仍可访问）
-//   其余     → Reclaimed（数据真的从磁盘消失）
-// 这里的措辞必须与那三个栏位一一对应，改任何一处都要看另一处。
+//   trash    → TrashedBytes（文件进了回收站：磁盘总量未减，清空后才释放）
+//   其余     → Reclaimed（数据真的从磁盘消失：delete 与跨卷 move 出卷）
+// 这里的措辞必须与那四个栏位一一对应，改任何一处都要看另一处。
 
 import { humanBytes } from './format'
 import type { OpKind } from '../wails'
@@ -45,6 +46,15 @@ export function reclaimLine(kind: OpKind, bytes: number): ReclaimLine {
         lead: '共 ',
         bytes: n,
         tail: ' 数据将只保留一份（冗余路径变成指向保留文件的软链接）',
+      }
+    case 'trash':
+      // 「可释放」在这里同样是假话（M22，2026-09-21）：回收站里的数据仍在磁盘上
+      // ——同卷只是一次改名，跨卷只是搬到另一个卷的回收站。要等用户清空回收站
+      // 才真正腾出空间，所以措辞说"移入"而不说"释放"。
+      return {
+        lead: '共 ',
+        bytes: n,
+        tail: ' 将移入回收站（清空回收站后才真正释放空间）',
       }
     default:
       return { lead: '共 ', bytes: n, tail: ' 空间可释放' }

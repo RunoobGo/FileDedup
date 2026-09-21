@@ -65,8 +65,11 @@ func TestPipelineToOpsIntegration(t *testing.T) {
 	if len(res.OK) != 2 || len(res.Failed) != 0 {
 		t.Fatalf("执行结果异常: %+v", res)
 	}
-	if res.Reclaimed != 2*uint64(len(content)) {
-		t.Fatalf("释放空间 = %d", res.Reclaimed)
+	// 2026-09-21（M22，04 §6.8.8）：口径从 Reclaimed 改到 TrashedBytes。原断言钉错了
+	// 语义——本步骤 kind=trash，文件进了回收站、数据仍在磁盘上，"释放空间"是假话。
+	// 本用例的诉求（两个冗余都成功移走、且会计与 OK 集合一致）一字未改。
+	if res.TrashedBytes != 2*uint64(len(content)) || res.Reclaimed != 0 {
+		t.Fatalf("移入回收站的字节数 = %d（Reclaimed=%d）", res.TrashedBytes, res.Reclaimed)
 	}
 
 	// 4) 磁盘断言：保留者存在，冗余消失，独立文件未受影响

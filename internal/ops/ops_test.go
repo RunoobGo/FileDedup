@@ -205,9 +205,15 @@ func TestS7PartialFailureContinues(t *testing.T) {
 	if len(res.OK) != 1 || res.OK[0] != fx.dup2.Path {
 		t.Fatalf("其余文件应继续处理: %+v", res)
 	}
-	// Skipped 不计入释放空间
-	if res.Reclaimed != fx.dup2.Size {
-		t.Fatalf("释放空间应只含 OK 项")
+	// Skipped 不计入任何一栏（本用例的诉求）。
+	//
+	// 2026-09-21（M22，04 §6.8.8）：断言从 Reclaimed 改到 TrashedBytes，不是为了让门禁
+	// 变绿——是本项论证了**原断言钉错了语义**：kind=trash 的文件进了回收站、数据仍在
+	// 磁盘上，从来就不该出现在"已释放"栏里。S7 的本意（跳过项不参与累计）一字未改，
+	// 只是改到正确的那一栏上验。
+	if res.Reclaimed != 0 || res.TrashedBytes != fx.dup2.Size {
+		t.Fatalf("跳过项不得参与累计、成功项应计入 TrashedBytes：reclaimed=%d trashed=%d",
+			res.Reclaimed, res.TrashedBytes)
 	}
 }
 

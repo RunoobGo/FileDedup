@@ -105,8 +105,14 @@ func TestAdsGuardAllowsWhenClean(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(target, "dup1.bin")); err != nil {
 		t.Fatalf("放行时文件应进了回收站：%v", err)
 	}
-	if res.Reclaimed != fx.dup1.Size {
-		t.Errorf("放行项应计入 Reclaimed: got %d want %d", res.Reclaimed, fx.dup1.Size)
+	// 2026-09-21（M22，04 §6.8.8）：本格是 kind=trash，"放行项计入哪一栏"从 Reclaimed
+	// 改为 TrashedBytes。原断言钉错了语义（进回收站 ≠ 释放空间），本用例的诉求
+	// ——"守卫放行时操作照常发生、会计照常累计"——一字未改，只是改到正确的那一栏上验。
+	if res.TrashedBytes != fx.dup1.Size {
+		t.Errorf("放行项应计入 TrashedBytes: got %d want %d", res.TrashedBytes, fx.dup1.Size)
+	}
+	if res.Reclaimed != 0 {
+		t.Errorf("回收站里的文件不算已释放: Reclaimed=%d", res.Reclaimed)
 	}
 }
 
@@ -225,9 +231,9 @@ func TestAdsRejectAccountingAndCallback(t *testing.T) {
 	if len(res.Skipped) != 0 {
 		t.Fatalf("拒绝不得记成 Skipped（把\"没做成\"报成\"已达成\"）: %+v", res.Skipped)
 	}
-	if res.Reclaimed != 0 || res.LinkedBytes != 0 || res.SymlinkedBytes != 0 {
-		t.Fatalf("拒绝项污染了会计口径: reclaimed=%d linked=%d symlinked=%d",
-			res.Reclaimed, res.LinkedBytes, res.SymlinkedBytes)
+	if res.Reclaimed != 0 || res.LinkedBytes != 0 || res.SymlinkedBytes != 0 || res.TrashedBytes != 0 {
+		t.Fatalf("拒绝项污染了会计口径: reclaimed=%d linked=%d symlinked=%d trashed=%d",
+			res.Reclaimed, res.LinkedBytes, res.SymlinkedBytes, res.TrashedBytes)
 	}
 
 	mu.Lock()

@@ -8,8 +8,9 @@
 // 它只在 `scripts/test-frontend-logic.sh` 里被执行。
 //
 // 钉住的口径来源：internal/ops/executor.go 的 aggregate()——
-//   hardlink → LinkedBytes、symlink → SymlinkedBytes，两者都**不**计入 Reclaimed。
-// 所以这两类（外加同卷 move）在 UI 上说"空间可释放"就是假话；
+//   hardlink → LinkedBytes、symlink → SymlinkedBytes，两者都**不**计入 Reclaimed；
+//   trash → TrashedBytes（2026-09-21 M22 起），同样不计入 Reclaimed。
+// 所以这几类（外加同卷 move）在 UI 上说"空间可释放"就是假话；
 // 结果条（ResultView.vue 的 opsbar）早就分别措辞，确认框曾经是唯一说错的地方。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -48,11 +49,20 @@ test('symlink 说清"只保留一份数据"，不借用硬链接的"占用不变
   assert.doesNotMatch(joined, /占用不变/)
 })
 
-test('trash / delete 仍说"空间可释放"——数据真的离开磁盘', () => {
-  for (const kind of ['trash', 'delete'] as const) {
-    const { joined } = line(kind, 2 << 20)
-    assert.match(joined, /空间可释放/, `${kind} 应保留"释放"措辞`)
-  }
+test('delete 仍说"空间可释放"——数据真的离开磁盘', () => {
+  const { joined } = line('delete', 2 << 20)
+  assert.match(joined, /空间可释放/)
+})
+
+// 2026-09-21（M22，04 §6.8.8）：trash 从上面那条用例里**拆出来**。理由不是"让门禁变绿"，
+// 而是原断言钉错了语义：回收站里的文件仍在磁盘上（同卷只是一次改名，跨卷只是搬到另一个
+// 卷的回收站），"空间可释放"对它是假话，还与紧挨着的"打开回收站"按钮自相矛盾。
+// 后端同一批把 trash 从 Reclaimed 拆进了独立的 TrashedBytes。
+test('trash 改说"移入回收站"：清空之前空间并未释放', () => {
+  const { joined } = line('trash', 2 << 20)
+  assert.match(joined, /移入回收站/)
+  assert.match(joined, /清空回收站后才真正释放/)
+  assert.doesNotMatch(joined, /可释放/)
 })
 
 test('数字三段式：bytes 段就是 humanBytes 的结果，可被调用方单独加粗', () => {

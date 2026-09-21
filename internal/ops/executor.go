@@ -332,7 +332,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 而用户去资源管理器一看文件夹占用丝毫未变——与事实不符的假账，
 				// 也让"总占用未变化"看起来像操作失败。
 				// 现在把硬链接的贡献单列（LinkedBytes），Reclaimed 只统计
-				// 真正从磁盘上消失的数据量（trash/delete/move 出卷）。
+				// 真正从磁盘上消失的数据量（delete 与跨卷 move 出卷）。
 				//
 				// 2026-09-20：软链接同属"链接类"合并——磁盘上少了一份完整数据
 				// （dup 位置只剩一个几百字节的链接对象），但保留项的数据块并未
@@ -340,11 +340,22 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 一整份文件）。不过为了与硬链接在 UI 上可区分、且在回撤语义上
 				// 不误导（回撤要重新占回这块空间），这里同样单列，不混进
 				// Reclaimed，让前端能分别表述。
+				//
+				// 2026-09-21（M22，04 §6.8.8）：同一笔假账在 trash 上复发过一次。
+				// 修正前 trash 落进 default，结果条写"成功 N（释放 X）"，紧挨着的
+				// 却是"打开回收站"——文件明明在回收站里（同卷只是一次改名；跨卷只是
+				// 把数据搬到另一个卷的回收站，磁盘总量都没减），用户按这句话去核对
+				// 总量必然对不上。现在 trash 单列 TrashedBytes。
+				// Reclaimed 的**定义**没变（登记的修法原话是"别改定义"），
+				// 变的只是"谁有资格进这一栏"。同卷 move 同样是把改名报成释放，
+				// 但要先能分辨改名与跨卷（MoveFile 不报 EXDEV）⇒ 登记为 M40，此处不动。
 				switch op.Kind {
 				case "hardlink":
 					res.LinkedBytes += e.Size
 				case "symlink":
 					res.SymlinkedBytes += e.Size
+				case "trash":
+					res.TrashedBytes += e.Size
 				default:
 					res.Reclaimed += e.Size
 				}

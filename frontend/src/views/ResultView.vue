@@ -419,16 +419,20 @@ function onConfirm(targetDir?: string) {
     </div>
     <div v-else-if="store.opsResult" class="opsbar panel done">
       <template v-if="store.opsResult.OK.length">
-        <!-- 三个字节口径互不重叠，必须分别措辞（见 wails.ts OpsResult 注释）。
+        <!-- 四个字节口径互不重叠，必须分别措辞（见 wails.ts OpsResult 注释）。
              混用会让用户去资源管理器核对时发现"对不上"，进而怀疑操作失败：
                LinkedBytes    数据没少，只是不再重复存第二份 → "占用不变"
                SymlinkedBytes 数据少了一整份（dup 只剩链接对象）→ 但要注意悬空风险
+               TrashedBytes   文件进了回收站，清空后才释放 → 不能说"释放"
                Reclaimed      数据真的从磁盘移除了 → "释放" -->
         <span v-if="store.opsResult.SymlinkedBytes" class="ok">
           <Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（已合并为软链接 {{ humanBytes(store.opsResult.SymlinkedBytes) }}，磁盘只保留一份数据）
         </span>
         <span v-else-if="store.opsResult.LinkedBytes" class="ok">
           <Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（已合并为硬链接 {{ humanBytes(store.opsResult.LinkedBytes) }}，占用不变）
+        </span>
+        <span v-else-if="store.opsResult.TrashedBytes" class="ok">
+          <Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（已移入回收站 {{ humanBytes(store.opsResult.TrashedBytes) }}，清空回收站后才释放空间）
         </span>
         <span v-else class="ok"><Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（释放 {{ humanBytes(store.opsResult.Reclaimed) }}）</span>
         <button class="btn-ghost" @click="store.openTrash()">打开回收站</button>

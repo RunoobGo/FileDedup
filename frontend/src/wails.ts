@@ -131,20 +131,26 @@ export interface OpsProgress {
 
 // OpsResult 清理操作聚合结果（Go 侧 model.OpsResult）。
 //
-// 三个字节口径互不重叠，UI 必须分别表述（见 ResultView.vue 结果条）：
-//   Reclaimed      真正从磁盘移除的数据量（trash / delete / move 出卷）
+// **四个**字节口径互不重叠，UI 必须分别表述（见 ResultView.vue 结果条）：
+//   Reclaimed      真正从磁盘移除的数据量（delete 与跨卷 move 出卷）
+//   TrashedBytes   移入回收站的数据量（文件仍在磁盘上，清空回收站后才释放）
 //   LinkedBytes    硬链接合并：数据未释放，只是不再重复存第二份
 //   SymlinkedBytes 软链接合并：磁盘上少了一整份数据（dup 位置只剩链接对象），
 //                  但保留项的数据块并未共享，且回撤要重新占回这块空间
 //
 // 为什么软链接不并进 Reclaimed：数值上它确实"释放了一整份文件"，
 // 但把它与 trash/delete 混在一起，UI 就再也无法单独提示"链接有悬空风险"。
+//
+// 为什么 trash 也不并进 Reclaimed（2026-09-21，M22）：回收站不是"已消失"——
+// 同卷进回收站只是一次改名，跨卷只是把数据搬到另一个卷的回收站，磁盘总量都未减。
+// 修正前它落在 Reclaimed 里，结果条因此写"释放 X"，而紧挨着的按钮是"打开回收站"。
 export interface OpsResult {
   OK: string[]
   Failed: { Path: string; Stage: string; Err: string }[]
   Skipped: string[]
   Cancelled: string[] // P2：取消后未派发的条目（未处理，仍在结果集中）
-  Reclaimed: number // 已从磁盘真正释放的字节（trash/delete/move 出卷）
+  Reclaimed: number // 已从磁盘真正释放的字节（delete / 跨卷 move 出卷）
+  TrashedBytes?: number // 移入回收站的字节（2026-09-21 M22）：清空回收站后才释放
   LinkedBytes?: number // 硬链接合并涉及的字节：当期不释放空间，仅变为共享
   SymlinkedBytes?: number // 软链接合并涉及的字节（2026-09-20）
   Warnings?: string[] // 操作已成功、但需告知用户的情况（如临时文件残留未删净）
