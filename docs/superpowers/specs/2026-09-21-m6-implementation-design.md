@@ -3384,3 +3384,107 @@ node:test 在第一个失败处就抛 ⇒ 那一跑**只亲眼看到**"RPC 发�
    是它们调用的 api 方法名。
 2. **M89 已在本批设计段登记**（§20.6-2，`executor.go:568-572` 部分成功时丢掉 `dst`）；
    M88 只让错误文本说实话，**没有**改变"文本是唯一留痕"这件事。
+
+---
+
+## 21. CI 三条腿首跑的失败面：Linux inode 家族 11 条 + Windows 4 条（2026-09-22）
+
+用户指令："提交变更，推送到仓库，并跟踪 CI 信息，修订 CI 错误问题"。
+推送 `fc5dabe..9194cc7`（99 个提交）后 run **35638637530** 三条腿读数为
+**macos ✓ / windows ✗ / check(linux) ✗**。这是 2026-09-21 三条腿 CI 成形后的
+**第一次真跑**（上一跑 35520016319 停在 2026-09-20，那时只有 3 条红），
+所以本轮不是"某次改动打红了 CI"，而是**六十多个提交的跨平台欠账一次性到账**。
+
+### 21.0 失败清单（逐字取自两份 job 日志）
+
+| 腿 | 包 | 用例 | 日志原文（截断处保留） |
+|---|---|---|---|
+| linux | `internal/ops` | `TestIdentityStillDetectsRegularReplacement` ×2 | `identity_still_test.go:47: 路径已被换成另一个文件，identityStill 必须判否（否则会覆盖第三方文件）` |
+| linux | 同上 | `TestIdentityStillDetectsSymlinkSwap` ×2 | `identity_still_test.go:108: 路径已被换成符号链接，identityStill 必须判否（不得跟随链接）` |
+| linux | 同上 | `TestHardlinkMergeDoesNotDeleteForeignBackup` / `TestSymlinkMergeDoesNotDeleteForeignBackup` ×2 | `identity_window_test.go:97/:106: 第三方文件被合并流程吸收了（返回 nil）：守卫没生效` |
+| linux | 同上 | `TestHardlinkMergeRechecksBackupOwnershipBeforeDelete` / symlink 双胞胎 ×2 | `identity_window_test.go:208: 前置条件不成立：换进去的文件仍被判定为本次操作的 dup，断言将失去意义` |
+| linux | 同上 | 四条 `…RefusesReplacedBackup` ×2 | `rollback_backup_guard_test.go:135/:149/:162/:179: backup 位的陌生文件被搬走或改写（M20）：read="" err=open /tmp/…/001/dup.bin.fdd-old: no such file or directory` |
+| linux | 同上 | `TestSymlinkMergeDetectsKeepReplacement` ×2 | `symlink_test.go:626: ❌ keep 已被替换仍合并成功：dup 的备份（原始内容最后副本）会被当残留删掉` |
+| windows | `internal/ops` | `TestBuildPathListRoundTripsUTF16` | `trash_windows_list_test.go:186: 第 2 个路径往返失真: got "F:\\emoji\\<4 个 U+FFFD>.bin" want "F:\\emoji\\😀😀.bin"` |
+| windows | 同上 | `TestVerifyUnopenableIsUnverifiable` | `verify_m52_m54_test.go:67: 打不开的文件 = 0, want VerdictUnverifiable(3)` |
+| windows | 同上 | `TestSameVolumeDetectsCrossMount` | `volume_test.go:82: 跨挂载点被判为同卷：volumeRoot 在 unix 恒为 "/"，M5 未修` |
+| windows | `internal/scanner` | `TestDedupeRootsSortsByFoldKey` / `TestDedupeRootsKeepsUnrelatedRootsAfterSortFix` | `scanner_m66_m70_m68_test.go:39: kept = [D:\data\b], want [/data/b]（宽根必须胜出…）` / `:50: kept = [D:\data\b D:\data\zz\sub], want [/data/b /data/zz/sub]` |
+
+`FAIL filededup/internal/ops 0.886s`（linux）／`FAIL filededup/internal/ops 2.105s` +
+`FAIL filededup/internal/scanner 2.307s`（windows）。其余 21 个包两腿全绿；macos 腿
+（`go test -race -count=2 ./...` + 根包 count=4 + CLI 冒烟）整条绿。
+**windows 腿的 11 条 inode 家族一条都没红** —— 这条差分本身就是证据，见 21.1-丁。
+
+### 21.1 Linux：11 条共用一个根因——inode 号在「unlink 到零链接」立即可被回收
+
+**甲·反证（不需要任何额外探针）**：`identityStill` 能返回真的路径只有一条
+（`verify.go:100-116` 的 `identityStatus`：`!id.Resolved → true` 已由 `newMergeFixture`/
+`needResolvedID` 的前置跳过排除；`err != nil` 与 `!cur.Resolved` 都返回 false），
+即 `cur.SameIdentity(id)` 为真；而 `SameIdentity`（`fsid.go:43-48`）**只比 `Dev` 与 `Ino`**。
+⇒ `identity_window_test.go:208` 那条**前置断言**（"换进去的文件必须不再被认成本次的 dup"）判假，
+等价于实测到"两个不同对象拿到同一组 (dev,ino)"。11 条红全部由这一个事实推出，无需假设。
+
+**乙·正对照（同一条 CI 里就有）**：同包 `TestIdentityStatusSeparatesGoneFromReplaced`
+（`verify_m52_m54_test.go:132-137`）造顶替用的是 **`os.Rename(other, replaced)`**，
+同一 runner、同一 `go test -race -count=2`，**通过**。⇒ 红不红由"顶替怎么写"决定，不是环境抖动。
+
+**丙·边界对照**：`TestUndoHardlinkBlocksSwappedTargetSameSize`（`identity_still_test.go:163`）
+同样用 Remove + WriteFile，却**通过** —— 它删的 `dup` 刚被 `HardlinkMerge` 做成 keep 的硬链接
+（nlink=2），unlink 只把链接数降回 1，**inode 不进空闲表**，新文件无从取到那个号。
+甲乙丙合起来把根因钉成一句：**只有"原对象被删到零链接、inode 被回收给紧随其后创建的新对象"这一条路会失效。**
+
+**丁·本机对照读数**（darwin/APFS，同一形状的三连删建，`stat -f ino=%i`）：
+`76358951 → 76358952 → 76358953 → 76358954`，**单调分配、不还号**；换不同长度内容同样还给新号
+（`76358954`）。这解释了 macos 腿与 windows 腿（NTFS 的 FileId 语义等价"随文件走、不还号"）为何全绿。
+
+**判据（为什么这不算"改测试让门禁变绿"）**：
+1. `(dev,ino)` 只能区分**同时存活**的对象——这是文件系统层的定义，不是实现缺陷；
+   `identityStill` 要"识破删除后原地重建"必须引入号外的第二因子。
+2. 可选的第二因子只有两类：**ctime**（被本仓**明令排除**：`fsid.go:41-42` 与 04 表 H2 的 DOC-H2 裁定，
+   理由在本轮更硬——合并主路径自己就 `rename(dup→backup)`，unix 上 rename 推进 ctime，
+   带上它会把每一次正常合并都判成顶替）与**内容**（`fsid.go:8-9` 原文写明的兜底方向：
+   "调用方应将比较视为平凡通过，安全兜底退回到内容级证据（多点采样 + 全量重算）"）。
+3. 而这批夹具声称复现的现实时序，`identity_window_test.go:10-12` 自己写的是
+   "同步盘落一个同名文件、下载器**原子改名**进来" —— 原子改名进来的对象必然带着
+   "原对象尚存活时"就已分配的 inode ⇒ 身份层**必然**识破。夹具实际写的却是
+   `os.Remove` + `os.WriteFile` 到同一路径，那是另一件事（inode 回收），且是身份层**原理上管不着**的那件。
+
+⇒ **处置**：把 6 处顶替夹具改成"先写在不旁边、再 `os.Rename` 顶位"（= 文档承诺的那个时序，
+也更接近真实第三方行为：没有名字消失的空档），**一条断言、一句期望值都不动**。
+残留的产品缺口不遮掩，另立 **M91**（§21.2）。
+
+### 21.2 新登记 M91（待裁定）：`(dev,ino)` 在回收 inode 的卷上可被"先删后建"骗过
+
+`merge_guard.go` 的四处归属守卫（`backupOwnershipStill` / `requireOriginalInBackup` /
+`removeOwnBackup` / `slotProvesHardlink`）**只认** `(dev,ino)`。在会还号的卷（本轮实测：GitHub
+ubuntu runner 的 `/tmp`）上，第三方"删掉 dup → 立刻在同名位置写新内容"可让判据恒真，
+后果就是这些用例断言的那件事：替陌生人销毁文件。三条修法，代价各不同，需裁定：
+
+| 修法 | 闭合度 | 代价 |
+|---|---|---|
+| A 内容级兜底：删除/搬移 backup 前按已验证的组哈希复核（`hasher` 现成） | 完全（含等长等内容的情形） | `HardlinkMerge`/`SymlinkMerge` 要收哈希与 size ⇒ 签名与 executor 两处调用点 + 约 15 处测试调用点；每次合并多读一遍 dup 字节 |
+| B 硬链接锚点：操作开始即给 dup 挂一个隐藏链接，全程不让 inode 归零 | 完全（且零额外读盘） | 新增一个必须清理的名字；崩溃留残留（`worktemp` 已能忽略该命名）；FAT/exFAT 不支持硬链接（那里身份本就未解析、判据已 fail-open，方向一致）；与 M38 的 `claimExact` 占位是同一族设施 |
+| C 只在 Linux 类卷上补第二因子（如 `FS_IOC_GETVERSION` 取 generation） | 部分（APFS 不暴露） | 平台专属、跨平台面反而变三份，违 I5 |
+
+本轮**一条都不实施**：M91 属"三选一"的处置面裁定，与 §6.11 表内已挂起的 M62/M56/M75(b) 同形。
+
+### 21.3 Windows 四条：三条是夹具的平台前提，一条是测试自带解码器的错
+
+| # | 取证（开码复核，非推断） | 处置 |
+|---|---|---|
+| W1 | `pathListSegments` 是**测试文件内**的 Win32 读法复刻（`trash_windows_list_test.go:23-45`），逐单元 `cur = append(cur, rune(u))`：代理对的高/低半各自 → `rune(0xD83D)` 非法 → `string()` 折成 U+FFFD。产品侧 `buildPathList` 用 `syscall.StringToUTF16`（`trash_windows.go:488-502`），代理对**本来就写对了** | 测试侧改用 `unicode/utf16.Decode` 合对（与被测物仍是不同实现，独立复刻的身份不变）。断言与用例意图（"编解码这层没问题，缺陷纯粹在 NUL 个数"）一字不动 |
+| W2 | `volumeIDOfExisting` 先 `filepath.Clean`（`volume.go:66`）再喂给注入桩，桩用 `strings.HasPrefix(p, "/mnt/b")`；Windows 上 Clean 产出 `\mnt\b\g.bin` ⇒ 桩恒回落 "dev-A" ⇒ `sameVolume` 两侧同号判同卷。**产品判据（st_dev / 卷序列号）与分隔符无关，未受影响** | 桩改成对 `filepath.ToSlash(p)` 判前缀，两条断言（跨挂载判否 / 同挂载判是）在任一平台都仍然真跑 |
+| W3 | 夹具用 `os.Chmod(path, 0)` 造"打不开"。Windows 的 chmod 只翻**只读属性**、不拒绝读 ⇒ `VerifyFile` 打得开、哈希相符 → 返 `VerdictPass(0)`，正是日志那个 `= 0`。断言本身（"读不了 = 无从判定，不许报成'被修改'"）在 Windows **未被检验**而非被推翻 | 前置自检：改完权限后**真的**读不了才继续；读得动就 `t.Skipf` 写明平台原因（与 `requireSymlinkSupport` / `newMergeFixture` 同一惯例）。按约束 5，这条在 Windows 腿记"未兑现"，不算通过 |
+| W4 | `dedupeRoots` 第一步就 `filepath.Abs`（`scanner.go:564-570`），Windows 上 `/data/b` → `D:\data\b`（工作目录在 `D:\a\FileDedup\FileDedup`）。期望值把 **unix 归一的产物**写死了；判据本身（宽根胜出 / 无父子关系的两根都留）在 Windows 同样成立：`fscase.Fold` 的分隔符腿恒把 `\` 换 `/`（`pathnorm` 收归后唯一实现），折叠键仍是 `d:/data/b` 前缀于 `d:/data/b/a` | 期望值改由平台自身的 `filepath.Abs`+`Clean` 算出（`want` 的形状随平台，**谁胜出**的判据不随平台）。改前在 linux/mac 上读数不变，windows 腿由红转绿 |
+
+W1~W4 全部落在**测试与夹具**，本轮 Windows 腿**没有生产代码改动**。
+
+### 21.4 兑现边界（先说清，免得划账说谎）
+
+- inode 回收只在 Linux runner 上真发生过 ⇒ 这 11 条夹具改动的"改前红"**本机 darwin 拿不到读数**；
+  能给的只有 CI 的既有红（run 35638637530）与**改后 CI 绿**（下一跑）。凡此一律写"CI 读数"，不写"本机验证"。
+- W1/W2/W4 的本机红同样拿不到（`//go:build windows` 与平台归一只在 windows 腿执行）；
+   linux/mac 三条腿只能证明"改动没有把原本绿的弄红"。
+- W3 改后在 windows 腿会是 **SKIP**，按 04 §6.8.0 与 AS-K2 的口径 **skip ≠ 通过**：
+  划账里必须写成"Windows 侧 M52 无从判定这条未验证"。
+- 本轮不动 §6.11 任何一行既有结论；新发现按约束 (1) 只新增 ID（M91）。
