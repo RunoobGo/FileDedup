@@ -84,7 +84,7 @@ fi
 
 if [ -n "$TAG" ]; then
 	if [ "$TAG" != "v$APP_VER" ]; then
-		fail "tag $TAG 与 AppVersion $APP_VER 不一致（按 tag 触发处理，依据：$TAG_WHY）。发布物名字与 GetVersion/「关于」会各说各话——要么改 tag，要么先同步版本号再打 tag"
+		fail "tag $TAG 与 AppVersion $APP_VER 不一致（按 tag 触发处理，依据：${TAG_WHY}）。发布物名字与 GetVersion/「关于」会各说各话——要么改 tag，要么先同步版本号再打 tag"
 	else
 		printf '\033[32m✓ tag %s 与版本号一致（依据：%s）\033[0m\n' "$TAG" "$TAG_WHY"
 	fi

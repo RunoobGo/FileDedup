@@ -165,12 +165,38 @@ func TestHashFullSegmentedEquivalence(t *testing.T) {
 	}
 }
 
-func TestHashFullOpenError(t *testing.T) {
-	// ReadAt 失败注入：不存在的文件 → 错误返回（不 panic）
-	f, err := os.Open(filepath.Join(t.TempDir(), "missing.bin"))
-	if err == nil {
+// TestHashFullReadErrorPropagates M129（第 2 轮 §23.10）。
+//
+// 改前这条叫 TestHashFullOpenError，函数体只有 `os.Open(missing)` + `if err == nil`
+// ——**从未调用 HashFull**，断的是标准库会不会打开一个不存在的文件。
+// 于是 HashFull 读路径上的任何守卫被改坏（把 CopyBuffer 的错误吞掉、
+// 或错误地当成"读到 0 字节即结束"）它都照绿，是 §22/§23 反复处理的同一形状：
+// 名字承诺了一个判据，体子里没有那个判据。
+//
+// 现在真调：句柄有效但已关闭 ⇒ 读必失败（Go 在三条腿上都是 fs.ErrClosed，
+// 不是 EOF），错误必须原样交回、且返回值必须是零数组——
+// 调用方按"进失败清单"处理，绝不能拿一个看似正常的指纹去比内容。
+func TestHashFullReadErrorPropagates(t *testing.T) {
+	const size = 4096
+	p := writeFile(t, size)
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, StreamChunk)
+	if _, err := HashFull(f, size, buf); err != nil {
 		f.Close()
-		t.Fatal("预期打开失败")
+		t.Fatalf("基线（句柄有效）应成功：%v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := HashFull(f, size, buf)
+	if err == nil {
+		t.Fatalf("句柄已关 ⇒ HashFull 必须报错，实得指纹 %x（静默出指纹=把读不动的文件当内容参与去重）", out)
+	}
+	if out != ([32]byte{}) {
+		t.Errorf("出错时不得交回部分指纹，实得 %x（err=%v）", out, err)
 	}
 }
 

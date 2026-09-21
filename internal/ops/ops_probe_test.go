@@ -12,7 +12,6 @@ package ops
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -89,15 +88,12 @@ func TestTrashFallbackRechecksIdentityBeforeEachAttempt(t *testing.T) {
 		if n == 1 {
 			// 批量失败之后、逐个回退之前：第三方把 dup 位置换成另一个 inode
 			// （内容逐字节相同，所以任何只看 size/Stat 的判据都发现不了）。
-			tmp := dup + ".swap-in"
-			if err := os.WriteFile(tmp, content, 0o644); err != nil {
-				t.Errorf("放置顶替文件失败: %v", err)
-				return nil, fmt.Errorf("setup: %w", err)
-			}
-			if err := os.Rename(tmp, dup); err != nil {
-				t.Errorf("顶替失败: %v", err)
-				return nil, fmt.Errorf("setup: %w", err)
-			}
+			// M115（第 2 轮 §23.4）：改前这里是手写的 `dup+".swap-in"` + WriteFile +
+			// Rename，与本包唯一实现（swap_fixture_test.go 的 swapInAt/swapOutAt）
+			// 只差一步——它没有 assertDistinctIdentity 自检，因此在会还号的卷上
+			// 可能造出"同 inode 的顶替"，用例红在守卫、实际夹具没成立。
+			// 现走 swapOutAt（原子改名 + 自检），断言一字未动。
+			swapOutAt(t, dup, content)
 			planted = true
 			return nil, errors.New("simulated batch trash failure")
 		}

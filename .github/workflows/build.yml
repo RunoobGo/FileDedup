@@ -10,6 +10,12 @@ jobs:
   build:
     name: Build - ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
+    # M120（04 §6.11 GATE-4）：AS-K5 那条纪律在 ci.yml:37-42 写死了理由——没有
+    # timeout-minutes 的作业一旦某步卡住就烧满 6 小时平台默认上限，还把已产出的
+    # 日志一起废掉。那条只套了 CI，发布流水线改前是零处。四平台矩阵含 Wails 打包，
+    # 给 40 分钟（本机那一跑约 8 分钟量级，留足 runner 冷启动与下载）。
+    # ★ 本机无 runner ⇒ "改对了"这一格未兑现，只能等一次 tag/手动触发。
+    timeout-minutes: 40
     permissions:
       contents: read   # 最小权限：仅 release job 需要 contents: write
     strategy:
@@ -172,6 +178,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # M120：只做"下载产物 + 建 release"，15 分钟足够宽
     permissions:
       contents: write
     steps:

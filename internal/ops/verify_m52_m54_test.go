@@ -192,16 +192,12 @@ func TestIdentityReplacedBeforeActionStillFails(t *testing.T) {
 		v, id := prev(e, h, p)
 		if e.ID == fx.dup1.ID && v == VerdictPass {
 			// 第三方把同名新文件放进 dup 位：路径在、身份已换。
-			intruder := filepath.Join(filepath.Dir(victim), ".intruder")
-			if err := os.WriteFile(intruder, []byte("THIRD-PARTY"), 0o644); err != nil {
-				t.Errorf("铺第三方文件失败: %v", err)
-			}
-			if err := os.Remove(victim); err != nil {
-				t.Errorf("移走 dup 失败: %v", err)
-			}
-			if err := os.Rename(intruder, victim); err != nil {
-				t.Errorf("顶替失败: %v", err)
-			}
+			// M115（第 2 轮 §23.4）：改前这里是 WriteFile → Remove → Rename 三步，
+			// 中间有一瞬路径上什么都没有 ⇒ 在会还号的卷上（CI 实测）顶替者可能拿到
+			// 同一个 inode 号，用例就退化成在测"文件系统的还号策略"而不是测守卫。
+			// 现走本包唯一实现 swapInAt（先写旁边、原子改名，末尾自带
+			// assertDistinctIdentity 自检）。断言一字未动。
+			swapInAt(t, victim, id, []byte("THIRD-PARTY"))
 		}
 		return v, id
 	}
@@ -214,6 +210,12 @@ func TestIdentityReplacedBeforeActionStillFails(t *testing.T) {
 	}
 	if len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Err, "被替换") {
 		t.Fatalf("Failed = %+v, want 1 条「已被替换、已拦截」", res.Failed)
+	}
+	// ★ M114 第一步（补强，不动判据）：把"确证顶替"那一格的文案整个钉死。
+	// 下面 identity_unknown_m114_test.go 断的是"读不动"那一格**不得**用这套说法，
+	// 两条对照才有意义：没有这条钉子，把两句改成同一句话仍然全绿。
+	if !strings.Contains(res.Failed[0].Err, "inode 已变化") {
+		t.Errorf("确证顶替的措辞必须带身份依据「inode 已变化」，否则「被替换」成了无凭据的断言: %q", res.Failed[0].Err)
 	}
 	if _, err := os.Stat(victim); err != nil {
 		t.Fatalf("第三方文件被我们删了（数据丢失）: %v", err)

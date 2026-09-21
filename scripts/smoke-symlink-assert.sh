@@ -51,8 +51,17 @@ else
 fi
 
 fails=0
-ok() { printf '  ✓ %s\n' "$1"; }
+# M119（04 §6.11 GATE-3）：只判 fails==0 是不够的——一条断言都没走到时（桩挂错路径、
+# case 全部 miss、某段被提前 return 跳过）fails 同样是 0，脚本却会打印"全部断言通过"
+# 并 exit 0。本脚本的职责正是"自证冒烟判据本身有效"，它自己不能靠"什么都没验"骗过。
+# ⇒ checks 由 ok/bad 各自累加，收尾要求它不低于 MIN_CHECKS。
+# MIN_CHECKS=14 = 本机实跑 `grep -c "✓\|✗"` 的读数（A1/A2/B/C/D 五段各若干条）；
+# 只设**下限**不设等号：以后加断言不必回来改这里，而"少跑到"一定会红。
+checks=0
+MIN_CHECKS=14
+ok() { checks=$((checks + 1)); printf '  ✓ %s\n' "$1"; }
 bad() {
+	checks=$((checks + 1))
 	printf '  \033[31m✗ %s\033[0m\n' "$1" >&2
 	fails=$((fails + 1))
 }
@@ -173,7 +182,7 @@ run_stubbed b 0 >/dev/null
 if grep -qF -- "-d $LOOP_DEV" "$STUBS/losetup.log"; then
 	ok "已按 $LOOP_DEV 精确释放（loop 释放日志锚定到 --find 的返回值）"
 elif grep -qF -- '-d ' "$STUBS/losetup.log"; then
-	bad "释放的是别的设备而非 $LOOP_DEV（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）——$LOOP_DEV 仍被占用"
+	bad "释放的是别的设备而非 ${LOOP_DEV}（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）——${LOOP_DEV} 仍被占用"
 else
 	bad "未释放 loop 设备（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）——反复运行会耗尽 /dev/loop*"
 fi
@@ -232,13 +241,21 @@ esac
 if grep -qF -- "-d $LOOP_DEV" "$STUBS/losetup.log"; then
 	ok "D 组路径同样释放了 $LOOP_DEV"
 else
-	bad "D 组路径未释放 $LOOP_DEV（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）"
+	bad "D 组路径未释放 ${LOOP_DEV}（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）"
 fi
 
 printf '\n'
-if [ "$fails" -eq 0 ]; then
-	echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D 真失败）"
-	exit 0
+printf 'smoke-symlink-assert: 走到断言 %s 条（下限 %s 条），其中失败 %s 条\n' \
+	"$checks" "$MIN_CHECKS" "$fails"
+if [ "$fails" -gt 0 ]; then
+	echo "smoke-symlink-assert: $fails 条断言失败" >&2
+	exit 1
 fi
-echo "smoke-symlink-assert: $fails 条断言失败" >&2
-exit 1
+# M119：条数不足 ⇒ 有整段没被执行。这时候 "fails=0" 不代表判据成立，只代表没验。
+if [ "$checks" -lt "$MIN_CHECKS" ]; then
+	echo "smoke-symlink-assert: 只走到 ${checks} 条断言（应不少于 ${MIN_CHECKS} 条）" \
+		"⇒ 有分支整段没被执行，不读作通过" >&2
+	exit 1
+fi
+echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D 真失败）"
+exit 0

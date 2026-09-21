@@ -224,7 +224,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}
 	// M6-P4 逃逸判据要用**用户原始指定的全部根**（含被宽根覆盖而丢弃的子根）：
 	// "已被宽根覆盖"这条推断在遇到保护剪枝时并不成立——宽根走不进受保护目录里面。
-	// 键统一走 visitKey（那条分隔符陷阱的实文在 visitKey 与 dedupeRoots 各自的注释里）。
+	// 键统一走 visitKey（那条分隔符陷阱的实文在 visitKey 自己的注释与 pathnorm 包注释里；
+	// M125 改前这里第二处指成了 dedupeRoots，而它的注释讲的是卷语义折叠/M36/C1，没有分隔符那一格）。
 	// M36：这里**不折**——
 	// 折叠会把"用户从没点过的另一种拼写"也算成他指定过，凭空放行一道保护剪枝
 	// （后果与登记：设计稿 §10.5-1 / M44）。

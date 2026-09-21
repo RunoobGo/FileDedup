@@ -112,6 +112,24 @@ wiring 'src/views/ResultView.vue' 'head: true' '' \
 	'Warnings 摘要行标了 head（M80：不标就会被自己投出的明细挤掉）'
 wiring 'src/components/FailedDrawer.vue' 'copyText(' 'navigator.clipboard?.writeText(' \
 	'复制全部走 utils/clipboard 的 copyText（M83：可选链短路时 .catch 从未挂上，无剪贴板环境完全静默）'
+# M116 / M118（第 2 轮 §23.5）：展示面两处「判据收在一份、组件只许引用」。
+# M116：同一句「秒级时间戳 → 本地时间串」在三个视图各写一遍内联串，而 utils/format 里
+#	早就有 formatMtime；两份实现可以各自漂移（hour12 / locale / 是否带秒），
+#	改一处忘两处时界面上会出现两种时间写法。锚的是「视图引用 formatUnixSec」。
+# M118：ScanView 的进度条自己写了 `Math.min(100, …)`——有上限、无下限、无 NaN 防，
+#	而同一 UI 里 ResultView 用的是三重钳的 percentOf。判据本体（越界钳住 + 非法值回 0）
+#	已由 opdisplay.test.ts 的两条 node 用例钉住，这里补的仍是「有没有去用」这一刀：
+#	.vue 无法被 node --test 导入，行为探针打不到视图，只能走接线锚。
+wiring 'src/utils/format.ts' 'export function formatUnixSec' '' \
+	'秒级时间格式化收在 utils/format（M116 落点）'
+wiring 'src/views/ScanView.vue' 'formatUnixSec(' '.toLocaleString(' \
+	'扫描页历史时间引用 formatUnixSec（M116：不得内联拼日期串）'
+wiring 'src/views/RecordsView.vue' 'formatUnixSec(' '.toLocaleString(' \
+	'记录页时间引用 formatUnixSec（M116）'
+wiring 'src/views/ResultView.vue' 'formatUnixSec(' '.toLocaleString(' \
+	'结果页历史时间引用 formatUnixSec（M116）'
+wiring 'src/views/ScanView.vue' 'percentOf(' 'Math.min(100, ' \
+	'扫描页进度条取自 percentOf（M118：不得自拼只夹上限的百分比）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

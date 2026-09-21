@@ -208,8 +208,15 @@ func verifyHardlinked(keep, dup string) error {
 //
 // P2：跨卷复制路径此前用 os.Create（0666&^umask）落地，可执行/只读等模式位
 // 会丢失；目标 mtime 也会变成"现在"，导致后续按 (path,size,mtime) 命中哈希缓存
-// 与保留策略全部失效。内容校验通过后才还原元数据——还原失败不作为整体失败
-// （数据已在目标处），单独返回错误供上层记录。
+// 与保留策略全部失效，故内容校验通过后要还原元数据。
+//
+// M112（04 §6.11 OPS-16，设计段 §23.1）：改前这段承诺"还原失败不作为整体失败
+// （数据已在目标处），单独返回错误供上层记录"——代码没这么做，也做不了：
+// 本函数直接把 restoreMeta 的错误原样返回，MoveFile:56 见错即 dst.release()
+// 删掉刚复制完的那份并整项判失败。不丢数据（源文件未动），但这次移动没做成。
+// 按注释那样回"成功但降级"需要 MoveFile 有三态出口，那是另一条挂账 M40 的形状
+// 改动；本轮只把话改回真话，不改行为。同包 undo.go:447 applyMtime 才是注释
+// 原先描述的那种口径（失败不升级为整体失败、返回 void）。
 func copyVerify(src, dst string, st os.FileInfo) error {
 	sf, err := os.Open(src)
 	if err != nil {

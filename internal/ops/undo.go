@@ -196,7 +196,12 @@ func undoMove(it UndoItem) (string, error) {
 	}
 	dst, err := MoveFile(it.DestPath, filepath.Dir(it.OrigPath))
 	if err != nil {
-		return "", err
+		// M113（04 §6.11 OPS-14e，设计段 §23.2）：这里原先是 `return "", err`。
+		// MoveFile 有两条"返回 dst 且 err≠nil"的部分成功路径（move.go:60-65 源被顶替、
+		// :66-72 删源失败），此时盘上已经是两份，而 app 层 undoFailure 的
+		// "（数据已在 …）"补写（M86 立的做法）认的就是这个返回值 —— 丢掉落点等于
+		// 让那份孤儿副本在界面上不存在。完全失败时 MoveFile 回空串，行为不变。
+		return dst, err
 	}
 	applyMtime(dst, it.MtimeNs)
 	return dst, nil

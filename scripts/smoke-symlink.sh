@@ -32,6 +32,14 @@
 
 set -euo pipefail
 
+# ★ 2026-09-21（第 2 轮审查 M134，04 §6.11 GATE-8）：本项目在 macOS 上由
+# bash 3.2.57 执行，而它在 LC_CTYPE=C.UTF-8 下扫描变量名时，会把紧跟 `$VAR`
+# 之后的**全角字符首字节当作变量名的一部分**——`（$LOOP）` 被读成 `$LOOP\xef`，
+# set -u 于是以 "LOOP…: unbound variable" 直接杀掉脚本，症状是"门禁红"，
+# 归因却是"环境出问题"，与区域设置的关系完全看不出来。
+# 规矩：**全角括号/标点紧邻的展开一律写 ${VAR}**。本文件与 smoke-symlink-assert.sh、
+# check-version-sync.sh 已按此收窄；真读数见设计段 §23.11。
+
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 # skip 以退出码 2 + "SKIP:" 前缀标记**自证**，绝不与全绿（0）同形。
@@ -76,7 +84,7 @@ if command -v mkfs.ext4 >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1; t
 	if mkfs.ext4 -q -F "$IMG" 2>/dev/null && LOOP="$(losetup --find --show "$IMG" 2>/dev/null)" \
 		&& mount "$LOOP" "$MNT" 2>/dev/null; then
 		MOUNTED_BY_US=loop
-		echo "    ✓ 已挂载 ext4（$LOOP）"
+		echo "    ✓ 已挂载 ext4（${LOOP}）"
 	else
 		# ★ 2026-09-20（审查 M8）：修正前这里直接 LOOP=""。losetup 已建立的
 		# 设备就此泄漏（cleanup 见 LOOP 为空便不 losetup -d）——反复运行会
@@ -127,13 +135,13 @@ ln -s "$KEEP" "$MNT/link.bin"
 [ "$(sha256sum "$MNT/link.bin" | cut -d' ' -f1)" = "$KEEP_SUM" ] \
 	|| fail "通过链接读到的内容与保留源不一致"
 [ "$(sha256sum "$KEEP" | cut -d' ' -f1)" = "$KEEP_SUM" ] || fail "保留源内容被改变"
-echo "    ✓ 链接建立，内容与保留源一致（$KEEP_SUM）"
+echo "    ✓ 链接建立，内容与保留源一致（${KEEP_SUM}）"
 
 # ---- ③ 链接是独立小文件，占用远小于数据本体 ----
 say "③ 链接自身占用（预期远小于数据）"
 LINK_SZ="$(stat -c %s "$MNT/link.bin")"
 DATA_SZ="$(stat -c %s "$KEEP")"
-[ "$LINK_SZ" -lt "$DATA_SZ" ] || fail "链接大小（$LINK_SZ）不小于数据（$DATA_SZ）"
+[ "$LINK_SZ" -lt "$DATA_SZ" ] || fail "链接大小（${LINK_SZ}）不小于数据（${DATA_SZ}）"
 echo "    ✓ 链接 $LINK_SZ B ｜ 数据 $DATA_SZ B（省下约 $((DATA_SZ - LINK_SZ)) B）"
 
 # ---- ④ 删除链接不影响保留源 ----
@@ -168,7 +176,7 @@ mv "$RESTORE.fdd-old" "$RESTORE"
 [ -f "$RESTORE" ] && [ ! -L "$RESTORE" ] || fail "回撤后应为独立普通文件"
 [ "$(sha256sum "$RESTORE" | cut -d' ' -f1)" = "$KEEP_SUM" ] \
 	|| fail "回撤后内容与原始数据不符"
-echo "    ✓ 还原为独立文件且内容正确（$KEEP_SUM）"
+echo "    ✓ 还原为独立文件且内容正确（${KEEP_SUM}）"
 
 # ---- ⑦ 悬空链接仍可回撤（备份是数据本体，与链接有效性无关）----
 say "⑦ 悬空状态下回撤（应成功）"

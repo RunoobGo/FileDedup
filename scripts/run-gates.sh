@@ -51,10 +51,16 @@ row() {
 }
 
 # 1) gofmt：rc 恒 0，判据必须是**列出的文件数**。
+# M124：但"文件数为 0"单独不成立——gofmt 自己崩了（rc≠0 且 stdout 空）也会数出 0，
+# 那一格改前读成 PASS。⇒ 判据两条：rc 必须为 0，且列出文件数必须为 0。
 echo "### 1 gofmt"
 GF=$(gofmt -l . 2>&1); GRC=$?
 echo "rc=$GRC"
-if [[ -n "$GF" ]]; then
+if [[ $GRC -ne 0 ]]; then
+  [[ -n "$GF" ]] && echo "$GF"
+  echo "GOFMT 自身退出码非 0（rc=${GRC}）⇒ 本行判 FAIL，不得退化成「没文件要报」就是绿"
+  fail; note "1 gofmt" FAIL
+elif [[ -n "$GF" ]]; then
   echo "$GF"
   echo "gofmt_files=$(printf '%s\n' "$GF" | wc -l | tr -d ' ')"
   echo "GOFMT 有文件未格式化 ⇒ 本行判 FAIL"
@@ -131,6 +137,13 @@ race_row "7 race-x2-all" go test -race -count=2 ./...
 race_row "8 race-x4-root" go test -race -count=4 .
 
 # 9~15) 前端与脚本面
+#
+# ★ M123（04 §6.11 GATE-5，设计段 §23.9）：`skipok=1` 那行改前只认"裸 rc==2 ⇒ SKIP"。
+# 而被包脚本自己的契约（smoke-symlink.sh:19-22、skip():37-40）是**两件事同真**：
+# "SKIP（跳过，非通过）:" 前缀 + 退出码 2。它整个脚本是 `set -euo pipefail`，
+# 中途任何命令以 2 退出（grep 读不出、mount 参数错都会给 2）都会被这里降级成
+# SKIP、总判定照样 exit 0——正是 AS-K2/M8 要防的"真失败伪装成合法跳过"那一格。
+# ⇒ 判据补成双条件：码对**且**日志里有那行自证，缺一即 FAIL。
 sh_row() {
   local label="$1" skipok="${2:-0}"; shift 2
   echo "### ${label}"
@@ -139,8 +152,14 @@ sh_row() {
   echo "rc=$rc"
   tail -n 6 "$LOGDIR/$label.log"
   if [[ $rc -eq 0 ]]; then note "$label" PASS
-  elif [[ $skipok -eq 1 && $rc -eq 2 ]]; then note "$label" SKIP   # 环境性跳过，不算通过
-  else fail; note "$label" FAIL; fi
+  elif [[ $skipok -eq 1 && $rc -eq 2 ]] && grep -q '^SKIP' "$LOGDIR/$label.log"; then
+    note "$label" SKIP   # 环境性跳过（双条件齐），不算通过、只算未取读数
+  else
+    if [[ $skipok -eq 1 && $rc -eq 2 ]]; then
+      echo "rc=2 但日志里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为 SKIP"
+    fi
+    fail; note "$label" FAIL
+  fi
 }
 sh_row "9 frontend-typecheck" 0 bash -c 'cd frontend && npm run typecheck'
 sh_row "10 frontend-build" 0 bash -c 'cd frontend && npm run build'

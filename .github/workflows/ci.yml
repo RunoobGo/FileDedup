@@ -127,19 +127,28 @@ jobs:
       # "runner 挂不上任何文件系统"与"7 条判据全部成立"都是绿：这条唯一的
       # 真实跨卷防线可以在无人察觉时失效。现在 rc=2 仍不阻断（环境受限不该
       # 怪代码），但会在作业摘要与日志里留下**醒目告警**，不再与全绿同形。
+      #
+      # ★ M133（04 §6.11 GATE-7，设计段随 §23.9 一并记）：上面那段只解决了"跳过与
+      # 全绿同形"，没解决"真失败与跳过同形"。smoke-symlink.sh 自己的契约（:19-22、
+      # skip():37-40）是**两件事同真**——"SKIP（跳过，非通过）:" 前缀 + 退出码 2，
+      # 而本步骤改前只认裸 rc=2；该脚本整体是 `set -euo pipefail`，中途任何命令以 2
+      # 退出（mount 参数错、grep 读不出）都会在这里被降级成"被跳过 + 告警"、作业仍绿。
+      # 本地那份 harness 同一格已按 M123 补成双条件，这里补齐云端这一半。
       - name: 跨卷软链接冒烟（独立卷 + 7 条判据）
         timeout-minutes: 10
         run: |
           set +e
           # step 级 timeout（AS-K5）：mount/losetup 坏的时候是**阻塞**而不是报错，
           # 只靠作业级 timeout-minutes 会把整个 job 连日志一起废掉。
+          # M133：输出一份留档，供 rc=2 那一格核对自证标记（PIPESTATUS 取 timeout 的码，
+          # 不是 tee 的——取错就变成"只要 tee 成功就算通过"）。
           timeout --signal=TERM --kill-after=30s 420s \
-            sudo bash scripts/smoke-symlink.sh
-          rc=$?
+            sudo bash scripts/smoke-symlink.sh 2>&1 | tee /tmp/smoke-symlink.log
+          rc=${PIPESTATUS[0]}
           set -e
           case "$rc" in
             0) echo "跨卷软链接 7 条判据全部成立" ;;
-            124|137|143) msg="跨卷软链接冒烟超时（420s 未完成，rc=$rc）——多半是 mount/losetup 阻塞"
+            124|137|143) msg="跨卷软链接冒烟超时（420s 未完成，rc=${rc}）——多半是 mount/losetup 阻塞"
                echo "::error::$msg"
                {
                  echo '## ⏱ 跨卷软链接冒烟超时'
@@ -148,7 +157,11 @@ jobs:
                  echo "超时按失败处理：阻塞与判据不成立都需要人来看。"
                } >>"$GITHUB_STEP_SUMMARY"
                exit 1 ;;
-            2) msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过"
+            2) if ! grep -q '^SKIP' /tmp/smoke-symlink.log; then
+                 echo "::error::rc=2 但输出里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为跳过（M133）"
+                 exit 1
+               fi
+               msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过"
                echo "::warning title=冒烟未执行::$msg"
                {
                  echo '## ⚠️ 跨卷软链接冒烟未执行'
@@ -158,7 +171,7 @@ jobs:
                  echo "判据 ①「硬链接跨卷必失败」只能在真实独立卷上实证，"
                  echo "同卷环境下无法降级验证。请检查 runner 的 loop/tmpfs 可用性。"
                } >>"$GITHUB_STEP_SUMMARY" ;;
-            *) echo "::error::跨卷软链接冒烟失败（rc=$rc）"; exit "$rc" ;;
+            *) echo "::error::跨卷软链接冒烟失败（rc=${rc}）"; exit "$rc" ;;
           esac
 
       # 冒烟脚本自身的判据（退出码契约 + loop 设备不泄漏 + 失败信息可排查）。

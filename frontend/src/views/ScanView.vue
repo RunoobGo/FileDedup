@@ -4,7 +4,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useScanStore, emptyFilters } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
-import { humanBytes, humanSpeed, humanTime, statusLabel, stageLabel, formatCount } from '../utils/format'
+import { humanBytes, humanSpeed, humanTime, statusLabel, stageLabel, formatCount, formatUnixSec } from '../utils/format'
+import { percentOf } from '../utils/opdisplay'
 import Icon from '../components/Icon.vue'
 
 const store = useScanStore()
@@ -14,9 +15,6 @@ const advancedOpen = ref(false)
 
 // v0.5.0 功能 3：最近一次扫描横幅（有历史时提供 恢复/查看历史 快捷入口）
 const lastScan = computed(() => store.histList[0] ?? null)
-function fmtHistTime(unixSec: number): string {
-  return new Date(unixSec * 1000).toLocaleString('zh-CN', { hour12: false })
-}
 function rootsBrief(roots: string[]): string {
   if (!roots.length) return '—'
   return roots.length === 1 ? roots[0] : `${roots[0]} 等 ${roots.length} 项`
@@ -95,8 +93,7 @@ function resetFilters() {
 
 const progressPercent = computed(() => {
   const p = store.progress
-  if (!p || !p.BytesTotal) return 0
-  return Math.min(100, (p.BytesDone / p.BytesTotal) * 100)
+  return percentOf(p?.BytesDone ?? 0, p?.BytesTotal ?? 0)
 })
 </script>
 
@@ -140,7 +137,7 @@ const progressPercent = computed(() => {
       <!-- v0.5.0：最近一次扫描快捷入口 -->
       <div v-if="lastScan" class="panel hist-banner">
         <Icon name="history" :size="15" class="hb-ico" />
-        <span class="hb-text">上次扫描 {{ fmtHistTime(lastScan.savedAt) }} ·
+        <span class="hb-text">上次扫描 {{ formatUnixSec(lastScan.savedAt) }} ·
           <span class="hb-roots" :title="lastScan.roots.join('\n')">{{ rootsBrief(lastScan.roots) }}</span>
           · {{ lastScan.groups }} 组可释放 {{ humanBytes(lastScan.reclaimable) }}</span>
         <button class="btn-ghost" :disabled="store.opsRunning"

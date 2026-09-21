@@ -4,7 +4,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
-import { humanBytes, formatCount } from '../utils/format'
+import { humanBytes, formatCount, formatUnixSec } from '../utils/format'
 import Icon from '../components/Icon.vue'
 import type { HistoryMeta, OpRecord, OpRecordItem } from '../wails'
 
@@ -21,10 +21,6 @@ onMounted(() => {
 watch(tab, (t) => { if (t === 'ops') store.refreshOps() })
 
 const loading = computed(() => store.histLoading)
-
-function fmtTime(unixSec: number): string {
-  return new Date(unixSec * 1000).toLocaleString('zh-CN', { hour12: false })
-}
 
 function rootsSummary(m: HistoryMeta): string {
   if (!m.roots.length) return '—'
@@ -234,7 +230,7 @@ function danglingTitle(it: OpRecordItem): string {
         </thead>
         <tbody>
           <tr v-for="m in store.histList" :key="m.id" :class="{ current: store.histResult?.id === m.id }">
-            <td class="mono">{{ fmtTime(m.savedAt) }}</td>
+            <td class="mono">{{ formatUnixSec(m.savedAt) }}</td>
             <td class="roots" :title="m.roots.join('\n')">{{ rootsSummary(m) }}</td>
             <td class="num">{{ formatCount(m.groups) }}</td>
             <td class="num">
@@ -278,7 +274,7 @@ function danglingTitle(it: OpRecordItem): string {
         <tbody>
           <template v-for="m in store.opList" :key="m.id">
             <tr :class="{ expanded: expandedOp === m.id }">
-              <td class="mono">{{ fmtTime(m.createdAt) }}</td>
+              <td class="mono">{{ formatUnixSec(m.createdAt) }}</td>
               <td>
                 <span class="kind-badge" :class="'k-' + m.kind">{{ OP_KIND_LABEL[m.kind] ?? m.kind }}</span>
                 <span v-if="!m.undoable" class="no-undo" :title="noUndoTitle(m)">不可回撤</span>

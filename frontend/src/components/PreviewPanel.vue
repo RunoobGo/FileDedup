@@ -39,6 +39,13 @@ const isMd = computed(() => store.preview?.kind === 'text' && isMarkdownExt(ext.
 //   400 KB → 41 724 节点 · 450 ms   ← 肉眼可见的卡顿，且 4 万节点会长期驻留内存
 // 因此超过阈值时**默认退回源码**（源码只是一个 <pre>，代价恒定），
 // 但保留手动渲染入口 —— 把选择权交给用户，而不是替他把界面冻住半秒。
+//
+// ★ M117（04 §6.11 FE-12）：按当前的后端上限，这道护栏**打不到**——预览内容只有
+// PreviewFile 一个来源，文本腿固定截在前 4 KiB（app.go 的 textLimit = 4 << 10），
+// 而 isMd 又要求 kind === 'text' ⇒ content.length > 64 KiB 恒假。上面那三档是
+// **渲染器本体**的代价读数（真造 400 KB 文档即得），不是这条分支的可达读数。
+// 保留它的理由是"后端上限以后变大时不必重新想起来"，不是"它现在在挡什么"。
+// 也不调低阈值：那会让正常 md 文件默认退回源码，属改行为，不属本轮。
 const MD_RENDER_MAX = 64 * 1024
 const overRenderCap = computed(() => (store.preview?.content.length ?? 0) > MD_RENDER_MAX)
 

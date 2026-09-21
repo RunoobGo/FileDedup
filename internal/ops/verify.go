@@ -96,6 +96,60 @@ func pathIdentity(path string) (fsid.ID, error) {
 	return fsid.FromPathNoFollow(path)
 }
 
+// fsidFromPathFn 是"读一个路径的当前身份"的包级接缝，**仅供测试注入读不动的情形**
+// （M114：EACCES / EIO 这类"不是不存在、而是读不出"的归因在本包无法用真文件系统造出来
+// ——无 root、无法可靠造出一个 Lstat 会失败而文件确实在的位置）。
+// 生产路径就是 fsid.FromPathNoFollow 本身，接一层不改任何语义。
+var fsidFromPathFn = fsid.FromPathNoFollow
+
+// identityVerdict 是"动手前再读一次身份"的四种归因（M114/OPS-13b，设计段 §23.3）。
+//
+// 为什么要有第四格：判据自 M54 起就已经是三路分发（放行 / 已消失 / 被顶替），
+// 但形状是 `(still, gone bool, bool)`——两个布尔只有三种合法组合，
+// 而 `identityStatus` 的 `(false, false)` 实际由**两条**不同的来路产生：
+//   - 读身份报错且不是 ENOENT（父目录 EACCES、断线卷 EIO/ESTALE、路径形状 ENOTDIR）；
+//   - 原先能解析、现在解析不出（`cur.Resolved` 为假）。
+//
+// 两条都是"我们不知道"，调用方却只能说"文件在扫描后被替换（inode 已变化）"——
+// 那是只有真看到另一个 inode 时才允许说的话。拦下（fail-closed）从来不是争议点，
+// 争议在**说法**：用户据此去找一个根本不存在的"新文件"，而该做的动作是重扫或查挂载。
+type identityVerdict int
+
+const (
+	// vSame 路径仍指向记录时那个对象。**包含**"记录里的身份本就未解析"那一格
+	// （FAT/exFAT 不给稳定索引）：那一格的处置与"确认同一个"完全相同（放行），
+	// 硬拆成两格会让每个调用点都要决定"未解析算放行还是算拦下"，而 M114 要修的只有文案。
+	vSame identityVerdict = iota
+	// vReplaced 确证被换成另一个对象（两侧都可解析且不同）⇒ 必须拦。
+	vReplaced
+	// vGone 这个位置上的对象已经没了（ENOENT）⇒ 目标已达成，记 Skipped（M54）。
+	vGone
+	// vUnknown 无从判定（读不动 / 原先能解析现在不能）⇒ 拦下，但**不得**说成被替换。
+	vUnknown
+)
+
+// identityCheck 是身份复核的判据本体，把归因一次说全，附带一句可展示的因由。
+// why 只在 vUnknown 时非空（调用方直接拼进文案），其余格给空串。
+func identityCheck(path string, id fsid.ID) (identityVerdict, string) {
+	if !id.Resolved {
+		return vSame, "" // 见 vSame 的注释：未解析按放行处理，与"确认同一个"同格
+	}
+	cur, err := fsidFromPathFn(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return vGone, ""
+		}
+		return vUnknown, err.Error()
+	}
+	if !cur.Resolved {
+		return vUnknown, "原先能解析身份，现在解析不出（卷行为异常，或路径已被换成不提供稳定索引的对象）"
+	}
+	if cur.SameIdentity(id) {
+		return vSame, ""
+	}
+	return vReplaced, ""
+}
+
 // identityStill 复核 path 当前指向的物理文件仍是 id 记录的那一个。
 // 不跟随符号链接：路径被换成链接/目录/另一文件时，身份必不同。
 //
@@ -113,8 +167,7 @@ func identityStill(path string, id fsid.ID) bool {
 	return still
 }
 
-// identityStatus 是 identityStill 的判据本体，多给一条"这个位置上的对象已经没了"
-// 的区分（M54/OPS-13，04 §6.11）。
+// identityStatus 是 identityCheck 的**两布尔视图**（M54/OPS-13 的形状，04 §6.11）。
 //
 // 修前 identityStill 的 `err != nil → false` 把两件事压成一件：
 //   - 用户（或另一个程序）自己把 dup 删了 ⇒ 目标其实**已达成**，与 VerifyFile
@@ -129,20 +182,10 @@ func identityStill(path string, id fsid.ID) bool {
 // os.Lstat 的 *PathError，Windows 腿（fsid_windows.go:128）返回 syscall.Errno，
 // 两侧该判据都成立（Errno 自带 Is）⇒ 一个纯函数跨平台，不需要真机。
 //
-// ★ 本函数只服务 executor 那六处需要区分处置的调用点；其余十处继续用
+// ★ M114 之后本视图只剩两格：executor 那六处改直读 identityCheck（第四格"读不动"
+// 在这里表达不出来——(false,false) 仍是两条来路共用的一格）。其余十处继续用
 // identityStill（各自的"消失"处置语义并不相同，见 merge_guard.go:90 的刻意 fail-closed）。
 func identityStatus(path string, id fsid.ID) (still bool, gone bool) {
-	if !id.Resolved {
-		return true, false
-	}
-	cur, err := fsid.FromPathNoFollow(path)
-	if err != nil {
-		return false, errors.Is(err, os.ErrNotExist)
-	}
-	if !cur.Resolved {
-		// 原先能解析、现在解析不出：卷行为异常或路径已被换成不支持索引的对象。
-		// 判否——宁可拦一次让用户重扫，也不放行一次可能覆盖他人文件的操作。
-		return false, false
-	}
-	return cur.SameIdentity(id), false
+	v, _ := identityCheck(path, id)
+	return v == vSame, v == vGone
 }

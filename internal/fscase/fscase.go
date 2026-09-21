@@ -149,17 +149,29 @@ func probe(dir string) bool {
 // verdictFrom 用刚创建的 lower 与另一种大小写的 upper 作判据。
 // ok=false 表示"upper 位置上另有其文件"，这次的结果不可归因，应换号重来。
 //
+// ★ M126（04 §6.11 FC-3，设计段 §23.10）：改成先分清 upper 的失败**是哪一种**。
+// 原先 `case uerr != nil: return true, true` 把"看不见"和"读不动"当成同一件事，
+// 于是 EIO / ESTALE / EPERM / ENOTDIR（死挂载、权限、路径形状）都会被报成
+// "卷区分大小写"这一**确证结论**，再被 Sensitive:54-70 按目录永久缓存：
+// 一次瞬时 I/O 故障就把整趟扫描的折叠语义钉死。包注释（:11-13）与 probe:116
+// 承诺的都是"不确定就退回平台默认、不猜测"，这里是那两条承诺唯一的破口。
+// 判错方向不是中性的：见包注释——折叠判错会让同一目录重复收集，
+// "重复组数与可释放空间虚高，据此下发的清理会多删文件"。
+//
 // ★ 只删自己创建的 lower：upper 可能是上次运行的残留，也可能是用户放的同名文件，
 // 我们无从分辨，因此一个字节都不碰（与 ops 侧 claimSlot 同一口径）。
 func verdictFrom(lower, upper string) (v bool, ok bool) {
 	li, lerr := os.Lstat(lower)
 	ui, uerr := os.Lstat(upper)
 	switch {
-	case uerr != nil:
-		return true, true // 换一种大小写看不见 → 卷区分大小写
-	case lerr == nil && os.SameFile(li, ui):
-		return false, true // 命中同一个对象 → 卷不区分
-	default:
+	case uerr == nil:
+		if lerr == nil && os.SameFile(li, ui) {
+			return false, true // 命中同一个对象 → 卷不区分
+		}
 		return false, false // upper 是另一个文件：撞名，换号
+	case errors.Is(uerr, os.ErrNotExist):
+		return true, true // 换一种大小写确实看不见 → 卷区分大小写（确证）
+	default:
+		return Default(), true // 读不动 = 无从判定 → 退平台默认，不外传确证
 	}
 }

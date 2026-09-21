@@ -1,6 +1,8 @@
 package cache
 
-// M4-T01 单测：命中判定 / 元数据失效 / 批量 UPSERT / 淘汰 / 统计 / 清空 / 损坏自愈。
+// M4-T01 单测：命中判定 / 元数据失效 / 批量 UPSERT / 淘汰 / 统计 / 清空 / 损坏隔离重建。
+// M121（04 §6.11 CACHE-8）：改前这里写"损坏自愈"，而包注释（cache.go:5，M96）已把口径
+// 改成"打开时隔离重建、运行期只停用，都不是自愈"——同一目录两份说法，这里跟包注释走。
 
 import (
 	"bytes"
@@ -139,9 +141,9 @@ func TestCorruptSelfHeal(t *testing.T) {
 	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database garbage"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Open(dbPath) // 应自动重建
+	c, err := Open(dbPath) // Open 腿：改名隔离后重建（不是"自愈"，口径见 cache.go 包注释）
 	if err != nil {
-		t.Fatalf("损坏自愈失败: %v", err)
+		t.Fatalf("损坏隔离重建失败: %v", err)
 	}
 	defer c.Close()
 	if err := c.Store([]Entry{{Path: "/z", Size: 1, MtimeNs: 1, Head: 1, Tail: 1}}); err != nil {

@@ -6,7 +6,7 @@ import { useToastStore } from '../stores/toast'
 import GroupCard from '../components/GroupCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import Icon from '../components/Icon.vue'
-import { humanBytes, formatCount } from '../utils/format'
+import { humanBytes, formatCount, formatUnixSec } from '../utils/format'
 import { opFailedLabel, percentOf } from '../utils/opdisplay'
 import { isGroupCrossVolume } from '../utils/pathpolicy'
 import type { OpKind } from '../wails'
@@ -216,7 +216,7 @@ function onConfirm(targetDir?: string) {
   <div class="result-view">
     <!-- v0.5.0 功能 3：历史结果提示条 -->
     <div v-if="store.histResult" class="panel hist-banner">
-      当前为历史结果（保存于 {{ new Date(store.histResult.savedAt * 1000).toLocaleString('zh-CN', { hour12: false }) }}），清理前会逐文件校验内容。
+      当前为历史结果（保存于 {{ formatUnixSec(store.histResult.savedAt) }}），清理前会逐文件校验内容。
     </div>
     <!-- 统计条（P1-2：无重复组且无失败项时整块隐藏，不再渲染全 0 统计与无效的排序/过滤控件） -->
     <div v-if="store.totalGroups > 0 || store.failed.length" class="statbar panel">

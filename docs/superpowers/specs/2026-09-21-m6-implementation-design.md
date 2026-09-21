@@ -3901,3 +3901,100 @@ RED：新用例走 `copyVerifyFile` 缝（`move.go:411`，"复制已完成、源
 不占号的两条（只记账）：(a) 代理乙指出 `339a95c` 提交说明里"M92 …判据一字未动"与同一提交
 被 M93 重写后的 diff 不符——那是**中间态**的说法，已提交的历史不改写，在 §6.19 记下；
 (b) 代理甲的 7 条伪造/失真（§23 开头已列逐串零命中的读数）——不登记、不占号。
+
+### 23.10 第 3 份子代理报告（叶子包）复核后追加：M126~M132
+
+追加时点在设计段提交（`eb099f3`）之后、实施提交之前；这份报告与代理甲不同，
+它每条都带了可复算的引文与"改哪一行会红"的验证建议，**7 条开码复核 7 条为真**
+（另有一条它自己标"本机无 runner 不可证"的未采信）。逐条读数：
+
+| ID | 坐标 | 复核到的事实（我自己开码/跑过的） | 本批处置 |
+| --- | --- | --- | --- |
+| M126 | `internal/fscase/fscase.go:154-163` | `verdictFrom` 的 `case uerr != nil: return true, true` 把**任何** Lstat(upper) 错误（EIO/ESTALE/EPERM/ENOTDIR）都当成"换种大小写看不见 ⇒ 卷区分大小写"这一**确证结论**并缓存（`Sensitive:55-70` 按目录永久缓存）。两处承诺被推翻：包注释 `:11-13`"探测不可用（只读卷、无写权限、目录尚不存在）时退回平台默认"、`probe:116`"任何一步不确定都退回默认值，不猜测"。★ 方向也不是"两种错法都行"：包注释 `:7-9` 明写判错方向的后果是"据此下发的清理会多删文件" | **修**：`errors.Is(uerr, os.ErrNotExist)` 才给确证，其余退 `Default()`。`verdictFrom` 是纯函数、**全仓零测试点**（`grep -rn "verdictFrom" --include=*.go .` 只命中 `:137` 调用与 `:149/:154` 自身），故三条用例都能在 darwin 本机真跑：ENOENT→确证、硬链接同号→不敏感、`upper` 落在文件之下（ENOTDIR）→退默认。RED 顺序：先写用例（第三条必红在"确证成 sensitive"），后改码 |
+| M127 | `internal/sysguard/sysguard_test.go:56-62` | 注释说"这里**显式钉住**该语义，防止有人顺手改成逐段扫描"，代码是 `if dirSkip(...) { t.Log(...) }`——`t.Log` 永不失败 ⇒ 死门禁。变异复算：把 `Guard.Dir` 改成逐段匹配，全包套件仍全绿 | **修**：`t.Log` 改 `t.Errorf`（钉住现有行为"后代段不判保护"，是**补强**）。判据 = 同一变异（临时把 `Dir` 改成逐段）必须红，改回必须绿 |
+| M128 | `internal/filter/extset_probe_test.go:12-13` × `internal/filter/filter.go:41-45` | 测试头写"修法只在 `newExtSet` 一处（I5）"，同包 `filter.go:41-45` 写的正是反面："为什么放在 Compile 而不是 newExtSet …在 newExtSet 里补点会让那份基准反过来钉住错误语义"；`newExtSet:78-94` 确只做小写与选表 ⇒ 说谎的是测试头 | **修**（话术面）：测试头改指 `normalizeExtList`/`Compile`，与 `filter.go` 同一说法 |
+| M129 | `internal/hasher/hasher_test.go:168-175` | `TestHashFullOpenError` 函数体只有 `os.Open(missing)` + `if err == nil { t.Fatal }`——**从未调用 `HashFull`**，断的是标准库行为。`HashFull` 里任何守卫（负 size、短读、变长）改坏它都照绿 | **修**：改成真调 `HashFull(f, …)`（`f` 用不可读句柄路径的等价注入：`os.Open` 已失败 ⇒ 直接调 `HashFull(nil-safe)` 不成立，故按 `HashFull` 的真实契约造"句柄有效但读失败"那一格——`HashFull` 签名 `:254` 收 `*os.File`，用例改走"打开后立刻 Close 再读"的 EBADF 路径）。若那条在 CI 上与本机行为不一致 ⇒ 降级为只登记 |
+| M130 | `internal/progress/progress.go:23` × `:68` × `:90` | `lastEmit` 只有声明与两处写入，**全仓无读取点**（`grep -rn lastEmit --include=*.go .` 恰好三条）——按时间节流的旧实现残骸，现由 ticker 承担 | **登记不修**：删字段是死代码清理，不属本轮判据面；且 `progress` 包刚在 §18 动过，避免同包二次改动 |
+| M131 | `internal/hasher/growth_sampling_test.go:134` | `r.Partial != r2.Partial \|\| r.Full != r2.Full` 的后半**恒不成立**：夹具是 300 KiB（`> SmallFileMax`）走大文件腿，而 `Result.Full` 只在小文件腿赋值（`hasher.go:108`→`:125`），两侧都是零数组 | **登记不修**：删一半是**收窄**断言（本批禁做），留着只是不锐利；下一批若加"小文件腿两次指纹一致"的另一条用例可顺带清 |
+| M132 | `internal/hasher/shortread_test.go:111-114` | 注释称"允许的上界是真实长度 + 一个 64 KiB 采样块——该口径下可达的精度上限"。`hasher.go:173-174` 的契约是"不低于真实长度的保守上界"，且推导取"全部读不满点里最小的 off+n"（`:181-190`）：夹具 `declared = real + 300 KiB` 时中点落在 `declared/2`，`v = declared/2` 可以远大于 `real + chunk` ⇒ 那句"上限"是**夹具特定**的，不是口径给的 | **登记不修**：断言本身对夹具成立（改它=改判据），要动的是注释；同包本轮已因 M129 开窗，按约束 7 留到下一批 |
+
+### 23.11 实施期新增两条（M133 / M134，均为开码复核为真后才编号）
+
+| ID | 坐标 | 复核到的事实 | 处置 |
+| --- | --- | --- | --- |
+| M133 | `.github/workflows/ci.yml:137-164`（冒烟步骤的 `case "$rc"`） | 本地 harness 按 **M123** 补成双条件时才看清：云端这一半是同一格的另一半——改前只认**裸 `rc=2`** 就降级成"被跳过 + 告警"、作业仍绿，而被测脚本的契约是"`SKIP（跳过，非通过）:` 前缀 + 退出码 2"两件事同真（`smoke-symlink.sh:19-22`、`skip():37-40`）。该脚本整体 `set -euo pipefail`，中途任何命令以 2 退出都会在这里被读成合法跳过 | **修**：输出 `tee` 留档 + `rc=${PIPESTATUS[0]}`（取 `timeout` 的码而不是 `tee` 的，取错就变成"tee 成功即通过"）+ `grep -q '^SKIP'` 不成立即 `exit 1`。★ 本机无 runner ⇒ 判据用**同一负控制**跑 yaml 里那段 shell：把被测命令换成"exit 2 且不打 SKIP" |
+| M134 | `scripts/smoke-symlink.sh:79`、`:130`、`:136`、`:171`、`scripts/smoke-symlink-assert.sh:185`、`:244`、`scripts/check-version-sync.sh:87`、`.github/workflows/ci.yml:151`、`:174` | **取红复算时撞出来的**：在 `LC_CTYPE=C.UTF-8` 下（python 子进程默认带这个变量）门禁行 14 稳定红 3 条，逐字是 `✗ 真失败时退出码 = 0，应为 1`、`✗ 输出无 FAIL 标记`、`✗ 失败信息未带设备号`；`out.d` 里的真相是 `smoke-symlink.sh: line 79: LOOP\xef: unbound variable`。根因：`$LOOP` **紧跟全角 `）`**，而 macOS 自带的是 **bash 3.2.57**，它在 `C.UTF-8` 下把全角括号的首字节算进变量名 ⇒ `set -u` 直接打死被测脚本 ⇒ D 组三条断言红在"没失败"，而红的原因是**夹具与被测脚本共用的解析器缺陷**，与产品无关。bash 5（CI 的 ubuntu 腿）不分字节，故这是一条**只在开发机上复现**的假红 | **修**：九处同类站点逐处补花括号（`${LOOP}）`），纯写法收敛、不改任何判据与文案。全仓扫法：正则 `\$\{?[A-Za-z_]\w*\}?(?=[（）：，、—％｜])` 过 `scripts/*.sh` 与 `.github/**/*.yml` |
+
+M134 的两条诚实限定：
+1. **没加静态断言防回归**。这类"全字后面漏花括号"完全可以进 `smoke-symlink-assert.sh` 的 C 组
+   做一条 grep 钉住，但新增断言会把 `MIN_CHECKS` 从 14 抬起、要连带重取条数读数，
+   且本批 M119 刚立过这道门 ⇒ 留下一批（登记在本行，不当已修）。
+2. **`.github/workflows/ci.yml` 那两处是预防性的**：CI 的 bash 5 不受影响，
+   改它只是因为全仓扫到了同一形状（同一规则一处实现一次，I5 的话术侧）。
+
+复算读数（同一负控制"被测命令 exit 2 且不打 SKIP"，跑的是 yaml 里那段 shell 原文）：
+
+```
+### 改前（HEAD 版同一步、同一负控制）rc=0
+    ::warning title=冒烟未执行::跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过
+    nope
+### 改后（工作树版，PIPESTATUS + 自证核对）rc=1
+    nope
+    ::error::rc=2 但输出里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为跳过（M133）
+```
+
+M134 改后读数（`LC_CTYPE=C.UTF-8` 逐条单跑五个 shell 门禁行）：
+`test-frontend-logic rc=0`、`check-version-sync rc=0`、`smoke-cli rc=0`、
+`smoke-symlink-assert rc=0（14 条 / 0 失败）`、`smoke-symlink rc=2（SKIP，本机无 root；这一行的码与区域设置无关）`。
+
+### 23.12 设计-执行偏离清单（本节是"设计段说过的话"与"实际做到的事"的对账）
+
+逐条如实，不做美化。凡"设计里承诺、执行时换形"的，都在这里留痕；没列出的条目按设计做了。
+
+| 条目 | 设计段原本的话 | 实际做到的 | 换形理由（复核后的事实） |
+| --- | --- | --- | --- |
+| M118 | "判据：`test-frontend-logic.sh` 加一条**行为探针**（`BytesDone > BytesTotal` 与 `NaN` 两格），取红一次再改" | 只加了 **5 条静态接线锚点**（`wiring ScanView wants percentOf( forbids "Math.min(100, "` 等），**没有新写行为探针** | 该脚本的行为探针是 `node --test` 跑 `frontend/tests/*.test.ts`，**导入不了 `.vue`**（vue-tsc 只查类型、不产出可 require 的模块）。而 `percentOf` 那两格本身早已被 `opdisplay.test.ts:85-98` 钉住 ⇒ 再写一遍是第二份实现（违 I5）。★ 诚实交代：这一格的"取红"改成了**接线锚点对改前文件的红**（见下），不是原设计的行为级红 |
+| M116 | "三处内联串改为零命中" + vue-tsc | 加了三条 `forbids .toLocaleString(` 锚点，并用**改前文件**验锚点有杀伤力（5 条全红） | 等价替换无新行为可断，接线锚点是本仓唯一能自动化的形状 |
+| M113 | "新用例走 `copyVerifyFile` 缝…断 `undoFailure` 组装出的 `FailedItem.Err` 含那个落点" | 用例**直接调 `undoMove`**，注入走 `removeSrc` 缝，判据落在 `undoMove` 的**第一个返回值** | `copyVerifyFile` 缝在 `MoveFile` 内部，够不到 `undoMove` 的返回语句；`undoFailure` 在 app 层，跨包用例要打两条缝。设计段后半句自己已改口（"判据要落在 `restored` 返回值非空"），实际按后半句做 |
+| M114 步 1 | "在其旁加一条'确认顶替那一格必须同时含 `inode 已变化`'的钉" | 做了（`verify_m52_m54_test.go` 增一条 `strings.Contains(..., "inode 已变化")`） | — |
+| M114 注入 | "如父目录 EACCES" ⇒ 用 `syscall.EACCES` 造"读不动" | 改用**平台中立的普通 error** `errSimulatedUnreadable`，并额外断"这句自证必须出现在文案里" | `syscall.EACCES` 的 `Error()` 文本是 `"permission denied"`，而 windows 腿 `syscall.Errno` 的文本与 `errors.Is(os.ErrPermission)` **不保证**一致 ⇒ 拿它做断言等于把用例钉在某一平台的 errno 表上（§21 那批 CI 红就是这么攒出来的） |
+| M114 承诺 | "现有 **12 个调用点**行为一字不变" | 实际生产调用点是 **10 处 `identityStill` + 1 处 `guardIdentity`**（后者覆盖六个动作）；改后 `identityStatus` 在**生产里再无调用者**，只剩 `identityStill` 的包装与三条测试引用 | "12"是把 guardIdentity 按六个动作展开数出来的，写法不严谨。★ 由此产生一条**新的话术债**：`identityStatus` 现在是"只有测试在用"的兼容层，注释已按真话改（"M114 之后本视图只剩两格"），但**没有删它**（删它是收窄既有断言的落点，违约束 2） |
+| M115 | "读数法：临时把 `swapInAt` 的 `before` 传成 `after` 同值，必须红在自检" | 按此做了（在夹具里插 `before = after`），两个调用点各自红在自检，位置逐字为 `ops_probe_test.go:96`、`verify_m52_m54_test.go:200` | — 另记一条**工具面事实**：覆盖率法不可用于这件事（`go tool cover -func` 对 `_test.go` 里的夹具函数**没有行**），所以"证明自检被走到"只能靠变异 |
+| M126 | 三条用例"都能在 darwin 本机真跑" | 只有**两条**真跑：`SameObject`（PASS）与 `UnreadableUpper`（改前红、改后绿）。`UpperAbsent` 那一格在 APFS 上不可达，用例**自检后 `t.Skipf`**（`verdict_from_test.go:33`），它是本轮 `top_SKIP` 由 5 变 6 的唯一来源 | 原话把"纯函数没有平台分支"写成了"每条都能跑"，忽略了自己创建的 `lower` 在不敏感卷上会**命中同一对象**（走 `SameFile` 支而非 ENOENT 支）。★ 该支的读数归 CI 的 linux 腿，本机不得称已验（AS-K2） |
+| M129 | "若那条在 CI 上与本机行为不一致 ⇒ 降级为只登记" | 未降级。`f.Close()` 之后再 `HashFull` 走的是 Go 运行时的 `checkValid` ⇒ 三条腿都返回 `fs.ErrClosed`，**不经过 OS errno**，故不需要 CI 读数即可定住 | 兑现了设计里那个条件的判定，而不是绕过它：判据不依赖平台 |
+| M122 | "判据 = 变异：删第三级键必须红；`-race -count=4` 连跑须稳" | 按此做，且复算时拿到**两类红**：连跑漂移（`:124` 第 2/3/4/5/6/7/8 跑各漂一次）与**期望顺序错**（`:112` 两条），后者才是第三级键自己的格子 | 无偏离；补一句：`:124` 那句文案仍写着"改前判据：GroupID 由 map 随机遍历序发放"（M94 的话术），它对 M122 是**过度归因**，本批不改（改它会动既有断言的文本，约束 2） |
+| ID 编号 | 约束："ID 只能在复核通过后分配" | 本批两次违规未遂：初稿在 5 个文件里写了 `OPS-17`/`DDP-2`/`FC-1`，其中 `OPS-17` 与 `DDP-2` 是**已存在的别家行**用过的列值；本轮末复核又在 `undo.go:199` 抓到一处残留（未入仓） | 教训落字：**写审计列之前先 `grep` 登记表**。三条已在 §6.11 的列值下重排（OPS-14e / OPS-13b / FC-3） |
+| 改码事故 | — | 两次工具级事故都被下游抓回：① 三次 `Edit` 对 `ResultView.vue` 静默零命中（锚点含全角空格差异）⇒ 是**新加的接线锚点**读出的；② 一次 `Edit` 误删 `identityStatus` 里 3 行生产代码 ⇒ 是"改完立刻回读函数"抓出的 | 不是判据、不登记 ID。记在这里是因为它给 M116 的接线锚点补了一次真实杀伤力读数 |
+
+**M122 / M127 / M129 的变异复算逐字读数**（本轮为写 §6.19 重新跑了一遍 `/tmp/recapture_r2.py`，
+每条都带"还原自检 sha256 前后同值"）：
+
+```
+M126 default: return true, true（旧形状）
+  --- FAIL: TestVerdictFromUnreadableUpperFallsBackToDefault
+      verdict_from_test.go:95: upper 读不动 ⇒ 必须退平台默认 false，实得确证值 true（lstat .../payload126c.txt/x: not a directory）：
+                               这是把"无从判定"报成"卷区分大小写"，且会被 Sensitive() 永久缓存
+
+M127 sysguard.Dir 改成逐段匹配
+  --- FAIL: TestGuardRecycleBinDirNameIsCaseInsensitive
+      sysguard_test.go:64: 后代路径自身被判保护：说明 dirName 判据改成了逐段匹配——…
+
+M129 HashFull 吞读错误 + 放过短读
+  --- FAIL: TestHashFullReadErrorPropagates
+      hasher_test.go:196: 句柄已关 ⇒ HashFull 必须报错，实得指纹 af1349b9f5f9a1a6…（静默出指纹=把读不动的文件当内容参与去重）
+
+M122 删掉排序第三级键（-count=12）
+  --- FAIL: TestGroupOrderAndIDsAreDeterministic
+      group_order_probe_test.go:112: 第 2 位 = {id:2 n:2 head:…z-b1.bin recl:614400}, want {id:2 n:2 head:y-c1.bin recl:614400}
+      group_order_probe_test.go:124: 第 7 跑与第 1 跑在第 1 位不一致（…）   ← 同一次跑内另 6 处漂移
+
+M113 undoMove 回空落点
+  --- FAIL: TestUndoMovePartialSuccessHandsBackRestoredPath
+      undo_move_partial_m113_test.go:75: 部分成功却回了空落点 ⇒ …（错误文本自带两个落点，返回值却是空的）
+
+M114 读不动并回"被替换"
+  --- FAIL: TestIdentityUnreadableIsNotReportedAsReplaced
+      identity_unknown_m114_test.go:79: 读身份失败被说成了确证的顶替（M114）："文件在扫描后被替换（inode 已变化），已拦截"
+      identity_unknown_m114_test.go:84: 文案应明说「无法确认」…
+      identity_unknown_m114_test.go:87: 底层原因必须原样出现在文案里…
+```

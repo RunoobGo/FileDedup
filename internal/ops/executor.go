@@ -333,16 +333,31 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	//   - 被 rename 换成另一个 inode ⇒ 必须拦截，放行就是错删第三方文件。
 	// 混记 Failed 的代价不只是文案：Skipped 与 OK 同路进 app.go 的 gone 集合去清
 	// 结果集与 byID（app.go:1898-1901），记 Failed 就在结果集里留一个盘上没有的路径。
+	//
+	// M114（04 §6.11 OPS-13b，设计段 §23.3）在这两格之外补第三格：**读不动身份**
+	// （EACCES/EIO/ESTALE/ENOTDIR，或原先能解析现在解析不出）。它既不是"已经没了"，
+	// 也不是"换成了另一个"，处置照旧拦下（fail-closed 的方向从来不是争议点），
+	// 但说法必须改成"无法确认…（原因为何）"——原先这一格被并入"被替换（inode 已变化）"，
+	// 等于宣称看到过一个并不存在的新对象。
 	guardIdentity := func(i int, path string) bool {
-		still, gone := identityStatus(path, procIDs[i])
-		if still {
+		v, why := identityCheck(path, procIDs[i])
+		if v == vSame {
 			return false
 		}
-		if gone {
+		switch v {
+		case vGone:
 			settle(i, outcome{code: ocSkipped})
-		} else {
+		case vReplaced:
 			settle(i, outcome{code: ocFailed, stage: "verify",
 				err: "文件在扫描后被替换（inode 已变化），已拦截"})
+		default:
+			// M114（04 §6.11 OPS-13b，设计段 §23.3）：vUnknown 及**将来任何**未登记的
+			// 结论都走这一格——fail-closed 的方向与另外两格一致（拦下），差别只在说法。
+			// 写成 default 而不是 case vUnknown 是有意的：新增归因时忘记在这里登记，
+			// 后果是"被当成无从判定拦下"（安全），而不是"被当成确认顶替"（假话）或
+			// "落到 switch 之后既不记账也不拦截"（漏一项）。
+			settle(i, outcome{code: ocFailed, stage: "verify",
+				err: fmt.Sprintf("无法确认文件仍是扫描时那个对象（%s），已拦截", why)})
 		}
 		return true
 	}
