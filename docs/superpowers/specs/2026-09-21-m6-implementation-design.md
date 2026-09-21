@@ -3425,10 +3425,10 @@ node:test 在第一个失败处就抛 ⇒ 那一跑**只亲眼看到**"RPC 发�
 等价于实测到"两个不同对象拿到同一组 (dev,ino)"。11 条红全部由这一个事实推出，无需假设。
 
 **乙·正对照（同一条 CI 里就有）**：同包 `TestIdentityStatusSeparatesGoneFromReplaced`
-（`verify_m52_m54_test.go:132-137`）造顶替用的是 **`os.Rename(other, replaced)`**，
+（`verify_m52_m54_test.go:121`，rename 在 `:141`）造顶替用的是 **`os.Rename(other, replaced)`**，
 同一 runner、同一 `go test -race -count=2`，**通过**。⇒ 红不红由"顶替怎么写"决定，不是环境抖动。
 
-**丙·边界对照**：`TestUndoHardlinkBlocksSwappedTargetSameSize`（`identity_still_test.go:163`）
+**丙·边界对照**：`TestUndoHardlinkBlocksSwappedTargetSameSize`（`identity_still_test.go:165`）
 同样用 Remove + WriteFile，却**通过** —— 它删的 `dup` 刚被 `HardlinkMerge` 做成 keep 的硬链接
 （nlink=2），unlink 只把链接数降回 1，**inode 不进空闲表**，新文件无从取到那个号。
 甲乙丙合起来把根因钉成一句：**只有"原对象被删到零链接、inode 被回收给紧随其后创建的新对象"这一条路会失效。**
@@ -3449,9 +3449,14 @@ node:test 在第一个失败处就抛 ⇒ 那一跑**只亲眼看到**"RPC 发�
    "原对象尚存活时"就已分配的 inode ⇒ 身份层**必然**识破。夹具实际写的却是
    `os.Remove` + `os.WriteFile` 到同一路径，那是另一件事（inode 回收），且是身份层**原理上管不着**的那件。
 
-⇒ **处置**：把 6 处顶替夹具改成"先写在不旁边、再 `os.Rename` 顶位"（= 文档承诺的那个时序，
+⇒ **处置**：把 7 处顶替夹具调用点改成"先写在不旁边、再 `os.Rename` 顶位"（= 文档承诺的那个时序，
 也更接近真实第三方行为：没有名字消失的空档），**一条断言、一句期望值都不动**。
 残留的产品缺口不遮掩，另立 **M91**（§21.2）。
+
+★ 本节两处行号是**实施前**取证时的行号，实施提交 `b6842bd` 改动了同一批文件后已前移
+（`identity_still_test.go` 163→165、`verify_m52_m54_test.go` 132→141）；正文已按改后行号刷新。
+"6 处"是本节初稿的误数：把 `identity_still_test.go` 的两条（普通文件 + 符号链接）数成了一条，
+实施后逐点名点齐是 **7 处**。
 
 ### 21.2 新登记 M91（待裁定）：`(dev,ino)` 在回收 inode 的卷上可被"先删后建"骗过
 
@@ -3488,3 +3493,39 @@ W1~W4 全部落在**测试与夹具**，本轮 Windows 腿**没有生产代码�
 - W3 改后在 windows 腿会是 **SKIP**，按 04 §6.8.0 与 AS-K2 的口径 **skip ≠ 通过**：
   划账里必须写成"Windows 侧 M52 无从判定这条未验证"。
 - 本轮不动 §6.11 任何一行既有结论；新发现按约束 (1) 只新增 ID（M91）。
+
+### 21.5 改后读数（实施提交 `b6842bd`，run `35642706382`）
+
+CI 三条腿：**`completed success`** —— `go test (macos)=success ; go test (windows)=success ;
+gofmt / vet x3 / test -race / frontend / smoke=success`。整份 job 日志里 `--- FAIL` 0 条、
+`FAIL filededup` 0 条，三条腿各 **22 个包 ok**（按 job 去重计数）⇒ §21.0 的 16 条全部转绿，
+且没有把别处弄红。
+
+本机（darwin/APFS）配套读数：`gofmt`/`build`/`vet ×3` 全 0；`go test -race -count=2 ./internal/ops/ ./internal/scanner/`
+两个包 `ok`；全套 15 行门禁 14×`rc=0` + 第 15 行 `rc=2`（`smoke-symlink` 需 root，**跳非过**），
+且与上一批那次**逐格相同**（`top_PASS=647 top_SKIP=5 top_FAIL=0`、`sub_PASS=77 sub_SKIP=1`、
+`run=730`、`src_test=699`）⇒ 本轮既没新增用例也没删用例。
+
+**变异取证（证明换夹具之后判据仍然杀得动）**：临时把 `identityStill` 改成恒 `return true`，
+本机当场红三条 ——
+
+```
+--- FAIL: TestIdentityStillDetectsRegularReplacement   identity_still_test.go:51
+--- FAIL: TestIdentityStillDetectsSymlinkSwap          identity_still_test.go:110
+--- FAIL: TestSymlinkMergeDetectsKeepReplacement       symlink_test.go:623
+```
+
+变异已复原（复原后 `git diff -- internal/ops/verify.go` 为空，实现仍是
+`still, _ := identityStatus(path, id); return still`）。
+
+**§21.4 的三条边界里，有两条本轮按预告兑现、一条要更正**：
+
+1. "改前红只能来自 CI" —— 兑现：本机的 11 条改前红至今没有读数，将来也不会有（APFS 不还号）。
+2. "W1/W2/W4 本机改前红拿不到" —— 兑现：本机只证明了"改动没把原本绿的弄红"。
+3. "W3 在 windows 腿会是 SKIP" —— **这句现在只是一条推断，不是读数**：三条腿的 `go test`
+   都不带 `-v`，日志里没有 `--- SKIP` 行，CI 无法区分"这一格走了 Skipf"与"这一格真的跑完并通过了"。
+   ⇒ 按约束 5 从严处理：Windows 侧"M52 无从判定分支"记**未验证**，不记通过；
+   要拿到这条的硬读数，得在 windows 腿补一次带 `-v` 的跑法（本轮不做，属 §6.5 开放项 E 同一族）。
+
+**本轮没有做的两件事，如实记下**：① 没动 `scripts/test-windows-quarantine.sh` 的隔离清单（仍为空），
+W3 走的是自探环境 `t.Skipf`，不是白名单遮掩；② 没实施 M91 的任何一条修法（三选一属裁定面）。
