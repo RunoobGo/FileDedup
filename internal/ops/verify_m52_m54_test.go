@@ -51,6 +51,12 @@ func TestVerifyNonRegularIsUnverifiable(t *testing.T) {
 }
 
 // P-4b（M52）：EACCES 打不开不是"被修改"。
+//
+// ★ 前置自检（2026-09-22，§21.3 W3）：`os.Chmod(path, 0)` 造"打不开"只在
+// 认权限位的卷上成立。Windows 的 chmod 只翻**只读属性**、不拒绝读，于是
+// `VerifyFile` 打得开、哈希相符 → 返回 VerdictPass，红的是夹具前提而不是判据
+// （windows 腿实测 `= 0`）。本卷读得动就 Skip 并写明原因，按 04 §6.8.0 约束 5
+// 记"Windows 侧这一条未验证"，不许拿 unix 的绿冒充。
 func TestVerifyUnopenableIsUnverifiable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root 用户无权限拒绝语义")
@@ -61,6 +67,11 @@ func TestVerifyUnopenableIsUnverifiable(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	if f, err := os.Open(path); err == nil {
+		_ = f.Close()
+		t.Skipf("本平台的 chmod 不拒绝读（Windows 只翻只读位）：「打不开」这一前提造不出来，" +
+			"M52 的无从判定分支在本卷上未验证（§21.3 W3）")
+	}
 
 	v, _ := VerifyFile(fx.dup1, fx.group.Hash, hasher.NewPool())
 	if v != VerdictUnverifiable {

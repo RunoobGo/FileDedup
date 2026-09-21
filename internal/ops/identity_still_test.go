@@ -13,12 +13,17 @@ import (
 // 恒返回未解析 ID，于是 identityStill 恒返回 true、undoHardlink 的防线①
 // 退化为只比大小。此处逐条钉住修复后的行为。
 //
-// 注意：本机为 Linux，Windows 句柄路径无法在本机执行；但**平台无关的契约**
-// 可以在此完整验证：identityStill 对「被替换的路径」必须判否、
-// 对「未动的路径」必须判是。修复前的 Linux 实现恰好也满足这两条
-// （因为 unix 的 lstat 带 dev/ino），因此本测试主要防**回归**：
-// 若日后有人把 identityStill 改回 FromFileInfo 或改成跟随链接的 os.Open，
+// 注意：Windows 句柄路径无法在 unix 上执行；但**平台无关的契约**可以在此
+// 完整验证：identityStill 对「被替换的路径」必须判否、对「未动的路径」必须判是。
+// 修复前的实现恰好也满足这两条（unix 的 lstat 带 dev/ino），因此本文件主要防
+// **回归**：若日后有人把 identityStill 改回 FromFileInfo 或改成跟随链接的 os.Open，
 // 下面 TestIdentityStillDetectsSymlinkSwap 会立刻失败。
+//
+// ★ 更正一处旧注释（2026-09-22，设计稿 §21.1）：本文件此前写"本机为 Linux"，
+// 并据此说"这两条在 unix 上恒可满足"。linux CI 腿把它证伪了——`(dev,ino)` 只在
+// **两个对象同时存活**时保证不同，而"删掉再原地建"会让会还号的卷（GitHub
+// ubuntu runner 的 /tmp）把同一个 inode 号发给新对象。顶替因此一律改成
+// "先写旁边、再 rename 顶位"（swap_fixture_test.go），断言一字未动。
 
 // TestIdentityStillDetectsRegularReplacement 路径被换成另一个文件 → 判否。
 func TestIdentityStillDetectsRegularReplacement(t *testing.T) {
@@ -35,13 +40,12 @@ func TestIdentityStillDetectsRegularReplacement(t *testing.T) {
 		t.Skip("本平台无法解析文件身份，跳过（Windows 句柄路径需在 Windows 上验证）")
 	}
 
-	// 替换：删掉原文件再建一个同路径的新文件（等价于用户手工替换）
-	if err := os.Remove(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte("original"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// 替换：把另一个文件原子改名顶进该路径。刻意不用 Remove + WriteFile
+	// （那会让新对象拿到刚被回收的 inode 号，身份层原理上识破不了；
+	// 2026-09-22 linux CI 就是红在这一格上，见 §21.1 与 swap_fixture_test.go）。
+	// 内容逐字节相同是**故意的**：这一格钉的必须是"只换了对象、没换内容"
+	// 也能识破，否则等于把判据退化成比内容。
+	swapInAt(t, p, orig, []byte("original"))
 
 	if identityStill(p, orig) {
 		t.Fatal("路径已被换成另一个文件，identityStill 必须判否（否则会覆盖第三方文件）")
@@ -96,13 +100,11 @@ func TestIdentityStillDetectsSymlinkSwap(t *testing.T) {
 		t.Skip("本平台无法解析文件身份")
 	}
 
-	// 把 at.bin 换成指向 real.bin 的符号链接
-	if err := os.Remove(at); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(real, at); err != nil {
-		t.Skipf("符号链接创建失败（平台限制）: %v", err)
-	}
+	// 把 at.bin 换成指向 real.bin 的符号链接。链接先建在旁边再原子顶位：
+	// 它的 inode 在 at.bin 仍存活时就已经分配，两个号必然不同（§21.1）。
+	// 若实现改用跟随链接的 os.Open，这里会解出 real.bin 的号，同样与 at 不等
+	// ⇒ 本格的"不跟随链接"钉子不受影响。
+	swapSymlinkOnto(t, at, real, id)
 
 	if identityStill(at, id) {
 		t.Fatal("路径已被换成符号链接，identityStill 必须判否（不得跟随链接）")

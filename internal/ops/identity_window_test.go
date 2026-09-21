@@ -69,18 +69,13 @@ func newMergeFixture(t *testing.T) mergeFixture {
 
 // plantForeignAtDup 在"复核已通过、dup 即将被改名成 backup"这一刻，
 // 把 dup 位置换成一个第三方文件。返回该文件的身份，供断言"没被删"。
+//
+// 顶替走 swap_fixture_test.go 的原子改名（原实现是 Remove + WriteFile，
+// 在会回收 inode 号的卷上让顶替者拿到刚释放的那个号，2026-09-22 linux 腿
+// 因此红在守卫上而不是红在夹具前提上——见 §21.1）。
 func plantForeignAtDup(t *testing.T, dup string) fsid.ID {
 	t.Helper()
-	if err := os.Remove(dup); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dup, []byte(victimData), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	victim, err := fsid.FromPathNoFollow(dup)
-	if err != nil {
-		t.Fatal(err)
-	}
+	victim := swapOutAt(t, dup, []byte(victimData))
 	if !victim.Resolved {
 		t.Skip("第三方文件身份不可解析，无法断言未被删除")
 	}
@@ -198,12 +193,7 @@ func installForeignSwapOnBackup(t *testing.T, dup string, dupID fsid.ID) {
 		}
 		if !done && oldp == tmp && newp == dup {
 			done = true
-			if err := os.Remove(backup); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(backup, []byte(victimData), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			swapInAt(t, backup, dupID, []byte(victimData))
 			if identityStill(backup, dupID) {
 				t.Fatal("前置条件不成立：换进去的文件仍被判定为本次操作的 dup，断言将失去意义")
 			}

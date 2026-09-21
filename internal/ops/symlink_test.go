@@ -614,12 +614,9 @@ func TestSymlinkMergeDetectsKeepReplacement(t *testing.T) {
 	}
 
 	// 模拟 TOCTOU 窗口：校验返回后、合并复核前，keep 路径被整体替换。
-	if err := os.Remove(keep); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keep, []byte("ATTACKER-REPLACEMENT-DATA"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// 顶替走原子改名而非 Remove+WriteFile（后者在会回收 inode 的卷上让顶替者
+	// 拿到原对象的号，身份层原理上识破不了；2026-09-22 linux 腿即红在此，§21.1）。
+	swapOutAt(t, keep, []byte("ATTACKER-REPLACEMENT-DATA"))
 
 	err = SymlinkMerge(keep, dup, kid, did)
 	if err == nil {

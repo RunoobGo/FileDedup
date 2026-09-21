@@ -71,15 +71,20 @@ func TestSameVolumeNotUsedForExecutionDecisions(t *testing.T) {
 func TestSameVolumeDetectsCrossMount(t *testing.T) {
 	orig := volumeIDOf
 	defer func() { volumeIDOf = orig }()
+	// 桩必须按**平台归一后**的形态判前缀：volumeIDOfExisting 会先 filepath.Clean
+	// （volume.go:66），Windows 上喂进来的是 `\mnt\b\g.bin`，按 "/mnt/b" 判前缀
+	// 会恒落空 ⇒ 两条路径拿到同一个假卷号，本格测的就不再是判据而是夹具
+	//（2026-09-22 windows 腿红在此，§21.3 W2）。
 	volumeIDOf = func(p string) (string, bool) {
-		if strings.HasPrefix(p, "/mnt/b") {
+		if strings.HasPrefix(filepath.ToSlash(p), "/mnt/b") {
 			return "dev-B", true
 		}
 		return "dev-A", true
 	}
 
 	if sameVolume("/mnt/a/f.bin", "/mnt/b/g.bin") {
-		t.Fatal("跨挂载点被判为同卷：volumeRoot 在 unix 恒为 \"/\"，M5 未修")
+		t.Fatal("跨挂载点被判为同卷：要么 sameVolume 又只看 volumeRoot（unix 恒为 \"/\"，M5 的原始症状），" +
+			"要么上面那个桩没能把两条路径分进不同假卷（分隔符/归一形态与平台不符，§21.3 W2）")
 	}
 	if !sameVolume("/mnt/a/f.bin", "/mnt/a/sub/g.bin") {
 		t.Fatal("同挂载点被判为跨卷")

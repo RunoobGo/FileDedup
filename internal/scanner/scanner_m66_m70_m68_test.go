@@ -21,6 +21,22 @@ import (
 	"filededup/internal/model"
 )
 
+// rootWant 把测试里书写的 unix 风格根路径换算成 dedupeRoots 在**本平台**会产出的
+// 归一形式——它第一步就是 filepath.Abs + Clean（scanner.go:564-570）。
+//
+// ★ 为什么期望值跟着平台走（2026-09-22，设计稿 §21.3 W4）：Windows runner 的工作
+// 目录在 D: 上，"/data/b" 归一成 "D:\data\b"；原先把 unix 的产物写死进 want，
+// 红的是拼写而不是判据。**谁胜出**（宽根吃掉子根 / 互不相干的两根都留）仍由这两条
+// 断言钉住，不随平台变；随平台变的只是那条路径怎么落地。
+func rootWant(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatalf("Abs(%q) 失败: %v", p, err)
+	}
+	return filepath.Clean(abs)
+}
+
 // P-1（M66）：判重集合的入集顺序必须按比较键排序。
 //
 // 走 dedupeRoots 而不是 Walk：它只做字符串工作 + probeCaseSensitive（已是注入点），
@@ -35,7 +51,7 @@ func TestDedupeRootsSortsByFoldKey(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("去重前的全部根 = %v, want 2 条", all)
 	}
-	if want := []string{"/data/b"}; !reflect.DeepEqual(kept, want) {
+	if want := []string{rootWant(t, "/data/b")}; !reflect.DeepEqual(kept, want) {
 		t.Fatalf("kept = %v, want %v（宽根必须胜出，子根判重丢弃；"+
 			"实得两条即 M66：排序键用了原样串）", kept, want)
 	}
@@ -46,7 +62,8 @@ func TestDedupeRootsKeepsUnrelatedRootsAfterSortFix(t *testing.T) {
 	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
 	probeCaseSensitive = func(string) bool { return false }
 	kept, _ := dedupeRoots([]string{"/data/zz/sub", "/data/b"})
-	if want := []string{"/data/b", "/data/zz/sub"}; !reflect.DeepEqual(kept, want) {
+	want := []string{rootWant(t, "/data/b"), rootWant(t, "/data/zz/sub")}
+	if !reflect.DeepEqual(kept, want) {
 		t.Fatalf("kept = %v, want %v（无父子关系的两根都要留）", kept, want)
 	}
 }

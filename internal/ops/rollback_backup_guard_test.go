@@ -52,12 +52,7 @@ func installBackupSwapOnLanding(t *testing.T, dup string, tamperLanding bool) {
 				return err
 			}
 			done = true
-			if err := os.Remove(backup); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(backup, []byte(backupVictimData), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			swapOutAt(t, backup, []byte(backupVictimData))
 			return nil
 		}
 		return orig(oldp, newp)
@@ -80,12 +75,7 @@ func installBackupSwapOnFailedLanding(t *testing.T, dup string) {
 	hardlinkRename = func(oldp, newp string) error {
 		if oldp == tmp && newp == dup {
 			done = true
-			if err := os.Remove(backup); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(backup, []byte(backupVictimData), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			swapOutAt(t, backup, []byte(backupVictimData))
 			return errors.New("模拟：落位改名失败")
 		}
 		return orig(oldp, newp)

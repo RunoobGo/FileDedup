@@ -14,14 +14,22 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 // pathListSegments 按 SHFileOperation 的读法把缓冲区切成「以 \0 分隔的段」。
 // 返回的切片**不含**终结时的空段——即真实会被处理的路径清单。
 //
 // 这是对 Win32 行为的独立复刻：列表读到第一个空字符串为止。
+//
+// ★ 更正（2026-09-22，设计稿 §21.3 W1）：解码原先逐 UTF-16 单元做
+// `rune(u)`，代理对的两半各自都是非法码位 ⇒ 每个非 BMP 字符折成一个 U+FFFD，
+// `TestBuildPathListRoundTripsUTF16` 在 windows 腿上自 2026-09-19 起恒红。
+// 失真出在**本函数**（测试自带的复刻），不在被测物：`buildPathList` 用的是
+// `syscall.StringToUTF16`，它按 Win32 契约正确写出代理对。现改用
+// `unicode/utf16.Decode` 合对——仍与被测物是两份不同实现，"独立复刻"的身份不变。
 func pathListSegments(buf []uint16) (paths []string, dangling bool) {
-	var cur []rune
+	var cur []uint16
 	for i, u := range buf {
 		if u == 0 {
 			if len(cur) == 0 {
@@ -34,11 +42,11 @@ func pathListSegments(buf []uint16) (paths []string, dangling bool) {
 				}
 				return paths, false
 			}
-			paths = append(paths, string(cur))
+			paths = append(paths, string(utf16.Decode(cur)))
 			cur = nil
 			continue
 		}
-		cur = append(cur, rune(u))
+		cur = append(cur, u)
 	}
 	// 走到末尾还有内容 → 缺终止 NUL，Win32 会越界读
 	return paths, true
