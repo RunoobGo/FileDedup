@@ -2623,3 +2623,148 @@ d14aed302d27dbafcc46cef410492c1f475e3b3e5063c48618e903a3b1e9e6ce  internal/scann
 - **M75(b)（UPSERT 无条件覆盖 `full` + ctime）继续等裁定**，本批一字不动。
 - Windows 侧本批不引入任何 URI/DSN 形式（取证 #3），故不存在"代码已改、验证未兑现"的新面；
   若 P-18-2 的实现在 Windows 上改变连接建立方式，划账时如实标注。
+
+### 18.7 实施后追记（2026-09-21 深夜；划账见 04 §6.14）
+
+#### 一、与 §18.2 改动面的偏离（四处，逐条如实记）
+
+1. **新增一条测试接缝 `evictFn`（§18.2 没列）**：`cache.go` 里 `var evictFn = func(c *Cache) error { return c.evictLocked() }`。
+   起因是 §18.3 P-18-4 预测的"修前红法"实测打不通（见下面二-4），而不是为了让实现变干净。
+   惯例同族：`ops.verifyFileFn`、`scanner.probeCaseSensitive`、`model.TrashFn`。生产恒等于 `evictLocked`。
+2. **M74 的界面通道不走 `addStartupNotice`**（§18.0 取证 #7 已预告这条偏离）：改走已在显示的
+   `scan:done` 失败清单，且全轮只有 `corruptCacheNotice()` 一个造句点。
+3. **M73 不按登记原文"与 history 同形"**（取证 #3/#4 两条修法都被读数否决），落成 Connector 包装。
+   Windows 侧因此**没有**新增 URI/DSN 面：路径仍以纯文件名交给驱动，与改前同形 ⇒ 本批无"代码已改、验证未兑现"的新平台面。
+4. **M78 的透传多做了一步归一**：设计段只说"整体透传"，实现先把历史 `filters` 里的 `null`/`undefined`
+   滤掉再由 `emptyFilters()` 兜底。原因开码才看清：`model.Filters` 无 `omitempty`，Go 侧 nil 切片
+   marshal 成 JSON `null`，而改前的 `?? []` 恰好挡着这一手 ⇒ 纯透传会把 `IncludeExts` 写成 `null`，
+   下游 `.join()` 直接炸。钉它的是 `scan-rescan-history.test.ts` 第三条用例。
+
+#### 二、修前必红（逐字抄录；红绿两侧都是实跑）
+
+1. **P-18-2（M73）—— 本批唯一在"改前树"上真跑出来的红**。做法：把 `cache.go` 换回 `HEAD` 版本
+   （`git cat-file blob HEAD:… >`），测试文件只留 M73 那两条（另两条引用新增符号，编译不过），跑完
+   `cp` 还原并 `shasum -a 256 -c` 核对 OK：
+
+```
+--- FAIL: TestEveryPooledConnectionCarriesPragmas
+    cache_m73_m75_test.go:48: 池上首条连接也应带 pragma：busy_timeout=0 synchronous=1
+    cache_m73_m75_test.go:68: 第 2 条额外连接的 pragma 没生效：busy_timeout=0 want 5000，synchronous=1 want 1(NORMAL)
+    cache_m73_m75_test.go:68: 第 3 条额外连接的 pragma 没生效：busy_timeout=0 want 5000，synchronous=2 want 1(NORMAL)
+```
+
+   **这条读数顺带更正登记原文**（§6.11 CACHE-2 行）：改前 `openDB` 只发 `journal_mode=WAL` 与
+   `synchronous=NORMAL` 两条，**全仓从来没有发过 `busy_timeout`**（grep 读数：HEAD 的 `cache.go` 里
+   `PRAGMA` 只有那两行）⇒ 登记说的"synchronous=NORMAL 只落在一条连接上"实测是"落在**一部分**连接上
+   （三条连接 1/1/2），`busy_timeout` 一条都没有"。缺陷成立且比登记描述更宽。
+   同跑的对照用例 `TestEvictDeleteCanReallyFail` 在改前树 `--- PASS` ⇒ 它本就是前提自检，不是红探针。
+
+2. **P-18-1 / P-18-1b（M71）**：改前树里 `claimRunLocked` 这个符号不存在，探针编译不过 ⇒
+   "修前红"由变异 **M18-a**（把认领退回"只判不写"，即改前形状）提供：
+
+```
+--- FAIL: TestClaimRunLockedIsJudgeAndWrite
+    pipeline_m71_test.go:38: 认领后状态必须已是 Scanning（判与写同临界区）：实测 Idle
+    pipeline_m71_test.go:43: 第二次认领竟然成功：窗口还在，两个 Run 会同时跑
+--- FAIL: TestPauseAndCancelSeeJustClaimedRun
+    pipeline_m71_test.go:72: 刚认领就 Pause 被拒（改前的假话之一）：当前不在扫描中（Idle），无法暂停
+```
+
+   第二条正是登记原文那句"同窗口 `Pause()` 见 `Idle` 直接回错"的实跑形态；`Cancel()` 那句被
+   `Resume()` 的断言先截断（`t.Errorf` 不中止），红法同因。
+
+3. **P-18-3 / P-18-8（M74）**：同样依赖新符号（`DBErrors`/`Corrupted`/`ErrCorruptDisabled`），
+   红由 **M18-c**（把 `Lookup` 的 Scan 错误整体折回未命中）提供：
+
+```
+--- FAIL: TestLookupDBErrorLeavesEvidenceAndIsNotCalledCorruption
+    cache_m74_test.go:48: DB 错误必须留证据：DBErrors=0 want 1
+    cache_m74_test.go:58: 未停用时每次点查都应各记一笔：DBErrors=0 want 2
+--- FAIL: TestRuntimeCorruptionStopsIssuingSQL
+    cache_m74_test.go:145: SQLite 原文必须被认成损坏（说明这不是拿假错误凑的）；DBErrors=0 底层错误=file is not a database (26)
+```
+
+   第三行的"底层错误"是**独立句柄**取回的原文（`corruptionEvidence`），证明损坏是真的
+   `file is not a database (26)`，不是假错误自证。前提自检排在所有断言之前。
+
+4. **P-18-4（M75a，cache 侧）—— 预测的修前红法被推翻**（§18.3 表里写的是"伪造超限计数 + RAISE
+   触发器从 `Store` 打进去"）。实测：`Store` 在 Commit 之后把 `cntValid` 置回 false（C5 既有语义），
+   `evictLocked` 于是先重算 `COUNT` 得 2 条、判定未超限、**连 DELETE 都不发**，返回 nil ⇒
+   那套夹具只能打进 `evictLocked` 本身（留作前提自检 #1 的独立用例），进不了 `Store`。
+   红由 **M18-d**（`Store` 末尾吞掉淘汰失败）提供：
+
+```
+--- FAIL: TestStoreEvictFailureSaysWriteBackSucceeded
+    cache_m73_m75_test.go:136: 淘汰失败却返回了 nil，本用例前提不成立
+```
+
+5. **P-18-5（M75a，dedup 侧）**：红由 **M18-e**（去掉 `errors.Is` 分岔）提供：
+
+```
+--- FAIL: TestCacheOpErrTextClassification
+    pipeline_m71_test.go:94: 淘汰失败仍被写成写回失败（Commit 早已成功，这句是假话）：
+      "缓存写回失败: 缓存 LRU 淘汰失败：哈希条目已写回，仅 LRU 淘汰未完成（探针）"
+```
+
+   这句就是**登记原文描述的用户可见假话**的逐字形态——一句话里同时写着"写回失败"和"已写回"。
+
+6. **P-18-6（M69）**：**M18-f 删掉的正是改前不存在的那一行**（`t.wg.Wait()`），所以这条就是改前形状：
+
+```
+--- FAIL: TestStopNeverFollowedByOlderSnapshot
+    progress_m69_test.go:78: Stop 之后又外发了更旧的快照（进度倒退）：序列 [3 0]
+    progress_m69_test.go:83: 界面看到的最后一条必须是最大值：末值=0 最大=3 序列=[3 0]
+```
+
+   ★ 第一版探针在此**红错了格**：`close(release)` 之后立刻读序列，改前的形状被读成
+   "外发不足两条"（断言没跑到顺序那一格）。补一条"等那条被卡住的外发真的落进序列"再取证，
+   才拿到预测的顺序倒退。记为流程教训：**取红也要验红的是不是那一格**。
+
+7. **P-18-7（M78）**：红由 **M18-g**（`rescanHistory` 退回逐字段列举）提供：
+
+```
+✖ 历史里的 AllowCloudHydration 必须透传到重扫载荷（M78 主案）
+  AssertionError: 重扫把云端占位档位静默降级成了安全档（改前形状）  actual: false, expected: true
+✖ 将来 Filters 新增字段时自动透传（钉住"整体透传"这个修法本身）
+  AssertionError: 新字段又被漏抄了——逐字段列举的必然复现路径  actual: undefined, expected: 'keep'
+```
+
+   同一次变异里另两条（`null` 归一、字节只换算一次）**保持绿** ⇒ 它们是给新实现加的防线，
+   不是缺口的探针，不冒充"修前红"。
+
+#### 三、变异实测表（§18.4 预测集 − 实测集的差集逐条解释）
+
+| # | 变异 | 预测被杀于 | 实测（全包名表，`-count=1 -v`） | 差集 |
+|---|---|---|---|---|
+| M18-a | 认领退回只判不写 | `internal/dedup` P-18-1 | `TestClaimRunLockedIsJudgeAndWrite`、`TestPauseAndCancelSeeJustClaimedRun`（该包仅此两条 FAIL） | 无（P-18-1b 是补的，一并记） |
+| M18-b | connector 不补 pragma | `internal/cache` P-18-2 | `TestEveryPooledConnectionCarriesPragmas`（仅此一条） | 无 |
+| M18-c | 折回"未命中" | `internal/cache` P-18-3/P-18-8 | `TestLookupDBErrorLeavesEvidenceAndIsNotCalledCorruption`、`TestRuntimeCorruptionStopsIssuingSQL` | **P-18-3b 未开火**：`TestMissingRowIsNotACorruptionError` 断言的是 `DBErrors==0`，把记账删掉它当然更"成立" ⇒ 它是**过度修正的防线**（防"把没查到也记成错误"），不是缺口探针，不据此说覆盖有洞 |
+| M18-d | `Store` 吞掉淘汰失败 | `internal/cache` P-18-4 **或** `internal/dedup` P-18-5（"两处都算合理落点"） | 只 `internal/cache`；`internal/dedup` 全包 rc=0 | **实测少于预测**：Run 级要造淘汰失败得先真塞过 `MaxEntries`(50 万) 行，本机不划算 ⇒ 淘汰这条链在 Run 级没有落点，只能由"分诊函数 + 改前树真跑的写回文案"两侧夹。记为覆盖边界（五-2） |
+| M18-e | 去掉 `errors.Is` 分岔 | `internal/dedup` P-18-5 | `TestCacheOpErrTextClassification` | **Run 级那条未开火**（`TestRunReportsCacheWriteBackFailureOnce` 走的是"库已关闭"的通用分支，与淘汰无关）⇒ 同一边界 |
+| M18-f | `Stop` 不 `Wait` | `internal/progress` P-18-6 | `TestStopNeverFollowedByOlderSnapshot`（`-race`，仅此一条） | 无 |
+| M18-g | `rescanHistory` 退回列举 | `frontend/tests` P-18-7 | 同上两条 node 用例 FAIL（rc=1） | 无（另两条按设计保持绿，见二-7） |
+| **M18-h**（§18.4 之外补的） | 停用说明去掉 `corrupted` 守卫（每轮都冒一条） | 未预测 | `TestCacheSecondScan`、`TestCacheMtimeContentChanged`（两条**既有**用例）、`TestCorruptCacheNoticeWording`、`TestRunReportsCacheWriteBackFailureOnce` | 预测少于实测 ⇒ 好事，记下来：既有套件本身在给这条守卫兜底 |
+
+变异全部逐条 `cp` 备份 → python 打补丁（锚点 `assert count==1`）→ 跑 → `cp` 还原 →
+`shasum -a 256 -c` 四个文件全 OK（`pipeline.go`、`cache.go`、`progress.go`、`scan.ts`）。
+
+#### 四、Run 级造不出"真损坏"夹具这件事（新增取证，不是猜测）
+
+试过两条路，都不成立，故 M74 的 Run 级用例改用"库已关闭"这种暂时性故障：
+
+- 把整库文件覆写成垃圾（连接池仍开着）：`--- PASS` 形状的真读数是
+  `覆写后 Lookup hit=true DBErrors=0 Corrupted=false`、`覆写后 Store err=nil` ⇒
+  SQLite 的页缓存把损坏整个吞了，运行期根本撞不到那条错误。
+- 想改撞"深层页"（不动 page 1）那版实验**做废了**：page size 取错了偏移（读成 28530），
+  且 WAL 未 checkpoint、主库只有 4096 B ⇒ 写的垃圾落在文件末尾之外。**这一版不作为证据**，
+  结论只来自上一条。
+
+⇒ 所以 `Corrupted()` 的真损坏证据在 `internal/cache`（用不经 DDL 的夹具，见 `newCacheOn`），
+Run 级只钉"至多一条 + 措辞边界 + 不可用≠损坏"。停用后的**真机恢复路径**仍未验证（本批不做隔离重建，M87）。
+
+#### 五、边界
+
+1. 停用只到"不再发 SQL + 说一条真话"；库不隔离、不重建、句柄不换 ⇒ **M87** 新登记。
+2. 淘汰失败的 Run 级落点没有用例（M18-d 差集），文案链路靠"分诊函数唯一 + 改前树真跑的通用分支"两夹。
+3. 界面不新增呈现位（裁定③）：本批只借用已有失败清单，`FailedItem` 结构未扩。
+4. `app.go` 一字未动 —— 它本来就在 `openCache` 失败时退化成"无缓存"，M73/M74 都在 `cache` 包内收敛。
