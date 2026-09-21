@@ -94,8 +94,12 @@ export const useScanStore = defineStore('scan', () => {
   //      给了排序等于向用户暗示存在优先级，那是错的心理模型。
   //   2. 它不改变勾选——只在执行时把勾选收窄成「勾选 ∩ 优先目录内的文件」。
   //      显式勾选是用户的明确表达，不能被一个策略设置悄悄改写。
-  //   3. 仅本次结果集有效，不落 settings.json；结果集一变就清空
-  //      （与 keepDirs 同生命周期）。
+  //   3. 仅本次结果集有效，不落 settings.json；结果集一变就清空。
+  //      ★ 原先这里写着"与 keepDirs 同生命周期"，是**错的**（两者恰好相反）：
+  //        keepDirs 是跨扫描保留的输入列表，换结果集不清；procDirs 一定跟着清。
+  //        顺带记下 keepDirs 的真实语义，免得后人照 procDirs 去"对齐"它——
+  //        界面上列着的目录 ≠ 仍在生效的保护：后端每次新扫描都会清空 a.keepIDs
+  //        （app.go StartScan 的复位段），得重新点一次「应用保留策略」才恢复。
   const procDirs = ref<string[]>([])
   // 最近一次执行的过滤结果，供结果页横幅说明「实际处理了几项」。
   // 不持久化——它描述的是一次已经发生的操作。
@@ -181,6 +185,11 @@ export const useScanStore = defineStore('scan', () => {
     preview.value = null
     currentFileID.value = null
     opsResult.value = null
+    // M17：扩展名过滤是"内容过滤器"，不是偏好——它决定哪些组可见。
+    // 留着它跨结果集会自己藏组：新扫描/换历史后 totalGroups 变成过滤后的口径，
+    // 统计条与工具栏在 totalGroups==0 时整块隐藏，那个还生效的过滤框也跟着消失，
+    // 用户只剩一句"没有发现重复文件"可看（其实是有的）。故随结果集一起归零。
+    resultExt.value = ''
     resetSelection()
     clearProcDirs() // 优先文件夹是"仅本次结果集"的，结果集作废即清空
     lastFilter.value = null
@@ -331,6 +340,7 @@ export const useScanStore = defineStore('scan', () => {
       opsResult.value = null
       resetSelection()
       clearProcDirs() // 结果集已换，优先文件夹不再对应当前内容
+      resultExt.value = '' // M17：同 clearStaleResult，过滤不跨结果集存活
       lastFilter.value = null
       hasResult.value = true
       histResult.value = histList.value.find((m) => m.id === id) ?? null

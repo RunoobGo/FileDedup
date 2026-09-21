@@ -50,3 +50,16 @@ export function reclaimLine(kind: OpKind, bytes: number): ReclaimLine {
       return { lead: '共 ', bytes: n, tail: ' 空间可释放' }
   }
 }
+
+// percentOf 把「已完成 / 总数」折成进度条宽度（0–100）。
+//
+// 为什么要钳：Done 与 Total 来自后端事件，不是同一时刻的快照——中止与跳过都会让
+// 总数在途收窄，于是可能瞬时出现 Done > Total；原先那句 (Done / max(1, Total)) * 100
+// 于是给出 >100 的宽度，填充条溢出自家轨道（视觉上"跑过头"，甚至顶破圆角）。
+// 为什么要防 NaN：事件字段是外部输入，Total 缺省时原先的 max(1, …) 只挡住了除零，
+// 没挡住 NaN——undefined / max(1, undefined) 是 NaN，浏览器对非法的 width 值
+// 直接丢弃整条声明，进度条会停在 CSS 初始宽度上（看起来"卡在某个百分比不动"）。
+export function percentOf(done: number, total: number): number {
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return 0
+  return Math.max(0, Math.min(100, (done / total) * 100))
+}

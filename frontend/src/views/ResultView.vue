@@ -7,6 +7,7 @@ import GroupCard from '../components/GroupCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import Icon from '../components/Icon.vue'
 import { humanBytes, formatCount } from '../utils/format'
+import { percentOf } from '../utils/opdisplay'
 import { isGroupCrossVolume } from '../utils/pathpolicy'
 import type { OpKind } from '../wails'
 
@@ -174,6 +175,11 @@ const opDisabledTip = computed(() => {
   if (store.procCountError) return `命中数计算失败：${store.procCountError}`
   return store.busyTip
 })
+
+// M17：进度条宽度。原先在模板里直接写 (Done / max(1, Total)) * 100，
+// 既不钳位也不防 NaN——Done 与 Total 来自不同时刻的事件（中止与跳过会让
+// 总数在途收窄），瞬时 Done > Total 就把填充条顶出轨道。
+const opsFill = computed(() => percentOf(store.opsProgress?.Done ?? 0, store.opsProgress?.Total ?? 0))
 
 async function pickProcDir() {
   const { api } = await import('../wails')
@@ -399,8 +405,7 @@ function onConfirm(targetDir?: string) {
     <!-- 操作执行反馈（M3-T06） -->
     <div v-if="store.opsRunning" class="opsbar panel">
       正在处理 <b>{{ store.opsProgress?.Done ?? 0 }}</b> / {{ store.opsProgress?.Total }} …
-      <div class="bar"><div class="fill"
-        :style="{ width: ((store.opsProgress?.Done ?? 0) / Math.max(1, store.opsProgress?.Total ?? 1)) * 100 + '%' }"></div></div>
+      <div class="bar"><div class="fill" :style="{ width: opsFill + '%' }"></div></div>
       <!-- P2：大批量清理（网络盘、回收站卡住）必须能中止，否则界面永久锁在"执行中" -->
       <button class="btn-ghost" title="停止派发剩余条目；已完成的部分不会回滚"
         @click="store.cancelOp()">中止</button>
