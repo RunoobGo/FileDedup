@@ -100,7 +100,7 @@ bash scripts/check-version-sync.sh                           # 6 个取值位 / 
 | `scripts/smoke-symlink-assert.sh` | 用 stub 打桩 `id`/`mount`/`losetup`，断言上一条脚本在"应跳过"时真的返回 2 并写明原因、在正常路径上确实释放了 loop 设备。冒烟脚本本身也是代码，没人测它的判据就等于判据可以静默失效 |
 | `scripts/check-version-sync.sh` | 6 个取值位 / 5 个文件的版本号对齐（`package-lock.json` 贡献 2 处）；tag 触发时再比对 `v<版本>` |
 | `scripts/test-frontend-logic.sh` | 前端纯逻辑行为探针（`frontend/tests/*.test.ts`）+ 组件接线静态断言。vue-tsc 只证明"能编译"，这里证明"界面上的句子是真的"——例如 hardlink 的确认框不得写"空间可释放"（磁盘占用其实不变）、组内冗余项数必须取自 `store.groupSelCount` 而不许组件自算。用 Node 自带的 TS 类型剥离与 test runner，**不引入测试框架依赖**；退出码 0=通过、2=本机跑不了（无 node / 版本过旧 / 目录不存在，CI 判失败）、1=断言失败 |
-| `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因），其余用例一律阻断 |
+| `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因；**当前清单为空**，即该平台任何失败都阻断），清单外用例一律阻断，条目命中 0 个测试时脚本自身变红 |
 
 CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runner 上跑隔离后的
 `go test`；`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
