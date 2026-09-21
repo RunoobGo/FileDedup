@@ -3537,3 +3537,179 @@ W3 走的是自探环境 `t.Skipf`，不是白名单遮掩；② 没实施 M91 �
 是 benchgen `case_pair` 的设计内平台差、不是缺陷**。两条的逐格取证与增量对账记在 04 §6.17 七，
 不在这里重复。★ 一句要紧的限定：CI 绿**不改变本机第 15 行 `rc=2 SKIP` 的记法**，
 只是把"完全无读数"变成"Linux 侧有读数、Windows 侧仍无"。
+
+---
+
+## 22. 第十批（三轮全量审查·第 1 轮）：测试自证面 + dedup 组序确定性 + 话术过期面（M92~M100，登记 M101~M111；2026-09-22）
+
+### 22.0 本批来源与复核纪律
+
+六个**只读**分区子代理并行审（A `internal/ops`／B `scanner+dedup+hasher+model`／C `cache+history+sqlconn+dbfile+progress+media+worktemp`／D 根包 `app*.go`+`cmd/`／E 八个平台 helper 包／F 前端+门禁脚本+文档口径）。
+**逐条自己开码复核后才进本段**，四条被推翻或收窄（§22.6），一条子代理未言明的连带事实被补上（§22.7）。
+上一批 M90 假登记的教训在这里第二次生效。
+
+本节以下每条都给了**真读数**（本机命令输出或 CI 日志原文），不是"读代码觉得有问题"。
+
+### 22.1 M92：根包互斥用例的计数器裸 `++` 在 CI 被判 DATA RACE
+
+**现象**：run `35644606017`（纯文档提交 `4c73f23`）macOS 腿 step7 `go test -race -count=2` 红，
+`--- FAIL: TestScanAndOpsAreMutuallyExclusive` + `race detected during execution of test`，
+`WARNING: DATA RACE` 的**读与写都指向 `app_p0_p1_test.go:212`**（`scanOK++` 那一行），两个
+goroutine 均由 `:208` 的 `gowrap1` 创建。这是 §21 那批修完之后**同一处代码的第二次 CI 红**。
+
+**先排除产品侧**：`StartScan` 的"判 `scanInFlight` + 写 `scanInFlight`"在同一次加锁内
+（`app.go:591-604`），所以两次受理**必然串行** ⇒ 竞态只在测试自己的计数器上，互斥逻辑无洞
+（断言那一格没红，红的是 race detector）。
+
+**本机不可复现，且复现不出来是有原因的**：单跑 ×6、整包 `-count=2` ×1、
+`GOMAXPROCS=1/2/4/8` 各 ×40（合计 160 次）**全为 0 次竞态**。临时打印计数器取到根因：
+本机 12 次采样**全是 `scanOK=1 opsOK=0`** —— 只有一个扫描抢到受理，裸 `++` 只发生一次，
+不构成两次访问。CI 那次是 `scanOK>=2` 才成立。
+
+**替代取证（因为原用例的触发时序本机造不出来）**：把该形状单独复刻到 `/tmp/raceshape`
+（12 goroutine、每个"成功后累加"，全部返回受理以最大化累加次数），本机 `-race`：
+
+| 形状 | `WARNING: DATA RACE` 次数（`-count=3`） |
+| --- | --- |
+| 裸 `cnt++`（= 改前形状） | **4** |
+| `atomic.Int64.Add(1)`（= 改后形状） | **0**（`ok raceshape`） |
+
+⇒ 本机 race detector **认得这个形状**，故 CI 那份读数为真、且原子版确实消掉了它。
+★ 如实限定：这证的是"形状"，不是"该用例在 CI 上重新转绿"——后者要等本批推送后那一跑，未兑现前不记通过。
+
+**修法**：`scanOK`/`opsOK` 改 `atomic.Int64`。**判据 `scanOK>0 && opsOK>0` 一字未动**
+（只是改成 `Load()` 后比较），不算改断言。
+
+### 22.2 M93：三条 P1-1 互斥用例的绿来自**错的那道门**（死门禁）
+
+这条是本批唯一的 P1 门禁缺陷，也是 §22.1 修完之后**紧接着才看得见**的——原子化只修了竞态，
+把"它其实什么都没断言"这件事从"偶发红"变回了"恒绿"。
+
+**取证链（每一步都是真读数，按动手顺序）**：
+
+1. **变异 M-R1-a**：把 `ExecuteOperation` 的扫描侧门禁整条短路
+   （`if a.scanInFlight` → `if a.scanInFlight && false`，`app.go:1809`）⇒
+   `TestScanAndOpsAreMutuallyExclusive` 与 `TestExecuteOperationRejectedWhileScanInFlight`
+   **`-count=6` 全绿**。门禁拆了用例不红 ⇒ 用例对目标判据零杀伤力。
+2. **抓逐字拒因**（临时打印 ops 腿第一条错误）：
+   `opsErr="暂无可操作的结果集（请先完成扫描或打开历史记录）"`
+   ⇒ 拒它的是 `app.go:1816` 的 `resultsReady` 门，**排在互斥门（`:1809`）下游还是上游都要紧**：
+   它在函数里位于 `:1816`，即**先于**任何"ops 真被执行"的可能，所以 `opsOK` 恒为 0。
+3. **补上 `resultsReady=true` 后再变异（M-R1-b）**：两条用例**仍然全绿**。再抓拒因，得到**另外两道门**：
+   - `opsErr="上一个清理操作仍在执行中"`（`opsRunning` 被同批另一个 ops goroutine 占住）
+   - `opsErr="清理账本不可用，已拒绝执行（无账本即无法回撤与追溯）：history.db 未就绪"`
+     —— 根因是 `newProbeApp`（`app_p0_p1_test.go:87-101`）**从不接 `a.hist`**，
+     而 `ExecuteOperation` 的写前账本是 fail-closed 的。
+4. **计数器读数**（补 `resultsReady` 的实验夹具，`-count=3`，`-v`）：
+
+   | 跑次 | `scanOK` | `opsOK` | 该轮断言实际内容 |
+   | --- | --- | --- | --- |
+   | 1 | 0 | 0 | **无**（两侧都没受理，`scanOK>0 && opsOK>0` 恒假） |
+   | 2 | 0 | 0 | **无** |
+   | 3 | 1 | 0 | 仅"ops 被拒"，而拒因是账本门不是互斥门 |
+
+   ⇒ 三次里**两次整条用例什么都没断言**，第三次证明的那一格也不是它声称的那一格。
+
+**判据结论**：这条用例的文档注释写着"互斥必须双向闭合"，但它**在任何一种产品缺陷下都不会红**。
+`TestExecuteOperationRejectedWhileScanInFlight`（`:186`）同因（未铺 `resultsReady`）。
+`TestExecuteOperationMutualExclusion`（`app_test.go:323`）**不在**本条面内：它断的是 `opsRunning`
+门，而那道门恰好是 `ExecuteOperation` 的第一个检查（`app.go:1805`），拒因归因正确。
+
+**修法（设计）**：判据从"数一数两类各成功了几次"改成**"拒因必须是那句互斥文案"**，
+这是本项目既有的反归因错位手法（§21 的 P-3b 负控制同族）：
+
+- 铺一个**能走到互斥门**的可操作态：接 `a.hist`（复用 `newHistApp` 的 `history.Open` 接法，
+  不另造一份）、在锁内一起铺 `resultsReady=true` + `groups`/`byID`（I5：抽成一处 helper）。
+- **phase A**（钉"扫描在途 ⇒ 拒清理"）：并发发 ops，要求 `opsOK==0` **且每条拒因含"扫描进行中"**；
+  任何一条拒因是别的门 ⇒ 当场红，用例不会再拿"别的门替它挡了"当通过。
+- **phase B**（钉"清理在途 ⇒ 拒扫描"）：并发发 `StartScan`，同样双条件（含"清理操作执行中"）。
+- 两 phase 各自再钉 `受理数 <= 1`：这条保留原用例的**并发价值**（若"判"与"写"被拆到两次加锁，
+  会出现两个都受理 ⇒ 红），M71 那一族就还是没人管。
+
+**★ 对"不许改测试断言来让门禁变绿"的正面交代（约束 2）**：本条**不是**把红改成绿。
+现状是恒绿，改后是**两条变异各自必须红**（交付判据见 §22.5），杀伤力从 0 变成有。
+原来的 `scanOK>0 && opsOK>0` 判据被换掉是**不得不**：它把"先后各受理一次"当成违规，
+而 §22.2-3 的读数是"先后受理"在正确实现下也会发生 ⇒ 该判据一旦夹具修好就**必然假红**。
+旧判据的意图（双向闭合）由 phase A/B 双条断言原样承接，且比它多钉了归因。
+
+### 22.3 M94：dedup 的组序与组号在同输入下不确定，且注释承诺的次级键从未参与
+
+**开码证据**（`internal/dedup/pipeline.go`）：
+- `:765` `for k, g := range finalGroups` —— `finalGroups` 是 **map**，Go 的 map 遍历序随机；
+- `:791-793` `id++` 后 `GroupID: id` ⇒ **组号由那个随机遍历序发放**；
+- `:800` 注释承诺"稳定排序：可释放空间降序，**其次组大小**"，`:801-806` 的次级键实际是
+  `groups[i].GroupID < groups[j].GroupID` —— `len(Files)` **在全函数里从未出现**，
+  而顶替它的那个 `GroupID` 本身就是随机的。
+
+⇒ 两组的 `Reclaimable` 相等时（例：3×2MiB 与 2×4MiB，都是 4MiB 可释放），**输出顺序和两个组号
+在两跑之间都不一致**。同一文件 `scanner.go:524-526` 把这条纪律写得很清楚：
+"不排序就是同一份输入两次扫描给出两份清单"——dedup 侧漏了。
+连带：`pipeline_test.go:186-189` 按下标比对 paranoid/普通两组，靠"夹具三组 Reclaimable 恰好不等"
+侥幸不闪，**不是判据保证**。
+
+**改组号前必须查过的连带面（已查，安全）**：`GroupID` 不进持久化身份 ——
+`internal/history/scan.go:200` 恢复历史时用的是 DB 自己的 `gr.id`，不是扫描期 `GroupID`；
+前端 `ResultView.vue:493` 只把它当 Vue `:key`（同一次结果集内唯一即可）。
+
+**修法**：排序键改成**全序**且兑现注释：`Reclaimable` 降序 → `len(Files)` 降序 →
+组内最小路径升序（`sortEntries` 已按 `Path` 升序排过，`g[0].Path` 即组内最小路径，确定性来源）；
+**`GroupID` 改为排序之后按序号发放**（1..N）⇒ 同输入两跑的组序与组号都一致。
+
+### 22.4 M95~M100：六处"话术跑得比代码快"
+
+| ID | 坐标 | 复核到的事实（不是子代理的原话，是我自己开码看到的） |
+| --- | --- | --- |
+| M95 | `internal/cache/cache.go:85` × `:89` × `internal/dedup/pipeline.go:279` | `dbErrs` 声明注释写"（本轮累计）"，同一文件隔 4 行的 `DBErrors()` 注释写"累计到的"——**相邻两行自相矛盾**。全仓 grep 该字段只有 `Add(1)`（`:106`）与 `Load()`（`:90`），**没有任何重置点**；而 `pipeline.go:279` 把它印进用户可见文案"哈希缓存在本轮被确证损坏…**本轮累计库错误 %d 次**"。`openCache` 只在启动开一次库（`app.go:305-319`）⇒ 第 1 轮的暂时性错误会串进第 2 轮起的"本轮"，且只增不减。违"计数不许说谎"。修法=把口径改成真话（进程期累计），**不新增轮内重置**（那要动 `Cache` 与轮次的契约，属扩面） |
+| M96 | `internal/cache/cache.go:4` | 包注释仍称"**损坏自愈**（确证损坏时隔离重建）"。同文件 `:86` 自己写着 `corrupt` 位是"停用，不是自愈"、M87 明言"直到重启应用"⇒ 措辞约束只管住了 `Corrupted()` 的返回文案，漏了包注释这一格 |
+| M97 | `internal/history/history.go:23-24` × `:155` | 注释称 `SchemaVersion` 是"库结构版本（PRAGMA user_version）"；全仓 grep `user_version` 三处，`initConn` 无条件 `PRAGMA user_version=1` **只写不读**，`Open` 全路径没有一处读回比对 ⇒ 对照 cache 侧 `enforceAlgoVersion`（`cache.go:153`）是**真门禁**，history 这个"版本"是给未来的假承诺。修法=把注释改成"目前只写不读，尚无版本门禁"，真门禁**不补**（补它是改行为，违约束 7） |
+| M98 | `internal/scanner/scanner.go:227` | 注释"见 **keyOf** 注释里的那条分隔符陷阱"，但 `scanner.go` 现只有 `visitKey`（`:162`），包内无 `keyOf`；而根包门禁 `app_pathnorm_gate_test.go:34` 断的正是 `keyOf` **不得再以函数形式存在** ⇒ 这条注释指向一个被门禁判死的符号，后来人按图索骥找不到落点（判据实文在 `:618-624`）。M64 交付后的注释残留 |
+| M99 | `internal/history/history_m59_test.go:52-54` | 用例头注释称"先用 **OpenedConnections 的增量**证明第二次读落在新建连接上"，而**同一文件** `:20-21` 已明写"Go 1.27 的 `sql.DBStats` 无 `OpenedConnections` 字段"，代码实际用的是"池空 ⇒ 再取必新建"+`InUse=1` 双检 ⇒ 那句是被否决的旧稿残留。自检本身不空过（M59 的断言是真断言），修的是注释 |
+| M100 | `internal/ads/ads_windows_test.go:18`、`probe_windows.go:55`、`ads.go:148`、04 §6.5 门禁表、09 §手册边界 | 三处代码注释 + 两处文档都还写着"**本仓无 Windows runner**，本条至今没有过真机读数（M32）"。**真读数**：green run `35642706382` 的 `go test (windows)` 腿日志第 644 行 `ok  	filededup/internal/ads   0.021s`，而 `TestFirstStreamNameIsDefaultOnRealNTFS`（V8）**通篇只有 `t.Fatalf`、无任何 Skip 分支** ⇒ V8 在真机 NTFS 上跑过并绿。⇒ 这是**未兑现转兑现**，但只转一半，见 §22.4 末 |
+
+**M100 只算部分兑现，收窄的理由**（这条我自己差点说过头）：M32 原登记（04 `:1658`）涵盖两层——
+① Win32 结构**偏移**（读错 `cStreamName` 会得到零长字符串 ⇒ 守卫恒放行）；② 端到端
+"**有一条真命名流被拦住**"。V8 只钉 ①；钉 ② 的是 **V8b** `TestDetectsRealNamedStreamOnNTFS`，
+它有两条**合法 Skip** 出口（`os.WriteFile(p+":note")` 失败、`Classify(errno)==ErrFSNoStreams`），
+而 CI 三条腿都**不带 `-v`**（§6.17 尾注自认"SKIP 与 PASS 无差分"）⇒ 从 `ok` 行无法判断 V8b
+是真绿还是走了 skip。**所以 ② 仍然没有读数**，M32 保持"部分兑现"，不得改写成"已兑现"。
+要拿到 ② 的硬读数，得在 windows 腿补一次带 `-v` 的跑法（本轮不做，与 §21.5 同一开放项）。
+
+### 22.5 本批交付判据（做不到就不划账）
+
+1. **两条变异各自必须红**（M93）：M-R1-b（拆 `ExecuteOperation` 扫描侧门禁）⇒ phase A 红；
+   M-R1-c（拆 `StartScan` 的 `opsRunning` 门禁）⇒ phase B 红。改前两棵树全绿的读数记在 §22.2。
+2. **M94 必须有"同输入两跑不一致"的改前红**：先取改前真读数（同一夹具连跑两遍比对组号序列），
+   再取改后（两跑组号序列逐位相同）。
+3. **M92/M95~M100 属话术与测试面**：不产新行为，判据是"改前该格的话是假的"——每条给出
+   开码坐标与那句原话，本表即是。
+4. 全套 15 行门禁（`/tmp/run_gates.sh`，stdout 重进**带时间戳的新文件**，不读固定路径旧报告）。
+5. 04 §6.18 划账 + §6.11 表**只增不改**（新 ID M92~M111；M32 行按其既有惯例加 dated 〔…〕括注，
+   不改写原结论）。
+
+### 22.6 复核后**被推翻或收窄**的四条（子代理原报，我开码否掉了危害面）
+
+1. **`hash_cache` DDL 两份 ⇒ "版本作废重建后死索引可复活"**：**推翻**。`openDB`（含
+   `DROP INDEX IF EXISTS idx_cache_size`，`cache.go:255`）**恒在** `enforceAlgoVersion`→
+   `createSchema` 之前调用（`cache.go:128` → `:145`，同一函数内顺序）⇒ 任何走到 `createSchema`
+   的路径上那个索引早已被删。DDL 两份是真的（`createSchema:184-200` 缺该条，靠人肉注释同步），
+   但只作为**维护隐患**登记 = **M111**，不重构（G4 回归 `cache_test.go:270-329` 只钉了 openDB 腿，
+   收归要动的是两处 DDL 列表的形状，属扩面）。
+2. **`ads_windows_test.go` 的"V8 绿即 M32 兑现"**：**收窄**到偏移层，理由见 §22.4 末（V8b 双 Skip 出口 + CI 无 `-v`）。
+3. **`realbytes` Windows 卷键大小写分裂 ⇒ 算缺陷**：**降级为登记**（**M104**）。方向是
+   `C:`/`c:` 折成两个 FNV 键 ⇒ 卷级证据按拼写分裂 ⇒ **退回逻辑口径**，是 fail-closed 不是错账；
+   且本机零 Windows 执行面，`internal/realbytes` 连一个 `*_windows_test.go` 都没有（实测 `ls`，
+   只有 `reported_unix`/`volume_unix`/`clone_darwin` 三份）⇒ 修它要连带补 windows 腿测试，另批做。
+4. **`filter` 段匹配区分大小写 vs `sysguard` 用 `EqualFold`**：**不擅自统一**（登记 **M105**）。
+   复核为真（`filter.go:252` `path.Match(pat, seg)` 全函数大小写敏感；`sysguard.go:109`
+   `strings.EqualFold(name, e.name)`），后果也真（不敏感卷上用户排除 `Temp` 挡不住 `TEMP`，
+   整棵照扫 = fail-open）。但"用户排除模式该不该区分大小写"是**产品口径**、`model`/手册
+   均无声明 ⇒ 按"未裁定项不自行选边"处理，进待裁定清单而不是本批改动面。
+
+### 22.7 本批补上的一条连带事实
+
+子代理只报"§6.11 里的 `dbErrs` 口径不对"（M95）。开码时发现的**连带一层**：
+`corruptCacheNotice` 的调用点是 `pipeline.go:466`，在 **`Run` 的 defer 里**，而 `Corrupted()`
+是**粘滞位**（一旦置真直到重启）⇒ 从第 2 轮起，每轮的轮末文案都会带着**第 1 轮起累积的全部**
+错误条数再说一遍"本轮"。这不是措辞瑕疵而是**同一数字每轮都变大**：用户按"本轮"读会以为
+错误在持续增长。修法仍是把口径改成真话（"进程启动以来累计"），并在 `:85` 与 `:89` 两处
+注释统一到同一个说法（I5：一个口径一个说法）。
