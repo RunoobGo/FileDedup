@@ -1969,3 +1969,151 @@ G1~G11 全部由本轮 grep/读码现取，无一条来自上一轮的记忆。�
    精确文本匹配多次失败；整行替换 + 表格列数（`awk -F'|'` 与邻居行对齐）核对是更稳的路径。
    本轮 M37/M41/M43/M46 四行的改动都用这个方式复核过结构未破。
 
+
+---
+
+## 15. 本轮全量代码审查的实施批次（OPS/SCN/FLT/REAL/MODEL/APP/FE/GATE，2026-09-21）
+
+上位指令：**"进行全量代码审查并测试，按照审查情况实施修订。"**
+分区审查由 5 个只读子代理并行完成（未碰工作树、未跑测试），产出 60+ 条候选。
+本节是**动手前**的取证与裁定：**每条都自己开码核对过**，核对不过的写成"推翻"或"降级"，
+不许照抄子代理结论。判据与 §1 约束一致：不扩大改动面、新增计数不进界面（M8）、
+修正既有假话类前端改动沿用 04:2014 的先例许可。
+
+### 15.0 动手前取证（位置 → 实际读到的代码 → 裁定）
+
+#### A. 复核为真、本批实施
+
+| ID | 位置与实测到的代码 | 裁定与修法 |
+|---|---|---|
+| **OPS-1**（Critical） | `move.go:124` `hardlinkRename(tmp, dup)` **成功**后 tmp 这个名字已被改名消耗；`:135-138` 的 `removeOwnBackup` 失败分支紧接着执行 `_ = os.Remove(tmp)`，注释写"确保临时硬链接不残留"。此刻 `tmp` 路径上若被第三方落了文件，这一行就是在**无按路径证据**地删别人的东西，错误还被 `_ =` 吞掉、结果记成"成功 + 残留告警"。同形位置 `symlink.go:129-131` **没有**这一行（`removeOwnBackup` 失败直接 `return err`）⇒ 两条合并路径不对称，硬链接侧多一枚无证删除 | 实施：删掉该 `_ = os.Remove(tmp)`；探针 = swap 成功后在 tmp 位第三方落文件 + `workTempRemove` 注错，断言第三方仍在 |
+| **OPS-7** | `executor.go:401-409` trash 的 pre-pass 逐个 `identityStill` 后**批量** `trash(paths)`；批量失败退化为逐文件分支 `:457-485`，该分支只做 `os.Stat` + `known[p]` 查表，`if m, err := trash([]string{p})`（:482）**之前不再复核身份**。trash 是全仓唯一"复核不紧贴动作"的 kind（delete/hardlink/symlink/move 都在动手前一行复核）⇒ 批量失败到逐个重试之间的延迟（整批 I/O + 并发排队）构成窗口 | 实施：回退分支每次单独 trash 前补一次 `identityStill(p, procIDs[i])`，不合规记 Failed/stage=verify，与 :405-407 同一措辞 |
+| **OPS-9**（I5） | 同一个 Win32 错误码在 ops 包内有两套命名：`regstatus.go:24` `regErrNotFound = syscall.Errno(2)` + `:32` **裸** `syscall.Errno(3)`；`symlink_windows.go:51-57` 一张具名表（`errFileNotFound`=2 / `errPathNotFound`=3 …）。`ads/ads.go:33-35` 是第三套（跨包，且 int 非 Errno） | 实施（包内）：把 `symlink_windows.go` 的具名表整体挪进无 tag 的 `winerrno.go`，`regstatus.go` 改引用 `errFileNotFound`/`errPathNotFound`，消灭裸 3；ads 侧收归需新建叶子包 ⇒ 扩面，登记不实施 |
+| **OPS-10** | `move.go:277-305` `claimDst` 的 `for i := 0; ; i++` 无上限、不看 ctx。同包 `trash_linux.go:104-107` 对同形状循环已给过结论并设 `xdgNameMaxTry = 10000`，注释原文："永远查不出 NotExist 会让全部并发 goroutine 一起挂死"。同一条理由在本包已经成立过一次 ⇒ 本处属漏改不是取舍 | 实施：`claimDst` 复用同一个包级上限常量，超限返回显式错误 |
+| **CACHE-1** | `HashHeadTail`（hasher.go:101-190）的采样分支按**声明 size** 算 `sampleOffsets`，追加的尾巴落在四个采样点之外；AS-H2 的 `rejectGrowthBeyond` 此前只挂在小文件一趟与两条全量路径上，**采样分支不在场**。真实盲区是"遍历 stat 之后、哈希之前"变长：此时缓存四点采样仍相符 ⇒ pipeline 跳过阶段 3（唯一调 HashFull 处），paranoid 又按 size 截断 ⇒ 假重复组（AS-H2 的第四入口）。**严重度必须按此措辞**：下游 executor 的 VerifyFile 内容复核会拦住删除，故这是"两道声明防线各有一处盲区"，不是已兑现的错删路径 | 已实施（本批起点）：采样分支 `r.Short = short` 之后补 `rejectGrowthBeyond`；导出 `RejectGrowthBeyond` 供 dedup 复用，避免 I5 第二份实现 |
+| **PARA-1** | `pipeline.go:813-835` `equal` 只比 `size` 字节就 `return true`；`size = int64(g[0].Size)` 来自更早的 stat。文件在比对期间被追加时，前 size 字节相同即判"逐字节一致"⇒ paranoid 这道**最后防线同样切尾**。另有 `size < 0`（坏卷/畸形挂载报出）时 `remain > 0` 不成立，函数**一次都不读就返回 true** | 实施：`equal` 收尾调 `hasher.RejectGrowthBeyond(a/b, size)`；入口 `size < 0` fail-closed 报错 |
+| **HASH-1** | `HashHeadTail`/`HashFull`/`HashFullSegmented` 无 size 下界守卫：负 size 走 `size <= SmallFileMax` 分支，`buf[:size]` 直接 panic（`slice bounds out of range [:-1]`）。worker panic 会让**整轮扫描**作废（pipeline 的 workerPanic 收口）⇒ 一个坏卷打死全部结果 | 已实施：三入口 `if size < 0 { return declaredSizeErr(size) }`，错误自证"声明长度不可信"而非"恰好被计数分支挡下" |
+| **DOC-1** | `hasher.go:174-178` 注释原文称"pipeline 的短读纠偏会在**阶段 3** 以实际读量再校正"。实际纠偏发生在阶段 2 拿到 `r.Short` 之后（`pipeline.go:486-487` `e.Size = actual`）；阶段 3 只按已纠正的 `e.Size` 调 HashFull | 实施：就地更正注释（属"修正既有假话"，非新增呈现） |
+| **SCN-3** | `scanner.go:596-602` `rootPrefixes` 无条件 `out[i] = r + sep`。根为 `/`（或任何已带尾分隔符的根）⇒ 前缀变成 `//`；`:608-615` `relativeTo` 对 `/Users/x` 的前缀匹配全部失败 ⇒ 兜底 `filepath.Base(full)` ⇒ 任何含 `/` 的 `ExcludePaths`（如 `a/b/*`）**静默永不命中**，方向是放行（该排的没排）。基准实现 `scanner_test.go:164-171` 同病 ⇒ 等价性用例在结构上抓不到这条 | 实施：根已以分隔符结尾则不追加；探针走 `rootPrefixes`+`relativeTo` 单元级断言（绕开等价性基准的传染性） |
+| **FLT-1** | `filter.go:45-61` `newExtSet` 只做 `strings.ToLower`；`has(ext)` 的调用方传入 `filepath.Ext` 产物（**带点**）。用户在 GUI（`ScanView.vue:84-85`，只 trim 不补点）或 CLI 里写 `tmp` ⇒ `"tmp" != ".tmp"` ⇒ 该条排除**整条 fail-open**，且界面不会报错 | 实施：在 `newExtSet` 一处归一（TrimSpace + 补点 + ToLower）。一处判定一处实现，GUI/CLI 不必各自改 |
+| **REAL-1** | `pipeline.go:486-487` 短读纠偏只 `e.Size = actual`。`e.Actual`/`e.ActualKnown` 仍是**截断前那份**的实占读数 ⇒ 逻辑栏已纠正、实占栏没纠正，双口径互相冒充（违 I6）。跨卷/回退情形下实占还会大于新逻辑长度 | 实施：同一处补 `e.ActualKnown = false; e.Actual = 0`，让实占栏显式落回"未统计"而不是冒充 |
+| **MODEL-1** | `model.go:137-144` `AnyActualKnown` 遍历 `g.Files` **全部成员**（含 files[0] 保留项）；`:149-159` `ReclaimActual` 只加 `files[1:]`。两函数的口径必须一致，因为 `AnyActualKnown` 是那个数字的"已统计"标志（调用点 `app.go:963`、`cmd/fdd-cli/main.go:141`）。保留项读到过实占而冗余项都没有时，标志为真、数字却纯是逻辑口径回退值 | 实施：`AnyActualKnown` 只看 `files[1:]`，与 `ReclaimActual` 逐字对齐 |
+| **APP-1** | `app.go:1384`/`1397` 的 `ApplyKeepPolicy` 全程持 `a.mu`，内部经 `keep.go:145` 调 `fscase.Sensitive(dir)`；`fscase.go:75-85` 注释原文可引：它**要往用户目录写探测文件**。策略侧已有 `WarmSensitivity` + `ApplyProcessPolicyWith`（AS-R3 的形状），保留侧既无 With 变体也无测试钉子（`app_process_lock_test.go:43` 只钉了 `PreviewProcessPolicy`）⇒ AS-R3 **修了一半** | 实施：照 AS-R3 形状补 `ApplyKeepPolicyWith` + 锁外预热，探针成对（锁内不得出现写盘探测） |
+| **APP-2** | `app.go:2220-2232`：`CacheStats`/`CacheClear` 各**锁外两次**解引用 `a.cch`（`if a.cch == nil` 后再 `a.cch.GetStats()`）；`shutdown` 在锁内置空（`:458-461`）。与 M9 的 `histSnapshot`（`:1626-1637`）逐字同形，而 M9 的 AST 门禁白名单只管 `a.hist` ⇒ 同一类缺陷的第二例 | 实施：加 `cchSnapshot()`，AST 门禁扩到 `a.cch` |
+| **APP-3** | `app.go:1878-1882` `PruneScanFiles` 失败只 `fmt.Fprintf(os.Stderr, ...)`，注释原文"属可忽略的陈旧关联，留痕即可"；`app.go:451-455` shutdown 的 drain 超时同样只 stderr。M7 的 `warnLedger`（`:1641-1646`）是这类"账本没写进去"的统一出口 ⇒ 这是同族**第 5、6 处**漏网 | 实施：两处改走 `a.warnLedger(...)`（打包 GUI 无控制台，只写 stderr 等于没写） |
+| **APP-4** | `app.go:2049-2052` 批量回撤的 `todo` 只收 `StateDone`；而 `:2004-2007` 的函数文档承诺"回撤失败的项保持 undo_failed，用户可修正后再次回撤"，单项通道 `:2171-2174` 也确实允许 `done \|\| undo_failed`。`undoing` 状态只在 `history.Open` 收口（`history.go:185-190`）。后果：部分失败后再点"全部回撤"→ todo 为空 → 前端弹"已回撤或未实际执行"（`scan.ts:775-776`），与事实不符 | 实施：`todo` 过滤改 `done \|\| undo_failed`，结果文案带"另有 N 项此前失败" |
+| **APP-6** | "哪些操作可回撤"有**两份内联实现**：`app.go:1674` `undoable := op.Kind != "delete" && !(op.Kind == "trash" && runtime.GOOS == "windows")`（写库真值 `OpMeta.Undoable`）与 `:1617-1622` `undoableReason` 里的 `if kind == "trash" && runtime.GOOS == "windows"`（文案）。两处判据必须同源，否则出现"落库说可撤、文案说不可撤"；且 `runtime.GOOS` 直接落在 RPC 层同时违 I5 与 H6 | 实施：抽无 tag 纯函数 `undoableFor(kind, goos)`，reason 分支改用它，两侧同源 |
+| **APP-7** | `sysguard.go:239-261` `isReservedName` 的名单是 CON/PRN/AUX/NUL + COM1-9 + LPT1-9；`:239` 的说明文案同口径。**缺 `CLOCK$`**——Microsoft 命名规范在册的保留设备名 | 实施：补一支 + 用例（含 `CLOCK$.txt` 取词干形态） |
+| **APP-9** | `sysguard.go:92-100` `hits`：prefix/suffix 比对是"把 name ToLower 后与**手写小写的** e.prefix 比"。表内当前两条恰好是小写（`.com.apple.timemachine-` / `.snapshots`）⇒ 今天没坏；但任何人新增一条带大写的 prefix/suffix 会**静默永不命中**（整卷 TM 快照挡不住，方向是放行）。`:26` 注释还写着"大小写不敏感"，是承诺与实现脱节 | 实施：装配时统一 `strings.ToLower`，把"永不命中"变成不可能 |
+| **APP-10** | `cmd/fdd-cli/main.go:132` `r := report{... Failed: failed}`，`failed` 为 nil 时 JSON 输出 `"failed": null`。仓内已有两处裁定"空列表必须是 []"（`oplog.go` 侧、`scan.go` 侧），且 `smoke-cli.sh:71` 已被迫 `or []` 兜底——**脚本的兜底就是这个缺陷存在证据** | 实施：`Failed: append([]model.FailedItem{}, failed...)` |
+| **FE-1** | `ResultView.vue:438` 「打开回收站」按钮在 OK 块内**无条件**显示。delete/hardlink/symlink 运行时 `TrashedBytes` 必为 0，按钮仍在暗示"去回收站看看"——正是 M22 立项理由的后半句（"数字改了、按钮没改"）。属"修正既有假话"类，非新增计数呈现 ⇒ 有 04:2014 先例许可 | 实施：store 记 `lastOpKind`，按钮按 `=== 'trash'` 显示 |
+| **FE-2** | `opdisplay.ts:59-61` 与 `ConfirmDialog.vue:36` 都用 `default:` 兜底返回硬编码文案，全仓无 `never` 检查。`scan.ts:679-681` 注释承诺"新增 kind 会在编译期报错"**不成立**——真新增一个 kind 会静默走 default 拿错文案。`OpKind` 又被 `wails_types_test.go:74` exempt ⇒ 类型面也不管 | 实施：两处 default 前加 `const _exhaustive: never = kind`，把假承诺变成真门禁 |
+| **FE-3** | `RecordsView.vue:249` 「重扫」按钮 `:disabled` 只看 `store.scanning \|\| store.opsRunning`，**不看本视图的 `loading`**；而 `scan.ts:326-377` 的 `rescan` 会先发起在途 `openHistory`。两者交错 ⇒ 统计条与列表来自不同代（正是 B3-2 自己点名的危险形状） | 实施：`:disabled` 补 `\|\| loading` + 回写后代际复核 |
+| **GATE-1** | `scripts/test-frontend-logic.sh:84-87` 只有 2 条 wiring 锚，且都不在 `views/`。实测：删掉 `ResultView` 的 `v-else-if TrashedBytes` 分支，**13 行门禁全绿** ⇒ 本轮 FE-1 这类改动的回归无人守 | 实施：补 2 条锚（只锚标识符，不锚中文文案，避免改字就红） |
+| **GATE-2** | `wails_types_test.go:357-385` 字段面：`goJSONNames` 若解析失效返回空、TS 侧也空 ⇒ `missing`/`extra` 都为 0，**两侧同时为空即静默通过**。同文件方法面 `:427-428` 已有 `len(tsMethods)==0 ⇒ t.Fatal` 的 fail-closed 口径 ⇒ 同一文件内两条标准不一致 | 实施：字段面补 `len(goNames)==0` 下界 + compared 计数下界 |
+| **GATE-3** | `docs/04:378` 门禁表仍写 `SKIP=''`，脚本实际用 `QUARANTINE=()` ⇒ 文档与脚本不符（照文档改脚本会改坏） | 实施：文档更正（括注式，不改写既有结论） |
+| **DOC-H2** | `docs/04:248` §3 H2 行写"用 (dev,ino,**ctime**) 再验一次"，而 `fsid.SameIdentity` 注释明写**不含 ctime**（chmod/xattr 会推进 ctime，含了就误拦正常改写），`identity_still_test.go:68-74` 把"原地重写仍放行"钉成预期 ⇒ **文档与代码不一致，代码是对的** | 实施：只更正文档，括注说明裁定依据 |
+
+#### B. 复核后推翻 / 降级（不得照抄子代理结论）
+
+| 项 | 子代理说法 | 开码后的事实 | 处置 |
+|---|---|---|---|
+| **SCN-2** | "隐藏规则抵消逃逸放行 ⇒ 被点名根下的子树一个文件都不扫" | `scanner.go:253-255` 把**全部根**预置进 `visited`/队列；逃逸成立意味着某根 R 在被剪目录 D 之下，而 R 自己那棵树在队列里，D 作为 W 的子项被隐藏规则跳过**不影响 R 的扫描** ⇒ 不丢文件 | **推翻**，留证：本批未据此改任何代码 |
+| **OPS-4** | "Windows trash 的 dst map 一次都没写（`trash_windows.go:238-280` 只 return），整批失败时'源消失+无落点'必判失败" | 事实成立，但这是 `executor.go:436-476` 注释里**明文裁定**的取向（"宁可让用户看到一条需要核实的错误"）。代价（TrashedBytes 少计、账本记 failed、结果集不清理）如实登记 | **降级**为登记项，不当缺陷修 |
+| **OPS-6** | 数据缺陷 | 是 §3 H2 行的文档与代码不符 ⇒ 见上表 **DOC-H2** | **改性质**：只改文档 |
+| **SCN-1** | "用户点名的根位于 `eAbsPath` 型保护条目内部时，整棵子树被逐层剪枝 ⇒ 扫出 0 文件、`ProtectedDirs` 虚计、`UnprotectedRoots` 谎称未保护" | 开码核对到的是**两条已存在的放行通道**：`scanner.go:238-241`（根自身命中清单时记 `startUnprot`，且剪枝不参与）与 `:356-362`（`guard.Dir` 命中后先问 `rootsUnder(rawKeys, all, visitKey(full))`，有根在其下即放行下潜）。**本轮未能构造出可复现的剪枝路径** ⇒ 不写成缺陷 | **待取证**：登记为 M47 系列一条，判据要求一次真夹具（根在 `/System` 型 absPath 条目内部）复跑，取证前不改扫描核心
+| **FE-9** | "`format.ts` 以 1024 计算却标 KB/MB，手册用 KiB/MiB" | 属实，但改单位会让现有前端断言变红。按"不许改测试断言让门禁变绿"⇒ 本批不动 | **登记** |
+
+#### C. 登记为 M47 起独立 ID、本批不实施（含现象与最小修法）
+
+登记表逐条给"位置 → 现象 → 证据 → 触发条件 → 最小修法 → 本机可验证性"，正文进 04 §6.11 附表。此处摘要：
+
+- **OPS-2**：`trash_linux.go:83-102` 跨卷复制完成后按**路径**盲删源；失败分支删 `.trashinfo` 留下无主孤儿条目（AS-H4 同形状）。linux 腿本机造不出第二挂载卷 ⇒ 无法红→绿。
+- **OPS-3**：`undo.go:389-399`、`:279`、`merge_guard.go:113-117` 先查后用（复核与动作之间无抢占），`claimExact` 未覆盖这三处 ⇒ 需连带更正 04 §6.9.8"兑现边界 5：各自已有防线"的判定依据，属裁定面。
+- **OPS-4**（由降级而来）：Windows `defaultTrash` 任何路径都返回空 dstMap（`trash_windows.go:237-280` 从声明到 return 一次未写），批量整批报错时"源消失 + 无落点"必落 `strict && !known[p]` ⇒ 记 Failed + 数据丢失警报。这是 `executor.go:436-476` 注释里**明文裁定**的取向，代价（TrashedBytes 少计、账本记 failed、结果集不清理）如实登记，不改判据。
+- **OPS-5**：executor 四栏用 `e.Size` 而非 `ActualBytes()`，与扫描页两口径并存 ⇒ **产品裁定**，非缺陷。
+- **OPS-8**：darwin `osascript` 整段跑完才输出，批量失败丢全部 dstMap ⇒ C2 修复在 darwin 腿失效。需二分重试改造，改动面大。
+- **OPS-11**：`verify.go:43-64` 把"打不开/读不了"（`os.Open` 非 ENOENT、`f.Stat()` 失败、`HashFull` I/O 错）折进 `VerdictFailed`，`executor.go:239` 一律套"文件在扫描后被修改"文案 ⇒ 三类"无从判定"与一类"确实变了"共用文案。
+- **OPS-12**：`trash_windows.go:441-448` `verifyRecycled` 用 `os.Stat` 判"源是否还在"，任何错误都被当成"已消失"（ACL/EACCES/EIO 会让仍在盘上的文件通过判据 1）。应走 `Lstat` 并把非 ENOENT 按"仍在"处理。
+- **OPS-13**：`verify.go:101-104`（err → false）× `executor.go:405/493/518/538/598`：`identityStill` 分不出"文件已消失"与"被替换"，用户自己删掉 dup 会得到"已被替换、已拦截"且记 Failed ⇒ 不进 app 的 `gone` 集合，结果集留一个不存在的路径。
+- **OPS-14**：`merge_guard.go:96-102` 的 `slotProvesSymlink` 走 `verifySymlinked`，后者在 `!tid.Resolved || !kid.Resolved` 时只比"能打开 + 大小一致"（`symlink.go:174-186`）⇒ 删侧取证在 NFS/FUSE 卷上可能把用户自己的链接当我们的残留删掉，与 `slotProvesHardlink` 的 fail-closed 口径相反。
+- **OPS-15**：`undo.go:186-198` 复用 `MoveFile(it.DestPath, filepath.Dir(it.OrigPath))`，而正向移动因重名递增过 `photo_1.jpg` 的文件回撤后停在 `photo_1.jpg`，不是 `OrigPath`。
+- **APP-5**：`GetOpRecord` 无分页且逐条 stat。**APP-8**：`app.go:1188-1194` `startCmd` 丢弃退出状态（`go func() { _ = cmd.Wait() }()`）⇒ `RevealInFolder`/`OpenTrash` 起得来但随后失败时完全不可见。**APP-11**：`history.go:115-148` 会话级 PRAGMA（`foreign_keys`/`busy_timeout`）只在开池时发一次，`database/sql` 遇 `ErrBadConn` 重建那条唯一连接后不重放。**APP-12**：`app.go:279-287`+`:1198` `cfgDir` 取不到时 `settingsPath()` 仍返回相对路径 ⇒ `SaveSettings` 写进程 CWD。**APP-13**：`app.go:1803` `beginJournal` 早于 S4 校验（`executor.go:187-190`）⇒ 未获批的 `delete` 也在账本留一条记录（`FinalizeOp` 收口为 cancelled），且 `FailedItem` 无 Path。
+- **FC-1**：`fscase` 探测失败时兜底"不敏感"，与"不确定时倾向不折"相反 ⇒ 会让 `dedupeRoots` **丢弃**一个真不同的根（方向是少扫，不是错删）。**FC-2**：`Fold` 在所有平台把 `\` 当分隔符。
+- **I5-1**：`\`→`/` 归一在 `keyOf`/`fscase.Fold`/`sysguard.normalize`/`toSlashPat` 四处实现且规则互相冲突；`sysguard` 有"不得 import internal 包"的自设分层约定 ⇒ 收归单一实现**需用户裁定优先级**。同时 M26 划账"四处只剩一份"须加限定：scanner 包内成立、全仓不成立。
+- **SCN-4**：`scanner.go:560`（`sort.Strings` 排**原样**串）+ `:570-588`（只回看 `kept`）⇒ 不敏感卷上宽根 `/data/b` 与子根 `/data/B/A` 因 `'B'(0x42) < 'b'(0x62)` 使子根先入 `kept`，宽根不被判重 ⇒ 同一棵树走两遍，`UnprotectedRoots` 跟着多计（M26 修后的残留形态）。
+- **SCN-5**：`res.Visited = len(visited)`（`:495`）偏高——`:253-255` 先把全部根预置、`:374-383` 在 **submit 时**登记而非读成功后、`:302-310` 取消后排空与 `ReadDir` 失败的目录同样留痕。与字段注释"实际访问目录数"不符；目前只被诊断/测试读取（`scanner_test.go:256`、`gate_cancel_test.go:127`）。
+- **SCN-6**：`scanner.go:554-558` 只做 `Abs`+`Clean`（无 `EvalSymlinks`）+ `:240` `guard.Dir(r, filepath.Base(r))` ⇒ 目录符号链接作根时 `ReadDir` 会跟随，而保护/留痕判据按**链接名**判（与 AS-H3 修正前同形）。
+- **PRG-1**：`progress.go:58-67`（取快照后**先释锁再 cb**）与 `:74-86`：ticker 取 S1 后释锁，`Stop` 取 S2(≥S1) 并 cb，随后 ticker 才 cb(S1) ⇒ "节流不丢终值"可被回退一次。`progress_test.go` 只测终值包含全部计数，未测这个交错。
+- **FLT-2**：`filter.go:83-88` 文档承诺"`Compile(nil)` 时 Apply 恒 true，调用方可直接调"，但 `scanner.go:364`（`f.IncludeHidden`）、`:409`（`f.AllowCloudHydration`）无条件解引用 `*model.Filters` ⇒ `Walk(ctx, roots, nil, n)` 一遇子目录即 panic（被 I3 的逐目录 recover 吞成整目录漏扫）。
+- **STATE-1**：`pipeline.go:234-257` `ValidateTransition` 在 mu 内**只判不写**，写入在锁外的 `setStatus`（`:257`）⇒ 窗口内第二个 `Run` 也能过检查（今天靠 `app.go:590 scanInFlight` 从外部挡），且该窗口内 `Pause()`/`Cancel()` 见 `Idle` 直接回错（`:129`）。
+- **WIN-1**：`GetCompressedFileSizeW` 调用前未 `SetLastError(0)`（返回值 0xFFFFFFFF 才是失败信号，脏的旧 lastError 会误判）。
+- **CACHE-2**：`cache.go:168-206` `openDB` 既无 `busy_timeout` 也不 `SetMaxOpenConns(1)`，而同仓 `history.go:120/135` 两样都做了 ⇒ 连带 `PRAGMA synchronous=NORMAL` 只落在一条连接上。
+- **CACHE-3**：`cache.go:220-222` `Lookup` 把一切 DB 错误折叠成"未命中"（含运行期损坏、满盘），而损坏判定只在 `Open` 做过一次 ⇒ 库中途坏了永不自愈，每轮只刷 `Store` 失败条目。修法：`Store`/`Touch` 错误经 `dbfile.IsCorruption` 命中时置一次 disabled 标志、只上报一条（与 M25 的 `addStartupNotice` 同槽位）。
+- **CACHE-4**：`cache.go:261-265 / 285` 两笔小账实不符：(a) `Store` 已 Commit 成功后 `evictLocked` 才失败，返回值仍被 `pipeline.go:403` 写成"缓存写回失败"；(b) UPSERT 的 `full=excluded.full` 无条件覆盖，而缓存失效判据含 ctime（`cache.go:230`），`chmod`/xattr/`rename` 这类只动元数据的操作会推进 ctime ⇒ 与 `fsid.SameIdentity` 刻意不含 ctime 的裁定（DOC-H2）方向相反，需一并裁定。
+- **MEDIA-1**：`pipeline.go:271-273`（配 `scan.ts:373`）G6 的介质自适应只在 `cfg.Threads<1` 时生效，而载入一条历史会把 `threads.value` 回填成历史行的显式线程数 ⇒ 此后介质探测静默不参与。另 `media/probe_darwin.go:146-149` 的 `diskutilCache` 是进程内缓存。
+- **FE-4**：`scan.ts:688-693` `guard` 与上锁之间隔了一次 `await`。**FE-5**：`scan.ts:365-372` `rescanHistory` 逐字段回灌，`Filters` 共 7 位此处只赋 6 位 ⇒ `AllowCloudHydration` 丢失（当前 GUI 无该开关，风险是"按此配置重新扫描"这句承诺对未来新增字段失效）。**FE-6**：`RecordsView.vue:72-80` 前端复刻后端 `undoableReason` 却少了平台条件（注释自称"与后端保持同一口径"⇒ 同一判据两份实现，I5 形态）；今天被存量数据遮蔽（`m.undoable` 取自落账列，macOS/Linux 的 trash 记录不显示该徽标）。修法：后端把 reason 文本随 `OpRecord` 下发，前端只渲染——属接口扩面，与裁定③（新增呈现归 M8）相邻，故登记。**FE-7**：`ResultView.vue:63-69` 一次最多投 7 条 toast，池上限 5 且溢出丢最旧 ⇒ 摘要行会被自己挤掉。**FE-8**：`FailedDrawer.vue:39` × `ResultView.vue:451` 同一入口两个"失败"数不同源。**FE-9**：`format.ts:5-10` 以 1024 计算却标 `KB/MB/GB`，而手册 09:113-141 用 KiB/MiB ⇒ 属实但改单位会让现有前端断言变红，按"不许改断言让门禁变绿"改为登记。**FE-10**：`FailedDrawer.vue:41` × `:18-24` 无剪贴板时「复制全部」静默无反馈。
+
+### 15.1 判据
+
+1. **无证删除一律消灭**：任何 `_ = os.Remove(path)` 必须能回答"凭什么说这个名字还是我们的"。
+   OPS-1 的判据不是"会不会真删到"，而是"证据链在哪一步断的"——swap 成功即宣告 tmp 名字已交还命名空间，
+   此后按名删除无据。
+2. **复核必须紧贴动作**：pre-pass 与动作之间的批量 I/O 时长不是零。OPS-7 用"同包其他 kind 都紧贴"作基准。
+3. **一处判定一处实现（I5）**：OPS-9/APP-6/FLT-1 都按此收敛到单一出口；跨包收归需新建叶子包的，先登记。
+4. **循环必须有界**：同包已给过结论的形状不再重犯（OPS-10 复用 `xdgNameMaxTry` 的裁定，而不是新发明一个数）。
+5. **两口径不得互相冒充（I6）**：REAL-1、MODEL-1 都是"标志与数字来自不同总体"，修法统一为"标志与数字同总体"。
+6. **fail-closed 优先于放行**：SCN-3、FLT-1、FC-1 三条缺陷的共同方向是"判据失效时放行"，
+   修复后判据失效必须落在"少扫/不排"侧而不是"多删/多扫"侧。
+7. **门禁的下界也是判据**：GATE-1/2 修的是"判据面可以被删空而全绿"，与 AS-K 批同源。
+8. **诚实措辞优先于严重度**：CACHE-1 明确写成"两道声明防线各有一处盲区"，不写成"会错删"——
+   executor 的内容复核是第三道，本批不夸大。
+
+### 15.2 改动面（生产文件）
+
+- `internal/hasher/hasher.go`（采样分支变长守卫 + 三入口负 size + 导出 `RejectGrowthBeyond` + DOC-1 注释更正）
+- `internal/dedup/pipeline.go`（`equal` 变长守卫与负 size；REAL-1 实占栏复位）
+- `internal/model/model.go`（`AnyActualKnown` 只看 `files[1:]`）
+- `internal/scanner/scanner.go`（`rootPrefixes` 尾分隔符判尾）
+- `internal/filter/filter.go`（`newExtSet` 扩展名归一）
+- `internal/ops/move.go`（OPS-1 删无证 Remove、OPS-10 `claimDst` 上界）
+- `internal/ops/executor.go`（OPS-7 回退分支身份复核）
+- `internal/ops/winerrno.go`（新，无 tag）+ `symlink_windows.go`（删本文件内表）+ `regstatus.go`（引用具名表）
+- `internal/sysguard/sysguard.go`（APP-7 `CLOCK$`、APP-9 prefix/suffix 装配归一）
+- `app.go`（APP-1 With 变体 + 锁外预热、APP-2 `cchSnapshot`、APP-3 两处走 `warnLedger`、APP-4 todo 口径、APP-6 `undoableFor`）
+- `cmd/fdd-cli/main.go`（APP-10 `failed: []`）
+- `frontend/src/stores/scan.ts`（`lastOpKind`）、`frontend/src/views/ResultView.vue`（FE-1）、
+  `frontend/src/utils/opdisplay.ts` + `components/ConfirmDialog.vue`（FE-2 never 钉）、
+  `frontend/src/views/RecordsView.vue`（FE-3 disabled + 代际）
+- 门禁与测试：`scripts/test-frontend-logic.sh`（GATE-1 两条锚）、`wails_types_test.go`（GATE-2 下界）
+- 文档：`docs/04-开发与测试计划.md`（GATE-3 `SKIP=''`→`QUARANTINE=()`、DOC-H2 §3 H2 行括注）、04 新增 §6.11
+
+### 15.3 探针（修前必红）
+
+1. `internal/hasher/growth_sampling_test.go` 4 条：采样路径变长未被拒 / 负 size panic / 错误自证入参不可信 / 负控制（size 相符时采样结果逐位不变）。
+2. `internal/ops/`：swap 成功后 tmp 位第三方文件必须存活（OPS-1）；回退逐个 trash 前身份变化必须拦截且不删除（OPS-7）；`claimDst` 在占位持续被占时须在有界次数内返回错误（OPS-10）。
+3. `internal/dedup/`：paranoid `equal` 在文件变长时须判不一致（PARA-1）；负 size 须报错而非返回 true。
+4. `internal/scanner/`：根为 `string(filepath.Separator)` 时 `relativeTo` 须给出真实相对路径（SCN-3）。
+5. `internal/filter/`：`ExcludeExtensions = ["tmp"]`（无点）须真的排除 `.tmp` 文件（FLT-1）。
+6. `internal/model/`：仅保留项 `ActualKnown` 时 `AnyActualKnown()` 须为 false（MODEL-1）。
+7. `app.go`：`CacheStats`/`CacheClear` 的句柄读取须经快照（AST 门禁扩项即探针，APP-2）；批量回撤须吃到 `undo_failed` 项（APP-4）；回撤真值与文案须同源（APP-6 表驱动）。
+8. `internal/sysguard/`：`CLOCK$`/`CLOCK$.txt` 须判保留名（APP-7）；大写形态的 prefix/suffix 条目须命中（APP-9）。
+9. CLI：无失败项时 JSON 须为 `"failed": []`（APP-10）。
+10. 前端：`lastOpKind` 非 trash 时按钮不显示（FE-1，node 用例）；`opdisplay`/`ConfirmDialog` 的 never 钉使新增 kind 在 `typecheck` 报错（FE-2）。
+
+### 15.4 变异
+
+每条实施后逐条改坏并抄真读数：删守卫→应红；把上限常量改 0→应红；`AnyActualKnown` 改回全遍历→应红；
+`newExtSet` 去掉补点→应红；`rootPrefixes` 恢复无条件追加→应红；删 `cchSnapshot` 改回裸解引用→AST 门禁应红；
+`undoableFor` 的 trash/windows 支改回 true→表驱动应红。全部读数写进 04 §6.11，不写本文。
+
+### 15.5 未兑现与边界
+
+- linux 腿（OPS-2/OPS-7 的跨卷部分）与 darwin osascript 腿（OPS-8）本机不可构造 ⇒ 平台相关改动一律写
+  "**代码已改、验证未兑现**"，绝不写"已通过"。
+- `smoke-symlink.sh` 需 root 挂独立文件系统，本机 rc=2 是**合法跳过**，不得读成通过（本轮复跑仍 rc=2）。
+- 本批不动 `format.ts` 单位（FE-9）、不动 executor 四栏口径（OPS-5）、不收归 ads 与 sysguard 的跨包常量
+  （OPS-9 包内部分 / I5-1），这些都需要用户裁定或新叶子包，属扩面。
+- CACHE-1 的修复把"采样分支无变长守卫"这一处盲区补上，但**不声称**"变长假重复已被彻底排除"：
+  缓存 full 的可信度仍建立在四点采样 + 变长探测 + paranoid 内容比对三者之上。
+
