@@ -212,6 +212,16 @@ jobs:
   #   bash scripts/smoke-cli.sh             → rc=0，205 组 / 90,522,243 B / 2,360 文件 /
   #                                            复扫命中 532，三跑一致
   # 首跑仍需一次真实 push 才能确认 runner 侧（Xcode/CGO、配额、时长）成立。
+  #
+  # 〔2026-09-22 对齐（M100/M108），上面四行是 2026-09-21 的原读数、不删只补：〕
+  #   ① "首跑"这一格**已兑现**：macOS 腿此后反复真跑，且已抓红过一次
+  #      （run 35644606017 的 step7 判 TestScanAndOpsAreMutuallyExclusive DATA RACE）。
+  #   ② 包数与用例数都漂了：现值 `go test -race -count=2 ./...` = 22 包 ok、
+  #      `go test -list '^Test' ./...` = 654 条（两值同批重取，见 04 §3.2 第五次核对）。
+  #   ③ 注释里"15 个 *_darwin_test.go"现为 darwin 专属 17 条（新增 cloudfile 1、
+  #      realbytes clone 取证 1）。
+  #   ④ 本地全套门禁的**唯一入口**已改成 `bash scripts/run-gates.sh`（15 行读数，
+  #      自带总判定与非 0 退出码）；本注释里的四行命令是它 2026-09-21 的手工前身。
   macos:
     name: go test (macos)
     runs-on: macos-latest

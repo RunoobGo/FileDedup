@@ -76,7 +76,10 @@ go run ./cmd/benchgen -dataset C -scale 0.02 -out ./benchdata   # 合成数据�
 
 ## 测试与回归
 
-改动后的本地回归配方（与 CI 同口径，见 `.github/workflows/ci.yml`）：
+改动后的本地回归配方（与 CI 同口径，见 `.github/workflows/ci.yml`）。
+**唯一入口是脚本**：`bash scripts/run-gates.sh` 一次跑完下面全部命令，逐行给
+PASS / SKIP / FAIL 并自带总判定与非 0 退出码（`smoke-symlink.sh` 需 root，本机恒
+rc=2 ⇒ 记 **SKIP 不算通过**）。下面那份清单是它的手工对照，两者口径必须一起改：
 
 ```bash
 gofmt -l .                                                   # 必须无输出
@@ -95,6 +98,7 @@ bash scripts/check-version-sync.sh                           # 6 个取值位 / 
 
 | 脚本 | 作用 |
 |---|---|
+| `scripts/run-gates.sh` | **全套门禁的唯一入口**：一次跑完上面那 11 条命令（拆合后 **15 行读数**），逐行给 PASS / SKIP / FAIL 并**自己返回非 0**。`gofmt` 按列出文件数判、`race` 行要求 rc=0 **且** `DATA RACE`=0、`smoke-symlink` 的 rc=2 记 SKIP 不计通过（跳过不等于验过） |
 | `scripts/smoke-cli.sh` | benchgen 生成固定数据集 → `fdd-cli` 冷扫 / 缓存首扫 / 缓存复扫，逐项比对分组集合、可释放字节、语料数，并与 manifest 对账 |
 | `scripts/smoke-symlink.sh` | 挂真实独立卷（loop+ext4，退到 tmpfs）验证软链接合并赖以成立的 7 条文件系统语义；退出码 0=通过、2=**合法跳过**（无 root / 挂不上卷）、1=失败——跳过绝不伪装成通过 |
 | `scripts/smoke-symlink-assert.sh` | 用 stub 打桩 `id`/`mount`/`losetup`，断言上一条脚本在"应跳过"时真的返回 2 并写明原因、在正常路径上确实释放了 loop 设备。冒烟脚本本身也是代码，没人测它的判据就等于判据可以静默失效 |
@@ -104,7 +108,8 @@ bash scripts/check-version-sync.sh                           # 6 个取值位 / 
 
 CI 门禁：`ci.yml`（PR 与 main push）三条腿——ubuntu 跑上述全套、windows runner 跑隔离后的
 `go test`（白名单清单现为空）、macOS runner 跑本机 `go vet` + `go test -race` + CLI 冒烟
-（D-2，2026-09-21 新增；该腿首跑待一次 push 兑现）；`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
+（D-2，2026-09-21 新增；该腿已在 CI 真跑过并抓红过一次 —— 见 04 §3.2 附注与 §6.18 一）；
+`build.yml`（`v*` tag 或手动触发）四平台打包 + 发布。
 真实回收站 / GUI 端到端仍需人工，平台 checklist 见 docs/04 §3.5。
 
 ## 发布

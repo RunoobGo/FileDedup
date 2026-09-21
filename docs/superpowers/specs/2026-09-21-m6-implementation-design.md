@@ -3713,3 +3713,33 @@ goroutine 均由 `:208` 的 `gowrap1` 创建。这是 §21 那批修完之后**�
 错误条数再说一遍"本轮"。这不是措辞瑕疵而是**同一数字每轮都变大**：用户按"本轮"读会以为
 错误在持续增长。修法仍是把口径改成真话（"进程启动以来累计"），并在 `:85` 与 `:89` 两处
 注释统一到同一个说法（I5：一个口径一个说法）。
+
+### 22.8 本批**复核后转登记**的清单（M112~M121）+ 一条被推翻（2026-09-22，划账 §6.18）
+
+§22.1~§22.7 是"改完的"。这一节是**开过码复核为真、但本批不改**的：它们不在 §22 已提交的
+设计面里（约束 7 不扩大改动面），按"每项实施前先写细化设计段"的纪律，下一批带自己的设计段再动。
+每条同样给**开码坐标 + 我自己看到的事实**，不抄子代理原话。
+
+| ID | 坐标 | 复核到的事实 | 为何本批不修 |
+| --- | --- | --- | --- |
+| M112 | `internal/ops/move.go:207-212` × `:222` × `:56-59` | `copyVerify` 的注释明写"还原失败**不作为整体失败**（数据已在目标处），单独返回错误供上层记录"，而 `:222` 是 `return restoreMeta(dst, st)` —— 该错误就是 `copyVerifyFile` 的错误，`MoveFile:56` 见错误即 `dst.release()` **把刚复制完的那份删掉**并整项判失败。源文件未动 ⇒ 不丢数据（fail-closed），但注释承诺的那条路**不存在**。★ 同包 `undo.go:445` 的 `applyMtime` 才是注释说的那个口径（"失败不作为整体失败"、返回 void），所以这不是"两种口径都对"，是同一件事在本包有两份说法 | 真要按注释做，得让 `MoveFile` 回"成功但降级"（`outcome` 有 `warn` 位而 `MoveFile` 签名只有 `(string, error)`）⇒ 与 **M40**「`MoveFile` 不回三态」同源，属形状改动；本批只登记，不动口径 |
+| M113 | `internal/ops/undo.go:197-199` | `undoMove` 复用 `MoveFile`，而 `err != nil` 分支直接 `return "", err` **把已返回的 `dst` 丢掉** ⇒ "已复制但删源失败（两份并存，新副本在 …）"里的落点在回撤账本上没有条目。这正是 **M86**（回撤侧丢 `restored`）的同一形状、同一个函数族，M86 已修的 `undoExecuteItem` 没覆盖到 `undoMove` 这一格 | M86 的修法（`undoFailure` 兜一层落点）在这里可复用，但要连带核 `MoveFile` 的部分成功语义在回撤面的记账口径 ⇒ 与 M89 同一批做才不留半截 |
+| M114 | `internal/ops/executor.go:344-345` ×（同族）`move.go:108/:112`、`symlink.go:82/:86` | `guardIdentity` 的 else 分支把三种情形压成一句"文件在扫描后被替换（inode 已变化），已拦截"：`identityStatus`（`verify.go:134-148`）返回 `(false,false)` 的路径有两条 —— 读身份**出错且非 ENOENT**（`:140`，例如父目录 EACCES）、以及**原先能解析现在解析不出**（`:142-146`）。两条都是"我们不知道"，不是"看到了另一个 inode"。四处 `identityStill` 的 S1 文案同型 | 判据本体要分第 3 态（确认顶替 / 无从判定），是 `identityStatus` 签名 + 那六处调用点的改动；且 `verify_m52_m54_test.go:215` 断的是 `"被替换"` 子串，改文案要先把"确认顶替仍说被替换"钉在前面（否则就是改断言凑绿） |
+| M115 | `internal/ops/verify_m52_m54_test.go:195-204`、`internal/ops/ops_probe_test.go:92-101` | 本包已有"顶替夹具"的唯一实现 `swap_fixture_test.go:33 swapInAt`（原子改名 + `assertDistinctIdentity` 自检，后者存在是因为 CI 实证过回收 inode 的卷会把原号发给新对象，见 `identity_still_test.go:25`）。这两条用例**各自手搓**了 `WriteFile → Remove → Rename`，绕开自检：前者非原子（中间有一瞬路径上什么都没有），后者用自定义后缀 `.swap-in`。后果不是假绿而是**可闪**——顶替者若拿回同一个 ino，`identityStatus` 判"仍是原对象"，用例期望的那条 `Failed` 就不出现 | 纯测试面收归（两条改走 `swapInAt`），价值真但不在 §22 设计面内 |
+| M116 | `frontend/src/views/ResultView.vue:219`、`ScanView.vue:18`、`RecordsView.vue:26` | 同一个展示规则（`new Date(sec*1000).toLocaleString('zh-CN', { hour12: false })`）**三处内联各写一遍**，而 `utils/format.ts:41` 已经是它的收归点（`humanBytes`/`formatCount` 同文件）。子代理报的"×4"是这三处 + 那份唯一实现 | 一处一行 import + 替换，风险低；但属"话术/形状"面，留到下一批与 M117/M118 同批做，避免本批再扩改动面 |
+| M117 | `frontend/src/components/PreviewPanel.vue:42`（`MD_RENDER_MAX = 64 * 1024`）× `app.go:1082`（`textLimit = 4 << 10`） | 这道"超过阈值默认退回源码"的护栏**不可达**：预览内容只有 `PreviewFile` 一个来源（`stores/scan.ts:903-916` 是唯一写入点），文本腿最多回 4 KiB ⇒ `content.length > 64 KiB` 恒假。于是 `:34-41` 那段注释里 20/100/400 KB 三档实测（"400 KB → 450 ms 肉眼可见的卡顿"）描述的是一条**到不了**的路径 | 三种处置（删护栏 / 把阈值改成与 4 KiB 相称 / 保留但注明"当前不可达，防的是预览上限以后变大"）各有取舍，且删码要连带核 `rendered` 那个开关的语义 ⇒ 要设计段，不顺手改 |
+| M118 | `frontend/src/views/ScanView.vue:96-100` × `utils/opdisplay.ts:83-86` | 百分比夹取有**两份实现**：`percentOf` 是收归点（带 `Number.isFinite` 与 `Math.max(0, …)` 下限），`ScanView` 的 `progressPercent` 自己写了一份 `Math.min(100, …)`。**子代理那句"第二条未夹取"不成立**——它夹了上限，只是少了下限那半边 | 一行改 `percentOf(p.BytesDone, p.BytesTotal)`；与 M116 同属前端展示面，同批做 |
+| M119 | `scripts/smoke-symlink-assert.sh:238-241` | 收尾只判 `fails -eq 0`，**没有断言条数下限** ⇒ 若所有 `ok`/`bad` 分支都没走到（桩挂错路径、`case` 全部 miss），脚本会打印"全部断言通过"并 `exit 0`。这条脚本存在的意义正是"自证冒烟判据本身有效"，而它自己可以被"一条都没验"骗过 | 修法就是加一个计数器 + `[ "$checks" -ge N ]` 下限；本批刚跑过它（行 14 绿），改它要重跑该行，留到下一批与 M120 一起 |
+| M120 | `.github/workflows/build.yml`（全文件） | **零处 `timeout-minutes`**，而 `ci.yml` 在 AS-K5 那一格（`:37-42`）已经把理由写死了："没有 timeout-minutes 的作业，一旦某步卡住就烧满 6 小时平台默认上限，还把已产出的日志一起废掉"。同一条纪律套了 CI，没套发布流水线 | 加两行 job 级 timeout 即可；改 workflow 文件属 CI 面，与本批 ci.yml 只加注释的幅度分开提交 |
+| M121 | `internal/cache/cache_test.go:3`（另 `:144` 的失败文案）× `cache.go:5` | M96 把包注释改成"损坏处理分两层，都不是'自愈'"之后，**同包测试文件头仍写着"损坏自愈"**。行为上没矛盾（那里说的是 Open 腿的隔离重建），口径上矛盾：同一件事在同一目录里两个名字。§22.7 刚为 `dbErrs` 的相邻两行立过"一个口径一个说法"这条 | 注释面一行；本批 M96 已经交付，重开同一格只加一个词，按"下一批统一清残余"处理更清楚 |
+
+**★ 复核后推翻的一条**（不登记、不改码）：本轮一度要把"`internal/cache/cache_test.go`
+上那道悬空的 `//go:build linux`"写成 M112。开码读数：`cache_test.go` 第 1 行是 `package cache`，
+**根本没有 build tag**；全仓 `//go:build linux` 只有一处（`app_p3_linux_test.go:1`），而它测的
+`revealCmd` 选的是 `xdg-open`/文件管理器那一族 Linux 专有命令，标签是**对的**。
+⇒ 该条按 §22.0 的纪律就地作废、不占号（假 ID 不留进登记表，与 M90 同一处理）。
+
+**本批 ID 段的自我更正**：§22 的标题写了"登记 M101~M111"，那是**在复核之前预定了一个区间**。
+实际复核通过后有内容的只有 **M104 / M105 / M106 / M108 / M111** 五个，
+**M101 / M102 / M103 / M107 / M109 / M110 六个号没有对应的已复核事实** ⇒ 不写进登记表、
+编号留空洞。教训落成真话：**ID 只能在复核通过后分配，不许预定区间。**
