@@ -2928,3 +2928,174 @@ M65（需真夹具）、M87（需状态机配合）、M77/M79/M80/M81/M83（前�
 6. **`res.Visited` 不做界面呈现**（裁定③）：本批只让它变成真话，不新增任何显示位。
 7. **M59 不做"连接池改大"**：`SetMaxOpenConns(1)` 留着。收归后它不再掩盖会话级 PRAGMA 的缺口，
    于是"缩池"从**修法**降级成**无关的现状** —— 这一步不做，避免把 M73 的实测代价（2.08 倍）搬到账本库上瞎猜。
+
+### 19.7 实施后追记（2026-09-22 凌晨；划账见 04 §6.15，代码面 `4cf0c7f`）
+
+#### 一、与 §19.2 / §19.3 的偏离（六处，逐条如实记）
+
+1. **`connPragmas` 留在 `cache.go`**（§19.2 写的是"删三件套"，含这个常量）。收归的是**机制**
+   （Connector 包装 + 逐连接重放），不是每库的**策略**：缓存库要 `synchronous=NORMAL`、
+   账本库要 `FULL`（M11 裁定，掉电时账本不能随 WAL 丢）。把常量搬进公共包等于把两套策略压成一套，
+   那是**假收归**。history 侧相应新增一份 `connPragmas` 变量（§19.2 说的是"inline 三条"），
+   好让 M11 那段理由跟着常量走，不留在注释里漂流。
+2. **删掉了 `history.go:134` 那句注释**（§19.2 已预告），但它被证伪的方式值得单记：
+   注释写的是"本库连接池限 1，故 Exec 设置的会话级 PRAGMA 对该库所有语句都生效"——
+   前半句是真（`SetMaxOpenConns(1)` 确实在），后半句是假（见二-1 的 `foreign_keys=0`）。
+   ⇒ **缩池从来不成立**，它只是让"很少建新连接"；M59 的成因归因按实测更正。
+3. **改动面多出两处测试跟随**：`app_m10_test.go` 三处 `a.settingsPath()` 调用改成
+   `mustSettingsPath(t, a)`（新 helper，回 error 即判死——那几个用例的 cfgDir 必然已设），
+   以及新增 `app_m86_test.go`（§19.2 的新测试清单里只有 `internal/ops/undo_m86_test.go`）。
+   **没有改任何一条既有断言**：前者是签名变化的编译跟随，后者是 P-19-7b 的落点。
+4. **P-19-7b 比计划更强：它在改前树真跑出来了**。§19.3 写的是"引用新返回值形状的部分由变异
+   M19-c 提供"，实际 `undoExecuteItem` 的签名本来就是 `(string, error)`（只是把第二个返回值丢成
+   `""`），所以两条用例都不必碰变异就红了（逐字读数见二-5）。M19-c 照跑，作为"改后仍能退回"的对照。
+   用例名与 §19.3 的 `TestUndoPartialRestoreKeepsPathInFailure` 不同：拆成
+   `TestUndoExecuteItemKeepsPartialLanding`（结构上别丢）+ `TestUndoPartialLandingReachesFailureList`
+   （展示通道要带上），因为判据 6 本身就是这两件事。
+5. **新增 §19.3 未列的一格 P-19-2c**（`TestWarnBackgroundKeepsLedgerPrefixOutOfSharedChannel`）：
+   抽共用出口最容易写错的是把"账本写入失败："写死在出口上（那会把一条 Finder 失败报成账本故障）。
+   它没有改前红可取（改前不存在这个函数），故补了一条反向变异 **M19-h** 让它红过一次（见三）。
+6. **`warnBackground` 顺带改了两件判据没要求的事**（交底，不藏）：
+   a. stderr 行现在与事件**同一句话** ⇒ `warnLedger` 的 stderr 从 `[history] <msg>` 变成
+      `[history] 账本写入失败：<msg>`（改前只有 `app:error` 带前缀）。实跑打印过原文，见二-6。
+   b. 出口加了 `a.emit != nil && a.ctx != nil` 守卫：改前 `warnLedger` 是无条件 `a.emit(a.ctx, ...)`，
+      `emit` 为 nil 时直接 panic。**这一格没有探针**（生产 startup 必然设 emit，测试里造 nil 只是凑数）
+      ⇒ 记为"顺带改动、未验"，不作为交付能力。
+
+#### 二、修前必红（逐字抄录；红绿两侧都是实跑）
+
+做法：把 `app.go` / `internal/history/history.go` / `internal/ops/undo.go` / `internal/scanner/scanner.go`
+换回 `2920c0e`（§19 设计段提交，实现未动那一版），`app_m10_test.go` 与 `app_m58_m60_m61_test.go` 挪开、
+后者只写回 M60/M61 段（M58 段引用改前不存在的 `startCmd` 双参签名，留着是编译障碍而非判据排除），
+跑完 `cp -p` 还原 + 逐文件 sha256 比对（脚本打印"全部到位"）+ `git status --porcelain` 为空。
+
+1. **P-19-1（M59）**：
+
+```
+--- FAIL: TestEveryLedgerConnectionCarriesPragmas
+    history_m59_test.go:100: 重建的连接没带 pragma：foreign_keys=0 want 1，busy_timeout=0 want 5000，synchronous=2 want 2(FULL)（foreign_keys 关掉 = 四处 ON DELETE CASCADE 静默失效，子表留孤儿行）
+```
+
+   同一条读数在**改后**是绿的，且 `synchronous` 两侧同为 2 —— 它没掉是 SQLite 默认值恰好也是 FULL，
+   **侥幸不是保证**，所以三条一起断言（§19.1-1）。
+
+2. **P-19-5 / P-19-6（M67）+ `gate_cancel_test.go` 的补强腿**：
+
+```
+    scanner_m67_test.go:41: 根 ReadDir 失败时 Visited 必须为 0，实测 1：改前形态把预置进 visited 的根算成"访问过"，而这个目录一次读都没有成功
+--- FAIL: TestVisitedCountsOnlySuccessfulReadDir (0.00s)
+    scanner_m67_test.go:90: 取消排空后 Visited 必须为 0（零磁盘 I/O 的正证），实测 1、files=0
+--- FAIL: TestWalkCancelDrainReadsNoDirectories (0.13s)
+    gate_cancel_test.go:138: 取消排空阶段不得有任何一次成功的 ReadDir，实测 Visited=1
+--- FAIL: TestWalkWithGateCancelDrainsWithoutIO (0.08s)
+```
+
+   第三条是**既有用例**在新判据下的红：它原来那句合取 `files==120 && Visited>0` 在改后永不成立
+   （§19.3 P-19-5 就地论证过——换形状不是放松）。它的等价类腿 `files==120` 这次没开火（改前
+   files 也是 0），符合预测。
+
+3. **P-19-7（M86，ops 侧表驱动三条）**：
+
+```
+=== RUN   TestUndoPartialRestoreMessagesNameTheLandingPath/回收站侧被顶替-未清理
+=== RUN   TestUndoPartialRestoreMessagesNameTheLandingPath/已复制但清理回收站侧失败
+    undo_m86_test.go:147: 错误文本没说出落点 /var/folders/.../TestUndoPartialRestoreMessagesNameTheLandingPath已复制但清2286528153/001/orig.bin，用户拿到的是一句「两份并存」却不知道去哪找："已复制但清理回收站侧失败（两份并存）: 模拟：回收站侧句柄被占用，删不掉"
+=== RUN   TestUndoPartialRestoreMessagesNameTheLandingPath/链接已删-还原备份失败
+    --- PASS: TestUndoPartialRestoreMessagesNameTheLandingPath/回收站侧被顶替-未清理 (0.01s)
+    --- FAIL: TestUndoPartialRestoreMessagesNameTheLandingPath/已复制但清理回收站侧失败 (0.00s)
+    --- PASS: TestUndoPartialRestoreMessagesNameTheLandingPath/链接已删-还原备份失败 (0.00s)
+```
+
+   A/C 两行按预测保持绿（`§19.0-2` 读到的就是只有 B 那条掉落的点）——反面兜底成立。
+
+4. **P-19-3（M60，读写两侧）**：
+
+```
+--- FAIL: TestSaveSettingsWithoutCfgDirFailsAndWritesNothing
+    app_m58_m60_m61_test.go:55: cfgDir 为空时 SaveSettings 必须以错误收口，实测 err == nil（配置被静默写到别处）
+    app_m58_m60_m61_test.go:58: cfgDir 为空时磁盘上不得出现 settings.json，实测 CWD 里有（err=<nil>）——那正是写进进程 CWD 的证据
+--- FAIL: TestGetSettingsWithoutCfgDirIgnoresCwdFile
+    app_m58_m60_m61_test.go:76: cfgDir 为空时 GetSettings 必须只给纯默认值，实测 {Threads:4 FiltersDefault:{...} Theme:dark Language:en}（读到的是 CWD 里那份不属于本应用的配置）
+```
+
+   第二格是**登记原文没说到的后果**：M60 行只写"写进进程 CWD"，实测同档还会把同目录里
+   **别人的** `settings.json` 当成本应用配置读回来。
+
+5. **P-19-4（M61）+ P-19-7b（M86，app 侧）**：
+
+```
+--- FAIL: TestUnconfirmedDeleteLeavesNoLedgerRow
+    app_m58_m60_m61_test.go:101: 未确认的永久删除必须在落账之前就被拒绝，实测返回 opID="ops-012108-1" err=nil
+    app_m58_m60_m61_test.go:109: 账本 op_records 从 0 涨到 1：一条「什么都没动」的删除记录留在了历史里，用户会以为发生过一次可回撤的操作
+    app_m58_m60_m61_test.go:115: 未确认的删除仍然走完了派发并发了终止事件 "ops:done"（序列 [ops:done]）
+--- FAIL: TestUndoExecuteItemKeepsPartialLanding
+    app_m86_test.go:68: 部分还原的落点必须在错误分支一起交回去，实测 ""（want "/var/folders/.../TestUndoExecuteItemKeepsPartialLanding2966584731/001/home/a.bin"）——app 层把它丢成空串，失败清单就再也没有第二次机会告诉用户数据在哪
+--- FAIL: TestUndoPartialLandingReachesFailureList
+    app_m86_test.go:110: 失败清单的文案没带上落点 /var/folders/.../elsewhere/a.bin，用户只看到一句失败却不知道数据在哪: "模拟：数据已放到别处，但收尾动作失败"
+```
+
+   `opID` 是时间编码（`ops-HHMMSS-N`），所以这条读数与实施前第一次取红（`ops-003532-1`）只有 ID 不同。
+   `TestUnconfirmedDeleteLeavesNoLedgerRow` 的第四格（`opsRunning` 不留痕）改前是绿的：
+   改前走完派发、正常复位了互斥 ⇒ 那一格防的是"前移之后忘记复位"这个**新引入**的风险，不是旧缺陷。
+
+6. **P-19-2 系（M58）没有改前红**（签名不同、编译不过），红由变异 M19-b 提供（见三）；
+   P-19-2c 的红由 M19-h 提供。改后 stderr 侧的实跑原文（同一条用例打印，双通道一致的唯一直接读数）：
+
+```
+[reveal] 打开所在文件夹失败（/tmp/x）：exit status 1
+[history] 账本写入失败：回撤失败态落库出错
+```
+
+#### 三、变异：预测集 vs 实测集（八条，逐条对差集）
+
+每条都是 `cp -p` 备份 → python 打补丁（锚点 `assert count==1`）→ `go test -count=1 -v` →
+`cp -p` 还原 → 逐文件 sha256 比对。八条变异共触达 6 个文件次，还原后全部一致、`git status` 干净。
+
+| # | 变异 | 预测被杀于 | 实测（逐字包级读数） | 差集解释 |
+|---|---|---|---|---|
+| M19-a | `WithPragmas` 直通 base | sqlconn + cache + history | `FAIL filededup/internal/sqlconn`（4 条机制用例全红）、`FAIL filededup/internal/cache`（`TestEveryPooledConnectionCarriesPragmas`）、`FAIL filededup/internal/history`（P-19-1 + `TestEvictOldest`/`TestPruneScanFiles`/`TestDeleteAndClear`/`TestSchemaTablesAndForeignKeys`/`TestListOpsAndClear`）、**`FAIL filededup`**（`TestLoadHistoryAndExecutePrunes`） | 实测**多一个包**：根包那条也经 `history.Open` 建库，`foreign_keys` 一掉它的级联断言就红。P-18-2 仍红 ⇒ 预测里那条"收归没丢覆盖"成立。包内多红的那 5 条既有断言同样不是缺口，是覆盖面比预测宽 |
+| M19-b | 回调改回 `_ = cmd.Wait()` | 根包 P-19-2 | 只 `TestStartCmdReportsNonZeroExit`（用时 10.01s = 等满超时窗） | 无差集。P-19-2b 保持绿是设计如此：它断言"不会调用"，静音类变异杀不动它，二者不互相顶包 |
+| M19-c | `restored` 丢回 `""` | 根包 P-19-7b | `TestUndoExecuteItemKeepsPartialLanding` + `TestUndoPartialLandingReachesFailureList` 两条全红 | 无（与二-4 合看：这条变异在改后树上顶的是"改前树本来就红"的那两格） |
+| M19-d | `:178` 文案删掉落点参数 | `internal/ops` P-19-7 | `FAIL filededup/internal/ops`，且只有 B 行 `/已复制但清理回收站侧失败` 红；`ok filededup` | 根包不红**不是漏网**：app 层钉的是"清单里的 Path/Err 带落点"，`undoFailure` 那一层兜底不依赖 `:178` 的措辞 ⇒ 两层各自独立可验，正是 M86 判据要的双保险 |
+| M19-e | `settingsPath` 去空串分支 | 根包 P-19-3 | P-19-3 两格 + `TestGetSettingsWithoutCfgDirIgnoresCwdFile` | 多于预测：§19.3 那行只点名了写侧，读侧那条是同一变异的第二格（见二-4） |
+| M19-f | S4 预检从 `ExecuteOperation` 移除 | 根包 P-19-4 **且 `internal/ops` 仍全绿** | `FAIL filededup`（1 条）、`ok filededup/internal/ops 0.795s` | 与预测**完全一致**。这条"ops 仍绿"就是 §19.1-4 的论点：账本行是 app 层的账，执行器那道管不着 ⇒ 保留它不等于修好了本条 |
+| M19-g | `Visited` 改回 `len(visited)` | `internal/scanner` P-19-5/6 + 预测补强腿开火 | 三条全红：两条新用例 + **既有** `TestWalkWithGateCancelDrainsWithoutIO`；`ok filededup` | 与预测一致（含"补强腿开火"这一条，二-2 就是它的改前读数） |
+| **M19-h**（§19.4 之外补） | "账本写入失败：" 写死回共用出口 | 未预测（P-19-2c 是实施时新增的格） | 只 `TestWarnBackgroundKeepsLedgerPrefixOutOfSharedChannel` | 预测少于实测 ⇒ 记下来：这条变异专门验"新加的守卫格是不是可证伪的"，答案是它是 |
+
+#### 四、门禁与用例重数（2026-09-22 凌晨真读数，全套 15 行重跑）
+
+`gofmt` 干净（本批两处不合规已 `gofmt -w`：`//（` → `// （` 两处注释、`Result` 结构体字段对齐）、
+`go build` rc=0、`go vet` linux/darwin/windows 三包 rc=0、
+`go test -count=1 -v ./...` rc=0：**`top_PASS=646` / `sub_PASS=77` / `top_FAIL=0` / `sub_FAIL=0`**、
+`run=729`、`ok_pkgs=22` + 1 个 no-test 包、**`src_test=698`**（上批 678 ⇒ 本批 +20 条 Go 用例）；
+`-race -count=2 ./...` 与 `-race -count=4 .` 均 rc=0、`DATA RACE` 计数 **0**；
+`typecheck` rc=0、前端 `build` rc=0（`index-DdrO38H1.js 152.67 kB`）、`test-frontend-logic` 35 项全过、
+`check-version-sync` 0.5.0 对齐、`smoke-cli` 三跑一致（205 组 / 可释放 90522243 B / 复扫命中 532）、
+`smoke-symlink-assert` 全过。
+
+**SKIP 不读作通过**：`top_SKIP=5` + `sub_SKIP=1`，逐条是
+`TestMoveFileCrossDeviceReal`、`TestWalkCaseSensitivityIsProbed`、
+`TestWalkSingleRootKeepsCaseVariantSubtrees`、`TestMultiRootWalkKeepsCaseVariantSubtrees`、
+`TestSymlinkedRootUnderProtectedDirIsReported`、`TestUndoableReasonExplainsAndGivesNextStep/windows_trash_…`
+——与 §6.14 那批同一组平台腿，本批**没有新增** skip。
+第 15 行 `smoke-symlink` 仍 **rc=2**（需要 root 挂独立文件系统，本机 uid=501）⇒ 该项**未验证**，
+不是通过。⇒ 14 行 rc=0 + 1 行 SKIP。
+
+#### 五、边界与新登记
+
+1. **新登记 M88（OPS-14c）**：`internal/ops/move.go:67` 的
+   `"已复制但删除源失败（两份并存）: %w"` 与本批 M86 的 `undo.go:178` **同型**（说了"两份并存"却不给落点），
+   差别只在它发生在**正向移动**路径。§19.0-2 把"返回双值的路径"数成三条（`:174`/`:178`/`:397`），
+   漏看了 move 侧这一条 ⇒ 按约束 (1) 不改写 M86 行的结论，新增 ID。本批**不修**（不扩大改动面；
+   修法与 M86 完全同构，开工时可顺带把两条文案一起补齐）。
+2. **M58 只有 darwin 一条腿有读数**。回调本身跨平台（`exitCodeCmd` 用测试二进制当桩，
+   三平台都能跑），但**真实外部命令的退出码语义没有取到**：`explorer shell:RecycleBinFolder`
+   即使资源管理器没开也回 0、`nautilus`/`thunar` 常后台化立即退出、`open -R` 的失败码
+   （`kLSApplicationNotFoundErr`→7）未在本机任何变体下验过。⇒ 这两档是**"代码已改、验证未兑现"**，
+   属 M7 的 Windows/Linux 证据包范围。
+3. **`res.Visited` 生产侧仍无消费者**（只有测试读它）：本批只让它变成真话，不新增呈现位（裁定③）。
+4. **`model.FailedItem` 结构未扩**：M61 的 Path 缺失走的是"提前拒绝、不再产生这条记录"，
+   M86 的落点走的是既有 `Err` 文本 + `Path=OrigPath`，两者都没动前端契约。
+5. **M61 的 `opID` 前缀 `ops-`** 说明它由时间生成，历史页看到一条 `cancelled` 的 delete 记录
+   本身就是"什么都没动"的语义 —— 本批把它**不再产生**，但**没有**清理既有库里已经留下的那类记录
+   （用户手上可能有）。这条不属于 M61 判据，未做，也未登记为新 ID（属数据清理策略，M8 界面面一并看）。
