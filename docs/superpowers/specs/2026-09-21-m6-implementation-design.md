@@ -25,6 +25,7 @@
 | 8 | 假账与静默失败（M22 + M25 + M26） | — | §6.8.8 M22/M25/M26 | §9 | ✅（含 §9.0 取证 E1~E17；**推翻 M26 登记的"Linux 主门禁可跑出两棵"**） | ✅（划账见 04 §6.9.9；新增登记 M40/M41/M42/M43，见 §9.5；九条变异真读数含 M-M26-b 本机逃逸） |
 | 9 | 遍历键不折叠（M36，方案 C） | — | §6.8.8 M36 | §10 | ✅（含 §10.0 取证 E1~E11；**推翻 I2 当年定的遍历期折叠机制**，折叠只留给"合并用户给的根"） | ✅（划账见 04 §6.9.10；新增登记 M44，见 §10.5-1） |
 | 10 | 稀疏卷判据（M28） | — | §6.8.8 M28 | §11 | ✅（含 §11.0 取证 E1~E12；**推翻登记的"`f_type` 白名单 + 每卷写探测"形状**，改用遍历内证据） | ✅（2026-09-21，实施 commit `333a9ba`，划账 04 §6.9.11，追记 §11.6） |
+| 11 | TS 类型对齐（M30） | — | §6.8.8 M30 | §12 | ✅（含 §12.0 取证 E1~E7；**缺口面比登记大**：3 个接口 9 个字段，非登记行只记的 `ScanSummary` 5+1） | ⬜（本节 2026-09-21 落盘，实施随其后） |
 
 ## 1. 适用于全部四项的通用约束
 
@@ -1591,3 +1592,77 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
    平台读数在 tag 文件；它钉的是"卷标识是物理量"（同卷同值、跨挂载实例不同值）。
 5. **§11.5-1 的开销面已在代码里挂账**：`scanner.go` 采集点注释直接指向 M29（Windows 腿由"每候选"
    扩到"每普通文件"），兑现仍待 Windows 真机。
+
+---
+
+## 12. M30：TS 类型与 Go 下发字段的对齐（04 §6.8.8 M30）
+
+> 本项**没有生产代码的行为变化**：补的是 `frontend/src/wails.ts` 的类型声明，加的是**门禁**。
+> 动因是登记行里那句话——"Go 侧 JSON 一律照发，TS 侧不声明就取不到，于是 M8 做呈现时的第一个
+> 动作必然是补类型，而那时很难分清这个字段后端到底有没有下发"。补字段本身不难，难的是**让它
+> 不再漂移**：所以本项的交付物是一个进根包门禁的静态比对器，补字段只是它抓出来的第一批账。
+
+### 12.0 动手前取证（2026-09-21，读码 + 一次性比对脚本）
+
+| # | 取证项 | 读数 | 出处 |
+|---|---|---|---|
+| E1 | 镜像面到底有多大 | 只在 `frontend/src/wails.ts`：24 个 `export interface`，另有 `BackendAPI`（方法面）与 `OpKind`（字面量联合）两个非数据镜像。`stores/`、`utils/`、`components/` 里的类型（`Toast`/`ReclaimLine`/markdown 的 `Block`/`Seg`/`IconDef`）纯前端，无 Go 对应物 | 读码 |
+| E2 | ★ 修前真读数（24 对逐对双向比对） | **3 个接口、9 个字段缺失**：`ScanSummary` 6（`reclaimableActual`/`protectedDirs`/`protectedFiles`/`skippedCloudFiles`/`skippedWorkTempFiles`/`unprotectedRoots`）、`GroupView` 2（`reclaimableActual`/`actualKnown`）、`PagedResult` 1（`totalReclaimableActual`）。**登记行只记了 `ScanSummary` 那 5+1 条**——M6-P2 同批加给 `GroupView`/`PagedResult` 的两处（共 3 个字段）被漏记，缺口面比登记大 | 一次性脚本，本轮 |
+| E3 | 反向（TS 有 Go 无）有几处 | 0 处——但 `OpRecordItem` 的 `isSymlink`/`dangling` 暴露出**映射对错了**：TS 镜像的是 `app.go` 的 `main.OpRecordItem`（匿名嵌入 `history.OpItem` + 两枚标注字段），不是 `history.OpItem` 本身。比对器必须按 `encoding/json` 的规则做**匿名嵌入提升**，否则这对会永远假红 | 脚本 + 读码 |
+| E4 | 有没有比对器覆盖不到的对 | 两处，都要**显式豁免且带理由**：`OpsFiltered`（Go 侧是 emit 点的 `map[string]any` 字面量，`app.go:1766`，无结构体可反射）、`OpKind`（字面量联合；Go 侧用字面量 `case` 校验，`executor.go:391`，没有常量集合）。豁免写进比对表，不许在代码里静默 `continue` | 读码 |
+| E5 | 两侧"字段名"怎么取才同口径 | Go 侧走 `reflect` 而非解析源码：有效 JSON 名 = 有 tag 取 tag 名（`json:"-"` 跳过、`omitempty` 不改名）、无 tag 取字段名、匿名嵌入提升——与 `encoding/json` 同一套规则（`history.OpItem.Hash` 的 `json:"-"` 就是现成的用例）。TS 侧没有类型系统可依赖，只能解析文本（小纯函数） | 读码 |
+| E6 | 比对器放哪 | **根包测试**（`wails_types_test.go`，`package main`）。理由：`ScanSummary`/`FileView`/`OpRecordItem` 定义在 main 包，**任何 `cmd/` 程序都 import 不了**；而根包测试本来就在门禁里（`go test -race -count=4 .`）⇒ 不新增门禁行、不复制类型定义（复制正是要防的漂移） | 读码 |
+| E7 | 修前必红的形态 | 比对器写好后**不改 TS 直接跑**即红，逐条列出那 9 个字段（E2 清单）——这就是"修前必红"的直接证据，不需要再做一次人工比对 | 设计 |
+
+### 12.1 判据
+
+1. **比对单位是接口对**（TS interface ↔ Go 类型），两侧字段名统一为**有效 JSON 名**。
+2. **两个方向都判红**：缺失（Go 有 TS 无）= 前端按类型取不到；多余（TS 有 Go 无）= 前端读一个
+   永远 `undefined` 的字段。两种都是"类型在说谎"，只是方向不同。
+3. **覆盖性自证**：`wails.ts` 里每个 `export interface` 必须在映射表或豁免表里——防"新增接口
+   忘了登记"；反向也查（映射表里的 TS 名必须在文件里存在），防"接口改名后表里留了个幽灵"。
+4. **H6 分层**：解析与比对是**无 IO 的纯函数**（`tsInterfaceFields` / `goJSONNames` /
+   `compareFieldSets`），各自有用例；读文件与反射只出现在测试壳里。
+
+### 12.2 改动面
+
+1. `frontend/src/wails.ts`：补 9 个字段（带上与 Go 侧同口径的注释——尤其"可能未统计"那几条）。
+2. 新增 `wails_types_test.go`（根包）：映射表（24 对 + 2 条豁免）+ 三个纯函数 + 三条断言。
+3. 文档：04 §6.9.12 划账；本稿 §0 行 11。
+4. **不动**：Go 侧任何结构体、`app.go`、CI 配置（门禁已有根包测试行）、以及 `stores/` 等纯前端类型。
+
+### 12.3 探针（修前必红清单）
+
+| # | 用例 | 断言 | 修前为什么红 |
+|---|---|---|---|
+| V1 | `TestTSInterfaceFieldsParsesRealFile` | 解析器纯函数：跳过注释与空行、认 `?` 可选、认内联对象类型（`Failed: { Path: … }[]` 里的 `Path` 不算本层字段）、认嵌套 `{}` 不提前收口 | 新函数不存在 ⇒ **编译红** |
+| V2 | `TestWailsTypesCoverGoFields`（真文件，双向） | 24 对逐对：缺失集合与多余集合都为空，报错时列出**接口名 + 字段名 + 两侧口径** | **修前语义红**：9 条缺失（E2 清单） |
+| V3 | `TestGoJSONNamesFollowsEncodingJSON` | 有效名规则（合成结构体，不依赖真类型）：无 tag→字段名、`-`→跳过、`omitempty`→不改名、匿名嵌入→提升 | 编译红（函数不存在） |
+| V4 | `TestWailsInterfacesAreAllMapped` | 覆盖性：文件里每个 `export interface` 在映射表或豁免表里；映射表里每个 TS 名在文件里存在 | 编译红 |
+| V5 | 既有门禁**保持绿**（反向对照） | 补字段后 `npm run typecheck`、根包 `go test -race -count=4 .`、`go vet` ×3 | 绿 |
+
+### 12.4 变异（逐条改坏 → 应红）
+
+| # | 变异 | 应变红 |
+|---|---|---|
+| M-M30-a | 从 TS 的 `ScanSummary` 删一个刚补的字段（如 `protectedDirs`） | V2（缺失侧） |
+| M-M30-b | 给 TS 的 `FileView` 加一个 Go 侧没有的字段 | V2（多余侧） |
+| M-M30-c | 映射表把 `OpRecordItem` 指回 `history.OpItem`（E3 修前的错映射） | V2（多余侧：`isSymlink`/`dangling`） |
+| M-M30-d | 解析器丢掉 `?` 可选字段（正则去掉 `\??`） | V1 + V2（`OpRequest.ProcessDirs?` 等会报缺失） |
+| M-M30-e | `goJSONNames` 不处理 `json:"-"`（把 `Hash` 当字段） | V3 + V2（真文件上 `OpRecordItem` 会多出 `Hash`） |
+| M-M30-f | `goJSONNames` 不处理 `omitempty`（名取成 `x,omitempty`） | V3 + V2 |
+
+### 12.5 未兑现与边界
+
+1. **两处显式豁免**（E4）：`OpsFiltered` / `OpKind` 没有可反射的 Go 对象，比对器不覆盖；
+   豁免理由写在比对表里。若将来把 `ops:filtered` 载荷升级成结构体、或把 kind 收敛成常量集合，
+   应随之收编（本项不做）。
+2. **只比字段名，不比类型**：`size: number` ↔ `uint64`、`[]string` ↔ `string[]` 这类"类型形状"
+   不在判据内——需要一套 Go↔TS 类型映射规则，且 Wails 下发的 JSON 形状与 Go 类型并非一一对应
+   （指针、接口、`omitempty` 都会改形状）。本项只保证"字段存在且名字对"。
+3. **不覆盖 `wails.ts` 之外的前端文件**：E1 已确认其余类型无 Go 对应物；将来若新增镜像面，
+   要加进映射表（覆盖性断言只在 `wails.ts` 内自证）。
+4. **UI 未呈现**（裁定 ②/③）：本项只补类型声明，不新增任何界面呈现；补字段 ≠ M8 开工。
+5. **`ScanSummary` 的两处口径缺口仍是缺口**：`history.db` 没存 `skippedCloudFiles`/
+   `skippedWorkTempFiles`/保护清单三项，从记录页恢复的历史摘要只能显示"未统计"——
+   本项只让**类型**如实描述这件事，不改变数据来源。
