@@ -5,7 +5,9 @@
   登记处 `docs/04-开发与测试计划.md` §6.7 C 组 1~4 项；§7 另接 04 §6.8.8 M21
   （登记修法即"并入工况 M6 的计数横幅"，故与本稿同源）；§8 另接 04 §6.8.8 M19/M20
   （回滚路径的 TOCTOU，与 §2/§6 的 `claimSlot` 是同一条"不替用户处置不属于本次操作的文件"主线）；
-  §9 另接 04 §6.8.8 M22/M25/M26（假账与静默失败：数字/失败/判据三者都必须在目标环境里**成立**）
+  §9 另接 04 §6.8.8 M22/M25/M26（假账与静默失败：数字/失败/判据三者都必须在目标环境里**成立**）；
+  §14 另接用户指令"审查…如有遗漏自动完成开发和修复"——不是新功能，而是**已有声明与实证的
+  对齐**（含 M43 兑现、M30 同族漏网 G10、新登记 M46）
 - 状态：**按实施顺序逐节追加**。本文只写"动手前必须定死"的判据、接入点与探针设计；
   实施后的兑现记录写在 04 §6.9 划账，不写在本文
 - 用户裁定（三条，约束本文全部章节）：① 每项实施前各写一段细化设计（即本文）；
@@ -27,6 +29,7 @@
 | 10 | 稀疏卷判据（M28） | — | §6.8.8 M28 | §11 | ✅（含 §11.0 取证 E1~E12；**推翻登记的"`f_type` 白名单 + 每卷写探测"形状**，改用遍历内证据） | ✅（2026-09-21，实施 commit `333a9ba`，划账 04 §6.9.11，追记 §11.6） |
 | 11 | TS 类型对齐（M30） | — | §6.8.8 M30 | §12 | ✅（含 §12.0 取证 E1~E7；**缺口面比登记大**：3 个接口 9 个字段，非登记行只记的 `ScanSummary` 5+1） | ✅（2026-09-21，交付 `d4af53f`：比对器 23 对 + 3 豁免，六条变异全杀；追记 §12.6，划账 04 §6.9.12） |
 | 12 | CoW 克隆双计（M27） | — | §6.8.8 M27 | §13 | ✅（含 §13.0 取证 E1~E8；**更正登记行的"下限"为"上限"**；夹具成 darwin 门禁的钉子；实施期另发现前提自检盲区 ⇒ 补读出口钉子，见 §13.6） | ✅（2026-09-21，交付 `e013f09`：darwin 克隆夹具 + 读出口钉子，M-M27-a/b/c 真读数见 §13.6；划账 04 §6.9.13） |
+| 13 | 本轮全量审查的修复包（G1~G11） | — | §6.8.8 M43（兑现）+ 新增 M45/M46 | §14 | ✅（含 §14.0 取证：**11 条声明与实证不一致**，其中 G10/G11 是取证时新发现；G1~G11 逐条附 file:line 与"矛盾的代码事实"两列） | 进行中（设计段落盘即本 commit；代码/文档面见后续 commit，划账 04 §6.10） |
 
 ## 1. 适用于全部四项的通用约束
 
@@ -1811,3 +1814,122 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
 6. **产物逐字不变**：`dist/assets/index-DQDgG5FN.js 152.55 kB` 与 §6.9.11/§6.9.12 同名同大小
    ——本项前端零改动。
 7. **计数**：源级 602 / 顶层 551+4+0 / 子用例 75 / `=== RUN` 630（+2 = 本项两条新用例）。
+
+---
+
+## 14. 本轮全量审查的修复包（G1~G11，2026-09-21）
+
+上位依据是用户指令："审查项目设计、开发以及历次审查文档，确认功能完全实现，审查问题全部
+修复，测试全部通过。如有遗漏自动完成开发和修复。"审查路径：**门禁新鲜读数**（全绿，仅
+`scripts/smoke-symlink.sh` rc=2 合法跳过）+ **文档声明逐条回代码比对**。本节只收
+"文档/注释/脚本在说一件代码并没有做的事"这一类缺口——它们不是新功能，而是**已有声明的真值
+问题**，与本稿 §2~§13 的"数字宁可说不知道"是同一条纪律。
+
+**审查中一并核实为"非缺陷"、本轮不动的三类**（写在这里以免下一轮重新考古）：
+
+- Linux 的 `.Trash-$UID` 未进内置清单：04:847 与总纲 :202/:220 已把它**指派给 M7**，
+  而 M7 未开工 ⇒ 是指派项不是孤儿项。
+- `docs/superpowers/specs/2026-08-05-dedup-formal-spec.md` 的 8 条 `Status: draft`：
+  04 §6.8.0.5 表头**明文规定**"specs 只追加、不改状态、不撤回" ⇒ 制度如此。
+- `ExportReport` 是 M5 空桩（`app.go:2202` 返回"报告导出将在 M5 提供"），09 手册对
+  导出功能的描述与 i18n 现状都是诚实的（:551/:733）⇒ 桩本身是 M9 的活。
+
+### 14.0 动手前取证（逐条：位置 → 原文 → 与之矛盾的代码事实）
+
+| # | 位置 | 声明原文（逐字） | 代码实证 | 结论 |
+|---|---|---|---|---|
+| G1 | `docs/09-用户手册.md:465`（§6.5 状态码表） | `\| OK \| 执行成功，计入释放空间 \|` | `internal/ops/executor.go:354-363` 按 kind 分四桶：`hardlink→LinkedBytes`、`symlink→SymlinkedBytes`、`trash→TrashedBytes`、`default→Reclaimed`。**OK 本身不进任何桶**，只有永久删除才进"释放空间" | 手册把一个**分四种口径**的计数说成一种，用户照 §6.5 读 `Reclaimed` 会以为回收站清理也算"释放" |
+| G2 | `docs/09-用户手册.md:627-628`（§10 FAQ） | "所以默认跳过并**单独报** `已跳过 N 个云端占位文件`（`skipped_cloud_files`）" | `skippedCloudFiles` 在前端只出现 2 次，**都在 `frontend/src/wails.ts`（注释 + 类型字段）**；`--include='*.vue'` 与 `stores/` 命中数为 0 ⇒ 界面没有这句话，只有 JSON/CLI 有该字段（裁定③的边界） | 手册描述了 GUI 提示，实为 CLI/JSON 字段 |
+| G3 | `scripts/test-frontend-logic.sh:91` | `printf '…%s 个用例全部通过（含 2 条接线断言）\n' "$count"` | 同脚本 :55 的 `count` 取自 node 计数行；本次真跑读数 `ℹ tests 20 / pass 20`，接线另打 2 行 `✓` ⇒ 实际 **20 node + 2 接线 = 22 项**。`$count` 只有 20，文案却写"含 2" | 计数口径自我矛盾（20 含 2 ⇒ 读者以为 node 侧 18）。门禁脚本自己犯了 §6.6.2"计数不许说谎" |
+| G4 | `wails_types_test.go:67` | `// 豁免两条：没有可反射的 Go 对象。` | 其后随 **3** 条 `nil` goType 豁免：`OpsFiltered`、`BackendAPI`、`OpKind` | 注释数错了（不影响判定，只影响读码） |
+| G5 | `frontend/src/wails.ts:282-320`（`BackendAPI`） | 32 枚方法声明 | Go 侧 `grep -c '^func (a \*App) [A-Z]' app.go` = **34**；三向差集（`comm` 实测）：Go 有 / TS 无 = `ExportReport`、`PreviewProcessPolicy`；TS 有 / Go 无 = **空**。反射口径已核实：`reflect` 只报导出方法（一次性程序验证：同包 `*S` 一导出未导出两方法，`NumMethod()==1`），`App` 无嵌入字段 ⇒ **零豁免可用** | 方法面**没有任何门禁**（M30 只比字段不比方法），已漂走 2 枚 |
+| G6 | `app.go:359-363`（`openLedger` 失败分支） | 原位注释自己承认："（只写 stderr 这一半仍是缺口：GUI 无终端 ⇒ 登记 M43，本项不动。）" | `history.Open` 失败 ⇒ 只有 `fmt.Fprintf(os.Stderr, …)` 后 `return`；而 `GetStartupNotice` 的前端消费者**已在**（`stores/scan.ts:833`），M12b 的隔离通知就走这条路（`app.go:373`） | M43 登记行已写清修法"与 `addStartupNotice` 同形（一行）"；本轮审查既已展开，顺手兑现 |
+| G7 | `docs/04-开发与测试计划.md:417`（B 组第 8 条） | "**CI 无 macOS job**（§3.2）：darwin 专属 15 个用例…都不进门禁" | `.github/workflows/ci.yml:215-217` 有 `macos: name: go test (macos) runs-on: macos-latest`（D-2 本轮自己加的，见任务 #14） | 该条已过时；同节第 6/7 条用 `~~删除线~~ + 已闭环` 格式，照抄先例 |
+| G8 | 04:1219（M37 登记行位置列） | "`internal/ops/move.go` / `symlink.go` / `merge_guard.go` 的 `backup+".undo"` 停靠名" | `grep -rn '\.undo"' internal/ --include='*.go'`（去测试）只命中 `merge_guard.go:156,159,163,165` 与 `worktemp.go:119` 的 `TrimSuffix`；move/symlink 两份重复舞步已随 §8 的 I5 收归 `rollbackUnverifiedSwap` 一处 | 位置清单过时（结论仍成立）；仿 M39 先例加括注，不改写判据 |
+| G9 | `internal/realbytes/realbytes_volume_unix_test.go:54-63` | 注释："Linux CI 上 /dev 可能与 / 同卷——那种环境里夹具不成立，skip 而不是红" | 唯一对照卷是 `/dev/null`；ubuntu runner 上 `/dev` 多为 devtmpfs（与 `/` 不同 dev）**可能**成立，但本机（darwin）无法取证 ⇒ 现状是"这条判据在 CI 上有没有证据"未知 | 加候选卷列表（`/dev/shm`、`/dev`、`/tmp`、`/`…）取第一个真正不同 dev 的，宽度换证据；Linux 腿本机拿不到读数 ⇒ 照实标"代码已改、验证未兑现" |
+| G10 | `app.go:1278-1282`（`ProcessPreview`） | Go 侧三枚 json tag：`effectiveIds`/`effectiveCount`/`unmatchedDirs` | `grep -n ProcessPreview frontend/src/wails.ts` = **无命中** ⇒ 整个类型在 TS 没有镜像。M30 的漏网原因清楚：§12.0 E2 是**从 wails.ts 已有的接口往回找字段缺口**，从未枚举"Go 下发但 TS 压根没有的类型" | M30 同族、同方向（Go 有 TS 无）；随 G5 一起补（`PreviewProcessPolicy` 的返回类型） |
+| G11 | `frontend/wailsjs/go/main/App.d.ts`（Wails 生成物，32 枚 `export function`） | — | 三向差集：`App.d.ts` 缺 `GetStartupNotice`、`PreviewProcessPolicy`；`App.d.ts` 有 / `BackendAPI` 无 = `ExportReport`。生成物只在 `wails build` 时刷新，而门禁（§3.3 那 13 行）里**没有** `wails build` ⇒ 提交进仓库的生成物会长期陈旧 | **新增登记 M46**，本轮不修（见 §14.5-2）。运行时不受害：Wails 按反射注入 `window.go.main.App.*`，与 `.d.ts` 无关；受影响的只是"照 `.d.ts` 读契约"的人 |
+
+G1~G11 全部由本轮 grep/读码现取，无一条来自上一轮的记忆。另有一处**未成立**的怀疑，
+如实记下：审查中怀疑 `cmd/benchgen/main.go` 的引用行号漂移，实测 `04:1805` 指的 `:291`
+与当前文件**一致**（"③ .fdd-old 残留…不计入 TotalFiles"正在 291 行），不改。真实漂移只
+有一处：`04:1223` 的 `RecordsView.vue:268` → 现为 **269**（`<th>回收空间</th>`）。
+
+### 14.1 判据
+
+1. **方法面的权威源是 Go 导出方法集 ↔ `wails.ts` 的手写 `BackendAPI`**，不是生成物
+   `App.d.ts`。理由见 G11 括注（生成物不在门禁面上、且运行时按反射注入）。钉子做成
+   **双向、零豁免**：Go 有 TS 无 ⇒ 红（前端取不到）；TS 有 Go 无 ⇒ 红（前端调一个不存在
+   的方法）。生命周期钩子（`startup`/`shutdown`/`beforeClose`）刻意小写，反射本来就不报，
+   因此**不需要排除表**——将来若要加豁免，必须像 §12.0 E4 那样写理由并显式列出。
+2. **M43 的文案必须说后果**，不能只说"历史库不可用"：现状是账本不可用时回收站/移动/
+   硬链接清理**被拒绝执行**（`beginJournal`），用户看到的是"点了没反应/报错"。三件事缺
+   一不可（照 `cacheUnavailableNotice` 的形状）：出了什么事、对用户意味着什么、在哪个文件上。
+3. **纯函数 + 一行接入**（H6/I5）：判定写在 `ledgerUnavailableNotice(err, histPath)`，
+   `openLedger` 只负责调它并 `addStartupNotice`；不用 `emit`（startup 早于前端注册监听，
+   事件必丢——同 M12b 的理由）。stderr 那一条**保留不动**：跑 CLI/无终端时它仍是唯一出口。
+4. **文档类缺口（G1/G2/G3/G7/G8）不新增判据代码**，只把话说对：G7/G8 走既有格式先例
+   （删除线 + 已闭环 / 括注更正），不改写既有结论；G1/G2 改手册措辞为代码实际口径；
+   G3 改脚本打印为**两个数各自真**（node 20 + 接线 2 = 22）。
+5. **skip 不算通过，前提自探独立于被测物**（M45 纪律）：G9 只加宽候选卷，不改判据；
+   全部候选同 dev 时仍 skip。Linux CI 上是否兑现，本轮**不预判**。
+6. **不扩大改动面**（§1 约束 5）：G11 与"手册其余章节的 i18n/M5/M8 描述"都只登记或只改
+   本轮点名的那一句；M46 新 ID 记录生成物陈旧。
+
+### 14.2 改动面
+
+**代码 6 件**
+
+| 文件 | 内容 |
+|---|---|
+| `frontend/src/wails.ts` | `BackendAPI` 补 `PreviewProcessPolicy(dirs, selectedIDs): Promise<ProcessPreview>` 与 `ExportReport(format, path): Promise<string>` 两枚声明；新增 `export interface ProcessPreview`（三字段，照 G10 的 tag）。`ExportReport` 处必须写明"Go 侧目前是 M5 空桩，调用即报错"，否则 TS 签名比 Go 现状更乐观——那是反向的谎 |
+| `wails_types_test.go` | G4 注释改"豁免三条"；映射表加 `ProcessPreview` 一对；新增 `tsInterfaceMethods`（纯函数，抽方法名）+ `goExportedMethods`（纯函数，吃 `[]string` 排序去重）+ `TestBackendAPIMatchesGoExportedMethods`（读 TS 文件 + `reflect.TypeOf(&App{})` 反射，双向比对，零豁免） |
+| `app.go` | 新增 `ledgerUnavailableNotice(histPath string, err error) string`（纯函数）；`openLedger` 失败分支加一行 `a.addStartupNotice(...)`，stderr 保留；删掉那句"（只写 stderr 这一半仍是缺口：…本项不动。）"的原位注释（本项就是来兑现它的，留着会指错） |
+| `app_m43_test.go`（新） | V1 必失败夹具（`history.db` 造成同名目录）→ `openLedger()` → 断言 `GetStartupNotice()` 非空且含 `history.db` + "拒绝执行"后果；V2 健康库时 `GetStartupNotice()==""`（不打扰）；V3 与 M25 的累积槽共存（两条通知都在、`\n` 分隔） |
+| `internal/realbytes/realbytes_volume_unix_test.go` | 跨卷对照改为**候选卷列表**（`/dev/null`、`/dev/shm`、`/dev`、`/run`、`/tmp`），取第一个 dev 与临时目录不同者做对照；全无对照才 skip，并把"试过了哪些"打进 skip 原因 |
+| `scripts/test-frontend-logic.sh` | 打印改为 `20 个 node 用例 + 2 条接线断言 = 合计 22 项全部通过`，接线数以实际计数为准（不写死 2） |
+
+**文档 4 件**：`docs/09` §6.5 OK 行按 kind 四分（G1）、§10 FAQ 云端句改口径（G2）；
+`docs/04` B 组第 8 条删除线 + 已闭环（G7）、M37 行加位置括注（G8）、M41 行 `:268→:269`
+（14.0 末段那处真实漂移）、M43 行末列翻转为"已实施"；新增 **M46 行**（G11）。
+另：本稿 §0 进度表加第 13 行。
+
+### 14.3 探针（修前必红）
+
+| 探针 | 形状 | 预期 |
+|---|---|---|
+| P1 方法面 | 只加 `TestBackendAPIMatchesGoExportedMethods`，不动 `wails.ts` | **红**，且原文要报出 `ExportReport`、`PreviewProcessPolicy` 两枚（这一条同时是 G5 的证据，不必另找） |
+| P2 `ProcessPreview` 镜像 | 映射表加一对而 TS 未声明 | **红**（`wails.ts 里找不到 export interface ProcessPreview`，走 §12 已有的失败路径） |
+| P3 M43 | 只加 `app_m43_test.go`，不动 `app.go` | **红**在 `GetStartupNotice()` 为空——前提是夹具自证（先断言 `history.Open(该目录)` 返回 error，故"空"只可能是"没上报"，不是"没失败"） |
+| P4 G9 | 本机 darwin 现状即绿 ⇒ **无修前红可取**，如实记。收益（Linux CI 有无证据）本轮不可证 | 不充数 |
+| P5 文档面（G1/G2/G3/G7/G8） | 注释与文案无红可取 ⇒ 证据形态是"改前原文 + 改后原文"两列，见划账表 | 不充数 |
+
+### 14.4 变异（逐条改坏 → 应红；真读数写进 04 划账，不写本文）
+
+| # | 变异 | 目标 |
+|---|---|---|
+| M-M14-a | 从 `BackendAPI` 删一枚 `PreviewProcessPolicy` | P1 方向 1 红 |
+| M-M14-b | 把 `TestBackendAPIMatchesGoExportedMethods` 改成**单向**（只查 TS→Go） | 反向缺口不红 ⇒ 证明双向是必要的（与 §12.4 M-M30 同族） |
+| M-M14-c | `ProcessPreview` 的 json tag 改错一枚（`effectiveCount`→`effectiveCnt`） | 字段镜像比对红 |
+| M-M14-d | `ledgerUnavailableNotice` 改成返回 `""` | P3 红 |
+| M-M14-e | 把 `addStartupNotice` 那行接入删掉（只留 stderr） | P3 红（回到登记前的缺口形状） |
+
+预测不了实测结果的行不写。P1/P2/P3 若某一枚变异实测杀不掉，照 M-M36-e/M-M26-b 先例
+如实记录并补钉。
+
+### 14.5 未兑现与边界
+
+1. **G9 的 Linux 腿**：本机是 darwin，无法验证 ubuntu runner 上 `/dev/shm` 是否可 stat。
+   划账必须写"**代码已改、验证未兑现**"，不得写"已通过"；兑现要等 macOS/Linux runner 读数。
+2. **G11（M46）不修**：刷新 `App.d.ts` 要跑 `wails build`（或 `wails generate module`），
+   这一步不在 §3.3 门禁 13 行里，且生成物按手写代码重排会产生大 diff。只登记，修法留给
+   M9 门禁收尾时定（要么把生成物比对进门禁，要么把生成物移出版本库）。
+3. **M45 的 Windows 腿**不变（本轮无 Windows runner），G6 与之无关。
+4. **裁定③仍然生效**：G2 只改手册措辞，**不**给前端加"已跳过 N 个云端占位文件"横幅；
+   G5 补的 `PreviewProcessPolicy`/`ExportReport` 只是**类型面**，前端零调用点（`grep` 实证
+   见 14.0），故 `npm run build` 产物字节数应逐字不变——这是本项的一条反向钉子
+   （若产物变了，说明动到了前端运行面）。
+5. **`ExportReport` 不做实现**（M5 空桩）：本轮只让它出现在契约面上并注明是桩。
+6. **本节不含新功能**：G1~G11 全部是"已有声明 ↔ 实证"的对齐；发现的真缺口若需要新行为
+   （如 CoW 按卷标注、记录页按 kind 分述），一律留在 M7/M8/M9，不在本轮顺手做。
+
