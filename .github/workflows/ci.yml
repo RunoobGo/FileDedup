@@ -69,6 +69,17 @@ jobs:
         working-directory: frontend
         run: npm ci && npm run typecheck
 
+      # M15：前端纯逻辑行为探针（零依赖：Node 自带 TS 类型剥离 + test runner）。
+      # 与 vue-tsc 的分工——类型检查只证明"能编译"，证明不了"界面上的句子是真的"；
+      # M15 那类缺陷（确认框对 hardlink 说"可释放"、结果条同一件事说"占用不变"）
+      # 在 vue-tsc 下永远全绿。
+      # ★ 脚本用 rc=2 表示"本机跑不了"（无 node / node 过旧）。在 CI 上这不是可放行的
+      #   合法状态：node 由 setup-node 钉住，出现 2 即环境退化，必须红
+      #   （教训同 smoke-symlink-assert：跳过与全绿同形会让防线静默消失）。
+      #   步骤在默认 `bash -e` 下执行，1 与 2 都会让本步失败。
+      - name: 前端逻辑探针（test-frontend-logic）
+        run: bash scripts/test-frontend-logic.sh
+
       - name: 前端构建（须先于 Go 步骤：go:embed 依赖 frontend/dist）
         working-directory: frontend
         run: npm run build

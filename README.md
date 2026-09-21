@@ -85,6 +85,7 @@ GOOS=windows GOARCH=amd64 go vet ./...                       # 跨平台
 GOOS=darwin GOARCH=arm64 go vet ./...                        # 跨平台
 cd frontend && npm ci && npm run build                       # 先产 dist（go test 依赖 embed）
                                                              # 含 prebuild: vue-tsc 类型检查
+bash scripts/test-frontend-logic.sh                          # 前端纯逻辑行为探针（零依赖，Node ≥22.18）
 go test -race -count=2 ./...                                 # 全包
 go test -race -count=4 .                                     # 根包（App 层状态机多压两轮）
 bash scripts/smoke-cli.sh                                    # 数据集 C×0.02 三跑比对
@@ -98,6 +99,7 @@ bash scripts/check-version-sync.sh                           # 6 个取值位 / 
 | `scripts/smoke-symlink.sh` | 挂真实独立卷（loop+ext4，退到 tmpfs）验证软链接合并赖以成立的 7 条文件系统语义；退出码 0=通过、2=**合法跳过**（无 root / 挂不上卷）、1=失败——跳过绝不伪装成通过 |
 | `scripts/smoke-symlink-assert.sh` | 用 stub 打桩 `id`/`mount`/`losetup`，断言上一条脚本在"应跳过"时真的返回 2 并写明原因、在正常路径上确实释放了 loop 设备。冒烟脚本本身也是代码，没人测它的判据就等于判据可以静默失效 |
 | `scripts/check-version-sync.sh` | 6 个取值位 / 5 个文件的版本号对齐（`package-lock.json` 贡献 2 处）；tag 触发时再比对 `v<版本>` |
+| `scripts/test-frontend-logic.sh` | 前端纯逻辑行为探针（`frontend/tests/*.test.ts`）。vue-tsc 只证明"能编译"，这里证明"界面上的句子是真的"——例如 hardlink 的确认框不得写"空间可释放"（磁盘占用其实不变）。用 Node 自带的 TS 类型剥离与 test runner，**不引入测试框架依赖**；退出码 0=通过、2=本机跑不了（无 node / 版本过旧，CI 判失败）、1=断言失败 |
 | `scripts/test-windows-quarantine.sh` | Windows 侧白名单式隔离（清单内逐条注明原因），其余用例一律阻断 |
 
 CI 门禁：`ci.yml`（PR 与 main push）跑上述全套，并在 windows runner 上跑隔离后的

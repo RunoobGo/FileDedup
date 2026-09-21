@@ -6,7 +6,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api, type OpKind } from '../wails'
-import { humanBytes } from '../utils/format'
+import { reclaimLine } from '../utils/opdisplay'
 import { useModal } from '../composables/useModal'
 
 const props = defineProps<{
@@ -59,6 +59,14 @@ const canConfirm = computed(() => {
 // 必须走下面的"计算中"分支，否则会落到 v-else 那条"将处理 40 个文件"上，又是一句假话。
 const narrowed = computed(() => store.procFiltering)
 const procDirsTip = computed(() => store.procDirs.filter(d => d.trim()).join('、'))
+
+// M15（2026-09-21 全仓审计 §六 15）：这批字节数对用户意味着什么，要按操作类型分别措辞。
+// 原先两个分支都写死"空间可释放"：hardlink 场景下数据一点没少（只是不再重复存第二份，
+// 结果条同批自己写的是"占用不变"），同卷 move 也腾不出空间——确认框说的是假话，
+// 用户点完确认去核对会发现"对不上"。措辞判据与后端字节口径同源，见 utils/opdisplay.ts。
+const reclaim = computed(() =>
+  reclaimLine(props.kind, narrowed.value ? store.effectiveBytes : store.selectedBytes),
+)
 
 async function pickDir() {
   picking.value = true
@@ -118,11 +126,11 @@ useModal(dlgRef)
         </template>
         <template v-else-if="narrowed">
           <div>将处理 <b>{{ store.effectiveCount }}</b> 个文件（已勾选 {{ store.selectedFiles.length }} 项，其中 {{ store.procExcluded }} 项不在优先文件夹内，本次不改动）</div>
-          <div>共 <b>{{ humanBytes(store.effectiveBytes) }}</b> 空间可释放</div>
+          <div>{{ reclaim.lead }}<b>{{ reclaim.bytes }}</b>{{ reclaim.tail }}</div>
         </template>
         <template v-else>
           <div>将处理 <b>{{ store.selectedFiles.length }}</b> 个文件</div>
-          <div>共 <b>{{ humanBytes(store.selectedBytes) }}</b> 空间可释放</div>
+          <div>{{ reclaim.lead }}<b>{{ reclaim.bytes }}</b>{{ reclaim.tail }}</div>
         </template>
       </div>
       <p v-if="narrowed" class="proctip">
