@@ -148,6 +148,22 @@ export const useScanStore = defineStore('scan', () => {
     })
   }
 
+  // M16：为"done 早于 startScan 回包"这条竞速留的记账——收到几次 scan:done、
+  // 最后一次带的是什么。startScan 的清态据此判断要不要把收尾重放一次（见那里）。
+  let doneSeq = 0
+  let lastDoneSummary: ScanSummary | null = null
+
+  // scan:done 的收尾。单独成函数是为了让 startScan 能在清态后原样重放它。
+  async function finishScanResult(s: ScanSummary) {
+    scanning.value = false
+    status.value = 'Done'
+    reclaimableTotal.value = s.reclaimable // 初始值，随即被 loadResultPage 全量口径覆盖
+    hasResult.value = true
+    await refreshFailed()
+    await loadResultPage(false)
+    view.value = 'result' // 完成后自动切结果页（M2-T05）
+  }
+
   // 上一轮结果作废：后端 StartScan 一成功就清掉 groups/byID（app.go），旧 fileID 全部失效。
   // 前端若继续显示旧结果，切到结果页既能看到旧数据、又能对失效 fileID 发起删除 →
   // 启动成功即清（启动失败时后端未清理，旧结果仍然有效，不能连带清掉）。
@@ -176,6 +192,7 @@ export const useScanStore = defineStore('scan', () => {
     scanning.value = true
     status.value = 'Scanning'
     progress.value = null
+    const doneSeqAtCall = doneSeq
     api
       .startScan({
         Roots: roots.value,
@@ -189,7 +206,18 @@ export const useScanStore = defineStore('scan', () => {
         Paranoid: paranoid.value,
         UseCache: true,
       })
-      .then(clearStaleResult)
+      .then(() => {
+        clearStaleResult()
+        // M16（2026-09-21 全仓审计 §五 16）：done 事件与本 RPC 回包之间没有先后保证。
+        // 小目录 + 缓存命中时后端能在回包前跑完并发出 scan:done，done 处理器刚把
+        // 新结果装进来，上面这句清态就把它整体抹掉了——界面停在"暂无结果"，
+        // 数据其实完好躺在历史里，用户以为扫描白做了一次。
+        //
+        // 清仍然要清，不能简单跳过：上一轮的 selectedFiles / preview / opsResult /
+        // 优先文件夹若不作废，界面上的 fileID 已随新扫描失效，勾上就能对错文件发起清理。
+        // 所以是"清完再把本次收尾重放一次"，两个顺序都收敛到新结果。
+        if (doneSeq !== doneSeqAtCall && lastDoneSummary) void finishScanResult(lastDoneSummary)
+      })
       .catch((e: any) => {
         scanning.value = false
         status.value = 'Idle'
@@ -753,14 +781,12 @@ export const useScanStore = defineStore('scan', () => {
       stageDesc.value = ev.Desc || ev.Stage
       refreshStatus()
     })
-    bind('scan:done', async (s: ScanSummary) => {
-      scanning.value = false
-      status.value = 'Done'
-      reclaimableTotal.value = s.reclaimable // 初始值，随即被 loadResultPage 全量口径覆盖
-      hasResult.value = true
-      await refreshFailed()
-      await loadResultPage(false)
-      view.value = 'result' // 完成后自动切结果页（M2-T05）
+    bind('scan:done', (s: ScanSummary) => {
+      // 记账先于收尾：收尾里有 await，回包若插在 await 中间而记账还没落，
+      // 就看不见"done 已经来过"了。（这条顺序属防御性写法，现有用例没单独钉它。）
+      doneSeq++
+      lastDoneSummary = s
+      void finishScanResult(s)
     })
     bind('scan:cancelled', async () => {
       scanning.value = false
