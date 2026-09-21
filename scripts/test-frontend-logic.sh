@@ -103,6 +103,15 @@ wiring 'src/components/ConfirmDialog.vue' 'const _exhaustive: never = props.kind
 # 又各自漏项（重扫漏 histLoading、删除什么都没挡），是「能点但点了出事」的温床。
 wiring 'src/views/RecordsView.vue' 'store.histBusy' 'store.scanning || store.opsRunning' \
 	'历史行禁用态取自 store.histBusy（FE-3：组件不得自拼互斥判据）'
+# FE-4/FE-7/FE-8/FE-10（§20 第九批，2026-09-22）：三条"判据收在一份、组件只许引用"的锚。
+# 与 FE-3 同理由——探针钉得住判据本身，钉不住"组件有没有去用它"；模板退回内联拼串时
+# node 用例与 vue-tsc 都照样绿。★ 只锚标识符/写法，不锚中文文案（改措辞是安全的）。
+wiring 'src/views/ResultView.vue' 'opFailedLabel(' '失败 {{ formatCount(store.opsResult.Failed.length) }}' \
+	'失败按钮措辞取自 opFailedLabel（M81：组件不得自拼"失败 N"，那是本次数与全量数不同源的成因）'
+wiring 'src/views/ResultView.vue' 'head: true' '' \
+	'Warnings 摘要行标了 head（M80：不标就会被自己投出的明细挤掉）'
+wiring 'src/components/FailedDrawer.vue' 'copyText(' 'navigator.clipboard?.writeText(' \
+	'复制全部走 utils/clipboard 的 copyText（M83：可选链短路时 .catch 从未挂上，无剪贴板环境完全静默）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

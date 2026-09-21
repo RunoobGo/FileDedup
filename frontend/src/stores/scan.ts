@@ -714,17 +714,25 @@ export const useScanStore = defineStore('scan', () => {
     // 但传 undefined 能让"这个请求没用到处理策略"在日志/抓包里一眼可见。
     const dirs = usableProcDirs()
     if (!guard('执行清理操作')) return
-    // 进度条分母要用生效数，所以这里必须拿到后端真值。按钮在 pending 时是灰的，
-    // 正常走不到"还没到位"这条路；这一句是把这个不变式变成代码而不是靠 UI 约定
-    // （key 已匹配时 ensureProcCounts 是空操作，不会多跑一次 RPC）。
-    await ensureProcCounts()
+    // M77（04 §6.11 FE-4）：上锁必须在**第一个 await 之前**。改先是 `await ensureProcCounts()`
+    // 之后才置 opsRunning，于是同一窗口里的两次点击都通过 guard；第二次还会在自己的 catch 里
+    // 把第一次**还在途**的互斥标记解回 false（设计段 §20.0-1，改前真读数见 §20.7）。
     opsRunning.value = true
     opsResult.value = null
     lastFilter.value = null
-    // Total 用生效数：进度条的分母若用勾选数，收窄后的操作会永远差一截走不满，
-    // 看起来像卡住了。
-    opsProgress.value = { Done: 0, Total: effectiveCount.value, Current: '' }
+    // 上锁与分母之间隔着一次 await（见下），这一格必须先置空：进度条是
+    // `v-if="store.opsRunning"`，不置空就会在窗口里显示**上一条操作**的 Done/Total，
+    // 那是一句假话；置空后读到的是"正在处理 0 / …"（与 undo 两腿同一形状），
+    // 宁可不给数字也不给一个过期的数字（与本文件 procExcluded / effectiveFiles 同口径）。
+    opsProgress.value = null
     try {
+      // 进度条分母要用生效数，所以这里必须拿到后端真值。按钮在 pending 时是灰的，
+      // 正常走不到"还没到位"这条路；这一句是把这个不变式变成代码而不是靠 UI 约定
+      // （key 已匹配时 ensureProcCounts 是空操作，不会多跑一次 RPC）。
+      await ensureProcCounts()
+      // Total 用生效数：进度条的分母若用勾选数，收窄后的操作会永远差一截走不满，
+      // 看起来像卡住了。
+      opsProgress.value = { Done: 0, Total: effectiveCount.value, Current: '' }
       await api.executeOperation({
         Kind: kind, FileIDs: ids, TargetDir: targetDir ?? '', ConfirmDanger: confirmDanger,
         ProcessDirs: dirs.length > 0 ? dirs : undefined,

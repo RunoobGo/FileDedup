@@ -64,7 +64,11 @@ func MoveFile(src, targetDir string) (string, error) {
 			"为避免误删第三方文件**未删除源**，两份并存，请核对后自行处理其一: %s", dst.path, src)
 	}
 	if err := removeSrc(src); err != nil {
-		return dst.path, fmt.Errorf("已复制但删除源失败（两份并存）: %w", err)
+		// M88（04 §6.11 OPS-14c，设计段 §20.0-5）：与 undo.go:177 改前同型——说了"两份并存"
+		// 却不给落点。这里更要紧的是 executor.go:568 在部分成功时只取 err 记 ocFailed、
+		// **把 dst 丢掉**（另登记 M89），于是错误文本是这份副本在整条链路上唯一的留痕处。
+		return dst.path, fmt.Errorf("已复制但删除源失败（两份并存，新副本在 %s，源文件仍在 %s，"+
+			"请核对后自行删去其一）: %w", dst.path, src, err)
 	}
 	return dst.path, nil
 }

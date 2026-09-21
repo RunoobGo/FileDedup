@@ -11,7 +11,7 @@
 //   其余     → Reclaimed（数据真的从磁盘消失：delete 与跨卷 move 出卷）
 // 这里的措辞必须与那四个栏位一一对应，改任何一处都要看另一处。
 
-import { humanBytes } from './format'
+import { humanBytes, formatCount } from './format'
 import type { OpKind } from '../wails'
 
 export interface ReclaimLine {
@@ -83,4 +83,24 @@ export function reclaimLine(kind: OpKind, bytes: number): ReclaimLine {
 export function percentOf(done: number, total: number): number {
   if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return 0
   return Math.max(0, Math.min(100, (done / total) * 100))
+}
+
+// opFailedLabel 结果横幅上那个"失败 N（查看）"按钮的措辞（M81）。
+//
+// 为什么需要它：全仓四个入口打开同一个失败抽屉，其中三处取 `store.failed.length`
+// （页签徽标、统计条、空态按钮），只有结果横幅取 `opsResult.Failed.length`。
+// 两个数**语义不同**（后端 app.go:1960 把操作前的快照与本次失败拼成并集，所以
+// `GetFailedItems` 是"扫描期 ∪ 本次"，`opsResult.Failed` 只是本次）——
+// 于是按钮写"失败 2（查看）"、点进去抽屉标题是"失败清单（7）"，而正文列的正是那 7 条。
+//
+// 修法不是把两个数拧成一个（登记的"都取 opsResult.failed"会让抽屉标题与自己列的正文
+// 不同源、并把扫描期失败项从计数里抹掉，理由见设计段 §20.0-3），而是**各说各的范围**：
+// 两个数不等时这条必须限定为"本次"。判据收在这里一份，组件只许引用。
+export function opFailedLabel(opFailed: number, listTotal: number): string {
+  if (opFailed <= 0) return '' // 本次没失败就不该有这颗按钮（全量非空是另一码事，走统计条）
+  // listTotal < opFailed 在后端并集口径下不可能出现；真出现说明状态错乱，
+  // 那时"限定本次"会编出一个解释不了的故事 ⇒ 按相等处理。
+  const n = formatCount(opFailed)
+  if (listTotal > opFailed) return `本次失败 ${n}（查看）`
+  return `失败 ${n}（查看）`
 }

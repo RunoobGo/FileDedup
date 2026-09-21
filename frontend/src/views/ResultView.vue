@@ -7,7 +7,7 @@ import GroupCard from '../components/GroupCard.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import Icon from '../components/Icon.vue'
 import { humanBytes, formatCount } from '../utils/format'
-import { percentOf } from '../utils/opdisplay'
+import { opFailedLabel, percentOf } from '../utils/opdisplay'
 import { isGroupCrossVolume } from '../utils/pathpolicy'
 import type { OpKind } from '../wails'
 
@@ -63,10 +63,18 @@ watch(confirmKind, v => { store.confirmOpen = !!v })
 function showWarnings() {
   const ws = store.opsResult?.Warnings ?? []
   if (!ws.length) return
-  toast.push(`有 ${ws.length} 条需要你关注的提示，可悬停查看明细`, 'error', 12000)
+  // M80（04 §6.11 FE-7）：摘要行标 head。这里一次最多投 1 + 5 + 1 = 7 条，而池上限 5、
+  // 溢出丢最旧 ⇒ 改前摘要行**必然**被自己投出的明细挤掉，用户看不见"有几条、去哪儿看全"。
+  toast.push(`有 ${ws.length} 条需要你关注的提示，可悬停查看明细`, 'error', 12000, { head: true })
   for (const w of ws.slice(0, 5)) toast.push(w, 'error', 12000)
   if (ws.length > 5) toast.push(`……另有 ${ws.length - 5} 条，详见提示条悬停内容`, 'error', 12000)
 }
+
+// opFailedLabel 措辞判据收在 utils/opdisplay 一份（M81）：横幅取本次失败数、
+// 抽屉取全量清单数，两个数不等时按钮必须限定"本次"，否则点进去数字对不上。
+const failedBtnLabel = computed(() =>
+  opFailedLabel(store.opsResult?.Failed?.length ?? 0, store.failed.length),
+)
 
 // warnLabel 按内容给出合适的按钮短标签：权限类提示是"必读指引"，
 // 不该与"临时文件残留"共用一个含糊的"提示"。
@@ -455,8 +463,8 @@ function onConfirm(targetDir?: string) {
       <button v-if="store.opsResult.Warnings?.length" type="button" class="skip"
         :title="store.opsResult.Warnings.join('\n')"
         @click="showWarnings()"><Icon name="alert" :size="13" /> {{ warnLabel }} {{ formatCount(store.opsResult.Warnings.length) }}（查看）</button>
-      <button v-if="store.opsResult.Failed.length" type="button" class="fail"
-        @click="store.failedOpen = true"><Icon name="alert" :size="13" /> 失败 {{ formatCount(store.opsResult.Failed.length) }}（查看）</button>
+      <button v-if="failedBtnLabel" type="button" class="fail"
+        @click="store.failedOpen = true"><Icon name="alert" :size="13" /> {{ failedBtnLabel }}</button>
       <button class="x" title="关闭结果提示" aria-label="关闭结果提示"
         @click="store.opsResult = null"><Icon name="close" :size="13" /></button>
     </div>

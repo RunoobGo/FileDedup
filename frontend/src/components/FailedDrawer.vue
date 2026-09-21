@@ -5,6 +5,7 @@ import { ref } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { formatCount } from '../utils/format'
+import { copyText } from '../utils/clipboard'
 import { useModal } from '../composables/useModal'
 
 const store = useScanStore()
@@ -15,12 +16,17 @@ const toast = useToastStore()
 const dlgRef = ref<HTMLElement | null>(null)
 useModal(dlgRef, () => store.failedOpen)
 
-function copyAll() {
+async function copyAll() {
   const text = store.failed.map(f => `${f.Stage}\t${f.Path}\t${f.Err}`).join('\n')
-  // C10：剪贴板写入可能被拒绝（无授权/非安全上下文），rejection 须接住
-  navigator.clipboard?.writeText(text).catch((e: any) => {
+  // C10：剪贴板写入可能被拒绝（无授权/非安全上下文），rejection 须接住。
+  // M83（04 §6.11 FE-10）：改前是"对 navigator.clipboard 做一次可选链调用再挂 .catch"——
+  // 短路时整个表达式为 undefined，那个 .catch 从未挂上 ⇒ 没有剪贴板的环境点了**完全静默**。
+  // 现在两条失败路径（没有剪贴板 / 写入被拒）都从 copyText 抛到这里。
+  try {
+    await copyText(text)
+  } catch (e: any) {
     toast.notifyError('复制失败', e)
-  })
+  }
 }
 </script>
 
