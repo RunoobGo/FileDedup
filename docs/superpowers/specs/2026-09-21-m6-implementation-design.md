@@ -3743,3 +3743,161 @@ goroutine 均由 `:208` 的 `gowrap1` 创建。这是 §21 那批修完之后**�
 实际复核通过后有内容的只有 **M104 / M105 / M106 / M108 / M111** 五个，
 **M101 / M102 / M103 / M107 / M109 / M110 六个号没有对应的已复核事实** ⇒ 不写进登记表、
 编号留空洞。教训落成真话：**ID 只能在复核通过后分配，不许预定区间。**
+
+---
+
+## 23. 三轮全量审查·第 2 轮设计段（2026-09-22）：§22.8 那 10 条的实施判据 + 本轮新增 4 条
+
+本轮来源三处，全部**自己开码复核**后才进本节：
+
+1. §22.8 登记的 **M112~M121** 十条（第 1 轮复核为真、当时按约束 7 未动）。
+2. 本轮两个只读审查子代理。★ 两者质量差得极远，必须先记下：
+   - 代理甲（声称审 `339a95c` 的 diff）交回 3 Critical + 4 Important + 2 Minor，
+     逐条开码复核后 **Critical 全三条与 Important 四条中的三条为伪造坐标**：
+     `identityStill` 实有 12 个非测试调用点（`grep -rn "identityStill(" --include=*.go internal/`
+     的逐行读数，见本轮取证），`percentOf` 在 `ResultView.vue:10` import、`:190` 使用，
+     全仓 `RunReport` / `Cache.Versions()` / "database is locked"（Go 侧）三串**零命中**，
+     根路径在 `scanner.go:565-575` 已 `filepath.Abs`，`run-gates.sh` 的竞态只有两行且
+     行 7 就是 `-race ./...`（含根包），并非它引的"6~9 行排除根包"。
+     ⇒ 甲的报告**一条不采信、一条不占号**（甲另指控的"§22.8 已登记项"重复除外）。
+   - 代理乙（审 `339a95c` 的实施面）交回 9 条，其中 **5 条开码即为真**（M122~M125
+     加一条提交说明不符），已按"复核通过才分配 ID"登记为 **M122 / M123 / M124 / M125**。
+     它另一处纠正也成立：我在派单时把 `339a95c` 的父提交写成 `0d63d1a`，
+     真读数是 `git cat-file -p 339a95c` 的 `parent 15b94a1`（§22 设计段那一跑）
+     ⇒ 用错基线的 `git diff` 会把 M71/M74/M75/M21 等中间批的改动算到本提交头上。
+   教训落成真话（与 §22.8 那条并列）：**子代理给的坐标要先当假设、后当事实**，
+   负向断言（"从没被调用""全仓不存在"）必须有我自己跑过的 grep 读数背书。
+
+### 23.0 本轮判据总则
+
+- 每条**动码前先看它红过一次**，失败原因须与预测同格；取红后验"红的是那一格"。
+- 注释/文案面（M112/M121/M125）不造 RED 码：判据是"**旧文案对着新代码必须为假**"，
+  以逐字对照 + `git diff` 读数入账，不假称跑红。
+- 平台腿拿不到真机读数的（M120 的 build.yml 属发布流水线，本机无 runner 可跑），
+  划账写"代码已改、验证未兑现"。
+- 断言只许**补强**、不许收窄（约束：不许改断言凑绿）。本轮唯一改文案的
+  M114 必须先钉住"确认顶替仍说被替换"再动（§23.4 步骤 1）。
+
+### 23.1 M112 `copyVerify` 注释 vs 实际处置（话术面）
+
+坐标：`internal/ops/move.go:207-213`（注释）× `:222`（`return restoreMeta(dst, st)`）
+× `:56-59`（`copyVerifyFile` 报错即 `dst.release()` + 整项失败）。
+
+复核读数：注释承诺"还原失败不作为整体失败（数据已在目标处），单独返回错误供上层记录"，
+而代码把 `restoreMeta` 的错误原样当 `copyVerify` 的错误返回，`MoveFile:56` 见错即删掉
+刚复制完的那份并判失败。同包 `undo.go:447 applyMtime` 才是注释描述的那种口径
+（失败不升级为整体失败、返回 void）⇒ 同一件事在本包有两份说法，说谎的是注释。
+
+修法：**只改注释**（改成真话："还原元数据失败与复制失败同处置——删掉半成品、整项判失败；
+源文件未动，故不丢数据，但这次移动没做成"）。不改行为：真要按注释做需 `MoveFile`
+回"成功但降级"三态，那是 **M40** 的形状改动，不属本批。
+判据：新文案与 `:56-59`/`:222` 三段逐字对照 + 记录"行为面仍挂 M40"。
+
+### 23.2 M113 `undoMove` 把已复制的落点丢掉（部分成功留痕）
+
+坐标：`internal/ops/undo.go:197-199`。复核读数：`MoveFile` 有两条"返回 `dst` 且
+`err != nil`"的部分成功路径（`move.go:60-64` 身份被顶替、`:112-116` 删源失败），
+`undoMove` 却 `return "", err`。app 层的兜子已经就位——`undoExecuteItem:2255` 会把
+`restored` 连带错误一起返回，`undoFailure:2211-2215` 见 `restored` 非空且不在文本里就补
+"（数据已在 …）"（M86）⇒ **本包只差把 `dst` 交回去这一行**。
+
+RED：新用例走 `copyVerifyFile` 缝（`move.go:411`，"复制已完成、源尚未删除"的注入点）
+造一次 `undoMove` 部分成功，断 `undoFailure` 组装出的 `FailedItem.Err` 含那个落点。
+预期改前红在"落点没出现在文本里"（错误文本本身含 `%s`，故必须断**账本字段**而非文本子串
+——`MoveFile` 的文本已经带落点，所以判据要落在"`restored` 返回值非空"这一格：
+断 `UndoOne` 的**第一个返回值**等于该落点）。取红读数入账后才能改。
+
+### 23.3 M114 `identityStatus` 的第三种情形被写成"被替换"（判据本体）
+
+坐标：`internal/ops/verify.go:134-148` × `executor.go:336-348`（`guardIdentity`）。
+复核读数：`(false, false)` 有两条来路——`fsid.FromPathNoFollow` 报错且非 `ENOENT`
+（`:139-141`，如父目录 EACCES）、原先能解析现在解析不出（`:142-145`）。两条都是
+"我们不知道"，`guardIdentity:344-346` 却统一记 "文件在扫描后被替换（inode 已变化），已拦截"。
+
+修法（分两步，顺序不可反）：
+1. **先补强现有断言**：`verify_m52_m54_test.go:215` 现断 `"被替换"` 子串；在其旁加一条
+   "确认顶替那一格必须同时含 `inode 已变化`"的钉（把当前文案钉死），并新增一条 RED 用例：
+   经新加的 `fsidFromPathFn` 缝注入"读身份失败（非 ENOENT）"，断该格文案**不得**出现"被替换"。
+   ⇒ 改前这条必须红，且红在文案（不是红在没拦住）。
+2. 再改判据本体：`verify.go` 引入 `identityVerdict`（same / replaced / gone / unknown）
+   与 `identityCheck(path, id) (identityVerdict, string)`；`identityStill` 与 `identityStatus`
+   退化成它的包装（`still = v==same`，`gone = v==gone`）⇒ 现有 12 个调用点行为一字不变。
+   `guardIdentity` 三分：`gone`→`ocSkipped`（M54 既有语义）、`replaced`→原文案、
+   `unknown`→"无法确认文件仍是扫描时那个对象（<原因>），已拦截"。
+
+边界（本轮不做）：`move.go:106/:110`、`symlink.go:80/:84` 那四处仍走 `identityStill`，
+处置是 fail-closed（拦下），只有文案同病。理由：那四处拦的就是"无从判定"，改文案要重写
+它们各自的 `fmt.Errorf` 拼接与对应断言，收益不抵改动面 ⇒ 在 §6.11 的 M114 行加括注留残，
+不当已修。
+
+### 23.4 M115 两处顶替夹具改走 `swapInAt`（测试面收归）
+
+坐标：`internal/ops/verify_m52_m54_test.go:195-204`（`WriteFile → Remove → Rename`，
+中间有一瞬路径上什么都没有）、`internal/ops/ops_probe_test.go:92-101`（自定义后缀 `.swap-in`）。
+本包唯一实现是 `swap_fixture_test.go:33 swapInAt`（原子改名 + `assertDistinctIdentity` 自检；
+该自检存在是因为 CI 实证过回收 inode 的卷会把原号发给新对象）。
+
+改法：两条都换成 `swapInAt(t, path, before, data)`，后缀与自检一并收归。
+断言一字不动（只改夹具）。判据：改后 `-race -count=2 ./internal/ops/` 全绿，
+且 `assertDistinctIdentity` 在两条用例里真的被走到（读数法：临时把 `swapInAt` 的
+`before` 传成 `after` 同值，必须红在自检 ⇒ 证明自检在本用例有效，随后改回）。
+
+### 23.5 M116 / M118 前端展示面两处收归
+
+- M116：`ScanView.vue:17-19`、`RecordsView.vue:25-27`、`ResultView.vue:219` 三处内联
+  `new Date(sec*1000).toLocaleString('zh-CN', { hour12: false })` ⇒ 收进
+  `utils/format.ts`（同文件已有 `formatMtime(ns)`，`:38-42`）。新增
+  `formatUnixSec(sec)` 与 `formatMtime` 共用一份实现（`formatMtime` 保持原签名不动，
+  避免牵动既有断言）。
+- M118：`ScanView.vue:96-100` 的 `progressPercent` 自己写了 `Math.min(100, …)`（**有上限、
+  无下限、无 NaN 防**）⇒ 改调 `utils/opdisplay.ts:83` 的 `percentOf`（`ResultView.vue:190`
+  已在用它，不是新缝）。★ §22.8 记的子代理"第二份完全没夹取"不成立，它夹了上限。
+
+判据：`scripts/test-frontend-logic.sh` 加一条 M118 的行为探针（`BytesDone > BytesTotal`
+与 `NaN` 两格），取红一次再改；M116 属等价替换，判据是 `vue-tsc` + 该脚本的接线断言
+（三处内联串改为零命中）。
+
+### 23.6 M117 `PreviewPanel` 那道不可达的护栏（保留 + 说明，不删）
+
+坐标：`frontend/src/components/PreviewPanel.vue:42`（`MD_RENDER_MAX = 64 * 1024`）
+× `app.go:1082`（`textLimit = 4 << 10`）× `stores/scan.ts:903-916`（`preview.content`
+唯一写入点）。复核读数：Markdown 分支要求 `kind === 'text'`（`:30`），而 text 腿内容
+上限 4 KiB ⇒ `content.length > 64 KiB` 恒假，`:34-41` 那段 20/100/400 KB 实测描述的是
+到不了的路径。
+
+修法（三选一里取"保留 + 注明"）：注释里写清**当前不可达**（后端 `textLimit = 4 KiB`
+远小于这道 64 KiB）、它防的是"预览上限以后变大"、以及那三档实测是**渲染器本体**的代价
+读数而不是本路径的可达读数。不删护栏、不移阈值：删一次要连带核 `rendered` 开关的语义，
+而阈值调低会让正常 md 文件默认退回源码（改行为）。
+
+### 23.7 M119 / M120 门禁脚本与发布流水线
+
+- M119：`scripts/smoke-symlink-assert.sh:238-241` 只判 `fails -eq 0`，无条数下限
+  ⇒ `ok()`/`bad()` 各加一条 `checks` 自增，收尾要求 `checks -ge 14`（14 = 本轮实跑
+  `grep -c "✓\|✗"` 的读数）。取红：临时在改后的副本上把 `run_stubbed` 的桩全部改挂
+  （或把 A/B/C/D 四段的入口 `if` 短路），须红在"断言条数 0 < 14"，而不是打印"全部断言通过"。
+- M120：`.github/workflows/build.yml` 两个 job（`:10 build`、`:170 release`）零处
+  `timeout-minutes`，而 `ci.yml:37-42` 已把理由写死（无 timeout 的作业卡住即烧满 6 小时
+  平台默认上限并连带废掉已产出日志）。加 job 级 `timeout-minutes`（build 40 / release 15）。
+  ★ 本机无 runner ⇒ 划账写"代码已改、验证未兑现"。
+
+### 23.8 M121 `cache_test.go` 的"损坏自愈"残余（话术面）
+
+坐标：`internal/cache/cache_test.go:3`（文件头"损坏自愈"）、`:141`（`// 应自动重建`）、
+`:144`（`t.Fatalf("损坏自愈失败: %v", err)`）× `cache.go:5`（M96 已改成"都不是『自愈』"）。
+复核读数：行为不矛盾（`:141` 说的是 `Open` 腿的隔离重建，`Open` 确实重建，见 `cache.go:124-141`），
+口径矛盾——同一件事在同一目录里两个名字，而 §22.7 刚为 `dbErrs` 相邻两行立过
+"一个口径一个说法"。修法：三处措辞统一到"隔离重建"（与 `cache.go:5` 同一说法），不动断言。
+
+### 23.9 本轮新增四条（M122~M125，代理乙提出、我逐条开码复核为真）
+
+| ID | 坐标 | 复核到的事实 | 本轮处置 |
+| --- | --- | --- | --- |
+| M122 | `internal/dedup/pipeline.go:800-817` × `group_order_probe_test.go:6-9` | 排序第三级键（`Files[0].Path`）**没有任何判据覆盖**：现夹具两组是"可释放量相同、成员数不同"，第二级就分出胜负 ⇒ 把 `:812` 那行删掉探针仍绿，而 `:804` "三级用尽后不再有平手"这句承诺随之变假话 | 扩夹具到三组：两组同可释放量**且同成员数**（2×600KiB 与 2×600KiB 不同内容），第三组保持第二级可分辨。判据 = **变异**：删第三级键必须红；`-race -count=4` 连跑须稳 |
+| M123 | `scripts/run-gates.sh:130-143` × `scripts/smoke-symlink.sh:19-22` | `sh_row … 1` 只认"裸 `rc==2` ⇒ SKIP"，而被包脚本自己的契约是 **"`SKIP:` 前缀 + 退出码 2"两件事同真**（`:37`/`:44` 各写一遍，CI 那份实现也是双条件）。⇒ 真失败若恰好以 2 退出，会被降级成 SKIP 且总判定仍 `exit 0`，正是 AS-K2 防的那一格 | 改成双条件：`rc==2` **且** 日志含 `SKIP:`；缺一即 FAIL。取红：在副本上把被测命令换成"exit 2 且不打 SKIP:"，改前读成 SKIP、改后读成 FAIL |
+| M124 | `scripts/run-gates.sh:54-65` | gofmt 行只判"列出文件数为 0"，`GRC` 仅回显不判定 ⇒ `gofmt` 自身崩溃（rc≠0 且 stdout 空）读成 PASS | `GRC -ne 0` 即 FAIL（判据从"一条"补成"两条"）。取红：副本里把 `gofmt -l .` 换成 `sh -c 'echo >&2 boom; exit 2'`，改前 PASS、改后 FAIL |
+| M125 | `internal/scanner/scanner.go:227`（M98 我自己写的括注） | 那句"分隔符陷阱的实文在 visitKey 与 **dedupeRoots** 各自的注释里"后半指错：`dedupeRoots:550-563` 的注释讲的是折叠/M36/C1（`probeCaseSensitive` 只为它服务），分隔符陷阱的实文在 **`pathnorm` 包注释**里（`visitKey:153-160` 就是那么指的） | 改指 `pathnorm` 包注释。第 1 轮 M98 的修法本身为真，只是新造的交叉引用又错了一处 ⇒ 就地修 + §6.11 该行加括注 |
+
+不占号的两条（只记账）：(a) 代理乙指出 `339a95c` 提交说明里"M92 …判据一字未动"与同一提交
+被 M93 重写后的 diff 不符——那是**中间态**的说法，已提交的历史不改写，在 §6.19 记下；
+(b) 代理甲的 7 条伪造/失真（§23 开头已列逐串零命中的读数）——不登记、不占号。
