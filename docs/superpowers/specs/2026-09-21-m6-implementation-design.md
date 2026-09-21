@@ -2395,7 +2395,7 @@ Path 换成真实路径"这一条看似省事，实测代价是本机**全部** 
    防线：`switch v` 的 `default:` 当前是放行分支，任何新增结论都会先命中它。
 5. **复核失败要分"已消失"与"被替换"**（M54）：前者按 S8 记 Skipped（与 `VerifyFile` 的
    `VerdictSkipped`、`delete` 分支的 `os.IsNotExist` 同一口径），后者按 S1 记 Failed 拦截。
-   `identityStill` 的签名与 15 个调用点**一个都不动**，改为走 `identityStatus`（I5：一处判定）。
+   `identityStill` 的签名与**其余十个**调用点**一个都不动**〔§17.7-4 更正：此处原写 15 个是错口径——实测改前全仓非测试调用点为 **16 处**（executor 6 + 其余 10），15 漏算了 `move.go:317` 又把注释行算了进来〕，改为走 `identityStatus`（I5：一处判定）。
 
 ### 17.2 改动面（生产文件）
 
@@ -2449,9 +2449,64 @@ Path 换成真实路径"这一条看似省事，实测代价是本机**全部** 
 2. **M62/M56 不实施**：取向与契约裁定（17.0 最后两行），等裁定后另起设计段。
 3. **Windows 腿零新增真机读数**：M52/M54 的分类判据走 `errors.Is`，Windows 侧只有
    `go vet windows` rc=0 + 既有用例面的形态覆盖，**不写"Windows 已验证"**。
-4. **`identityStatus` 只服务 executor 六处**：`move.go:60/102/106`、`symlink.go:80/84/117`、
+4. **`identityStatus` 只服务 executor 六处**：`move.go:60/102/106/317`、`symlink.go:80/84/117`、
    `merge_guard.go:44/90`、`undo.go:173` 十处**继续用 `identityStill`**——它们各自的处置语义
    与"要不要区分已消失"并不一致（如 `merge_guard.go:90` 是刻意 fail-closed 的删文件侧），
    统一改判属扩大改动面，不做。
 5. **P-4 的 `chmod 0` 用例在 root 下自动 skip**（`Geteuid()==0` 无权限拒绝语义），
    非 root 腿才是真读数；目录那条不依赖权限，两端都跑。
+
+### 17.7 实测读数（变异取证与三处"预测被推翻"；2026-09-21 实施后补）
+
+基线锚点（`cp` 备份 + `shasum -a 256 -c` 全程复核，五条变异跑完三个文件仍 OK）：
+
+```
+7379977dd3fbecf1d69446596e3e14282a26602745fe4257ee0866304df05109  internal/ops/executor.go
+e44bd5366bd71bc7b7d79d19568bbd713660662ff304f011dbbcda139c989339  internal/ops/verify.go
+d14aed302d27dbafcc46cef410492c1f475e3b3e5063c48618e903a3b1e9e6ce  internal/scanner/scanner.go
+```
+
+| # | 变异（实测执行形态） | 目标 | 实测 | 全包名表 |
+|---|---|---|---|---|
+| M17-a | `fkeys[i] = fscase.Fold(r, sens[i])` 改为 `fkeys[i] = r`（排序键换回原样串，sens 仍前置） | P-1 | **红**：`kept = [/data/B/A /data/b], want [/data/b]` | 全仓 `go test ./...` 只有 `filededup/internal/scanner` 一个 FAIL，其内只有 `TestDedupeRootsSortsByFoldKey` 一条 ⇒ 与预测**同集**，无差集 |
+| M17-b | 删掉 `WalkWithGate` 起首的 `if f == nil { f = &model.Filters{} }` | P-2 | **红**：`Failed = [{… Stage:scan Err:遍历异常已隔离，该目录已跳过: runtime error: invalid memory address or nil pointer dereference}]` | 同上，只有 `internal/scanner` / `TestWalkWithNilFiltersIsAllDefault` |
+| M17-c | 根侧 `guard.Dir` 只用原样串 | P-3 | **N/A（未跑）** | M68-a 实现后**回退**（见下 2），P-3 已改成 `t.Skipf`，没有可杀的存活实现。不写"已验证" |
+| M17-d | `case VerdictPass:` 换回 `default:`（未知结论即"通过"），并删掉加固腿那段兜底 | P-5 | **红**：`越界校验结论被 default 放行并真删了文件（M52 加固腿失效）` | 只有 `internal/ops` / `TestUnknownVerdictFailsClosed` |
+| M17-d′ | 追加一条设计段没列的**弱变异**：只删兜底 `default:`、保留 `case VerdictPass:` | P-5 | **红在另一格**：`Failed = [], want 1 条「未知校验结论」`（文件不再被删，但静默不入队） | 同上。⇒ P-5 的三条断言各自咬住一种失效形态，不是只咬"真删文件"那一种 |
+| M17-e | `guardIdentity` 里 `gone` 分支从 `ocSkipped` 改为 `ocFailed` | P-6b | **红**：`Skipped = [], want [ …/dup1.bin ]（S8：目标已达成，与 VerdictSkipped 同一口径）` | 只有 `internal/ops` / `TestIdentityGoneBeforeActionRecordsSkipped` |
+| M17-f | `identityStill` 改为 `return still \|\| gone`（把"已消失"也当没被动过） | 全量 `go test ./internal/ops` | **红**：`路径已不存在，identityStill 必须判否` | **只有 `TestIdentityStillRejectsMissingPath` 一条**（`identity_still_test.go:140`，断言在 `:153`）。预测里还写了"`symlink_test.go` 那批钉子"——**实测未开火**：那批钉子走的是"被顶替"分支，与 `gone` 无涉。差集如实记为"预测多于实测"，不代表覆盖有洞 |
+
+**四处必须写进划账的偏差（不按 §16.6 的做法掩掉）**：
+
+1. **P-2 的 panic 首落点不是预测的那条腿。** 设计段 17.0 预测在目录分支（`matcher.Apply`
+   之前的 `f.IncludeHidden`），实测在**文件分支**：改后基线里首帧是 `scanner.go:400`
+   （`cloudCheck` 之前那道 `f.AllowCloudHydration` 判定），变异体内因删了三行而行号前移。
+   ⇒ 缺陷成立、判据成立，但"第一落点"的**位置**预测错了；两者都是"整目录被 recover 吞掉"，
+   所以修法的落点（入口兜底）不受影响。
+2. **M68-a 实现过又回退，本批交付的是"取证 + 转登记"，不是修复。** 按"根侧解析真实路径后
+   再问一次清单"实现后，负控制钉子 P-3b 立刻变红：darwin 上 `t.TempDir()` 落在
+   `/var/folders/…`，其真身是 `/private/var/folders/…`，而 `sysguard.go:145` 有条目
+   `{kind: eAbsPath, plat: pDarwin, name: "/private", why: "var/tmp/folders 等运行时目录的真身"}`
+   **按前缀命中** ⇒ 用户从没点过的普通根全部被判成"脱离保护"并写进 `UnprotectedRoots`。
+   这不是实现写错，而是"链接根换真实路径再判"这条判据**本身**会把"真身在保护前缀下"
+   误伤成"脱离保护"：清单里同时存在 `/private` 这类**祖先级**条目时，解析后的路径比
+   链接名更容易命中清单，方向与逃逸判据相反。⇒ 回退生产改动，P-3 保留为 `t.Skipf`
+   （**不得读作通过**），剩余一半转登记 **M84**。
+3. **P-6a 无红可取。** `TestIdentityStatusSeparatesGoneFromReplaced` 是新判据的定义性用例，
+   `identityStatus` 与它同时落地，改前编译期就没有这条路径——性质同 §16.6 的 P-3 等价性锁。
+   M54 真正的"修前必红"是 **P-6b**（`Skipped = []`，抄录见上），不拿 P-6a 冒充。
+
+4. **17.1-5 的"15 个调用点"是错口径，实测 16 处。** 判据 5 写"`identityStill` 的签名与 15 个
+   调用点一个都不动"，`git grep` 改前（`ed95ef7`）非测试调用点实际是 **16 处** ——
+   executor 6 + 其余 10（`move.go:60/102/106/317` 四处、`symlink.go:80/84/117` 三处、
+   `merge_guard.go:44/90` 两处、`undo.go:173` 一处）。15 这个数漏了 `move.go:317`
+   （`claimedDst.stillOurs`，写成一行 `return` 的方法，grep 时被当成定义混掉了），
+   又把 `merge_guard.go:8`、`symlink.go:49/78` 三条**注释里的** `identityStill` 算了进去。
+   ⇒ "一个都不动"这件事本身成立（那十处签名与语义都没改），错的是**计数**，
+   已在 17.1-5 就地括注更正、未改写原句其余部分。
+
+**加固腿自己引入的错（必须记，不掩）**：给两处 keep 源 switch 加 returning `default:` 之后，
+`go vet` 报 `unreachable code`（`executor.go:614`、`:677`）——因为那两处原本以
+`case VerdictPass:` 结尾，加了兜底后 `VerdictPass` 自己掉进 `default:` 被拦死。
+修法不是删兜底，而是**补一条显式空体 `case VerdictPass:`**（注释写明"少了这一格，合并全被拦死"）。
+教训：`default` 兜底只能加在"成功分支已显式列全"的 switch 上，否则它咬的是成功腿。
