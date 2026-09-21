@@ -2768,3 +2768,163 @@ Run 级只钉"至多一条 + 措辞边界 + 不可用≠损坏"。停用后的**
 2. 淘汰失败的 Run 级落点没有用例（M18-d 差集），文案链路靠"分诊函数唯一 + 改前树真跑的通用分支"两夹。
 3. 界面不新增呈现位（裁定③）：本批只借用已有失败清单，`FailedItem` 结构未扩。
 4. `app.go` 一字未动 —— 它本来就在 `openCache` 失败时退化成"无缓存"，M73/M74 都在 `cache` 包内收敛。
+
+---
+
+## 19. 第八批：app / history / scanner / undo 面六条（M58 / M59 / M60 / M61 / M67 / M86；2026-09-22）
+
+**本批范围怎么来的**：§6.11 登记表里"本机可验证、不需要裁定"的行，到 §18 交付后只剩
+**M58(APP-8) / M59(APP-11) / M60(APP-12) / M61(APP-13) / M67(SCN-5) / M86(OPS-14b)** 六条。
+下面这些**不在本批**，理由各不同，写在 19.6：M57（性能项，缺基准）、M63（与既有钉子正面冲突，待裁定）、
+M65（需真夹具）、M87（需状态机配合）、M77/M79/M80/M81/M83（前端面，与 M8 一并处理）。
+
+### 19.0 动手前取证（现跑现取；登记原文 → 实际读到的代码 → 判定）
+
+1. **M59 —— 取到了真读数，而且比登记的更具体**。登记说"会话级 PRAGMA 只在开池时发一次，
+   `ErrBadConn` 重建后不重放 ⇒ 外键约束静默失效"。本机不便造 `ErrBadConn`，改走**同一机制的另一条触发源**：
+   让池回收那条空闲连接（`SetConnMaxIdleTime`/`SetConnMaxLifetime` 置 1ms + sleep 50ms），
+   下一次查询只能新建连接。实验（`internal/history` 内，读 `s.db` 的 PRAGMA 原文）：
+
+```
+    zz_m59_scratch_test.go:27: 改前·池上首条连接：foreign_keys=1 busy_timeout=5000 synchronous=2
+    zz_m59_scratch_test.go:44: 重建连接后：foreign_keys=0 busy_timeout=0 synchronous=2
+```
+
+   三条各有结论，**不是一刀切**：
+   - `foreign_keys` 1 → **0**：真失效。它承重 —— `hist_groups`/`hist_files`/`op_items` 四处
+     `REFERENCES … ON DELETE CASCADE`（`history.go:72/80/81/100`），关掉之后删扫描历史只删主表、
+     子表**留孤儿行**，且 `LoadScan` 仍可能按旧 `hist_id` 捞出残留组 ⇒ 属数据事故，不只是"约束没了"。
+   - `busy_timeout` 5000 → **0**：`history.go:133-135` 那句注释"本库连接池限 1，故 Exec 设置的
+     会话级 PRAGMA 对该库所有语句都生效"**在被回收的连接上是错的**（fdd-cli 与 GUI 并存时 BUSY 直接变故障）。
+   - `synchronous` 2 → **2**：SQLite 默认就是 FULL，这条**侥幸无损**。⇒ 划账时不得把三条一起说成"全部失效"。
+   - 诚实边界：复现走的是"空闲回收"，`ErrBadConn` 那条路是同一机制的另一触发源（读 Go 的
+     `database/sql` 语义），本批**不声称复现了真实 `ErrBadConn`**。
+
+2. **M86 —— 登记说的"必然丢失"要先拆成三条，因为三条的文案成熟度不同**。
+   `ops.UndoOne` 返回 `(target, err)` 双值的只有三处（全在 `internal/ops/undo.go`）：
+
+   | 坐标 | 分支 | 现在这句话带不带落点 |
+   |---|---|---|
+   | `:174` | 跨卷恢复后回收站侧被替换（两份并存） | **带**（"已恢复到 %s…未清理回收站侧"） |
+   | `:178` | 已复制但清理回收站侧失败（两份并存） | **不带**（只有"两份并存"四个字） |
+   | `:397` | 软链接回撤：链接已删、还原备份失败 | **带**（"原文件保留在 %s（数据未丢失）"） |
+
+   丢弃发生在 `app.go:2166-2171`：`if uerr != nil { … return "", uerr }` —— `restored` 就地扔掉。
+   而用户可见通道只有两条：`MarkItemUndo(…, uerr.Error())` 进账本 err 列、`FailedItem{Path, Stage, Err}`
+   进失败清单（`FailedDrawer.vue:55` 原样渲染 Path 与 Err）。⇒ **真正丢落点的只有 `:178` 那一条**，
+   且丢的原因是文案没写，不是因为 `restored` 变量被丢（另两条本来就靠文案送达）。
+   可用性取证：该分支的三个动作已有接缝 `renameFile`/`copyVerifyFile`/`removeSrc`
+   （`move.go:403/407/411`，均 `var = os.XXX`）⇒ 能做成**确定性**场景，不是竞态。
+
+3. **M67 —— `Visited` 在产线侧零消费者**。全仓 `res.Visited` 只有一个写入点
+   （`scanner.go:489` `= len(visited)`）与两个读取点，都在测试里
+   （`scanner_test.go:256` 剪枝对比、`gate_cancel_test.go:127` 取消排空）；`app.go`/`cmd` 都不读它。
+   偏高来自三处形状（`scanner.go:247-249` 全部根预置 / `:368-377` 子目录在 **submit 时**登记 /
+   `:296-305` 取消后排空与 `ReadDir` 失败都照样留痕），而 `visited` 这张表**同时**是去重集
+   （子目录登记晚了就会被重复入队）⇒ 修法必须是"拆成两个东西"，不是"挪一下登记时机"。
+
+4. **M61 —— 顺序读数**：`ExecuteOperation` 在 `app.go:1852` 调 `beginJournal`（写前落盘全部计划），
+   S4 校验却在更下游的 `executor.go:193-196`。`delete` 走 `undoableFor("delete", …) == false`
+   那一档 ⇒ `beginJournal` 不因账本问题拒绝，`BeginOp` 成功返回 journalID，
+   执行器整批拒掉后 `:1887-1892` 照样 `FinalizeOp`（残留 planned → cancelled）
+   ⇒ 账本多一条"什么都没动"的记录。且 `executor.go:194` 那条 `FailedItem` **不带 Path**。
+
+5. **M60 —— 同一问题在别处已经有兜底，settings 独漏**：`startup` 里 `cfgDir` 取不到就留空串
+   （`app.go:278-288`），`openCache:305`、`openLedger:365` 各自 `if a.cfgDir == "" { return }`；
+   只有 `settingsPath():1203` 无条件 `filepath.Join(a.cfgDir, "settings.json")` ⇒ 空串时返回
+   **相对路径** `"settings.json"`，`SaveSettings:1246` 把它写进进程 CWD（GUI 打包后 CWD 通常是只读或"!"）。
+
+6. **M58 —— 出口形状**：`startCmd:1193-1199` 是 `go func() { _ = cmd.Wait() }()`。
+   登记建议"走 `warnLedger` 同族出口"，但 `warnLedger:1700-1703` 写死了
+   `"[history]"` tag 与"账本写入失败："前缀 ⇒ 直接复用会造出一句假话。
+   该出口的真价值是"stderr + `app:error` 双通道、绝不静默"这一形状，值得抽一层共用而不是复制。
+
+7. **会被本批连带改动的既有钉子**（先登记，免得实施时以为是回归）：
+   `internal/ops/ops_test.go:142 TestS4DeleteRequiresConfirm`（走 `Execute`，不受 app 层前移影响）、
+   `internal/scanner/gate_cancel_test.go:127`（见 19.3 P-19-5，必须**补强**，理由就地论证）、
+   `internal/scanner/scanner_test.go:256`（剪枝对比，新口径下仍成立）、
+   `internal/history` 全部现有用例（`initConn` 改动只加不换语义）。
+
+### 19.1 判据（六条，每条都可证伪）
+
+1. **M59**：账本库的**每一条**连接（含回收后新建的）都必须带 `foreign_keys=ON`、`busy_timeout=5000`、
+   `synchronous=FULL`。判据是连接属性而不是文件属性 ⇒ 只能逐连接验。
+2. **M58**：`startCmd` 启动成功后进程退出码非零时，**必须**产生一条用户可见提示（stderr + `app:error`），
+   内容含命令失败事实；启动成功且退出 0 时**不得**冒提示（反面钉，防"每开一次 Finder 就弹一条"）。
+3. **M60**：`cfgDir` 为空时 `SaveSettings` 必须以错误收口，且**磁盘上不得出现** `settings.json`；
+   `GetSettings` 同档返回纯默认值（读别人目录里的文件同样是假话）。
+4. **M61**：未获批的 `delete` 必须**在落账之前**就被拒：账本 `op_records` 行数不增、
+   不产生 `ops:done`、`opsRunning` 不留痕；执行器那道 S4 照旧保留（`Execute` 是导出 API，
+   任何调用方都可能绕过 app 层直接进，且既有钉子 `TestS4DeleteRequiresConfirm` 钉的正是那道）。
+   —— 取证一条：`cmd/fdd-cli` 只做扫描（`dedup.New()`，全仓 grep 无 `ops.` 调用），
+   所以"保留执行器那道"的理由**不是** CLI 需要它，别把这句假话写进划账。
+5. **M67**：`Visited` 必须等于"真的发过一次 `ReadDir` 且成功的目录数"。三格各自钉：
+   根 `ReadDir` 失败 ⇒ 不计；取消后排空 ⇒ 不计（这条同时是"零磁盘 I/O"的正证）；正常全遍历 ⇒ 与
+   实际读过的目录数一致（用一次性计数，不靠 `visited` 去重集）。
+6. **M86**：`UndoOne` 的三条双值路径（`:174`/`:178`/`:397`）**每一条**返回的错误文本都必须含落点路径；
+   且 app 层不得在 `restored` 非空时把它与错误一起丢掉（结构上保留，展示走既有 FailedItem 通道）。
+
+### 19.2 改动面（只这些文件）
+
+| 文件 | 动什么 |
+|---|---|
+| **`internal/sqlconn/sqlconn.go`（新增）** | 把 §18 落在 `cache.go` 里的"每条连接建好即重放会话级 PRAGMA"收归成一份：`WithPragmas(base driver.Connector, pragmas []string) driver.Connector`。cache 与 history 两处各写一份是同一条判据的两个实现（I5）；本批 M59 要动它，正好一起收。 |
+| `internal/sqlconn/sqlconn_test.go`（新增） | 收归后的**等价性锁** + "新建连接仍带 pragma"（P-19-1 的库无关腿）。 |
+| `internal/cache/cache.go` | 删 `pragmaConnector`/`applyConnPragmas`/`connPragmas` 三件套，改调 `sqlconn.WithPragmas`。**行为一字不变**（§18 已划账的语义，靠既有 P-18-2 与新收归锁共同兜住）。 |
+| `internal/cache/cache_m74_test.go` | `newCacheOn` 里的 `pragmaConnector{…}` 换成 `sqlconn.WithPragmas(…)`（测试内构造句柄的写法跟随实现，不是改断言）。 |
+| `internal/history/history.go` | `initConn` 改走 `sql.OpenDB(sqlconn.WithPragmas(sqlite.NewConnector(path), 会话级三条))`；`SetMaxOpenConns(1)` **保留**（它自己的理由与 M73 不同：账本写频极低 + 从根上消 BUSY 面）；文件级 `journal_mode=WAL`/`user_version` 与建表留在原处；删掉 `:134` 那句现在被证伪的注释。 |
+| `app.go` | M58：抽 `warnBackground(tag, userMsg)`，`warnLedger` 变其一行包装（`"[history]"` + "账本写入失败："原样保留）；`startCmd` 收一个退出回调参数，两处调用点各传自己的话术。M60：`settingsPath()` 改返回 `(string, error)`，`GetSettings`/`SaveSettings` 两处跟随。M61：`ExecuteOperation` 在置 `opsRunning` **之前**做 S4 预检并直接返回错误。 |
+| `internal/ops/undo.go` | M86：`:178` 那句改成自带落点（与 `:174`/`:397` 同构）。 |
+| `internal/scanner/scanner.go` | M67：`visited` 保留为去重集，新增 worker 本地 `accessed` 计数（`ReadDir` 成功后 `++`，收口求和赋给 `res.Visited`）；字段注释与实现对齐。 |
+
+新增测试文件（全部"只引用改前符号"的走改前树真跑；引用新符号的由变异取红，逐条在 19.3 标明）：
+`internal/history/history_m59_test.go`、`app_m58_m60_m61_test.go`、
+`internal/ops/undo_m86_test.go`、`internal/scanner/scanner_m67_test.go`、`internal/sqlconn/sqlconn_test.go`。
+**不动** `frontend/`（六条全在后端）、不动 `cmd/fdd-cli`、不动 `model.FailedItem` 结构（裁定③）。
+
+### 19.3 探针（每项都要先看它红过一次，失败原因须与预测一致）
+
+| # | 用例 | 预测的修前红 | 红从哪来 |
+|---|---|---|---|
+| P-19-1 | `TestEveryLedgerConnectionCarriesPragmas`（history） | 回收空闲连接后 `foreign_keys=0`、`busy_timeout=0` | **可改前树真跑**（只引用 `Open`/`s.db` 这些改前就有的东西）；与 §18 P-18-2 同族 |
+| P-19-1b | `TestConnPragmasSurviveReconnect`（sqlconn） | 收归前无此包 ⇒ 编译期不存在 | 收归等价性：改后须绿；红由变异 M19-a 提供 |
+| P-19-2 | `TestStartCmdReportsNonZeroExit`（app） | `startCmd` 只有 `error` 返回值、没有退出通道 ⇒ 无签名可传回调 | 改前树：`startCmd` 签名不同，编译不过 ⇒ 红由变异 M19-b（回调改回 `_ = cmd.Wait()`）提供 |
+| P-19-2b | `TestStartCmdQuietOnSuccess`（反面钉） | 同上 | 同上，与 P-19-2 同批 |
+| P-19-3 | `TestSaveSettingsWithoutCfgDirFailsAndWritesNothing`（app） | 改前 `SaveSettings` 返回 `err == nil` 且 CWD 出现 `settings.json` | **可改前树真跑**（用 `t.Chdir` 把 CWD 换到临时目录，免得污染仓库） |
+| P-19-4 | `TestUnconfirmedDeleteLeavesNoLedgerRow`（app） | 改前 `op_records` 多一条、`ops:done` 会发、返回值非空 opID | **可改前树真跑**（只引用 `ExecuteOperation`/`history.Open`） |
+| P-19-5 | `TestWalkCancelDrainReadsNoDirectories`（scanner） | 改前 `Visited` = 预置的根数（≥1）而非 0 ⇒ 断言"取消后一次 ReadDir 都没有"红 | 新用例；既有 `gate_cancel_test.go:127` 需**补强**为"`Files==120` 即失败"并加"`Visited==0`"正证 —— 就地论证：那句 `res.Visited > 0` 钉的正是被本项推翻的旧口径，留着它会在 M67 之后**永不触发**（假绿），不是放松，是换到能触发的形状 |
+| P-19-6 | `TestVisitedCountsOnlySuccessfulReadDir`（scanner） | 根 `ReadDir` 失败（chmod 0）时改前仍计 1 | **可改前树真跑** |
+| P-19-7 | `TestUndoPartialRestoreMessagesNameTheLandingPath`（ops，表驱动三条） | `:178` 那条不含 target | **可改前树真跑**（走三个已有接缝造确定性场景） |
+| P-19-7b | `TestUndoPartialRestoreKeepsPathInFailure`（app） | 改前 `undoExecuteItem` 丢弃 `restored`，失败清单 Path 只有 OrigPath | 引用新返回值形状的部分由变异 M19-c 提供 |
+
+### 19.4 变异计划（预测"该红的包名表"，跑完与实测表相减）
+
+| # | 变异（把改后退回改前形状） | 预测被杀于 |
+|---|---|---|
+| M19-a | `sqlconn.WithPragmas` 直通 base（不补 pragma） | `internal/sqlconn` + `internal/cache`（P-18-2 应仍红 ⇒ 收归没丢覆盖）+ `internal/history` |
+| M19-b | `startCmd` 的退出回调改回 `_ = cmd.Wait()` | 根包（app）P-19-2 |
+| M19-c | `undoExecuteItem` 把 `restored` 重新丢成 `""` | 根包 P-19-7b |
+| M19-d | `:178` 文案删掉落点参数 | `internal/ops` P-19-7 |
+| M19-e | `settingsPath` 去掉空串错误分支 | 根包 P-19-3 |
+| M19-f | S4 预检从 `ExecuteOperation` 移除（只留执行器那道） | 根包 P-19-4（**且预测 `internal/ops` 仍全绿** —— 那正是要看的差集：账本行是 app 层的账，执行器管不着） |
+| M19-g | `Visited` 改回 `len(visited)` | `internal/scanner` P-19-5/P-19-6 + 预测 `TestWalkWithGateCancelDrainsWithoutIO` 的补强腿开火 |
+
+### 19.5 交付判据
+
+六条各有"修前必红"抄录（能改前树真跑的必须真跑，不能的必须点名是哪条变异顶的）；
+变异预测集 − 实测集的差集逐条解释；全套 15 行门禁重跑，任何一项红就停下修；
+`docs/04` §6.15 划账 + §6.11 表内六行加〔已实施〕括注（原句一字不动）；三提交，绝不 push。
+
+### 19.6 本批不做 / 转登记（写在动手前）
+
+1. **M57（APP-5）**：登记自己标"属性能项，需基准"。分页 + 批量 stat 的正确性可测，
+   但"大记录页卡顿"这条收益没有基准就说不出口 ⇒ 与 M8 的界面/性能面一并处理，本批不动。
+2. **M63（FC-2）**：与既有钉子 `TestFoldSwapLegIsPlatformIndependent` 正面冲突（见 04 表尾第三条追记），
+   未裁定不改。
+3. **M65（SCN-1）**：需要先造"扫描根位于 `/System` 型 absPath 保护条目内部"的真夹具；
+   造不出来之前它对扫描核心是**未知**而非已知缺陷。
+4. **M87（CACHE-3b）**：运行期隔离重建要跨三层换句柄，本批不碰（§18.7 五-1 同一条）。
+5. **前端 FE 面（M77/M79/M80/M81/M83）**：与 M8 一并做，避免为单条改动各起一次界面回归。
+6. **`res.Visited` 不做界面呈现**（裁定③）：本批只让它变成真话，不新增任何显示位。
+7. **M59 不做"连接池改大"**：`SetMaxOpenConns(1)` 留着。收归后它不再掩盖会话级 PRAGMA 的缺口，
+   于是"缩池"从**修法**降级成**无关的现状** —— 这一步不做，避免把 M73 的实测代价（2.08 倍）搬到账本库上瞎猜。
