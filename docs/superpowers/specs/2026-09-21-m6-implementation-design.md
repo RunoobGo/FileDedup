@@ -3,7 +3,8 @@
 - 日期：2026-09-21
 - 上位依据：`2026-09-20-scenario-optimization-design.md`（工况总纲）§2.1~§2.4、§4、§5；
   登记处 `docs/04-开发与测试计划.md` §6.7 C 组 1~4 项；§7 另接 04 §6.8.8 M21
-  （登记修法即"并入工况 M6 的计数横幅"，故与本稿同源）
+  （登记修法即"并入工况 M6 的计数横幅"，故与本稿同源）；§8 另接 04 §6.8.8 M19/M20
+  （回滚路径的 TOCTOU，与 §2/§6 的 `claimSlot` 是同一条"不替用户处置不属于本次操作的文件"主线）
 - 状态：**按实施顺序逐节追加**。本文只写"动手前必须定死"的判据、接入点与探针设计；
   实施后的兑现记录写在 04 §6.9 划账，不写在本文
 - 用户裁定（三条，约束本文全部章节）：① 每项实施前各写一段细化设计（即本文）；
@@ -19,6 +20,7 @@
 | 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ✅（含 §5.0 取证，E7 纠正了本稿动手前的结构布局印象） | ✅（划账见 04 §6.9.5） |
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ✅（含 §6.0 取证，**推翻登记的"最小修法：无条件探测"**；真读数取自本机 hdiutil 造的大小写敏感卷） | ✅（划账见 04 §6.9.6；§6.4 末尾有本稿预测的一处修正） |
 | 6 | worktemp 跳过计数（M21） | — | §6.8.8 M21 | §7 | ✅（含 §7.0 取证 E1~E8；五层管道照抄、计数落在跳过点） | ✅（划账见 04 §6.9.7；M 表无事后修正——M-d 那一行是**跑之前**改准的） |
+| 7 | 回滚路径的 TOCTOU（M19 + M20） | — | §6.8.8 M19/M20 | §8 | ✅（含 §8.0 取证 E1~E9；顺手消掉 move/symlink 逐字重复的一份） | ✅（划账见 04 §6.9.8；新增登记 M37/M38/M39，见 §8.5） |
 
 ## 1. 适用于全部四项的通用约束
 
@@ -967,3 +969,128 @@ default:
    但这**不是**新增的清理通道。
 6. **Windows 腿无差别**：本项全在无 build tag 的纯逻辑里（判定、计数、管道），
    `go vet` 三条腿覆盖；无需真机读数，也不含平台分支。
+
+---
+
+## 8. M19 + M20：回滚路径的 TOCTOU（04 §6.8.8 M19、M20）
+
+> 两项同源，都是**回滚/恢复动作把不属于本次操作的对象当成自己的来处置**：
+> M19 在回收站回撤的**落位**一侧（原位判空后不认领 → `rename` 静默覆盖第三方文件），
+> M20 在合并回滚的**还原**一侧（非法搬动 backup 位上的陌生文件，并把它称作"原文件"）。
+> 判据形状也同一条：**动手之前先证明那个位置上还是我们的对象；证明不了就一个字节都不碰，只把位置报出来。**
+> 这一条正是 §2/§6 的 `claimSlot`（证明不了就显式失败）在**反向动作**上的对偶。
+
+### 8.0 动手前取证（E1~E9）
+
+| # | 结论 | 证据（本机读码 / GOROOT 读数） |
+|---|---|---|
+| E1 | M19 现场：**同一函数里一支有抢占、一支没有** | `internal/ops/undo.go:134-147`：`target := it.OrigPath`；`Lstat` 判空 → **不认领**直接 `renameFile(it.DestPath, target)`。另名那一支（原位被占）在 M2 已改成 `claimDst` 原子抢占（:141）。⇒ 不变量"落位前先认领"只覆盖了一半 |
+| E2 | 覆盖是**静默**的（不是理论风险） | `go doc os.Rename`："If newpath already exists and is not a directory, Rename replaces it."；Windows 腿 `internal/syscall/windows/syscall_windows.go:366` = `MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)`。⇒ 非目录一律**替换**，只有目录/被占用等才会报错 |
+| E3 | 同一个问题在 trash 侧**结论相反**，理由要写下来 | `internal/ops/trash_linux.go:128-133` 明确否决占位：`rename(目录 → 已存在的普通文件)` 在 Linux 上返回 ENOTDIR，而移入回收站的源可以是目录。**回撤方向没有这个约束**：`undoSourceCheck` 已要求 DestPath 必须是普通文件（`undo.go:97`），源恒为文件 ⇒ 占位可用。两侧结论不同、各有依据，写在此处以免将来被当成"同一处没修干净" |
+| E4 | 抢占工具已在，只缺"不递增"那一档 | `claimDst`（`move.go:288-316`）是"另找可用名 + `_N` 递增"；`claimedDst.stillOurs()/release()`（:319-329）现成。本项要的是**抢占失败即换路**的那一半：`claimExact` |
+| E5 | M20 现场，且**逐字重复两份** | `move.go:129-143` 与 `symlink.go:116-132` 是同一段 12 行（连注释都各写一份）——I5（同一判据两份实现）的现成样本。⇒ 本项顺手把这段**上收**到 `merge_guard.go`，此后只剩一份 |
+| E6 | 守卫词汇都已在同一个文件 | `backupOwnershipStill`（= `identityStill(backup, dupID)`）、`claimSlot`、`slotProvesHardlink`、`abandonForeignBackup` 全在 `merge_guard.go`；其中 `slotProvesHardlink` 的 `id.Resolved &&` 前缀，是"用于**删除**的判据必须与 `identityStill` 的 fail-open 相反"的既有先例 |
+| E7 | 既有断言钉住了哪几件事 | ① `rollback_message_test.go`（2 条）：还原失败的文案必须指向 backup 本尊；② `hardlink_verify_test.go:177` 与 `symlink_test.go:381`：终局复核失败要**回滚成原独立文件**，且 `assertNoResidue` 要求 `.fdd-old.undo` **不残留**；③ `identity_window_test.go:266`（M3 的还原失败报位置）；④ `undo_test.go:83/121`（另名恢复的两档）。⇒ 其中 ②④ 的全部用例都用 `fsid.ID{}`（零值）调合并 ⇒ **回滚前置必须是 fail-open**，见 §8.1 |
+| E8 | 步骤 4 的 dup 位**没有**抢占（本次读码新查出） | 步骤 3 把 dup 腾空后，到步骤 4 `hardlinkRename(tmp, dup)` 之间，全流程只复核过 **backup**（`backupOwnershipStill`），**没有任何一处核对 dup 位是否空着**。第三方在这个窗口落子 → 步骤 4 按 E2 静默覆盖。登记 **M38**，不在本项实施（理由见 §8.5-2） |
+| E9 | 同一段里的停靠名同样是"无主写 + 无证删" | `hardlinkRename(dup, backup+".undo")`（无抢占写）与 `_ = os.Remove(backup+".undo")`（无证删）；`undoHardlink` 的 `.fdd-undo-tmp` 槽位（`undo.go:250-251` 的无条件 `os.Remove`）同族。登记 **M37 / M39**，不在本项实施（理由见 §8.5-1） |
+
+### 8.1 判据
+
+**M19 —— 空位分支改成"先认领、后使用"：**
+
+1. 新增 `claimExact(path)`：`O_CREATE|O_EXCL` 建 0 字节占位；抢到即这个名字归我们，
+   随后的 `renameFile` 替换的是**我们自己的占位**，不再是"赌没人来"。
+   与 `claimDst` 的唯一差别是**被占时不递增**（换名即换语义，交给调用方换路）。
+2. 抢不到（`EEXIST`：含悬空符号链接与目录）或连"能否占用"都没问出来（其它错误）→
+   一律走既有的 `claimDst(name.fdd-restored.ext)` 另名恢复。这与旧口径等价：
+   旧代码把 `Lstat` 的非 ENOENT 错误同样当作"已占用"（`undo.go:136-137` 的原注释与写法）。
+3. 失败分支照旧 `claim.release()`——新增的这一支也必须能清掉自己的占位。
+
+**M20 —— 两条回滚分支在搬运 backup 之前加同一道前置：**
+
+- `requireOriginalInBackup(backup, dup, dupID, cause)`：`backupOwnershipStill(backup, dupID)`
+  不成立 ⇒ **不搬、不挪、不删**，只报位置；文案里**不得**出现"原文件保留在 …"
+  （那正是 M20 登记的伤害：把他人的文件说成用户的原文件）。
+- 成立 ⇒ 走原路径。**步骤 5 的"停靠—还原—清理"三步一字不动**（保住 E7 全部断言）。
+- 两道前置的判据形状与 `slotProvesHardlink` **刻意不同**：这里沿用 `identityStill`
+  的 fail-open（`dupID` 未解析时放行）。理由是 E7②④：判据管的是"要不要**放行一次回滚**"，
+  判错的代价是回到修前行为（陌生文件被搬回 dup，仍在用户目录里），**不是销毁数据**；
+  而 fail-closed 会让所有零值 ID 的回滚永久失效——`TestHardlinkMerge_FailureKeepsOriginalIntact`
+  正是零值 ID 且必须回滚成功。
+
+### 8.2 改动面（4 个生产文件 + 2 个新测试文件）
+
+| 文件 | 改动 |
+|---|---|
+| `internal/ops/move.go` | ① 新增 `claimExact`（紧挨 `claimDst`，含"只差递增与否"的注释）；② 步骤 5 回滚整段（:129-143）→ 一行 `rollbackUnverifiedSwap` 调用；③ `rollbackAfterSwapFailure` 调用处增传 `dupID` |
+| `internal/ops/symlink.go` | 同上两处（:116-132 整段 → 一行调用；`rollbackAfterSwapFailure` 增传 `dupID`） |
+| `internal/ops/merge_guard.go` | 新增 `requireOriginalInBackup`、`rollbackUnverifiedSwap`（**上收**，消 I5 重复）；`rollbackAfterSwapFailure` 增 `dupID` 参数 + 前置调用 |
+| `internal/ops/undo.go` | `undoTrash` 空位分支：`Lstat` → `claimExact`（注释写明抢占点落在哪两个动作之间） |
+| 新 `internal/ops/undo_claim_test.go` | V1~V2（M19） |
+| 新 `internal/ops/rollback_backup_guard_test.go` | V3~V6（M20，硬链接/软链接各两条） |
+
+既有测试**一条不改**（E7 四条清单即验收条件）。
+
+### 8.3 探针（V1~V6）与修前必红
+
+| 探针 | 断言 | 修前为什么红 |
+|---|---|---|
+| V1 `TestUndoTrashClaimsOrigNameBeforeRename` | 在 `renameFile` 接缝里让第三方**原子落子**（`O_EXCL` 写自己的文件到 OrigPath）：落子成功 ⇒ 它的字节必须仍在原处；落子被 `EEXIST` 挡下 ⇒ 恢复必须照常到位（`dst == orig`、内容与 mtime 齐全） | 落子成功，随后被 `os.Rename` 静默替换（E2）——第三方文件的字节**当场消失**（改名把它 unlink 了） |
+| V2 `TestUndoTrashFailedRenameLeavesNoPlaceholder` | 接缝让改名失败（非 EXDEV）⇒ 报错，且 OrigPath 上**不得留下 0 字节占位** | 绿（回归保护）。它钉的是修法**不许**把崩溃窗口留在磁盘上：占位建立后进程被杀＝用户原名变成 0 字节文件，所以 `claim.release()` 必须在每条失败支路生效 |
+| V3 `TestHardlinkMergeRollbackRefusesReplacedBackup` | 步骤 5 复核失败 **+** backup 位被第三方顶替（同一接缝里：先复制式落位、再把 backup 换成陌生文件）⇒ 报错；backup 位那个文件**原封不动**、dup 位仍是本次校验未通过的对象；文案含"已不是本次操作的原文件"、**不含**"原文件保留在 " | 陌生文件被搬进 dup 位、原位置清空，且文案把他人的文件称作"原文件保留在 …"（M20 登记原话） |
+| V4 `TestSymlinkMergeRollbackRefusesReplacedBackup` | 同上（软链接腿，`requireSymlinkSupport`） | 同上——`symlink.go` 里那份逐字重复的实现（E5） |
+| V5 `TestHardlinkMergeSwapFailureRefusesReplacedBackup` | 步骤 4 失败 **+** backup 被顶替 ⇒ 拒绝；dup 位**不得出现陌生文件**；文案不含"原文件保留在 " | 旧码 `hardlinkRename(backup, dup)` 把陌生文件搬进 dup 位，且只返回裸改名错误（连位置都没报） |
+| V6 `TestSymlinkMergeSwapFailureRefusesReplacedBackup` | 同上（软链接腿） | 同上（`symlink.go`） |
+
+接缝构造要点（照 `identity_window_test.go` 的既有惯例）：
+- 顶替发生在**同一接缝的同一时刻**——步骤 3 成功之后（`backupOwnershipStill` 已在 :121 复核过），
+  所以不会被 M1 的窗口 A 守卫（`abandonForeignBackup`）先拦下；这正是"M20 守卫之间的空档"本身。
+- 每次接缝替换都带 `done` 标志与 `t.Cleanup` 里的"前置条件未触发"断言，
+  避免用例在没走到目标分支时**静默通过**。
+
+**修前必红（两路，缺一不可）**：
+1. 探针文件先落地、生产代码不动 → V1、V3、V4、V5、V6 红（读数照抄进划账）；V2 绿（回归保护）。
+2. 既有断言清单（E7）在修前修后都必须全绿——它们同时是"没把回滚功能改坏"的负控制。
+
+### 8.4 变异（六条，逐条改坏 → 必须变红）
+
+| 编号 | 变异 | 应红 |
+|---|---|---|
+| M-M19-a | `claimExact` 调用换回 `os.Lstat` 先查后用（回到修前语义） | V1 |
+| M-M19-b | `claimExact` 的 `O_CREATE\|O_EXCL` 去掉 `O_EXCL` | 既有 `TestUndoTrashOrigOccupiedUsesRestoredName`（原位上的第三方文件被截断，且恢复落错名） |
+| M-M19-c | 两条失败支路不调 `claim.release()` | V2（0 字节占位残留） |
+| M-M20-a | 删掉 `rollbackUnverifiedSwap` 里的 `requireOriginalInBackup` 调用 | V3、V4 |
+| M-M20-b | 步骤 4 分支不加前置（只修步骤 5） | V5、V6 |
+| M-M20-c | 前置里的 `backupOwnershipStill(backup, …)` 写成查 **dup** 位（查错了位置） | 既有 `rollback_message_test.go` 两条 + `TestHardlinkMerge_FailureKeepsOriginalIntact` + `TestSymlinkMerge_RollbackWhenVerifyFails`（回滚被自己永久拒掉） |
+
+M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮住（M-M20-a），
+查错位置只有**既有**用例逮得住——两者不是同一失效模式，各自都要有杀手。
+
+### 8.5 未兑现与边界
+
+1. **M37（`.fdd-old.undo` 停靠名：无主写 + 无证删）不修**。判据形状已明：写侧用
+   `claimSlot`（被占即拒绝回滚），删侧要"能证明才删"。之所以不在本项动：`hardlink_verify_test.go:228`
+   的 `assertNoResidue` **正好钉住了"必须清掉"这一半**，改它等于改一条 2026-09-19 用户判据用例
+   的语义；且"清不掉的那一份怎么向用户交代"要先有结论。`undoHardlink` 的 `.fdd-undo-tmp`
+   （`undo.go:250-251`）同族 → **M39**。
+2. **M38（步骤 4 的 dup 位落子窗口，E8）不修**。修法就是本项落地的 `claimExact` 占位，
+   但**它会把一个新的失败形态引进合并主路径**：崩溃时用户的**真名**位置上留下 0 字节文件
+   （M19 侧同样有，但那里我们本来就要往这个位置放文件；合并侧 dup 原本是"空着等链接"）。
+   要不要接受，需要一个独立的设计决定（含"重跑时怎么看待这个占位"），按 §1 约束 5 登记不扩大。
+3. **`claimExact` 的残余窗口**：占位与改名之间（微秒级）第三方若**先删我们的占位再落子**
+   （主动针对本次操作），仍会被覆盖。与 `claimDst` 的残余窗口同族、同理由（Go 没有 NOREPLACE
+   改名原语，加一道复核也只是把微秒窗口缩成微秒窗口），照 `merge_guard.go:55-60` 的写法
+   记在这里，不写无法证伪的守卫。
+4. **崩溃窗口（本项新引入，接受）**：占位建立后、改名完成前进程被杀 ⇒ 用户的**原名**位置上
+   留一个 0 字节文件；数据仍在回收站/移动目标处，账本条目未落账。**不主动清理**它
+   （我们无从与用户自己的 0 字节文件区分），而扫描器内置的 0 字节跳过会让它不进语料
+   （`scanner.go` 的 `size==0` 分支）。§8.2 把"认领"与"改名"写成相邻两行，让窗口尽可能短。
+5. **Windows 腿未在真机核对一处语义**：`O_CREATE|O_EXCL` 撞上"已存在的**目录**"时返回
+   `EEXIST` 还是 `EACCES`，按 E2 的语义两者都会走另名恢复（不覆盖、不报错），
+   **无行为差异**，故不单列 ID，只记边界；本项两处新逻辑都在无 build tag 的纯逻辑里，
+   `go vet` 三条腿覆盖。
+6. **M19 只动 trash 回撤这一支**：`undoMove` 走 `MoveFile`（`claimDst` 递增抢占，天然不覆盖）；
+   `undoHardlink`/`undoSymlink` 各自已有防线（后者的原位判据见 `undo.go:310-368`）。
+7. **`rollbackAfterSwapFailure` 的既有语义被原样保留**：临时链接仍在我的名字下（步骤 1 建立、
+   步骤 2 复核过），所以拒绝搬运时仍照旧清掉 tmp；文案（含"还原"字样）不动，
+   `identity_window_test.go` 的 M3 断言因此保持绿。
