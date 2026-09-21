@@ -23,6 +23,8 @@
 | 6 | worktemp 跳过计数（M21） | — | §6.8.8 M21 | §7 | ✅（含 §7.0 取证 E1~E8；五层管道照抄、计数落在跳过点） | ✅（划账见 04 §6.9.7；M 表无事后修正——M-d 那一行是**跑之前**改准的） |
 | 7 | 回滚路径的 TOCTOU（M19 + M20） | — | §6.8.8 M19/M20 | §8 | ✅（设计：§8.0 取证 E1~E9；实施：六条探针 5 红→全绿 + 变异六条逐条命中，**另补第 7 条变异 M-M20-c′**；顺手消掉 move/symlink 逐字重复的一份） | ✅（划账见 04 §6.9.8；新增登记 M37/M38/M39，见 §8.5） |
 | 8 | 假账与静默失败（M22 + M25 + M26） | — | §6.8.8 M22/M25/M26 | §9 | ✅（含 §9.0 取证 E1~E17；**推翻 M26 登记的"Linux 主门禁可跑出两棵"**） | ✅（划账见 04 §6.9.9；新增登记 M40/M41/M42/M43，见 §9.5；九条变异真读数含 M-M26-b 本机逃逸） |
+| 9 | 遍历键不折叠（M36，方案 C） | — | §6.8.8 M36 | §10 | ✅（含 §10.0 取证 E1~E11；**推翻 I2 当年定的遍历期折叠机制**，折叠只留给"合并用户给的根"） | ✅（划账见 04 §6.9.10；新增登记 M44，见 §10.5-1） |
+| 10 | 稀疏卷判据（M28） | — | §6.8.8 M28 | §11 | ✅（含 §11.0 取证 E1~E12；**推翻登记的"`f_type` 白名单 + 每卷写探测"形状**，改用遍历内证据） | ⬜（本节 2026-09-21 落盘，实施随其后） |
 
 ## 1. 适用于全部四项的通用约束
 
@@ -370,6 +372,10 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
 > 另：tag 从 `!windows` 收窄为 `darwin || linux` + 一个恒 false 的兜底文件，
 > 理由是 `Blocks` 字段在其它 unix 变体上布局不同，宁可不读也不按猜的偏移读。
 
+> **§3.1 的 API 追记（M28，2026-09-21）**：上表的 `From(size, reported, ok)` 已增第四参
+> `trustsZero`、`Of` 已被删除（它的语义 = "没有卷级证据"的单文件封装），新增
+> `Reported`（原 `reported` 导出）/`VolumeID`/`Tracking`，见 §11.2。原文保留。
+
 带 tag 的两个文件只做"读一个数"，判定与回退规则全部在无 tag 层——这样
 `From` 的回退分支在 Linux 主门禁里就是可执行断言，Windows 的 NTFS 压缩语义虽然
 只能在真机验证，但"读不到就回退并标记"这一条不需要真机就能钉住。
@@ -446,6 +452,9 @@ M-P2-e 是这张表里唯一"做不到红"的一条，如实标出而不是删�
   这一侧——故障卷上"1 GB 重复组实占 0"是一个自信的错误数字，而退回逻辑口径
   至多是"这一类没拿到收益"。要两者兼得需按卷判 `st_blocks` 可信度
   （`statfs` 的 `f_type` + 每卷一次探测），登记为开放项 M28。
+  （**M28 追记，2026-09-21**：该开放项已实施，但**判据形状被推翻**——既不用 `f_type`
+  白名单，也不用每卷一次写探测，改用遍历期本就拿得到的**同卷非零证据**，见 §11 的
+  E3~E6。上面那句"要两者兼得需 …"是当时的判断，保留原文以存其真。）
 - **APFS 的 16 MiB 落地阈值**（§3.0 补充实测）意味着"小文件稀疏"在本机根本不存在，
   实占=逻辑；这一类不是缺陷，但会让用户在 mac 上看到"两个数一样"，文案须说明。
 - **Windows 每候选文件多一次元数据查询**（§3.1 修正段）：真机未测，登记为 M29 待评估。
@@ -1402,3 +1411,151 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
 
 边界里新登记的一条（E10 兑现）：**M44** —— 逃逸判据的键精确化后，不敏感卷上"手输拼写与盘上
 仅大小写不同"的保护清单内路径不再放行剪枝（fail-closed），由 V3 钉成断言。
+
+---
+
+## 11. M28：稀疏卷判据（04 §6.8.8 M28）
+
+> 修的是什么：`reported==0 && size>0` 这一类读数（真全洞文件——本机 APFS 上 `truncate` 到
+> 1 GiB 而不写一个字节，读数就是 0 blocks，E1）目前被 M6-P2 的规则 2 一律判成"未统计"，
+> 退回逻辑大小。代价是一个 256 MiB 全洞重复组仍按 256 MiB 报可释放（E2，端到端真读数）。
+> 本项把"**这个 0 可不可信**"用**本卷自己给出的读数**回答：遍历中在本卷见过 `reported>0`
+> 的，其 0 采信为真读数；没见过的卷维持原状（fail-closed）。
+> **登记行写的判据形状（`statfs` 的 `f_type` 白名单 + 每卷一次写探测）被本节的取证推翻**，
+> 理由在 E3~E6——照它做既拿不到"证据"，还要在只读扫描里引入写盘。
+
+### 11.0 动手前取证（2026-09-21，本机实测 + 读码）
+
+| # | 取证项 | 读数 | 出处 |
+|---|---|---|---|
+| E1 | ★ 这笔代价在本机是不是活的 | 是。`dd if=/dev/zero of=hole2.bin bs=1 count=0 seek=1073741824` ⇒ `size=1073741824 blocks512=0 dev=16777230`；同目录 `small.bin`(1024 B) ⇒ `blocks512=8`。`go test ./internal/scanner -run TestWalkAllHoleFileNeverReportsZeroActual -v` 落到日志分支 `本卷对全洞报 0 blocks：按『未统计』回退逻辑口径`（PASS） | 本机执行 |
+| E2 | ★ 端到端修前读数（`fdd-cli`） | 两套夹具读数**一模一样**：`proven`（两枚 256 MiB 全洞 + 一枚 8 KiB 普通文件）与 `unproven`（只有那两枚全洞）都是 `reclaimable_bytes_actual=268435456`（=逻辑回退）、`reclaimable_actual_known=false`。**unproven 的读数就是"恒报 0 的卷"在数字上的形态**——修后它必须**保持**这样 | 本机执行，本轮 |
+| E3 | `f_type` 能不能当**卷**键 | **不能**：`/tmp`（`dev=16777230`）与 `/Volumes/fx`（`dev=16777244`）是两个不同的挂载实例，`f_type` **同为 `0x1a`（apfs）**。按 f_type 聚合证据 = 把两卷读数混成一池，方向是**误信** | 本机执行（`.scratch-m28` 临时程序读 `unix.Statfs`） |
+| E4 | `f_type` 能不能退而作**家族白名单** | 能分家族（apfs `0x1a` / devfs `0x13`），但它回答的是"这是什么文件系统"，不是"本卷的 `st_blocks` 会不会报非零"——两者只在"驱动器正常"时才重合。白名单另有两个烂尾方向：未知类型只能 fail-closed（收益拿不到），Linux 要枚举 ext4/btrfs/xfs/…、Windows 侧**根本没有对应物**（GCPSW 不是 statfs 家族） | 本机执行 + 读码 |
+| E5 | 登记的"每卷一次写探测"代价 | 扫描全程**只读**（本轮唯一写盘探测是 fscase 那次，且已按 C1 收窄到"≥2 根才探"）。为 M28 再引入按卷写盘，会在三类真实工况上出问题：① 同步客户端把新临时文件当用户资产（M6-P1 整节的动机场景）；② 只读挂载/无写权限目录直接失败（fail-closed 等于白探）；③ 崩溃/被杀留残留。**证据**这条路一次盘都不用碰 | 读码 + 设计 |
+| E6 | 证据从哪来、要多少成本 | 本卷**已经给出的读数**：`reported>0` 就是"该卷在 `st_blocks` 里报真实分配"的直接证据，同卷任何一个非空普通文件都有（E1 的 `small.bin`、`/etc/hosts` 均为 8 blocks512）。遍历本来就会 `Info()` 每个文件 ⇒ **零额外 syscall、零写盘** | 读码 + E1 |
+| E7 | 判定能不能在遍历中做 | **不能**：worker 并发，证据可能来自"还没遍历到的文件" ⇒ 读数取决于线程调度快慢，同一语料两次扫描可能不同（与"计数不许说谎"同族的纪律）。判定放**收尾**（`workerWg.Wait()` 之后），与 `escapedRoots`/`protectedDirs` 的收口同一处 | 读码 |
+| E8 | 对手（NFS/FUSE 恒报 0）本机能不能真造 | 不能：本机没有可挂的 NFS/FUSE 服务端（起 `nfsd` 要改系统配置、要 root），**真读数未兑现**（§11.5-2）。但对手的**形态**在主门禁上可以完整复现：「本卷没有任何非零证据」= 只放全洞文件的目录（E2 的 `unproven`） | 读码 |
+| E9 | 跨卷对照能不能在测试里造 | 能（本机）：`/dev/null` 在 devfs 上（`dev=-370076309`，`f_type=0x13`），与 `t.TempDir()` 的 apfs 卷**不同 dev**。Linux CI 上要看 `/dev` 是否独立挂载——同卷则 skip（不进隔离清单，§7 约定） | 本机执行 |
+| E10 | 目录的 `blocks` | 也是 0：`/` 与 `/System` 都报 `blocks512=0`。**"0 blocks"在 APFS 上不是"洞"的同义词**，也说明目录读数不能充当证据（本项只采信普通文件） | 本机执行 |
+| E11 | `mkfile -n 1g` 的顺带读数 | `blocks512=32`（16 KiB），不是 0——与 §3.0 记的 `mkfile -n 8m` 占 8 MiB 不同源（同族命令在不同尺寸下落地策略不同）。与判据无关；**夹具一律用 `os.Create`+`Truncate`**（= E1 的 `dd seek` 同机制），不用 `mkfile` | 本机执行 |
+| E12 | 既有用例受影响面 | `TestWalkAllHoleFileNeverReportsZeroActual`（04 §6.9.3 的 U6）的**夹具**（目录里只有全洞文件）正好落在"无证据 ⇒ 未统计"一侧 ⇒ **断言与读数全部不变**，只需改函数注释（"开放项 M28"→"已实施，见 §11"）与 `probeActual`（它用的 `Of` 被删，改走 `Reported`+`From`，语义一字不变）。`TestWalkActualKnownForPlainFile`/`TestWalkRecordsSparseActualBelowSize`/`TestWalkZeroSizeFileStillSkipped` 不受影响 | 读码 |
+
+### 11.1 判据
+
+"一个 0 blocks 是不是真读数"**只对卷有意义**，对单个文件无意义（M6-P2 已论证：单文件不可区分
+"全洞"与"该卷恒报 0"）。本项用**本卷的读数**回答这个问题，判据只有一句：
+
+> **本卷是否被这一趟遍历证明会报非零实占**（同卷、读到了、非零，三者同时成立）。
+
+判定表（只动第四行；其余三行逐字保持 M6-P2 的口径）：
+
+| 情形 | M6-P2 处置 | M28 之后 |
+|---|---|---|
+| `!ok`（平台读不到） | `(size, false)` | **不变**——读不到就是读不到，**卷级证据不翻案**（证据说的是"0 可信"，不是"读得到"） |
+| `ok && reported>0` | `(reported, true)` | **不变**；它同时构成该卷的证据 |
+| `ok && reported==0 && size>0`，**无**证据 | `(size, false)` | **不变**（fail-closed：恒报 0 的卷挡在这） |
+| `ok && reported==0 && size>0`，**有**证据 | `(size, false)` ← 收益丢失 | **`(0, true)`** ← 本项解锁 |
+| `size==0` | `(0, true)`（遍历期本就跳过 0 字节） | 不变 |
+
+三条不变式，写死在实现里：
+
+1. **证据不跨卷**：`VolumeID` 不同就不互相作证（E3：同一个 `f_type` 都不算同卷）。
+2. **`!ok` 与证据无关**：读失败的条目即便本卷别处有非零证据，仍走 `(size, false)`。
+3. **判定在收尾统一做**（E7）：遍历期一律按"无证据"出值（= 今天的行为），收尾只做一件事——
+   把有证据的卷上的"未统计 0"重判。**无证据时（今天的所有工况）行为逐字节不变。**
+
+两处口径选择（都不是随手取的）：
+
+- **证据在过滤之前采集**：卷会不会报非零，与用户勾了什么过滤无关；被 `ExcludeExts`/大小/隐藏
+  规则挡掉的文件同样作数。放在 `matcher.Apply` 之后就变成"语料里恰好有普通文件才有收益"，
+  那是把用户过滤当成了卷属性。
+- **只采信普通文件**（`IsRegular` 之后采集）：目录的 blocks 在 APFS 上恒 0（E10），
+  设备/管道一类更不该参与；0 字节文件报 0 没有信息量。
+
+收益边界：本项**只解锁** `reported==0 && size>0` 这一类（全洞文件）。`!ok` 一类（平台读不到、
+非 NTFS 卷、FUSE 不支持）**不**解锁——没有读数可以采信。
+
+### 11.2 改动面（1 个新语义 + 4 个生产文件 + 2 个测试文件）
+
+1. **`internal/realbytes/realbytes.go`**（无 tag，全部判定与回退仍在这一处）：
+   - `From(size, reported uint64, ok bool)` → **`From(size, reported uint64, ok, trustsZero bool)`**：
+     第四参只作用于 `reported==0 && size>0` 那一分支（`trustsZero ⇒ (0,true)`）。
+   - **删** `Of`：它的语义就是"不带证据的单文件判定"，两个调用点一个要走证据链（scanner）、
+     一个要读原始读数（测试前提探针），留着它就是一处"没有证据也能判"的入口。
+   - `reported` **改名导出为 `Reported(path, info)`**：平台层唯一的读数入口（只报数不判定）。
+   - **新增 `VolumeID(path string, info os.FileInfo) (uint64, bool)`**：卷（挂载实例）标识。
+   - **新增 `Tracking`**（纯集合，非并发安全：每 worker 一份、收尾 `Merge`——热路径每文件一次
+     `Observe`，刻意不加锁）：`Observe(vid, reported uint64, ok bool)`（`ok && reported>0` 才算
+     证据）、`Trust(vid) bool`、`Merge(*Tracking)`。
+2. **`internal/realbytes/realbytes_unix.go`**：`reported`→`Reported` 改名；`VolumeID` = `Stat_t.Dev`
+   （`info.Sys()` 断言失败 ⇒ `(0,false)`，fail-closed）。
+3. **`internal/realbytes/realbytes_windows.go`**：`reported`→`Reported` 改名；`VolumeID` =
+   `filepath.VolumeName(path)` 的 FNV-1a 64（`C:` / `\\server\share` / `\\?\Volume{…}` 都给出稳定
+   前缀；空串 ⇒ `(0,false)`）。哈希只为把键统一成 `uint64`，冲突方向是"两卷证据混池"（§11.5-6）。
+4. **`internal/realbytes/realbytes_other.go`**：`Reported` 恒 `(0,false)`；`VolumeID` 恒 `(0,false)`
+   （其他 unix 变体不按猜的字段偏移读，与 `fsid_other.go` 同一处置）。
+5. **`internal/scanner/scanner.go`**：worker 装配区加 `tracking := make([]*realbytes.Tracking, workers)`
+   与 `pendZero := make([][]zeroCase, workers)`；候选文件处（`:424` 一带）改为
+   `rep, rok := realbytes.Reported(full, info)` → `vid, vok := realbytes.VolumeID(full, info)` →
+   `if vok { tracking[idx].Observe(vid, rep, rok) }`（**在 `matcher.Apply` 之前**）→ 建条目后
+   `if vok && rok && rep == 0 { pendZero[idx] = append(pendZero[idx], zeroCase{e: e, vid: vid}) }` →
+   `e.Actual, e.ActualKnown = realbytes.From(size, rep, rok, false)`；收尾合并 tracking 后
+   `for _, z := range pendZero 全量 { z.e.Actual, z.e.ActualKnown = realbytes.From(z.e.Size, 0, true, tr.Trust(z.vid)) }`
+   （单条重判也走 `From`——I5：一处判定一处实现）。
+6. **测试**：`internal/realbytes/realbytes_test.go` 三条既有用例**机械加第四参 `false`**
+   （断言一字不动，钉的仍是 M6-P2 规则 1/2/3）+ 新增 V1~V3；`internal/scanner/scanner_realbytes_test.go`
+   的 `probeActual` 改走 `Reported`+`From(…,false)`（语义不变）、U6 注释更新、新增 V4~V6。
+7. **不动**：`internal/model`（`ActualBytes` 对 `(0,true)` 已正确返回 0）、`hash_cache` 列集
+   （U7 钉着"实占不进缓存"）、`ScanSummary`/`fdd-cli` 字段、所有平台读数实现本身的算术。
+
+### 11.3 探针（修前必红清单）
+
+| # | 用例 | 断言 | 修前为什么红 |
+|---|---|---|---|
+| V1 | `realbytes`：`TestFromTrustsZeroOnlyWhenVolumeProven` | 四向：`(1MiB,0,true,false)→(1MiB,false)`（M6-P2 原状）、`(1MiB,0,true,true)→(0,true)`（收益）、`(1MiB,4096,true,true)→(4096,true)`（非零不受影响）、`(1MiB,0,false,true)→(1MiB,false)`（**读不到不因卷证据翻案**，不变式 2） | 修前**编译红**（`From` 无第四参） |
+| V2 | `realbytes`：`TestTrackingOnlyRecordsNonZeroEvidence` | `Observe(v,0,true)` 不成证据；`Observe(v,4096,false)` 不成证据（`ok` 是合约的一部分，不因当下平台实现恰好报不出这种组合而省略）；`Observe(v,4096,true)` 成立；**`Trust(另一卷) == false`**（不变式 1，不池化） | 修前编译红（`Tracking` 不存在） |
+| V3 | `realbytes`：`TestTrackingMergeKeepsKeysSeparate` | 两份各记一个卷，`Merge` 后两个键各自成立、未记的第三个键不成立 | 同上 |
+| V4 | `realbytes`（unix）：`TestVolumeIDSameDirSameID` | 同目录两个文件同 ID 且 `ok`；跨卷用 `/dev/null`（E9）对照——**不同 ID 才断言，同 ID 则 `t.Skipf`**（该环境没有第二个卷，夹具不成立） | 修前编译红（`VolumeID` 不存在） |
+| V5 | `scanner`：`TestWalkAllHoleOnProvenVolumeReportsRealZero` | 目录 = 全洞 64 MiB（E1 机制）+ 1 KiB 普通文件 ⇒ 全洞条目 `Actual==0 && ActualKnown==true` 且 `ActualBytes()==0`；普通条目 `ActualKnown && Actual>0`。前提自探：夹具 `Reported != 0` ⇒ `t.Skipf`（该卷把洞落地分配） | 修前**语义红**：`reported==0` 一律回退 ⇒ `Actual=64 MiB`（变异下可复现，M-M28-a/c） |
+| V6 | `scanner`：`TestWalkAllHoleOnUnprovenVolumeStaysUnknown` | 目录里**只有**全洞文件 ⇒ 无任何非零证据 ⇒ 条目 `Actual==size && !ActualKnown`（E2 的 `unproven` 形态，fail-closed 的钉） | 修前**绿**（正是今天的口径）——它的作用是让 M-M28-b/c 会红 |
+| V7 | `scanner`：`TestWalkEvidenceIgnoresFilters` | 目录 = 全洞文件 + 一枚被 `ExcludeExts` 挡掉的普通文件 ⇒ 全洞条目仍 `(0,true)`（证据与被过滤无关，§11.1 口径选择） | 修前语义红（同 V5 形态） |
+| V8 | 既有四条**保持绿** | `TestFromFallsBackWhenPlatformReportsZero`（规则 2 原状）、`TestWalkAllHoleFileNeverReportsZeroActual`（U6，夹具落在无证据侧）、`TestWalkActualKnownForPlainFile`、`TestWalkRecordsSparseActualBelowSize` | 绿（无证据路径逐字节不变） |
+| V9 | 真读数（非用例，`fdd-cli` 两套夹具） | `proven`：修前 `reclaimable_bytes_actual=268435456 / known=false` ⇒ 修后 `0 / true`；`unproven`：修前修后**同读数**（`268435456 / false`） | 修前读数已取（E2） |
+
+### 11.4 变异（逐条改坏 → 应红）
+
+| # | 变异 | 应变红 |
+|---|---|---|
+| M-M28-a | 删掉证据采集（`tracking[idx].Observe(...)` 一行） | V5、V7 |
+| M-M28-b | `Trust` 恒真（不看集合） | V6（无证据目录被误采信） |
+| M-M28-c | 删掉收尾重判（`pendZero` 整段） | V5、V7 |
+| M-M28-d | `Trust` 忽略卷键（`return len(t.seen) > 0`，池化） | V2、V3 |
+| M-M28-e | `Observe` 丢掉 `ok` 条件（`if reported > 0` 就记） | V2（`Observe(v,4096,false)` 那条） |
+| M-M28-f | 收尾重判时把 `!ok` 的条目也翻案（例如对 `From` 传 `ok=true`） | V1 第四向 |
+| M-M28-g | 证据采集挪到 `matcher.Apply` 之后 | V7 |
+
+> M-M28-e 的说明：当下两个平台实现里 `ok=false` 必然伴随 `reported=0`（unix/Windows 都是这样返回的），
+> 所以这条变异在**端到端路径上不可杀**；它杀在纯函数层（V2）——那是**合约**的一部分：
+> "读不到"与"读到 0"是两件事，将来任何一个平台实现只要破了这个组合，就会被 V2 立刻抓住。
+
+### 11.5 未兑现与边界
+
+1. **Windows 腿未兑现真机**（与 M6-P2 同档）：`VolumeID` 走 `filepath.VolumeName` + FNV、
+   读数走 `GetCompressedFileSizeW`，都只有 `GOOS=windows go vet` 的交叉编译保证；
+   "GCPSW 对全洞稀疏文件返回 0"只有 MSDN 依据，**没有真机读数**。不写作已通过。
+2. **NFS/FUSE "恒报 0" 的真机未兑现**（E8）：本机无服务端可挂。防线本身的形态由 V6 在主门禁上
+   钉住（无证据 ⇒ fail-closed），但"真实 sshfs/s3fs 的读数长什么样"本轮没量过。
+3. **"偶发报 0"的故障驱动不在防线内**：证据判据回答的是"本卷会不会报非零"。一个对多数文件报
+   真值、对个别文件瞎报 0 的驱动，仍会被采信——单文件无从证伪。这是拿"整卷收益"换来的取舍，
+   与 M6-P2 当年"整卷放弃"的选择相反，方向已由用户裁定受理（本项即其解锁条件）。
+4. **全洞语料卷拿不到收益**：该卷上被 stat 到的普通文件若**全是**全洞（或全被剪枝），就没有
+   证据 ⇒ 维持未统计。刻意如此：没有可证伪的证据就不采信。
+5. **UI 未呈现**（裁定 ②/③）：本轮只到 `FileEntry.Actual/ActualKnown` 与 `fdd-cli` 的组级聚合；
+   "实占未知"与"真 0"在界面上的区分属 M8。划账不得因后端字段齐了就记兑现。
+6. **Windows 的 FNV 冲突**：两卷哈希相撞时证据会混池（方向是"更易被采信"）。概率约 2⁻⁶⁴，
+   且需要其中一卷先产生非零证据；记在此处，不写进代码。
+7. **证据的可见面**：只来自"被 stat 到的普通文件"——目录（E10）、符号链接（跳过）、非普通文件、
+   被剪枝/未遍历到的子树都不参与；0 字节文件报 0 无信息量。
+8. **计数无变化**：M28 不跳过任何文件，`ScanSummary` 的任何一个计数都不动（收益只体现在
+   `Actual`/`ActualKnown` 与组级 `reclaimable_actual`）。
