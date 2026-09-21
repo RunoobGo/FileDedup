@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"filededup/internal/ads"
 	"filededup/internal/fsid"
 	"filededup/internal/hasher"
 	"filededup/internal/model"
@@ -126,6 +127,11 @@ type Options struct {
 	TrashVerifiesRecycle bool
 }
 
+// adsCheck NTFS 备用数据流判据（M6-P3）。抽成包级变量供测试注入假判据：
+// 真实的命名流只有 NTFS 造得出来（`echo x > f.txt:note` 在 APFS/exFAT 上不会创建
+// 流），而"该不该拦""拦了之后账怎么记"这两件真正可测的事不该留白。
+var adsCheck = ads.Check
+
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
 // 安全语义（01 §9 / 02 决策 7）：
 //   - 保留项拒绝执行（S2）；delete 必须 ConfirmDanger（S4）
@@ -234,6 +240,21 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: "校验失败：文件在扫描后被修改"})
 			report(e.Path)
 		default:
+			// M6-P3 备用数据流守卫：内容校验已通过、正要进 toProcess 的那一刻。
+			// 位置只有这一处是有意的——五种 op.Kind（trash/delete/move/hardlink/
+			// symlink）全部只处理进了 toProcess 的项，而 toProcess 唯一来源就是
+			// 上面这道循环，所以一道守卫覆盖全部破坏性动作。
+			//
+			// 记 Failed 而不是像 M6-P1 那样记 Skipped：语境相反。扫描期的跳过是
+			// 引擎替用户省流量（用户没要求操作）；这里用户已经点了清理，这一项
+			// **没做成**，必须进失败抽屉。Stage 用 "ads" 而非复用 "verify"，
+			// 因为两者的处置建议完全不同（"文件被改过"要重扫，"有备用流"要手工处理）。
+			if oc := adsCheck(e.Path); oc.Reject {
+				res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "ads", Err: oc.Reason})
+				emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: oc.Reason})
+				report(e.Path)
+				continue
+			}
 			toProcess = append(toProcess, e)
 			procIDs = append(procIDs, vid)
 		}

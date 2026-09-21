@@ -160,7 +160,7 @@ func ReclaimActual(files []*FileEntry) uint64 {
 // FailedItem 失败清单条目（扫描与操作共用）。
 type FailedItem struct {
 	Path  string
-	Stage string // scan/prefilter/hash/verify/ops
+	Stage string // scan/prefilter/hash/verify/ads/ops
 	Err   string
 }
 
