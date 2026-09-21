@@ -193,12 +193,30 @@ func (f *folder) foldRoot(i int) string {
 	return fscase.Fold(f.roots[i], f.sens[i])
 }
 
-// key 折叠 + 分隔符统一为 "/" 的**比较键**。
-// 不能拿 fold 的结果直接做前缀比较：fold 在不敏感卷上会把 "\" 换成 "/"，
-// 在敏感卷上原样返回，两种形态混在一起比较时前缀判定会静默失效
-// （04 §6.8.8 登记的 dedupeRoots 同类问题正是这一条）。
+// keyOf 把**折叠后的路径**归一成比较键：平台分隔符一律换成 "/"。
+// sep 是平台分隔符真值（H6：差异由参数注入，不靠 build tag 分流），
+// 生产调用点传 string(filepath.Separator)。
+//
+// 为什么非归一不可：fold 只在**不敏感卷**上顺手把 "\" 换成 "/"，敏感卷上原样返回，
+// 于是"折叠后的串"两种分隔符都可能出现。拿这种串去和"按平台分隔符拼出来的前缀"比较，
+// 在 Windows（分隔符 "\"）上就恒不成立——04 §6.8.8 登记的 M26 正是这一条，
+// 而 darwin/Linux 上两种写法恰好同值，看不出问题。
+//
+// 分工写死在这里：filepath.Separator 是**输入侧**的归一真值（本函数的 sep 参数），
+// "/" 是**键空间**的约定。把两者混进同一个表达式，就是 M26 的成因。
+func keyOf(folded, sep string) string {
+	return strings.ReplaceAll(folded, sep, "/")
+}
+
+// underKey 判断键 key 是否就是 root 本身、或位于其下。两个参数都必须是 keyOf 的产物。
+// 键空间里恒为 "/"，故前缀一律用 "/" 拼——**这里不许出现平台分隔符**（见 keyOf 注释）。
+func underKey(key, root string) bool {
+	return key == root || strings.HasPrefix(key, root+"/")
+}
+
+// key 折叠 + 分隔符统一为 "/" 的**比较键**（键空间构造的唯一入口，见 keyOf）。
 func (f *folder) key(p string) string {
-	return strings.ReplaceAll(f.fold(p), string(filepath.Separator), "/")
+	return keyOf(f.fold(p), string(filepath.Separator))
 }
 
 // rootsUnder 返回位于 dir（含自身）之下的那些用户原始根。
@@ -206,7 +224,7 @@ func (f *folder) key(p string) string {
 func rootsUnder(keys []string, paths []string, dirKey string) []string {
 	var out []string
 	for i, k := range keys {
-		if k == dirKey || strings.HasPrefix(k, dirKey+"/") {
+		if underKey(k, dirKey) {
 			out = append(out, paths[i])
 		}
 	}
@@ -558,11 +576,14 @@ func dedupeRoots(roots []string) ([]string, []bool, []string) {
 	var keepSens []bool
 	for i, r := range out {
 		dup := false
-		fr := fscase.Fold(r, sens[i])
+		// M26：比较键先归一（keyOf），前缀判定走 underKey——两者都在 "/" 空间里，
+		// 与平台分隔符无关。修前这里写的是 fk+string(filepath.Separator)，
+		// 而 fr/fk 在 Windows 不敏感卷上是 "c:/a/b" 这种形态 ⇒ 该分支恒不成立。
+		fr := keyOf(fscase.Fold(r, sens[i]), string(filepath.Separator))
 		for j, k := range kept {
 			// k 是 r 的前缀目录（各按自身卷的语义折叠后比较）
-			fk := fscase.Fold(k, keepSens[j])
-			if fr == fk || strings.HasPrefix(fr, fk+string(filepath.Separator)) {
+			fk := keyOf(fscase.Fold(k, keepSens[j]), string(filepath.Separator))
+			if underKey(fr, fk) {
 				dup = true
 				break
 			}
