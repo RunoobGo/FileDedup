@@ -17,6 +17,10 @@ export const emptyFilters = (): Filters => ({
   MaxSize: 0,
   ExcludePaths: [],
   IncludeHidden: false,
+  // M6-P1：默认不读取云端占位（安全档）。必须在此显式列出——payload 由
+  // {...filters} 浅合并且空清单会 `delete Filters.IncludeExts`，隐式缺省会让
+  // 这一档随调用点漂移；显式 false 才是可回归的契约。
+  AllowCloudHydration: false,
 })
 
 // 大小过滤单位换算：UI 输入框标注 KB（ScanView），后端 internal/filter/filter.go

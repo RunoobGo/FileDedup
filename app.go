@@ -145,6 +145,13 @@ type ScanSummary struct {
 	// 用户看到的结果比盘上少，就得有一个地方说明少掉的是什么、为什么。
 	ProtectedDirs  uint64 `json:"protectedDirs"`
 	ProtectedFiles uint64 `json:"protectedFiles"`
+	// SkippedCloudFiles 本轮因"云端占位"跳过的文件数（M6-P1）。计数与
+	// ProtectedFiles 同理：命中不是失败，但静默放弃会让用户以为盘上就只有这些
+	// 可去重文件。AllowCloudHydration=true 时恒为 0。
+	//
+	// ★ 同 UnprotectedRoots 的口径缺口：history.db 没存这个数，从记录页恢复时
+	// 只能显示"未统计"，不得用零值冒充"这一轮没有云端文件"。
+	SkippedCloudFiles uint64 `json:"skippedCloudFiles"`
 	// UnprotectedRoots 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名
 	// 了清单内的路径或其内部）。警示文案属 M8（本轮只有 JSON 与 CLI 报告）。
 	//
@@ -622,6 +629,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		// 没有新的 StartScan ⇒ 没有新一轮 Run ⇒ 这几个值仍是本轮的"。
 		pDirs := a.pipe.ProtectedDirs()
 		pFiles := a.pipe.ProtectedFiles()
+		cloudSkipped := a.pipe.CloudSkipped()
 		unprot := a.pipe.UnprotectedRoots()
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
@@ -632,6 +640,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			Elapsed:           elapsed.String(),
 			ProtectedDirs:     pDirs,
 			ProtectedFiles:    pFiles,
+			SkippedCloudFiles: cloudSkipped,
 			UnprotectedRoots:  unprot,
 		})
 	})

@@ -29,6 +29,11 @@ type FileEntry struct {
 }
 
 // Filters 扫描过滤器。
+//
+// 没有 JSON tag：字段名就是线名（前端 wails.ts 的 Filters 按 PascalCase 镜像）。
+// 新增布尔位一律把**安全侧留成零值**——AllowCloudHydration 因此是"允许"而非"禁止"：
+// 旧 settings.json、旧历史行、以及前端尚未跟进的 emptyFilters() 三种情形都解成
+// false＝跳过占位，不需要任何迁移代码（设计稿 §4.2）。
 type Filters struct {
 	IncludeExts   []string // 空 = 全部，如 ".jpg"
 	ExcludeExts   []string
@@ -36,6 +41,9 @@ type Filters struct {
 	MaxSize       uint64   // 0 = 不限
 	ExcludePaths  []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
 	IncludeHidden bool
+	// AllowCloudHydration=true 时**照常读取云端占位文件**（即隐式触发按需下载），
+	// 且不计数。默认 false＝跳过并计 SkippedCloudFiles。
+	AllowCloudHydration bool
 }
 
 // TaskStatus 任务状态机取值。

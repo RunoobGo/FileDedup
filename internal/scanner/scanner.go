@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"filededup/internal/cloudfile"
 	"filededup/internal/filter"
 	"filededup/internal/fscase"
 	"filededup/internal/model"
@@ -82,6 +83,13 @@ type Result struct {
 	// ProtectedDirs 只数**目录**：剪枝没有下潜，报"跳过了 N 个文件"就是编数。
 	ProtectedDirs  int
 	ProtectedFiles int
+	// SkippedCloudFiles 是 M6-P1 跳过的云端占位文件数（macOS dataless /
+	// Windows RECALL_ON_DATA_ACCESS）。为什么又是"独立计数、不记 Failed"：
+	// 占位文件没被读取就没被去重，是引擎**按用户默认意愿**主动放弃的（读了
+	// 就等于替用户下载全文），语义上同 ProtectedFiles 一类；但它影响的正是
+	// 用户最关心的"能省多少"，所以必须单列一个数，让界面能说清"这次没算的是
+	// 云端文件，共 N 个"。允许水合（AllowCloudHydration）时照常读取、**不计数**。
+	SkippedCloudFiles int
 	// UnprotectedRoots 是"因为用户显式指定了它，所以保护对它失效"的根路径。
 	// 界面必须据此警示（M8）：这些根扫出来的东西可能全是系统元数据，
 	// 也可能是用户唯一真正想扫的——两种情况下他都该知道自己脱离了保护范围。
@@ -98,6 +106,11 @@ type Waiter interface {
 // probeCaseSensitive 同一手法）：盘根伪文件与 Windows 保留名只在 Windows 清单里，
 // 不能注入就永远只能在 Windows 上才有断言机会，而那是"等于没测"。
 var guard = sysguard.New(sysguard.Current)
+
+// cloudCheck 云端占位判据（M6-P1）。抽成包级变量供测试注入假判据：
+// 真实的 dataless/RECALL 位要靠云端客户端配合制造，本机与 CI 都造不出来，
+// 不能注入就等于把"顺序对不对""计数准不准"这两件真正可测的事留白。
+var cloudCheck = cloudfile.Of
 
 // probeCaseSensitive 按卷探测入口；抽成变量供测试扮演敏感/不敏感卷
 // （真实大小写敏感卷需要专门格式化的卷，本机与 CI 都无法现造）。
@@ -233,6 +246,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	// 保护计数按 worker 记账、收口时合并（与 locals/fails 同一手法，不加锁）。
 	protDirs := make([]int, workers)
 	protFiles := make([]int, workers)
+	cloudSkipped := make([]int, workers)
 	escapedRoots := make([][]string, workers)
 	var workerWg sync.WaitGroup
 
@@ -351,6 +365,19 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						fails[idx] = append(fails[idx], model.FailedItem{Path: full, Stage: "scan", Err: err.Error()})
 						continue
 					}
+					// M6-P1 云端占位：必须排在 IsRegular / 0 字节 / matcher.Apply
+					// **三者之前**（04 §6.9.4 判据）。两处理由不同：
+					//   - Windows 的 RECALL 位只存在于 Info() 带来的属性里，而占位
+					//     文件在部分客户端下 Mode 并不可靠；放 IsRegular 之后就永远看不到。
+					//   - 计数说的是"有多少云端文件没参与"，与扩展名/大小过滤无关：
+					//     放在 matcher 之后，一个 .txt 的占位会被扩展名过滤静默吃掉，
+					//     这个数就开始说谎。
+					// 允许水合（AllowCloudHydration）时整段跳过：用户显式要读，
+					// 那就按普通文件走，既不跳过也不计数。
+					if !f.AllowCloudHydration && cloudCheck(info) {
+						cloudSkipped[idx]++
+						continue
+					}
 					if !info.Mode().IsRegular() {
 						continue
 					}
@@ -413,6 +440,9 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}
 	for _, n := range protFiles {
 		res.ProtectedFiles += n
+	}
+	for _, n := range cloudSkipped {
+		res.SkippedCloudFiles += n
 	}
 	// 逃逸根去重后排序：多个 worker 可能各自报同一个根，而 worker 完成顺序
 	// 不确定——不排序就是同一份输入两次扫描给出两份清单（回归无法断言，

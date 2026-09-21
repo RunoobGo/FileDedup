@@ -8,6 +8,11 @@ export interface Filters {
   MaxSize: number
   ExcludePaths: string[]
   IncludeHidden: boolean
+  // M6-P1 云端占位：true = 照常读取（隐式触发按需下载）且不计数；
+  // false = 跳过并计入 skippedCloudFiles。Go 侧零值即安全档，但这里必须
+  // 显式列出：TS 的对象字面量缺字段会被当成 undefined 下发，Go 解出 false
+  // 恰好也是安全档——写出来是为了让"新增一档语义"这件事在前端可见。
+  AllowCloudHydration: boolean
 }
 
 export interface ScanConfig {

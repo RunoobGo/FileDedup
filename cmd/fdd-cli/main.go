@@ -51,6 +51,10 @@ type report struct {
 		// 不折算成被剪走的文件总量——剪枝没下潜，估出来的就是假数。
 		ProtectedDirs  int `json:"protected_dirs"`
 		ProtectedFiles int `json:"protected_files"`
+		// M6-P1（2026-09-21）云端占位跳过数。为 0 有两种含义——盘上确实没有
+		// 占位文件，或用户用 -allow-cloud-hydration 显式允许读取——后者由
+		// 命令行自身知情，报告里不复述，避免为一个大可不必的状态加字段。
+		SkippedCloudFiles int `json:"skipped_cloud_files"`
 		// M6-P2（2026-09-21）实占口径合计。reclaimable_bytes 保留逻辑口径不动
 		// （它是历史数字与既往报表的参照），实占另起一键，两数之差就是稀疏/
 		// 压缩文件此前被虚报的量。
@@ -68,6 +72,7 @@ func main() {
 	maxSize := flag.Uint64("max-size", 0, "最大文件大小字节（0=不限）")
 	exclude := flag.String("exclude", "", "扩展名排除，逗号分隔，如 .tmp,.log")
 	includeHidden := flag.Bool("hidden", false, "包含隐藏文件")
+	allowCloud := flag.Bool("allow-cloud-hydration", false, "允许读取云端占位文件（会触发按需下载）")
 	out := flag.String("o", "", "输出到文件（默认 stdout）")
 	cachePath := flag.String("cache", "", "哈希缓存 DB 路径（空 = 禁用缓存）")
 	flag.Usage = func() {
@@ -89,6 +94,8 @@ func main() {
 			MinSize:       *minSize,
 			MaxSize:       *maxSize,
 			IncludeHidden: *includeHidden,
+			// M6-P1：默认 false＝跳过云端占位并计数，与 GUI 同一默认档。
+			AllowCloudHydration: *allowCloud,
 		},
 	}
 	for _, e := range strings.Split(*exclude, ",") {
@@ -147,6 +154,7 @@ func main() {
 	r.Stats.CacheHits = int(p.CacheHits())
 	r.Stats.ProtectedDirs = int(p.ProtectedDirs())
 	r.Stats.ProtectedFiles = int(p.ProtectedFiles())
+	r.Stats.SkippedCloudFiles = int(p.CloudSkipped())
 
 	var w io.Writer = os.Stdout
 	if *out != "" {
