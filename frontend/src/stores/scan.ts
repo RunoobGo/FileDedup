@@ -778,6 +778,15 @@ export const useScanStore = defineStore('scan', () => {
     })
     // 初始拉取
     api.getVersion().then((v: string) => (appVersion.value = v)).catch(() => {})
+    // M12b：启动阶段的一次性提示。后端 startup 跑在本文件 bind 之前，
+    // 那会儿事件发出来没人接，所以只能由这里拉——文案长且是"账本没了"级别，
+    // 给 20s 而不是默认 6s。
+    api
+      .getStartupNotice()
+      .then((msg: string) => {
+        if (msg) toast().push(msg, 'warn', 20000)
+      })
+      .catch(() => {})
     api.getSettings().then((s: Settings) => {
       settings.value = s
       // 应用主题

@@ -257,6 +257,10 @@ export interface BackendAPI {
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
+  // GetStartupNotice 启动阶段的一次性提示（无则空串）。M12b：历史库影像损坏
+  // 被隔离重建时，后端在 startup 里就知道，但那时前端还没注册监听器，
+  // 事件必丢——所以由前端初始拉取取走。
+  GetStartupNotice(): Promise<string>
   ListScanHistory(): Promise<HistoryMeta[]>
   LoadScanHistory(id: number): Promise<ScanSummary>
   DeleteScanHistory(id: number): Promise<void>
@@ -324,6 +328,7 @@ export const api = {
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),
+  getStartupNotice: (): Promise<string> => backend().GetStartupNotice(),
   listScanHistory: (): Promise<HistoryMeta[]> => backend().ListScanHistory(),
   loadScanHistory: (id: number): Promise<ScanSummary> => backend().LoadScanHistory(id),
   deleteScanHistory: (id: number): Promise<void> => backend().DeleteScanHistory(id),

@@ -174,7 +174,14 @@ type App struct {
 	// 让关闭按钮第一次按下是"中止并等待"，第二次才是"照办退出"。
 	wg          sync.WaitGroup
 	quitPending int
-	forceExit   func(code int) // 可测接缝：单测里不能真把测试进程带走
+
+	// startupNotice 启动阶段产生、但事件送不达的提示（M12b）。
+	// startup 跑在前端注册监听之前，emit 出去也没人接（app:ready 之所以能用，
+	// 是因为它只是给界面变个版本号，丢了无所谓；本条丢了就等于没修），
+	// 因此改由前端初始化时主动拉一次，见 GetStartupNotice。
+	startupNotice string
+
+	forceExit func(code int) // 可测接缝：单测里不能真把测试进程带走
 
 	// H5：本会话内经原生目录选择器（SelectDirectory）明确授权过的目录集合
 	// （Clean 后的绝对路径）。move 的 TargetDir 必须落在其内——此前该参数是
@@ -246,18 +253,39 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	// v0.5.0：扫描历史/清理账本（独立 history.db，确证损坏时隔离重建）
-	if a.cfgDir != "" {
-		histPath := filepath.Join(a.cfgDir, "history.db")
-		if hs, err := history.Open(histPath); err == nil {
-			a.hist = hs
-		} else {
-			// 2026-09-18 审查 C3 之后这里不再只是"失去历史/回撤能力"：账本不可用时
-			// 回收站/移动/硬链接会被拒绝执行（仅永久删除照常），见 beginJournal。
-			// 留痕必须说清后果，否则用户只看到"清理报账本不可用"而不知所以然。
-			fmt.Fprintf(os.Stderr, "[history] 历史库不可用：本次运行不保存历史，且回收站/移动/硬链接清理将被拒绝执行: %v (path=%s)\n", err, histPath)
-		}
-	}
+	a.openLedger()
 	a.emit(a.ctx, "app:ready", AppVersion)
+}
+
+// openLedger 打开账本库，并在"确证损坏→隔离重建"发生时把原因留给界面。
+//
+// 从 startup 里抽出来是为了可测：startup 会去解析真实的 os.UserConfigDir，
+// 单测调用它就会动到用户机器上的 history.db（隔离逻辑甚至会把它改名）。
+// 这里对 a.hist 的直接写在 M9 的白名单内（startup / openLedger / shutdown
+// 同属"启动前置"，那时还没有任何并发读者）。
+func (a *App) openLedger() {
+	if a.cfgDir == "" {
+		return
+	}
+	histPath := filepath.Join(a.cfgDir, "history.db")
+	hs, err := history.Open(histPath)
+	if err != nil {
+		// 2026-09-18 审查 C3 之后这里不再只是"失去历史/回撤能力"：账本不可用时
+		// 回收站/移动/硬链接会被拒绝执行（仅永久删除照常），见 beginJournal。
+		// 留痕必须说清后果，否则用户只看到"清理报账本不可用"而不知所以然。
+		fmt.Fprintf(os.Stderr, "[history] 历史库不可用：本次运行不保存历史，且回收站/移动/硬链接清理将被拒绝执行: %v (path=%s)\n", err, histPath)
+		return
+	}
+	a.hist = hs
+	// M12b（2026-09-21 全仓审计 §五 12）：确证损坏的账本被隔离重建后，原先只
+	// fprintf(stderr)，GUI 用户没有终端，看到的只是"历史记录页凭空变空"。
+	// 不能用 emit：此刻前端的监听器还没注册（bind 在 store.init 里，早于挂载的
+	// 事件都会丢），所以存进 startupNotice，由前端初始拉取取走。
+	if q := hs.QuarantinedTo(); q != "" {
+		a.mu.Lock()
+		a.startupNotice = ledgerQuarantineNotice(q)
+		a.mu.Unlock()
+	}
 }
 
 // beforeClose 挂到 options.OnBeforeClose：返回 true 表示「这一次先别关窗口」。
@@ -1099,6 +1127,24 @@ func defaultSettings() Settings {
 }
 
 // ---------- 版本与存根（M3/M4/M5 范围） ----------
+
+// ledgerQuarantineNotice 把"账本影像损坏已隔离重建"翻成界面文案（纯函数）。
+// 必须说清三件事：为什么历史记录空了、旧文件还在不在（在，可自行恢复）、
+// 后果是什么（此前记录的清理操作不再有回撤依据）。
+func ledgerQuarantineNotice(quarantined string) string {
+	return "历史记录与回撤账本已清空：历史库影像损坏，已隔离为 " +
+		filepath.Base(quarantined) + " 并重建。旧文件仍在配置目录，需要时可手工查看或恢复；" +
+		"本次运行起，此前记录的清理操作无法再回撤。"
+}
+
+// GetStartupNotice 取启动阶段的一次性提示（无则空串）。
+// 为什么不是事件：见 App.startupNotice 的注释——startup 早于前端注册监听，
+// 发出去的事件必然丢；前端在 store.init 的"初始拉取"里调一次即可。
+func (a *App) GetStartupNotice() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.startupNotice
+}
 
 // GetVersion 当前版本。
 func (a *App) GetVersion() string { return AppVersion }

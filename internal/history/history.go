@@ -42,7 +42,15 @@ type Store struct {
 	mu   sync.Mutex
 	db   *sql.DB
 	path string
+	// quarantined 非空表示本次 Open 走了"影像损坏→改名隔离→重建"，值是隔离后的文件名。
+	// 只在 Open 里写一次，之后只读（见 QuarantinedTo）。
+	quarantined string
 }
+
+// QuarantinedTo 返回本次打开时被隔离的旧库文件名；未发生隔离则返回空串。
+// M12b（2026-09-21 全仓审计 §五 12）：隔离重建后用户看到的是"历史记录页凭空变空"，
+// 而原因只写在 stderr——GUI 用户根本没有终端。这个出口让 App 层能把原因说给界面。
+func (s *Store) QuarantinedTo() string { return s.quarantined }
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS scan_history (
@@ -148,6 +156,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db, err := initConn(path)
+	var quarantinedName string
 	if err != nil {
 		if !dbfile.Exists(path) || !dbfile.IsCorruption(err) {
 			// 暂时性/环境故障：报出去（调用方会失去历史能力但绝不丢数据）。
@@ -158,6 +167,7 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("历史库影像损坏但隔离失败，已放弃重建（未删除文件）: %w（原始错误：%v）", qerr, err)
 		}
 		fmt.Fprintf(os.Stderr, "[history] 历史库影像损坏，已改名隔离为 %s 后重建\n", quarantined)
+		quarantinedName = quarantined // M12b：还要经 QuarantinedTo 说给界面，见下面的 accessor
 		db, err = initConn(path)
 		if err != nil {
 			return nil, fmt.Errorf("历史库重建失败: %w", err)
@@ -178,7 +188,7 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, path: path}, nil
+	return &Store{db: db, path: path, quarantined: quarantinedName}, nil
 }
 
 // Close 释放句柄。

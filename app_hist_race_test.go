@@ -74,10 +74,11 @@ func TestHistFieldReadsRaceWithShutdown(t *testing.T) {
 
 // histFieldDirectReadFuncs 允许直接读写 a.hist 的函数（其余一律走 histSnapshot）。
 //
-// startup / shutdown 是生命周期的两端（赋值、锁内 Close+置空）；histSnapshot 是唯一
-// 出口。这三处怎么写都行。
+// startup / openLedger / shutdown 是生命周期的两端（赋值、锁内 Close+置空）；
+// histSnapshot 是唯一出口。这几处怎么写都行——openLedger 从 startup 抽出（M12b
+// 要把"隔离重建"做成可测），跑在同一时刻：那时还没有任何并发读者。
 var histFieldDirectReadFuncs = map[string]bool{
-	"startup": true, "shutdown": true, "histSnapshot": true,
+	"startup": true, "openLedger": true, "shutdown": true, "histSnapshot": true,
 }
 
 // histSnapshotOnlyFuncs 允许读字段、但**只许**以 `hs := a.hist` 形式读一次的函数：

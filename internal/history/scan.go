@@ -249,9 +249,25 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 func (s *Store) UpdateKeepPaths(histID int64, paths []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE scan_history SET keep_paths = ? WHERE id = ?`,
+	res, err := s.db.Exec(`UPDATE scan_history SET keep_paths = ? WHERE id = ?`,
 		mustJSON(paths), histID)
-	return err
+	if err != nil {
+		return err
+	}
+	// M12a（2026-09-21 全仓审计 §五 12）：行不存在时必须报错，不能静默返回 nil。
+	// 这一行可能刚被裁剪或删除（PruneScanFiles 的空组回收、DeleteScanHistory、
+	// ClearScanHistory），静默"成功"等于界面上显示已保存、库里那行根本不存在——
+	// 下次恢复该历史时保留项回到上一次的状态，而用户以为他的决策一直生效。
+	// 同文件的 FinishItem/FinalizeOp 都做了 n == 0 报错，这里是漏网的那一处。
+	// 调用方 App.persistKeepPaths 已带 histID == 0 短路，故报错只可能是"行真没了"。
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("历史记录 %d 不存在（可能已被删除或裁剪），保留决策未写入", histID)
+	}
+	return nil
 }
 
 // PruneScanFiles 按已消失路径裁剪历史（清理操作完成后调用）：删文件行、
