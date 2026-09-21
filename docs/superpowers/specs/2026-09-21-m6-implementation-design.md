@@ -1382,3 +1382,23 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
 5. **V2 在 macOS 上 skip**：父卷不敏感 ⇒ 两棵真目录无法并存，兑现环境是 Linux CI
    （与 C1 的 V3 正好互补：那条在 macOS 因不敏感而 skip、在 Linux 兑现；本条同）。
    本机证据由 V6 的 `hdiutil` 真构型读数承担。
+
+### 10.6 实施后追记（2026-09-21，逐条真读数）
+
+改动落地为 commit `693c9b6`（设计段 `816faf3`），划账在 04 §6.9.10。逐条对照本节的预测：
+
+| 预测 | 实测 | 结论 |
+|---|---|---|
+| V1 红在"编译红 + 旧断言语义相反" | 编译红如期（新 API）；语义相反由 M-M36-a 复现：`visitKey("/X/Docs/Sub/F.TXT") = "/x/docs/sub/f.txt", want "/X/Docs/Sub/F.TXT"` | 一致 |
+| V2 本机 skip、Linux 兑现、真读数 2→3 | 默认 `TMPDIR` 下 SKIP（如期）；**把 `TMPDIR` 指向 `hdiutil` 敏感卷后 PASS**（新发现的兑现途径，三条需敏感卷的用例同批通过）；V6 真构型 `files_total=2 → 3` | 一致，且兑现面比预测宽 |
+| V3 修前放行、修后 fail-closed | 修后 PASS；M-M36-c 下三条断言全红（含 `UnprotectedRoots = […/LOST+FOUND/inner]`——修前会报出一个用户没点过的根） | 一致 |
+| V4/V5 保持绿 | 全包（含敏感卷 `TMPDIR`）`ok`；`TestDedupeRootsFoldsByProbedVolume`、`TestWalkCaseSensitivityIsProbed`、`TestWalkSingleRootSkipsProbe`、`TestRootInsideProtectedDirStillScanned` 均 PASS（后者在敏感卷 `TMPDIR` 下也跑到了真两棵） | 一致 |
+| M-M36-e 不可杀 | 如期不可杀（两种 `TMPDIR` 全包 `ok`），如实记录为"无危害" | 一致 |
+| 三条 `folder` 用例被推翻 | 原位替换为 `TestVisitKeyNeverFolds`（+3 −3，源级 `^func Test` 仍 588）；`dedupeRoots` 顺带收窄为两返回值，方案 B 的"已知不美"消失 | 一致 |
+
+一处**口径更正**（与实现无关，属划账口径）：此前 §6.9.8/§6.9.9 记的"PASS 608 = 顶层 RUN 612"
+把两级并作一个数——608 是含 71 条子用例的锚定 PASS 行数，612 的 `^=== RUN` 里也含那 71 条
+（子用例的 RUN 行不带缩进、结果行带缩进）。本项起按顶层/子用例分层记录，详见 04 §6.9.10。
+
+边界里新登记的一条（E10 兑现）：**M44** —— 逃逸判据的键精确化后，不敏感卷上"手输拼写与盘上
+仅大小写不同"的保护清单内路径不再放行剪枝（fail-closed），由 V3 钉成断言。
