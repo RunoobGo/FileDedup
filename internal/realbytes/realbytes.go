@@ -29,6 +29,10 @@ const BlockSize = 512
 //  3. 其余情形**原样返回，不做封顶**——实占大于逻辑是真实存在的一类
 //     （块粒度：1 KiB 实写占 4 KiB；预分配：mkfile -n 8m 占 8 MiB）。
 //     `min(实占, 逻辑)` 会凭空抹掉这一块。
+//     **反方向也有一类（M27）**：CoW 克隆/块级去重卷上共享 extent 被每一份各计一次
+//     （本机 APFS 真读数：克隆对各自报满额、删掉一份只释放 0 B）⇒ 返回值在这类卷上是
+//     **上限**而非确定值。per-file 不可区分（用户态没有 extent 映射这条路），
+//     呈现侧按卷标注属 M8；夹具见 realbytes_clone_darwin_test.go，算术与读数见 04 §6.9.13。
 func From(size, reported uint64, ok, trustsZero bool) (actual uint64, known bool) {
 	if !ok {
 		return size, false
