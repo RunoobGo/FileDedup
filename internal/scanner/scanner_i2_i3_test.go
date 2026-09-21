@@ -91,6 +91,8 @@ func TestWalkPanicIsolatedAsFailed(t *testing.T) {
 // 不碰盘，因此在任何分隔符、任何大小写语义的卷上都成立。
 // 断言的是 I2 的实质——折叠与否**只来自按卷探测**：
 // 同一对仅大小写不同的根，探测说不敏感就并成一棵，说敏感就留两棵。
+// M36（2026-09-21）之后这里是折叠**唯一**的消费方（遍历键一律不折，见 visitKey），
+// 故这条也是"折叠没有一并被删掉"的反向对照。
 func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
 	base := t.TempDir() // 绝对路径，分隔符与卷名前缀交给平台
@@ -106,7 +108,7 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	}
 
 	sens(false)
-	kept, ksens, _ := dedupeRoots(variants)
+	kept, _ := dedupeRoots(variants)
 	if len(kept) != 1 {
 		t.Fatalf("探测说不敏感时保留根数 = %d, want 1（两根应被并成一棵）：%v", len(kept), kept)
 	}
@@ -115,13 +117,10 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	}
 
 	sens(true)
-	kept, ksens, _ = dedupeRoots(variants)
+	kept, _ = dedupeRoots(variants)
 	if len(kept) != 2 {
 		t.Fatalf("探测说敏感时保留根数 = %d, want 2（两棵子树各自入列，修正前被折叠成一棵）：%v",
 			len(kept), kept)
-	}
-	if len(ksens) != 2 || !ksens[0] || !ksens[1] {
-		t.Fatalf("保留根的卷语义标注 = %v, want [true true]", ksens)
 	}
 	if n := probed.Load(); n == 0 {
 		t.Fatal("敏感卷未走按卷探测（折叠仍被硬编码）")
@@ -206,40 +205,37 @@ func TestWalkSingleRootSkipsProbe(t *testing.T) {
 	}
 }
 
-// TestFolderSingleRootNeverFolds C1（设计稿 §6.4 V1）：**单根不折叠**是结构性结论
-// （单根遍历里每个目录只会以唯一拼写出现），不是"这台机器恰好如此"，故直接对 newFolder
-// 断言、不依赖任何卷属性。sens 故意给 false（darwin/windows 的平台默认）——修前正是它
-// 让单根的键全部小写化，把被折叠的两棵**不同**目录并成一棵。
-func TestFolderSingleRootNeverFolds(t *testing.T) {
+// TestVisitKeyNeverFolds M36（设计稿 §10.3 V1）：**遍历期的比较键一律不折叠**。
+//
+// 这里原位替换了原先三条直接戳 folder 的用例——`TestFolderSingleRootNeverFolds`、
+// `TestFolderMultiRootStillFolds`、`TestFolderFoldPerRoot`。它们断言的对象
+// （`newFolder`/`fold`/`foldRoot`/`needFold`）在方案 C 下被整体删除，属设计稿 §6.2
+// 已经预告过的"推翻 I2 当年定的机制"那一半；旧用例要的"折叠按各根所在卷分别生效"
+// 现在**只**发生在 `dedupeRoots` 的合并判据里，由上面的
+// TestDedupeRootsFoldsByProbedVolume 继续钉住。遍历键这边的新判据更强：
+// 不分根数、不看卷语义、一律拼写精确（三个维度都不再有参数）。
+//
+// 纯字符串推理，不碰盘、不需要敏感卷，故在任何平台任何卷上都成立；
+// 真夹具与真构型（hdiutil 挂敏感卷）读数见同目录 scanner_m36_test.go 与设计稿 §10.0。
+func TestVisitKeyNeverFolds(t *testing.T) {
 	sep := string(filepath.Separator)
-	root := filepath.Join(sep, "X", "Docs")
-	f := newFolder([]string{root}, []bool{false})
-	if f.needFold {
-		t.Fatal("单根扫描不应启用折叠：启用后大小写不同的两棵子树会被并成一棵（静默漏扫）")
-	}
-	sub := filepath.Join(root, "Sub", "F.TXT")
-	if got := f.fold(sub); got != sub {
-		t.Errorf("单根 fold(%q) = %q, want 原样（改大小写即折叠没关掉）", sub, got)
-	}
-	if got := f.foldRoot(0); got != root {
-		t.Errorf("单根 foldRoot(0) = %q, want %q（visited 种子键必须与 fold 同口径）", got, root)
-	}
-}
+	toSlash := func(p string) string { return strings.ReplaceAll(p, sep, "/") }
 
-// TestFolderMultiRootStillFolds C1（设计稿 §6.4 V2）：反向对照——两根时 I2 的按卷折叠
-// 一字不动，证明修的是"单根"而不是"取消折叠"。
-func TestFolderMultiRootStillFolds(t *testing.T) {
-	sep := string(filepath.Separator)
-	senRoot := filepath.Join(sep, "sen")
-	insRoot := filepath.Join(sep, "ins")
-	f := newFolder([]string{senRoot, insRoot}, []bool{true, false})
-	if !f.needFold {
-		t.Fatal("两根且有一根不敏感时必须启用折叠（I2 语义不得被 C1 改动）")
+	// 1) 大小写原样：路径里有几处大小写，键里就有几处（只允许分隔符归一）。
+	p := filepath.Join(sep, "X", "Docs", "Sub", "F.TXT")
+	if got := visitKey(p); got != toSlash(p) {
+		t.Errorf("visitKey(%q) = %q, want %q（键只允许归一分隔符）", p, got, toSlash(p))
 	}
-	p := filepath.Join(insRoot, "Dir", "F.TXT")
-	want := strings.ToLower(strings.ReplaceAll(p, sep, "/"))
-	if got := f.fold(p); got != want {
-		t.Errorf("两根时不敏感根下的路径仍应折叠: got %q, want %q", got, want)
+	// 2) 反向：两种拼写必须给出两个键——这正是 M36 的判据本身
+	//    （折成一个键 ⇒ 大小写不同的两棵子树被并成一棵，静默漏扫且不记失败）。
+	lower := strings.ToLower(p)
+	if visitKey(lower) == visitKey(p) {
+		t.Errorf("visitKey 把两种拼写折成同一个键（%q）：大小写不同的两棵子树会被并成一棵",
+			visitKey(p))
+	}
+	// 3) 键空间约定不变（M26）：分隔符归一到 "/"，与平台无关。
+	if got := keyOf(`C:\a\B`, `\`); got != "C:/a/B" {
+		t.Errorf("keyOf 在 Windows 真值下未把分隔符归一到键空间：%q", got)
 	}
 }
 
@@ -262,42 +258,5 @@ func TestWalkSingleRootKeepsCaseVariantSubtrees(t *testing.T) {
 	}
 	if len(res.Failed) != 0 {
 		t.Fatalf("不应有失败项（修前也是 0——这正是本项「静默」的地方）: %+v", res.Failed)
-	}
-}
-
-// TestFolderFoldPerRoot 混合卷语义：折叠按各根所在卷分别生效，不能一刀切。
-// 路径一律用 filepath.Join 现拼：fold 靠「root + 原生分隔符」认根，写死 "/" 的用例
-// 在 Windows 上会因认不出根而落到平台默认，测到的不是被测的那条分支。
-// 折叠键只在遍历内部判重用，不作为对外路径返回，故 fold 允许归一分隔符；
-// 断言盯的是「敏感卷不动大小写」这一条。
-func TestFolderFoldPerRoot(t *testing.T) {
-	sep := string(filepath.Separator)
-	toSlash := func(p string) string { return strings.ReplaceAll(p, sep, "/") }
-	senRoot := filepath.Join(sep, "sen")
-	insRoot := filepath.Join(sep, "ins")
-	f := newFolder([]string{senRoot, insRoot}, []bool{true, false})
-
-	senPath := filepath.Join(senRoot, "Dir", "F.TXT")
-	insPath := filepath.Join(insRoot, "Dir", "F.TXT")
-	if got, want := f.fold(senPath), toSlash(senPath); got != want {
-		t.Errorf("敏感卷根下的路径被改了大小写: %q, want %q（只允许分隔符归一）", got, want)
-	}
-	if got, want := f.fold(insPath), strings.ToLower(toSlash(insPath)); got != want {
-		t.Errorf("不敏感卷根下的路径未折叠: %q, want %q", got, want)
-	}
-	if got, want := f.foldRoot(0), toSlash(senRoot); got != want {
-		t.Errorf("foldRoot(0) = %q, want %q", got, want)
-	}
-	if got, want := f.foldRoot(1), toSlash(insRoot); got != want {
-		t.Errorf("foldRoot(1) = %q, want %q", got, want)
-	}
-	// 兜底：不属于任何根的路径按平台默认语义
-	stray := filepath.Join(sep, "other", "MIX.txt")
-	want := strings.ToLower(toSlash(stray))
-	if fscase.Default() {
-		want = toSlash(stray)
-	}
-	if got := f.fold(stray); got != want {
-		t.Errorf("fold(%q) = %q, want %q（默认语义=%v）", stray, got, want, fscase.Default())
 	}
 }

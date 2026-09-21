@@ -136,76 +136,36 @@ var cloudCheck = cloudfile.Of
 // （真实大小写敏感卷需要专门格式化的卷，本机与 CI 都无法现造）。
 var probeCaseSensitive = fscase.Sensitive
 
-// folder 路径折叠器：折叠与否由「该路径所属扫描根所在卷」决定（I2）。
-// 修正前是包级函数 + 编译目标硬编码，等于对全部卷做一次平台赌博。
-type folder struct {
-	roots    []string
-	prefixes []string // root + sep，与 sens 同序
-	sens     []bool   // 各根所在卷是否区分大小写
-	def      bool     // 平台默认（路径不属于任何根时）
-	needFold bool     // 存在需要折叠的根；全敏感时 fold 直接原样返回
+// visitKey 遍历期的比较键（M36，设计稿 §10.1）：**只归一分隔符，不做大小写折叠**。
+//
+// 遍历期没有可并之物：队列只投用户的原样根，其后每个路径都由
+// filepath.Join(父, ReadDir 得到的名字) 生成，链接/junction 已被跳过 ⇒ 同一目录
+// 在一趟遍历里只会以唯一拼写出现。此时任何折叠都只剩一种作用——把大小写不同的
+// 两棵**不同**目录误并成一棵：后遇到的那棵整棵不进语料，且一条失败都不记
+// （真读数见 04 §6.9.6 的 ED 行）。根在哪卷也无济于事：折叠键描述的是**根所在卷**，
+// 而一棵根的子树在任意深度上都可能嵌着另一卷（把敏感卷挂进普通目录即得此构型）。
+//
+// 折叠并没有退场——它仍是**合并用户给的根**的判据（见 dedupeRoots）：只有那里才会
+// 出现"同一棵树的两种拼写"（用户手输）。两种错法的代价不对称——折错丢语料且不可
+// 恢复；该折没折只是同一目录走两遍，由流水线阶段 1.5 的物理身份去重吸收
+// ——故不确定时倾向不折。
+func visitKey(p string) string {
+	return keyOf(p, string(filepath.Separator))
 }
 
-func newFolder(roots []string, sens []bool) *folder {
-	f := &folder{roots: roots, prefixes: rootPrefixes(roots), sens: sens, def: fscase.Default()}
-	// C1（2026-09-21，设计稿 §6.1）：**单根不做折叠**。折叠唯一的真实用途是把"同一棵树
-	// 的两种拼写"并成一个键，而单根出发的遍历里每个目录只会以唯一拼写出现（队列只投
-	// 原样根，其后每个路径都是 filepath.Join(父, ReadDir 得到的名字)，链接/junction 已
-	// 被跳过）——没有可并之物，折叠只可能把大小写不同的两棵**不同**目录误并成一棵。
-	// 实测：单根扫大小写敏感卷上的 alpha/ 与 ALPHA/，只收得到一棵子树，且 files_failed=0。
-	// 反方向的错法（该折没折 → 同一棵收两遍）由流水线阶段 1.5 的物理身份去重兜底，
-	// 代价不对称，故不确定时倾向不折。sens 此处保留不参与折叠：它是"没测过"的诚实值。
-	if len(roots) <= 1 {
-		return f
-	}
-	for _, s := range f.sens {
-		if !s {
-			f.needFold = true // 有不敏感卷 → 必须按其语义折叠
-			break
-		}
-	}
-	if !f.def {
-		f.needFold = true // 兜底分支（路径未命中任何根）落在不敏感平台默认上
-	}
-	return f
-}
-
-// fold 折叠遍历中产生的全路径：按其所属扫描根所在卷的语义。
-func (f *folder) fold(p string) string {
-	if !f.needFold {
-		return p
-	}
-	for i, rp := range f.prefixes {
-		if strings.HasPrefix(p, rp) {
-			return fscase.Fold(p, f.sens[i])
-		}
-	}
-	return fscase.Fold(p, f.def)
-}
-
-// foldRoot 折叠第 i 个根本身：根路径不带尾分隔符，命中不了自身的 root+sep 前缀，
-// 故单独按该根卷的语义折叠。单根时与 fold 同口径地原样返回——否则 visited 的种子键
-// 会被平台默认小写化，而其后每个目录的键不折，两套键打架（C1，见 newFolder 注释）。
-func (f *folder) foldRoot(i int) string {
-	if !f.needFold {
-		return f.roots[i]
-	}
-	return fscase.Fold(f.roots[i], f.sens[i])
-}
-
-// keyOf 把**折叠后的路径**归一成比较键：平台分隔符一律换成 "/"。
+// keyOf 把**路径**归一成比较键：平台分隔符一律换成 "/"。
 // sep 是平台分隔符真值（H6：差异由参数注入，不靠 build tag 分流），
 // 生产调用点传 string(filepath.Separator)。
 //
-// 为什么非归一不可：fold 只在**不敏感卷**上顺手把 "\" 换成 "/"，敏感卷上原样返回，
-// 于是"折叠后的串"两种分隔符都可能出现。拿这种串去和"按平台分隔符拼出来的前缀"比较，
-// 在 Windows（分隔符 "\"）上就恒不成立——04 §6.8.8 登记的 M26 正是这一条，
-// 而 darwin/Linux 上两种写法恰好同值，看不出问题。
+// 为什么非归一不可：路径串里两种分隔符都可能出现——`fscase.Fold` 只在**不敏感卷**上
+// 顺手把 "\" 换成 "/"（dedupeRoots 的合并判据走的正是它），敏感卷上原样返回。拿这种串
+// 去和"按平台分隔符拼出来的前缀"比较，在 Windows（分隔符 "\"）上就恒不成立
+// ——04 §6.8.8 登记的 M26 正是这一条，而 darwin/Linux 上两种写法恰好同值，看不出问题。
 //
 // 分工写死在这里：filepath.Separator 是**输入侧**的归一真值（本函数的 sep 参数），
 // "/" 是**键空间**的约定。把两者混进同一个表达式，就是 M26 的成因。
-func keyOf(folded, sep string) string {
-	return strings.ReplaceAll(folded, sep, "/")
+func keyOf(p, sep string) string {
+	return strings.ReplaceAll(p, sep, "/")
 }
 
 // underKey 判断键 key 是否就是 root 本身、或位于其下。两个参数都必须是 keyOf 的产物。
@@ -214,13 +174,9 @@ func underKey(key, root string) bool {
 	return key == root || strings.HasPrefix(key, root+"/")
 }
 
-// key 折叠 + 分隔符统一为 "/" 的**比较键**（键空间构造的唯一入口，见 keyOf）。
-func (f *folder) key(p string) string {
-	return keyOf(f.fold(p), string(filepath.Separator))
-}
-
 // rootsUnder 返回位于 dir（含自身）之下的那些用户原始根。
-// dirKey 必须是 folder.key 的产物；paths 与 keys 同序，是要展示给界面的原样路径。
+// dirKey 必须是 keyOf（遍历期经 visitKey）的产物；keys 与 paths 同序，
+// paths 是要展示给界面的原样路径。
 func rootsUnder(keys []string, paths []string, dirKey string) []string {
 	var out []string
 	for i, k := range keys {
@@ -239,7 +195,8 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 // WalkWithGate 并行遍历 roots：
 //   - 跳过符号链接与 0 字节文件（内置行为）
 //   - 应用过滤器
-//   - 重叠根目录与子目录去重（折叠与否按各根所在卷探测，I2）
+//   - 重叠根目录与子目录去重（重复的**根**按各根所在卷探测、折叠后合并，I2）
+//   - 遍历期比较键不折叠（M36，见 visitKey）：折叠只服务"合并用户给的根"
 //   - unix 平台 FileKey 由 lstat 顺带填充；Windows 留待 ResolveKey 按需解析
 //   - ②-S：每目录处理前过 gate（暂停挂起、取消快速排空），取消后不再触盘
 func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers int, gate Waiter) *Result {
@@ -247,10 +204,9 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		workers = 4
 	}
 	res := &Result{}
-	cleaned, sens, all := dedupeRoots(roots)
-	// I2：折叠按各根所在卷探测；G2：根前缀预计算一次，供每个文件的 relativeTo 复用
-	fld := newFolder(cleaned, sens)
-	prefixes := fld.prefixes
+	cleaned, all := dedupeRoots(roots)
+	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
+	prefixes := rootPrefixes(cleaned)
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
 	matcher := filter.Compile(f)
 
@@ -263,10 +219,12 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}
 	// M6-P4 逃逸判据要用**用户原始指定的全部根**（含被宽根覆盖而丢弃的子根）：
 	// "已被宽根覆盖"这条推断在遇到保护剪枝时并不成立——宽根走不进受保护目录里面。
-	// 折叠键统一走 folder.key（见它注释里的那条分隔符陷阱）。
+	// 键统一走 visitKey（见 keyOf 注释里的那条分隔符陷阱）。M36：这里**不折**——
+	// 折叠会把"用户从没点过的另一种拼写"也算成他指定过，凭空放行一道保护剪枝
+	// （后果与登记：设计稿 §10.5-1 / M44）。
 	rawKeys := make([]string, len(all))
 	for i, r := range all {
-		rawKeys[i] = fld.key(r)
+		rawKeys[i] = visitKey(r)
 	}
 	// (1) 用户点名的根本身就是清单内路径：照他的意思扫，但这份"已脱离系统保护"
 	// 必须留痕，界面据此警示（M8）。剪枝不参与，故不计入 ProtectedDirs。
@@ -286,7 +244,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	)
 
 	for i := range cleaned {
-		visited[fld.foldRoot(i)] = struct{}{}
+		visited[visitKey(cleaned[i])] = struct{}{}
 	}
 
 	// submit 投递目录：先计数再入队（保证 closer 的 Wait 不早于 Add）。
@@ -385,7 +343,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						// 保护是为了挡住误伤，不是为了否决专家的指名请求。放行时把涉及的
 						// 根记进 UnprotectedRoots，界面必须警示"这一片已脱离系统保护"。
 						if d := guard.Dir(full, de.Name()); d.Skip {
-							if esc := rootsUnder(rawKeys, all, fld.key(full)); len(esc) > 0 {
+							if esc := rootsUnder(rawKeys, all, visitKey(full)); len(esc) > 0 {
 								escapedRoots[idx] = append(escapedRoots[idx], esc...)
 							} else {
 								protDirs[idx]++
@@ -402,7 +360,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						if matcher.ExcludeDir(relativeTo(prefixes, full), de.Name()) {
 							continue
 						}
-						key := fld.fold(full)
+						key := visitKey(full)
 						mu.Lock()
 						_, seen := visited[key]
 						if !seen {
@@ -536,19 +494,20 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 }
 
 // dedupeRoots 规范化并剔除被其他根包含的子根（a 与 a/b 同扫时丢弃 a/b），
-// 返回与保留根同序的「该根所在卷是否区分大小写」，以及**去重前的全部规范化根**。
+// 返回保留的根，以及**去重前的全部规范化根**。
 //
-// 第三个返回值单独给出是 M6-P4 的逃逸判据要用：保护清单会把宽根的一条子树剪掉，
+// 第二个返回值单独给出是 M6-P4 的逃逸判据要用：保护清单会把宽根的一条子树剪掉，
 // 此时"子根已被宽根覆盖"并不成立（宽根走不进受保护目录里面），被丢弃的子根
 // 仍须作为"用户显式指定过"的依据放行。
 //
-// I2：判重前按各根所在卷的语义折叠。
+// I2 + M36（2026-09-21）：判重前按各根所在卷的语义折叠——这里是折叠**唯一**的消费方
+// （遍历期一律不折，见 visitKey）：同一棵树的两种拼写只可能出现在**用户给的根**上。
+// 探测（probeCaseSensitive）因此只为这个合并服务。
 //
-// C1（2026-09-21）：单根不探测，理由**不是**"无从判重所以折叠无关紧要"——单根扫描照样
-// 要用折叠键（`visited` 去重），只是它**不需要**折叠（设计稿 §6.1：单根遍历里每个目录
-// 只会以唯一拼写出现）。不探测是为了不给最常用的一条路（只选一个目录）平白往用户目录里
-// 写探测文件；折叠本身由 newFolder 对单根整个关掉。
-func dedupeRoots(roots []string) ([]string, []bool, []string) {
+// C1（2026-09-21）：单根不探测。理由**不是**"无从判重所以折叠无关紧要"（单根时这个
+// 函数确实没有可判之物，但真正让探测失去意义的是遍历键本来就不折叠，设计稿 §10.1），
+// 而是不给最常用的一条路（只选一个目录）平白往用户目录里写探测文件。
+func dedupeRoots(roots []string) ([]string, []string) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -562,11 +521,7 @@ func dedupeRoots(roots []string) ([]string, []bool, []string) {
 	}
 	sort.Strings(out)
 	if len(out) <= 1 {
-		sens := make([]bool, len(out))
-		for i := range sens {
-			sens[i] = fscase.Default()
-		}
-		return out, sens, out
+		return out, out
 	}
 	sens := make([]bool, len(out))
 	for i, r := range out {
@@ -593,7 +548,7 @@ func dedupeRoots(roots []string) ([]string, []bool, []string) {
 			keepSens = append(keepSens, sens[i])
 		}
 	}
-	return kept, keepSens, out
+	return kept, out
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

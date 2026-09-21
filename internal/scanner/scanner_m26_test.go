@@ -64,13 +64,10 @@ func TestDedupeRootsStillMergesNestedNativeRoots(t *testing.T) {
 	}
 
 	// 故意倒序传入：合并结果与入参顺序无关（dedupeRoots 内部先排序）
-	kept, sens, all := dedupeRoots([]string{narrow, wide})
+	kept, all := dedupeRoots([]string{narrow, wide})
 
 	if len(kept) != 1 || kept[0] != wide {
 		t.Fatalf("本机真实嵌套根未并成一棵（只该留宽根）：kept=%v want [%s]", kept, wide)
-	}
-	if len(sens) != 1 {
-		t.Fatalf("保留下来的根应带对应的卷语义标注：sens=%v", sens)
 	}
 	// all 是**去重前**的全部规范化根（M6-P4 的逃逸判据要用它），顺序为排序后
 	if len(all) != 2 || all[0] != wide || all[1] != narrow {
