@@ -9,6 +9,7 @@ package realbytes
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -51,24 +52,67 @@ func TestVolumeIDSameDirSameID(t *testing.T) {
 	}
 }
 
+// rawDevQuiet 与 rawDev 同一个独立读法，但不致命：候选列表里允许有本机不存在的挂载点。
+func rawDevQuiet(p string) (uint64, bool) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(p, &st); err != nil {
+		return 0, false
+	}
+	return uint64(st.Dev), true
+}
+
+// crossVolumeCandidates 跨卷对照的候选挂载点（G9，设计稿 §14.2）。
+//
+// 为什么要列表而不是只押一个：原先只押 `/dev/null`，darwin 上是 devfs（与临时目录
+// 必不同 dev，本机实测），但 Linux 上 `/dev` 常常就是挂在 `/` 之下的 devtmpfs、
+// 与根同 dev——那种环境里唯一对照失效，整条判据退成 skip，CI 上等于没有证据。
+// 逐个试到第一个"dev 真不同"的为止；全试完仍无对照才 skip（与 requireTailSparse
+// 同款纪律：环境不满足在使用点自探，skip 不算通过）。
+var crossVolumeCandidates = []string{
+	"/dev/null",            // darwin devfs / linux 通常在 devtmpfs
+	"/dev/shm",             // linux tmpfs
+	"/dev",                 // linux devtmpfs / darwin devfs
+	"/run",                 // linux tmpfs
+	"/tmp",                 // 独立 tmpfs 的机器（含容器）
+	"/proc",                // linux procfs：伪文件系统，dev 与磁盘卷必不同
+	"/System/Volumes/Data", // darwin 数据卷：与只读系统卷 / 不同 dev
+}
+
 func TestVolumeIDDistinguishesMounts(t *testing.T) {
-	// 跨卷对照用 /dev/null（devfs）：本机实测它与临时目录不同 dev（设计稿 E9）。
-	// Linux CI 上 /dev 可能与 / 同卷——那种环境里夹具不成立，skip 而不是红
-	// （与 requireTailSparse 同款：环境不满足在使用点自探）。
 	dir := t.TempDir()
 	p := filepath.Join(dir, "a.bin")
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	rawA := rawDev(t, p)
-	rawB := rawDev(t, "/dev/null")
-	if rawA == rawB {
-		t.Skipf("本环境 /dev/null 与临时目录同卷（dev=%d），跨卷夹具不成立", rawA)
+
+	var cand string
+	var rawB uint64
+	var tried []string
+	found := false
+	for _, c := range crossVolumeCandidates {
+		d, ok := rawDevQuiet(c)
+		if !ok {
+			continue // 本机没有这个挂载点，不算"试过了"
+		}
+		tried = append(tried, c)
+		if d == rawA {
+			continue // 同卷，不构成对照
+		}
+		cand, rawB, found = c, d, true
+		break
+	}
+	if !found {
+		t.Skipf("候选挂载点全部与临时目录同卷（试：%s，临时目录 dev=%d），跨卷夹具不成立",
+			strings.Join(tried, " "), rawA)
 	}
 	va, _ := VolumeID(p, statOf(t, p))
-	vb, _ := VolumeID("/dev/null", statOf(t, "/dev/null"))
+	vb, _ := VolumeID(cand, statOf(t, cand))
 	if va == vb {
-		t.Errorf("两个不同挂载实例（raw dev %d/%d）给了同一个 VolumeID %d：证据会跨卷池化",
-			rawA, rawB, va)
+		t.Errorf("两个不同挂载实例（raw dev %d/%d，对照 %s）给了同一个 VolumeID %d：证据会跨卷池化",
+			rawA, rawB, cand, va)
 	}
+	// 对照卷打进日志：划账要抄"这台机器用的是哪个对照"，不能只写"通过"。
+	t.Logf("跨卷对照成立：%s（dev=%d）vs 临时目录（dev=%d）→ VolumeID %d vs %d",
+		cand, rawB, rawA, va, vb)
 }

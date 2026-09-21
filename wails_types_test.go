@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -64,7 +65,10 @@ var wailsMirrors = []mirrorPair{
 	{"UndoResult", reflect.TypeOf(UndoResult{}), ""},
 	{"CacheStats", reflect.TypeOf(cache.Stats{}), ""},
 	{"PreviewData", reflect.TypeOf(PreviewData{}), ""},
-	// 豁免两条：没有可反射的 Go 对象。
+	// M44/G10（2026-09-21 审查）：Go 下发但 TS 压根没有镜像的类型，M30 的枚举方向
+	// 看不到（§14.0 G10）——它是 PreviewProcessPolicy 的返回类型。
+	{"ProcessPreview", reflect.TypeOf(ProcessPreview{}), ""},
+	// 豁免三条：没有可反射的 Go 对象。
 	{"OpsFiltered", nil, "Go 侧是 ops:filtered 的 map[string]any 字面量（app.go 的 emit 点），无结构体可反射；载荷要升级成结构体时随之收编"},
 	{"BackendAPI", nil, "方法面（Promise 签名），不是数据镜像"},
 	{"OpKind", nil, "字面量联合（export type）；Go 侧用字面量 case 校验（internal/ops/executor.go），没有常量集合"},
@@ -78,6 +82,22 @@ var wailsMirrors = []mirrorPair{
 //   - 深度 1 的行去掉 `//` 注释后匹配 `名字 [?] :`；
 //   - 空行、注释行、方法签名（没有冒号的）一律跳过。
 func tsInterfaceFields(src, name string) ([]string, error) {
+	body, err := tsInterfaceBody(src, name)
+	if err != nil {
+		return nil, err
+	}
+	var fields []string
+	for _, code := range body {
+		if f, ok := tsFieldName(code); ok {
+			fields = append(fields, f)
+		}
+	}
+	return fields, nil
+}
+
+// tsInterfaceBody 抽出 interface 本层（花括号深度 1）的代码行，注释已剥掉。
+// tsInterfaceFields / tsInterfaceMethods 共用这一份遍历（I5：两处解析必然漂）。
+func tsInterfaceBody(src, name string) ([]string, error) {
 	lines := strings.Split(src, "\n")
 	start := -1
 	for i, l := range lines {
@@ -89,7 +109,7 @@ func tsInterfaceFields(src, name string) ([]string, error) {
 	if start < 0 {
 		return nil, fmt.Errorf("wails.ts 里找不到 export interface %s", name)
 	}
-	var fields []string
+	var body []string
 	depth := 0
 	for _, l := range lines[start:] {
 		code := l
@@ -97,16 +117,60 @@ func tsInterfaceFields(src, name string) ([]string, error) {
 			code = code[:idx] // 注释里的花括号与大括号都不算
 		}
 		if depth == 1 {
-			if f, ok := tsFieldName(code); ok {
-				fields = append(fields, f)
-			}
+			body = append(body, code)
 		}
 		depth += strings.Count(code, "{") - strings.Count(code, "}")
 		if depth <= 0 {
 			break
 		}
 	}
-	return fields, nil
+	return body, nil
+}
+
+// tsInterfaceMethods 同一个 body 里挑出**方法声明**（`名字(` 开头），顺序即声明顺序。
+func tsInterfaceMethods(src, name string) ([]string, error) {
+	body, err := tsInterfaceBody(src, name)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, code := range body {
+		if m, ok := tsMethodName(code); ok {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// tsMethodName 一行是不是方法声明；是则返回方法名。纯函数。
+// 判据 = "`(` 之前那一段全是标识符字符"：字段声明（`kind: string`）的冒号前不含括号，
+// 内联对象类型（`nested: {`）的冒号前也不是标识符，两条都进不来。
+func tsMethodName(line string) (string, bool) {
+	s := strings.TrimSpace(line)
+	paren := strings.Index(s, "(")
+	if paren <= 0 {
+		return "", false
+	}
+	name := s[:paren]
+	for _, r := range name {
+		if r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			continue
+		}
+		return "", false
+	}
+	return name, true
+}
+
+// goExportedMethods 反射取一个类型的方法集名字（升序）。reflect 只报**导出**方法，
+// 因此生命周期钩子（startup/shutdown/beforeClose 刻意小写）自然不在面里——
+// 本项因此不需要排除表（设计稿 §14.1-1；一次性程序实测同包两方法类型 NumMethod()==1）。
+func goExportedMethods(t reflect.Type) []string {
+	out := make([]string, 0, t.NumMethod())
+	for i := 0; i < t.NumMethod(); i++ {
+		out = append(out, t.Method(i).Name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // tsFieldName 一行是不是字段声明；是则返回字段名。纯函数。
@@ -345,8 +409,42 @@ func TestWailsInterfacesAreAllMapped(t *testing.T) {
 	}
 }
 
+// TestBackendAPIMatchesGoExportedMethods 方法面双向比对（G5/P1，设计稿 §14.1-1）。
+//
+// 为什么源是 Go 的反射方法集而不是生成物 `wailsjs/go/main/App.d.ts`：Wails 运行时按反射
+// 注入 `window.go.main.App.*`，手写声明才是前端真正依赖的契约面，而生成物只在 `wails build`
+// 时刷新——那一步不在 §3.3 门禁 13 行里，所以它已经在漂移（本轮实测缺两枚，登记 M46）。
+//
+// **零豁免**：Go 侧反射本来就只报导出方法（生命周期钩子刻意小写，见 goExportedMethods
+// 注释），TS 侧声明的每个名字都必须真有后端。将来确实需要豁免时，必须像 wailsMirrors 的
+// exempt 那样把理由写在数据里，不许在判据代码里开洞。
+func TestBackendAPIMatchesGoExportedMethods(t *testing.T) {
+	src := readWailsTS(t)
+	tsMethods, err := tsInterfaceMethods(src, "BackendAPI")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tsMethods) == 0 {
+		t.Fatal("BackendAPI 解析出 0 枚方法声明：解析器失效会让本项静默通过")
+	}
+	goMethods := goExportedMethods(reflect.TypeOf(&App{}))
+
+	missing, extra := compareFieldSets(goMethods, tsMethods)
+	if len(missing) > 0 {
+		t.Errorf("BackendAPI 缺 %d 枚 Go 导出方法（后端在、前端按类型调不到）：%s",
+			len(missing), strings.Join(missing, ", "))
+	}
+	if len(extra) > 0 {
+		t.Errorf("BackendAPI 声明了 %d 枚 Go 侧不存在的方法（运行期必然 reject，是反向的谎）：%s",
+			len(extra), strings.Join(extra, ", "))
+	}
+	// 计数一并打出：漂移发生时除了名字还要知道规模（划账要抄这个数）。
+	t.Logf("方法面：Go 导出 %d 枚 / BackendAPI 声明 %d 枚", len(goMethods), len(tsMethods))
+}
+
 func assertSameOrder(t *testing.T, what string, want, got []string) {
 	t.Helper()
+
 	if len(want) != len(got) {
 		t.Fatalf("%s 字段数 = %d, want %d\n got = %v\nwant = %v", what, len(got), len(want), got, want)
 	}

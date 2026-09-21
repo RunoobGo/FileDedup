@@ -62,7 +62,9 @@ fi
 # 字符串时，node 用例与 vue-tsc 都照样绿。这里补一刀最小必要的文本锚点。
 # ★ 只锚标识符引用、不锚中文文案——改措辞是安全的，锚文案会误报。
 wiring_fail=0
+wiring_total=0
 wiring() { # $1=文件 $2=必须出现 $3=禁止出现（可空） $4=说明
+	wiring_total=$((wiring_total + 1))
 	local file="$1" want="$2" forbid="$3" why="$4"
 	if [ ! -f "$FE/$file" ]; then
 		printf '  \033[31m✗ 找不到 %s，接线断言无法执行\033[0m\n' "$file" >&2
@@ -88,4 +90,12 @@ if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1
 fi
-printf 'test-frontend-logic: %s 个用例全部通过（含 2 条接线断言）\n' "$count"
+# 计数不许说谎（G3，设计稿 §14.0）：原先打的是 "$count 个用例…（含 2 条接线断言）"，
+# 而 $count 只数了 node 的 tests 行——接线断言是**另算**的，读起来像"20 里有 2"。
+# 现在三个数各自真，接线数以实测计数为准（将来加条目不用再改文案）。
+if [ "$wiring_total" -lt 1 ]; then
+	printf 'test-frontend-logic: 一条接线断言都没执行（wiring_total=0）——判据面被删空了\n' >&2
+	exit 1
+fi
+printf 'test-frontend-logic: node 用例 %s 项 + 接线断言 %s 项 = 合计 %s 项全部通过\n' \
+	"$count" "$wiring_total" "$((count + wiring_total))"

@@ -278,6 +278,18 @@ export interface PreviewData {
   mimeType?: string
 }
 
+// ProcessPreview 是 PreviewProcessPolicy 的返回体（Go 侧 app.go 同名结构体）。
+// 语义：处理策略只做执行时过滤、不改动勾选，所以"实际会处理哪些"在界面上本来
+// 不可见——这个类型就是那份缺失的可见性。目前前端尚无调用点（呈现属 M8），
+// 但类型面必须存在：缺了它，方法声明就引用了一个不存在的类型（G10/M30 同族漏网）。
+export interface ProcessPreview {
+  // 勾选项中位于优先文件夹内的 ID（Go 侧已与服务端快照求过交集）
+  effectiveIds: number[]
+  effectiveCount: number
+  // 一个可处理文件都没命中的目录（用户写了个不存在的或空的路径，靠这个字段才看得见）
+  unmatchedDirs: string[]
+}
+
 // Wails 注入对象（最小接口约束，替代 any 边界；响应字段与 Go json tag 一致）
 export interface BackendAPI {
   SelectDirectory(): Promise<string>
@@ -290,6 +302,10 @@ export interface BackendAPI {
   GetResultGroups(q: ResultQuery): Promise<PagedResult>
   GetFailedItems(): Promise<FailedItem[]>
   PreviewFile(id: number): Promise<PreviewData>
+  // PreviewProcessPolicy 只读预览"处理策略实际会命中哪些"（无副作用、不写账本、
+  // 不动文件系统，因此不受 opsRunning 互斥限制）。声明在方法面钉子里（G5）：
+  // 缺声明 = 后端有、前端按类型调不到。
+  PreviewProcessPolicy(dirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
   RevealInFolder(id: number): Promise<void>
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
@@ -317,6 +333,11 @@ export interface BackendAPI {
   ClearOpRecords(): Promise<void>
   CacheStats(): Promise<CacheStats>
   CacheClear(): Promise<void>
+  // ExportReport **目前是 M5 空桩**：Go 侧固定返回错误「报告导出将在 M5 提供」
+  // （app.go 的 ExportReport）。声明在此只为了让方法面与 Go 对齐（G5），不代表
+  // 功能可用——调用必然 reject。实现落在 M9，届时签名可能变化（format/path → 返回值），
+  // 那时由方法面钉子与类型面钉子同时把关，不许 TS 先乐观。
+  ExportReport(format: string, path: string): Promise<string>
 }
 
 declare global {

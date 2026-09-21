@@ -325,6 +325,17 @@ func cacheUnavailableNotice(dbPath string, err error) string {
 		"不影响去重结果。原因：" + err.Error()
 }
 
+// ledgerUnavailableNotice 把"账本库打不开"翻成界面文案（纯函数，M43）。
+//
+// 与 cacheUnavailableNotice 同形（出了什么事 / 在哪个文件上 / 对用户意味着什么），
+// 但后果那一层完全不同、也更重：缓存打不开只是慢，账本打不开会让回收站/移动/硬链接
+// 清理**被拒绝执行**（beginJournal 拿不到写前账本就不动手，仅永久删除照常）。
+// 不写"历史全没了"这种吓人的话——库没打开，本来就没有本次运行的历史可丢。
+func ledgerUnavailableNotice(histPath string, err error) string {
+	return "历史库不可用（" + filepath.Base(histPath) + "），本次运行不保存历史记录，" +
+		"且回收站/移动/硬链接清理会被拒绝执行（仅永久删除不受影响）。原因：" + err.Error()
+}
+
 // addStartupNotice 追加一条启动期提示（空串忽略）。
 //
 // 2026-09-21（M25）：槽位原来是"后写覆盖先写"，于是两个启动期问题同时发生时，
@@ -359,9 +370,11 @@ func (a *App) openLedger() {
 	if err != nil {
 		// 2026-09-18 审查 C3 之后这里不再只是"失去历史/回撤能力"：账本不可用时
 		// 回收站/移动/硬链接会被拒绝执行（仅永久删除照常），见 beginJournal。
-		// 留痕必须说清后果，否则用户只看到"清理报账本不可用"而不知所以然。
-		// （只写 stderr 这一半仍是缺口：GUI 无终端 ⇒ 登记 M43，本项不动。）
+		// M43（2026-09-21 审查 §14 兑现）：stderr 那一条留着给 CLI/无终端场景，
+		// 但 GUI 用户没有终端——后果必须同时进 startupNotice，否则用户只看到
+		// "清理莫名被拒绝"而不知所以然。不用 emit：此刻前端监听器还没注册（同 M12b）。
 		fmt.Fprintf(os.Stderr, "[history] 历史库不可用：本次运行不保存历史，且回收站/移动/硬链接清理将被拒绝执行: %v (path=%s)\n", err, histPath)
+		a.addStartupNotice(ledgerUnavailableNotice(histPath, err))
 		return
 	}
 	a.hist = hs
