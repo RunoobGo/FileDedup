@@ -2510,3 +2510,116 @@ d14aed302d27dbafcc46cef410492c1f475e3b3e5063c48618e903a3b1e9e6ce  internal/scann
 `case VerdictPass:` 结尾，加了兜底后 `VerdictPass` 自己掉进 `default:` 被拦死。
 修法不是删兜底，而是**补一条显式空体 `case VerdictPass:`**（注释写明"少了这一格，合并全被拦死"）。
 教训：`default` 兜底只能加在"成功分支已显式列全"的 switch 上，否则它咬的是成功腿。
+
+---
+
+## 18. 第七批：cache / state / progress 面（M71 / M73 / M74 / M75(a) / M69 / M78；2026-09-21）
+
+登记来源：04 §6.11 登记表内**本机可验证、不需裁定**的六条。M75(b)、M62、M56、M48、M82、M84
+仍留在待裁定队列，本批一律不动。
+
+### 18.0 动手前取证（现跑现取，含一次工作树异常）
+
+**0. 先记一件与代码无关但影响读数的事故。** 本批取证开始时（22:51）`internal/dedup/` 全部 15 个
+`.go` 被同时覆写成**同一内容**：49152 B（恰好 48 KiB）、同一 mtime、跨文件相同 MD5
+（`b2d1ca5d…`），内容是一段 206 行的 `./path:N:…` grep 输出。`grep`/`Read` 读不到任何符号，
+看起来像"包被删空"。逐条查实：
+
+- `git status --short` 恰好 15 行 ` M internal/dedup/…`，全仓 341 个跟踪文件里**只有这一包**受损
+  （用 python 按 `(md5, len)` 分组扫全部跟踪文件，重复组只有 1 个）；
+- `git cat-file -s HEAD:internal/dedup/<f>` 逐个读数 1120~37148 B，**HEAD 侧 15 个 blob 全部完好**
+  ⇒ 纯工作树事故，不是提交造成的；`git log`/`reflog` 显示 HEAD 仍是 `36a2a5f`（22:41），未动。
+- 处置（不用破坏性 git）：`cp -p` 把垃圾留档到 `/tmp/dedup_corrupt_backup/`（sha256
+  `90167c7d…`），再 `git cat-file blob HEAD:<path> > <path>` 逐个写回。
+- 恢复后真读数：`git status --short` **空输出**；`go build ./...` `rc=0`；`go vet ./internal/dedup/` `rc=0`；
+  `go test ./internal/dedup/` → `ok filededup/internal/dedup 3.287s`。
+- **连带更正**：§6.13 第四节那套"15 行门禁 rc=0 / `run=693`"读数取自 ~22:4x，**早于 22:51**。
+  它们描述的是"与 HEAD 一致的那棵树"，而现在这棵树是恢复出来的——内容按 git 判定与 HEAD 相同，
+  但"读数时刻"这件事不成立，故本批交付时会重跑全套门禁并另报新读数，不拿 §6.13 的旧数充当第七批的门禁。
+
+下面 1~10 是在恢复后的树上重取的本批取证。
+
+| # | 取证 | 真读数 |
+|---|---|---|
+| 1 | M71 窗口形状 | `pipeline.go:231-239` 在 `p.mu` 内做终态复位 + `ValidateTransition(p.status, StatusScanning)`，**只判不写**；`:246` 释锁；`:247-252` 六个原子计数归零 + `:255 gate.Resume()`；`:257 p.setStatus(model.StatusScanning)` 才第二次取锁写入。同窗口 `Pause()`（`:126-142`）/`Cancel()`（`:166-177`）读到的仍是 `Idle` ⇒ 一个回"当前不在扫描中"、一个 `running=false` 回"没有进行中的扫描任务"。今天**唯一的**拦截在 app 层：`app.go:591-595` 的 `a.mu` + `scanInFlight` |
+| 2 | M73 现状（对照组） | 临时探针 `TestZZScratchPlainDSN`（现状形状：裸 path + `db.Exec` 设 pragma）：池上先 `PRAGMA synchronous=NORMAL`+`busy_timeout=5000`，随后取到的第二条连接读数 **`busy=0 sync=2`**（2=FULL，即 SQLite 默认）。⇒ 登记原文"synchronous=NORMAL 只落在一条连接上"由读数控实，不是推测 |
+| 3 | M73 修法 A（DSN URI）被真读数否决 | 同探针两种 DSN：`url.URL{Scheme:"file", Opaque:path}` ⇒ 三条连接都拿到 `busy=5000 sync=1`，**但库没落在目标路径**（`os.Stat` 报 no such file，目录里多出名为 `a b` 的文件：`#` 被当成 URI fragment）。`url.URL{Path: filepath.ToSlash(path)}` ⇒ darwin 下落点正确且三连接全 `5000/1`；但同一构造喂 Windows 路径产出 `file://C:%5CUsers%5C…`，`//` 之后的 `C:` 被吃成 authority。本机无 Windows 真机 ⇒ **DSN 形整体否决**（缓存库建到别处 = 每轮白算 + `永不自愈`，且这一半无法验证） |
+| 4 | M73 修法 B（照抄 history 的 `SetMaxOpenConns(1)`）被测量否决 | 基准（Apple M4，4000 条库，8 worker × 3000 次主键点查 = 24000 次）：默认池 `139.1 ms`、**单连接 `289.8 ms`（2.08×）**、4 连接 `124.6 ms`。`cache.go:65-66` 的注释"Lookup 用 RLock 并行（阶段 2 多 worker 同时点查）"是被测出来的，不是装饰 ⇒ 登记建议的"与 history 同形"**有害**，否决；顺带把这三行读数写进代码注释，供后人复用 |
+| 5 | M73 采修法 C 的可行性 | `go doc modernc.org/sqlite`：`func NewConnector(dsn string) (driver.Connector, error)` 存在 ⇒ 用它取基础 connector、自己包一层 `Connect` 后跑 pragma，**路径仍以纯文件名交给驱动**（不引入 URI），每条新连接都带 pragma。另一条 `RegisterConnectionHook(fn ConnectionHookFn)` 是**进程级**钩子、按 dsn 区分，会波及同进程的 `history.db` ⇒ 不用 |
+| 6 | M74 折叠点 | `cache.go:211 Lookup` → `:220-222 row.Scan(...) err != nil ⇒ return Entry{}, false, false`，`sql.ErrNoRows` 与"库坏了"走同一条出口。全仓 `IsCorruption` 只有两处 consulted（`cache.go:92`、`history.go:161`，grep 读数）⇒ 打开之后运行期的损坏没有任何判定 |
+| 7 | M74 提示槽位（推翻登记原文的修法） | 登记写"只上报一条（与 M25 的 `addStartupNotice` 同槽位）"。实测槽位消费方式：`scan.ts:851-856` 的 `api.getStartupNotice()` 在 **store init 的"初始拉取"里调一次**（`.then(msg => toast().push(...))`），全仓再无第二个消费者（`grep StartupNotice` 读数：只有 `wails.ts:316/389` 的类型与包装 + `scan.ts:852` 这一处调用）；`app.go:1267-1270 GetStartupNotice` 的注释自己写明"前端在 store.init 的'初始拉取'里调一次即可"。⇒ 扫描**运行中**写进去的提示永远不会显示 = 又造一句假话。改走已在显示的通道：`scan:done` 的失败清单（`FailedItem{Stage:"cache"}`，前端每轮 `refreshFailed`）。**这是对登记原文的偏离，理由就是这条读数** |
+| 8 | M75(a) 文案与事实错位 | `cache.go:285` 在 `tx.Commit()` 成功（`:282`）之后 `return c.evictLocked()`；`pipeline.go:401-403` 把 `Store` 的任何错误一律写成 `"缓存写回失败: " + e.Error()` ⇒ 哈希**已经写进去了**却被报成写回失败 |
+| 9 | M69 回退窗口 | `progress.go:59-67` ticker 分支"mu 内取快照 → 释锁 → cb"；`:76-84 Stop` 同形。两条路径互不排斥 ⇒ ticker 取 S1、释锁，`Stop` 取 S2(≥S1) 并 cb(S2)，ticker 才 cb(S1)，此后 goroutine 已退出 ⇒ **界面最后一条进度是较旧的那条**。既有 `TestTrackerThrottle`（`progress_test.go:32`）只断言"终值包含全部计数"，没测**顺序** |
+| 10 | M78 字段位差 | `scan.ts:384-391 rescanHistory` 逐字段回灌 6 位，`emptyFilters()`（`scan.ts:13-24`）有 7 位，缺的正是 `AllowCloudHydration`。历史侧键名对得上：`HistoryMeta.Filters` 是 `model.Filters` 内联 marshal（`app.go` 结构体 + `model.Filters` **无 json tag**）⇒ JSON 键就是 Go 字段名 `AllowCloudHydration`，前端 `m.filters?.AllowCloudHydration` 读得到。`HistoryMeta` 的 TS 侧 `filters: Filters`（`wails.ts:71`）已含该字段 |
+
+### 18.1 判据（六条，每条都可证伪）
+
+1. **M71**：状态机的"认领"必须是一次动作——判与写在**同一个** `p.mu` 临界区内完成。抽出
+   `claimRunLocked()`（复位终态 → `ValidateTransition` → 写 `StatusScanning` → 存 `p.cancel`），
+   `Run` 只调它一次；`:257` 那句 `setStatus(StatusScanning)` 保留，但语义退化成"认领后若被
+   `Pause` 抢走则记 `afterResume`"这一格，不再是写入的唯一落点。
+   判据的可观测形式：认领成功后 `Status()` 立刻是 `Scanning`，第二次认领必被拒。
+2. **M73**：`busy_timeout=5000` 与 `synchronous=NORMAL` 必须对**每一条**连接生效，且连接池
+   不得为了绕这个问题缩到 1；路径交给驱动的形式不得改变（不引入 URI）。
+3. **M74**：`Lookup` 只有 `sql.ErrNoRows` 才允许判"未命中"；其余 DB 错误必须留下证据（计数），
+   其中被 `dbfile.IsCorruption` 确证者置一次 `corrupt` 标志，置位后 `Lookup`/`Store`/`Touch`
+   不再向库发 SQL；一轮扫描至多**一条**FailedItem 说明这件事，且不得说"已自愈/已重建"。
+4. **M75(a)**：写回已 Commit 而淘汰失败时，用户看到的必须是"哈希已写回、LRU 淘汰未做（下次
+   扫描会再试）"，不得写成"缓存写回失败"。判据用哨兵错误 `cache.ErrEvictFailed` + `errors.Is`，
+   不在调用方重新解释 SQLite 文本。
+5. **M69**：`Stop()` 返回之后，不得再有更早的快照被外发。实现取向：**先等节流 goroutine 收口**
+   （`WaitGroup`）再取终值外发，cb 全程不在锁内（不把 Wails emit 拉进临界区）。
+6. **M78**：`rescanHistory` 不得再逐字段手抄——以 `emptyFilters()` 为底、整体透传历史 `filters`，
+   只对需要换算的两字段（Min/MaxSize 字节→KB）做覆盖。将来 `Filters` 加字段时自动透传。
+
+### 18.2 改动面（只这些文件）
+
+| 文件 | 动作 |
+|---|---|
+| `internal/dedup/pipeline.go` | 抽 `claimRunLocked()` 并在 `Run` 起首单次调用（M71）；`Store`/`Touch` 失败文案按 `errors.Is` 分岔（M75a）；轮末按 `cch.Corrupted()` 追加**至多一条** FailedItem（M74） |
+| `internal/cache/cache.go` | `openDB` 走 `sql.OpenDB(pragmaConnector)`，每连接两 pragma（M73）；`Lookup` 错误三分类 + `dbErrs`/`corrupt` 原子位 + `Corrupted()`，`Store`/`Touch` 在 corrupt 时短路（M74）；`evictLocked` 失败包 `ErrEvictFailed`（M75a） |
+| `internal/progress/progress.go` | `Start` 记 `WaitGroup`，`Stop` 先 `Wait()` 再取终值外发（M69） |
+| `frontend/src/stores/scan.ts` | `rescanHistory` 改整体透传（M78） |
+| 新增测试 | `internal/cache/cache_m73_m74_m75_test.go`、`internal/dedup/pipeline_m71_test.go`、`internal/progress/progress_m69_test.go`、`frontend/tests/scan-rescan-history.test.ts` |
+| `docs/04`、本文件 | §6.14 划账 + §18.7 实施后追记（下一提交） |
+
+### 18.3 探针（每项都要先看它红过一次，失败原因须与预测一致）
+
+| 探针 | 钉的判据 | 预测的"修前红法" |
+|---|---|---|
+| P-18-1 `TestClaimRunLockedIsJudgeAndWrite` | 18.1-1 | 认领后 `Status()` 仍为 `Idle`（旧形状只判不写）；第二次认领返回"可认领" ⇒ `--- FAIL: … 认领后状态应为 Scanning` |
+| P-18-2 `TestPragmasApplyToEveryPooledConn` | 18.1-2 | 第二条连接 `busy_timeout=0`、`synchronous=2`（取证 #2 同形，但走真实 `Open`）⇒ 红在断言，不是 skip |
+| P-18-3 `TestDBErrorIsNotSilentlyAMiss` | 18.1-3 | `Lookup` 在库被写坏后返回 `hit=false` 且**无任何证据**：`DBErrors()` 不存在即编译不过 ⇒ 改为对旧形状写"计数为 0 而 Store 报错"的可编译形态，红法须实测抄录，不许预测当读数 |
+| P-18-4 `TestStoreEvictFailureKeepsCommittedRows` | 18.1-4 | 淘汰失败被折成 `Store` 返回裸错误，`errors.Is(e, ErrEvictFailed)` 不成立；且已 Commit 的行必须查得到 |
+| P-18-5 `TestRunReportsEvictAsNotWriteBackFailure` | 18.1-4 | `FailedItem[0].Err` 以"缓存写回失败"开头 ⇒ 与"已写回"相反，红在该字符串 |
+| P-18-6 `TestStopNeverFollowedByOlderSnapshot` | 18.1-5 | cb 序列最后一条 < 序列最大值（ticker 的旧快照压在终值之后）⇒ 红在"末值必须等于最大值" |
+| P-18-7 前端 `rescanHistory 透传未来字段` | 18.1-6 | 造一条 `filters` 含 `AllowCloudHydration: true` 的历史记录，重扫下发的 payload 里该位为 `false`/缺省 ⇒ 红 |
+| P-18-8 `TestCorruptStopsIssuingSQL` | 18.1-3 | corrupt 置位后仍继续发 SQL（每轮再错一次），`Lookup` 计数持续上涨 ⇒ 红 |
+
+### 18.4 变异计划（预测"该红的包名表"，跑完与实测表相减）
+
+| 变异 | 动作 | 预测被杀于 |
+|---|---|---|
+| M18-a | `claimRunLocked` 退回"只判不写" | `internal/dedup` P-18-1 |
+| M18-b | 删掉 connector 的 per-conn pragma（回到 `db.Exec` 一次） | `internal/cache` P-18-2 |
+| M18-c | `Lookup` 把所有 `Scan` 错误折回"未命中"（去掉三分类） | `internal/cache` P-18-3/P-18-8 |
+| M18-d | `Store` 末尾 `return c.evictLocked()` 改 `return nil`（吞掉淘汰失败） | `internal/cache` P-18-4 或 `internal/dedup` P-18-5（**两处都算合理落点，记实测**） |
+| M18-e | 去掉 `errors.Is` 分岔，文案统一"缓存写回失败" | `internal/dedup` P-18-5 |
+| M18-f | `Stop` 不再 `Wait()` 直接取终值 | `internal/progress` P-18-6 |
+| M18-g | `rescanHistory` 改回逐字段列举（少一位） | `frontend/tests` P-18-7 |
+
+### 18.5 交付判据
+
+六项各有"修前必红"抄录 + 变异实测表（预测集 − 实测集的差集必须逐条解释）；全套 15 行门禁重跑
+（含 §18.0-0 之后必须重取这一条）；`go test -race` 腿不得出现 `data_race` 命中；前端 `typecheck`
+与 `test-frontend-logic` 绿（无 node 或 node<22.18 时按 SKIP 报，不得读作通过）。
+
+### 18.6 本批不做 / 转登记
+
+- **M74 的"自愈"那一半不做**：登记原文暗示"确证损坏→隔离重建"。运行期隔离需要 close 现库、
+  改名、重开、并把新句柄换回 `p.cch`（app 层持有、扫描在途），跨三层且无真故障可全验。
+  本批只做到"确证损坏 ⇒ 停止发 SQL + 说一条真话"，剩下的隔离重建**新登记 M87**。
+- **界面新增呈现位不做**（裁定 ③）：M74 只借用已有的失败清单，不新增计数、不加控件。
+- **M75(b)（UPSERT 无条件覆盖 `full` + ctime）继续等裁定**，本批一字不动。
+- Windows 侧本批不引入任何 URI/DSN 形式（取证 #3），故不存在"代码已改、验证未兑现"的新面；
+  若 P-18-2 的实现在 Windows 上改变连接建立方式，划账时如实标注。
