@@ -2186,3 +2186,111 @@ G1~G11 全部由本轮 grep/读码现取，无一条来自上一轮的记忆。�
     等于漏锚），以及 FE-3 那条需要 `forbid` 位——它禁掉的是被替换掉的旧写法
     `store.scanning || store.opsRunning`，只锚新写法的话旧写法复活也不会红。
 
+
+---
+
+## 16. M64（I5-1）：路径归一实现的收归（04 §6.11 登记表；2026-09-21 用户裁定"优先收归，分层约定后补"）
+
+### 16.0 动手前取证（位置 → 实际读到的代码 → 裁定）
+
+**归一实现（登记时说"四处"，逐条开码读到的实际形态）**
+
+| # | 实现 | 位置 | 对 `\` 的处理 | 尾斜杠 | 大小写 | 生产调用点 |
+|---|---|---|---|---|---|---|
+| 1 | `keyOf(p, sep)` | `scanner.go:167-169` | 只换 `sep` 传入的那个字符（H6：平台真值由参数注入） | 不动 | 不折 | `visitKey:153`、`dedupeRoots:575/578` |
+| 2 | `fscase.Fold(p, sensitive)` | `fscase.go:31-41` | **恒**换 `\`→`/`（含 unix） | 不动 | `sensitive=false` 时 `ToLower` | `ops/keep.go:161/267/284/322`、`scanner:575/578` |
+| 3 | `sysguard.normalize(p)` | `sysguard.go:285-293` | **恒**换（:282-284 注释写明理由："不用 filepath.ToSlash/Clean：它们在 Linux 上把 `\` 当普通字符，而本包必须在任一 GOOS 上判定 Windows 风格路径"） | **去全部尾 `/`，根 `/` 保留** | 不折 | `:202/203/234` |
+| 4 | `filter.toSlashPat(s)` | `filter.go:139-144` | **恒**换，带"无 `\` 即原样返回"的零分配 fast path | 不动 | 不折 | 模式侧 `:125`、rel 侧 `:175/:198` |
+
+三条**改变判据形状**的实测发现（不是照抄登记条目）：
+
+1. **`keyOf` 在 `dedupeRoots` 里是空操作。** `:575` 写的是 `keyOf(fscase.Fold(r, sens[i]), string(filepath.Separator))`，
+   而 `Fold` 已恒把 `\` 换成 `/` ⇒ Windows 上串里已无 `\`（sep 换不到东西）、unix 上 sep 就是 `/`（换了等于没换）。
+   故 `keyOf` 的**真实作用面只有 `visitKey` 一条**（遍历期键空间，M36 决定不折 ⇒ 它是那条路上唯一的归一）。
+   这个空操作不是 bug，但它是"四处各自长出来"能长期不被发现的形状证据。
+2. **`filter` 的两侧同函数**（模式侧 `:125` 与 rel 侧 `:175/:198` 都过 `toSlashPat`）⇒ unix 上把合法文件名
+   `a\b` 换成 `a/b` 是**对称**的，匹配关系不变。所以 FC-2（M63）的实际风险面只在 `fscase.Fold`
+   （`dedupeRoots` 的合并判据），**不在** `filter`——登记条目里"影响折叠与排除判据"这半句是扩大了的表述，本节按实测收窄。
+3. **分层约定是文档级、无门禁强制。** `sysguard.go:15-19` 写"不 import 任何 internal 包"，但全仓
+   grep 无任何用例/脚本检查 import 面（AST 门禁只有 `app_hist_race_test.go:95/176` 那类，检查的是锁内字段访问）
+   ⇒ 新增一个叶子依赖**不会**让任何门禁变红，"后补"补的是**说法**而不是**判据**。
+   同时实测 `go list ./internal/...` = **14 个包**（`ads cache cloudfile dbfile dedup filter fscase fsid hasher
+   history media model ops progress realbytes scanner sysguard worktemp`）⇒ 新增 pathnorm 后 04 §7 交付物清单
+   里那句"14 包"是要一起改的真值。
+
+**同一"/"键空间里的第二条判据（前缀）也长了四份**——登记时只数了归一，开码发现这才是更该收的那一半：
+
+| 位置 | 表达式 | 调用前的归一 / 守卫 |
+|---|---|---|
+| `scanner.go:173-175` `underKey` | `key == root \|\| HasPrefix(key, root+"/")` | 两侧都是 `visitKey`/`keyOf` 产物 |
+| `sysguard.go:296-301` `under` | `p == e \|\| HasPrefix(p, e+"/")` | 两侧过 `normalize` |
+| `ops/keep.go:320-323` `inDirFold` | `foldedPath == prefix \|\| HasPrefix(foldedPath, prefix+"/")` | `TrimSuffix(Fold(Clean(dir)),"/")`；**prefix 为空串 ⇒ 整卷命中**（注释写明是刻意的） |
+| `filter.go:271-273` | `prefix != "" && (rel == prefix \|\| HasPrefix(rel, prefix+"/"))` | 多一条"空模式不得命中一切"守卫 |
+
+四份的**表达式同形**，差别只在调用前的归一和空串守卫 ⇒ `Under(child, parent)` 一份可覆盖全部四处
+（`Under(x, "")` 展开后正好是 keep.go 想要的"空前缀即整卷"，而 filter 那条守卫本就在调用侧）。
+
+### 16.1 判据与裁定落地方式
+
+1. **单一实现落 `internal/pathnorm`**（新叶子包，import 面只允许 `strings`，无 build tag）。
+   为什么不塞进现有包：`fscase` import `os`+`worktemp` 且要写盘探测（会把副作用带进 sysguard 的纯字符串判据面）；
+   `model` 是数据类型包；`sysguard` 自己是被依赖方。
+2. **API 两个，都是"一处判定一处实现"的收口**：
+   - `func Slash(p, sep string) string`：把 `sep` 那一个字符换成 `/`；`sep` 由**调用点**给
+     （平台真值 `string(filepath.Separator)` 或字面 `"\"`），不含该字符时原样返回（零分配 fast path 收成一份）。
+   - `func Under(child, parent string) bool`：`"/"` 键空间的前缀判据一份实现。
+3. **行为逐字不变**：每个调用点传它今天用的那个字符，故本轮**不产生任何语义变化**——
+   `Slash(p, "\\")` 与今天的 `normalize`/`toSlashPat`/`Fold` 的替换腿逐字同，
+   `Slash(p, string(filepath.Separator))` 与今天的 `keyOf` 逐字同。
+   **FC-2（M63）因此本轮不修**：它是行为变化（unix 上 `\` 算不算分隔符），登记仍在 M63；
+   本条的收益正是"改它只需要动一处"。
+4. **不收的三样**（防过度收归）：大小写折叠（`fscase` 的卷语义判据，不是路径归一）；
+   尾斜杠规则（`sysguard` 的"保根 `/`"与 `keep.go` 的"剥成空串即整卷"是**两种刻意不同**的语义，
+   且各自只有一份实现 ⇒ 无重复可收，保持就地）；`keep.hidden`（`keep.go:114`）的按段切分走 stdlib
+   `filepath.ToSlash`，单实现、且它是"平台真值"腿的正确用法示例。
+5. **收归要被门禁守住**，否则下一轮还会长出第五份：新增根包用例扫描仓内全部非测试 `*.go`，
+   断言"`\`→`/` 这一形态只允许出现在 `internal/pathnorm`"。
+
+### 16.2 改动面（生产文件）
+
+| 文件 | 改法 |
+|---|---|
+| `internal/pathnorm/pathnorm.go`（新） | `Slash` + `Under`，含"哪一字符算分隔符由调用点负责"的分歧说明 |
+| `internal/pathnorm/pathnorm_test.go`（新） | 等价性锁（语料对拍四份旧 body）+ 空串/根/连续分隔符边界 |
+| `internal/scanner/scanner.go` | 删 `keyOf`（:167-169）与 `underKey`（:173-175）；`visitKey` 改调 `pathnorm.Slash(p, string(filepath.Separator))`；`rootsUnder`/`dedupeRoots` 改调 `pathnorm.Under`；`:575/:578` 的空操作腿删除（保留 `Fold` 腿），并就地写明"为什么删得掉" |
+| `internal/sysguard/sysguard.go` | `normalize` 的替换腿改调 `pathnorm.Slash(p, "\\")`（尾斜杠循环保持就地）；`under` 改调 `pathnorm.Under`；包注释 :15-19 的分层约定按裁定"后补" |
+| `internal/filter/filter.go` | 删 `toSlashPat`，三处改调 `pathnorm.Slash(s, "\\")`；`:272` 前缀改调 `pathnorm.Under`（`prefix != ""` 守卫留在调用侧） |
+| `internal/fscase/fscase.go` | `Fold` 的替换腿改调 `pathnorm.Slash(p, "\\")`，`ToLower` 腿保持就地 |
+| `internal/ops/keep.go` | `inDirFold` 前缀改调 `pathnorm.Under` |
+| `app_pathnorm_gate_test.go`（新，根包） | 16.1-5 的 I5 门禁 + "五个旧名字不得再有函数体"的退场断言 |
+| `docs/04` | §6.8.0 约束 5（分层）与 §6.9.9 的 M26"四处只剩一份"表述按实测更正；§7 交付物清单 14 包 → 15 包；§6.11 登记表 M64 行标注已实施；新增 §6.12 划账 |
+
+### 16.3 探针（修前必红）
+
+| 探针 | 预期首轮读数 | 性质 |
+|---|---|---|
+| P-1 I5 门禁（仓内 `\`→`/` 只许一处） | **红**，逐条点名 `scanner.go` / `sysguard.go` / `filter.go` / `fscase.go` 四处 | 真红-真绿对；这条是本轮收归能否守住判据的那条腿 |
+| P-2 旧名字退场断言 | **红**，点名 `keyOf` / `underKey` / `normalize` / `under` / `toSlashPat` 五个 body 仍在 | 真红-真绿对（收归后只剩调用，不残留第二实现） |
+| P-3 等价性锁（`pathnorm` 语料对拍） | **无红可取**：新函数在改前不存在，编译期即无此路径 | 诚实标注：性质同 OPS-9"命名收归、行为不变"，强度证据走 16.4 变异 |
+| P-4 既有 M26 钉子（`scanner_m26_test.go:29-33`、`scanner_i2_i3_test.go:237`） | 改前绿；改后必须**仍绿且断言一字不动**（只把 `keyOf(...)` 换个写法） | 反向钉子：若收归把 M26 的语义弄丢，这几条会红 |
+
+### 16.4 变异（每条：改坏 → 跑目标用例 → 抄原文 → 还原 → `shasum -c`）
+
+| # | 变异 | 目标 | 预期 |
+|---|---|---|---|
+| M-M64-a | `Slash` 删掉零分配 fast path（直接 `ReplaceAll`） | 全量 | 行为等价 ⇒ **不红**；本条的价值是把"fast path 是分配优化而非判据"写成读数，不许当成"变异被杀"记账 |
+| M-M64-b | `Slash` 改成 `filepath.ToSlash`（平台语义） | sysguard / filter / pathnorm 的跨平台用例 | 红（unix 上不再换 `\` ⇒ Windows 风格清单与模式在 Linux 主门禁失效） |
+| M-M64-c | `Under` 写成 `HasPrefix(child, parent)`（少一条 `/`） | scanner / filter / pathnorm 前缀判据 | 红（`/data/ab` 被判为 `/data/a` 的后代） |
+| M-M64-d | 在 `scanner.go` 里手写第五份 `\`→`/` 本地实现 | P-1 门禁 | 红 ⇒ 证明这条门禁真的在守，而不是恒过 |
+
+### 16.5 边界与未兑现
+
+1. **本轮零生产语义变化**，因此不声称修掉任何一条既有缺陷；M63（FC-2）/M65（SCN-1）等仍在登记。
+2. **Windows 真机腿不新增**：`Slash(p, string(filepath.Separator))` 在 darwin 上就是恒等映射，
+   该差异只由"参数注入 `\\`"的用例面覆盖（既有 M26 用例形状不变）+ 三平台 `go vet`/`build` 各 rc=0。
+   不写"Windows 路径语义已验证"。
+3. **"分层约定后补"的实际内容**：改的是 `sysguard` 包注释与 04 §6.8.0 约束 5 的**表述**
+   （"不 import 任何 internal 包"→"不 import 任何有依赖/有副作用的 internal 包；唯一例外是只 import
+   `strings` 的叶子包"），sysguard 的真实 import 面以 `go list` 读数为准（仍为纯字符串判据）。
+4. **`keyOf` 在 `dedupeRoots` 的空操作腿被删除**是行为等价的，但它是"读代码时以为它在做某件事、其实没有"
+   的形状，故在 16.0-1 留了取证记录，并在改后代码注释里写明理由，避免下一轮有人"补回来"。
