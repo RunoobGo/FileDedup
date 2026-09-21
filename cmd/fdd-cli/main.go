@@ -23,8 +23,12 @@ type fileJSON struct {
 }
 
 type groupJSON struct {
-	Reclaimable uint64     `json:"reclaimable"`
-	Files       []fileJSON `json:"files"`
+	Reclaimable uint64 `json:"reclaimable"`
+	// 实占口径（M6-P2）。ActualKnown=false 时 reclaimable_actual 完全来自逻辑
+	// 回退（该卷读不到实占），它与 reclaimable 相等**不代表**"实占就是这么多"。
+	ReclaimableActual uint64     `json:"reclaimable_actual"`
+	ActualKnown       bool       `json:"actual_known"`
+	Files             []fileJSON `json:"files"`
 }
 
 type report struct {
@@ -47,6 +51,11 @@ type report struct {
 		// 不折算成被剪走的文件总量——剪枝没下潜，估出来的就是假数。
 		ProtectedDirs  int `json:"protected_dirs"`
 		ProtectedFiles int `json:"protected_files"`
+		// M6-P2（2026-09-21）实占口径合计。reclaimable_bytes 保留逻辑口径不动
+		// （它是历史数字与既往报表的参照），实占另起一键，两数之差就是稀疏/
+		// 压缩文件此前被虚报的量。
+		ReclaimableActualSum uint64 `json:"reclaimable_bytes_actual"`
+		ActualKnown          bool   `json:"reclaimable_actual_known"`
 	} `json:"stats"`
 	Groups []*groupJSON       `json:"groups"`
 	Failed []model.FailedItem `json:"failed"`
@@ -113,13 +122,21 @@ func main() {
 	r.Scan.Paranoid = *paranoid
 	r.Scan.Elapsed = elapsed.String()
 	for _, g := range groups {
-		gj := &groupJSON{Reclaimable: g.Reclaimable}
+		gj := &groupJSON{
+			Reclaimable:       g.Reclaimable,
+			ReclaimableActual: g.ReclaimableActual,
+			ActualKnown:       g.AnyActualKnown(),
+		}
 		for _, f := range g.Files {
 			gj.Files = append(gj.Files, fileJSON{Path: f.Path, Size: f.Size, ModTime: f.ModTime})
 			r.Stats.DuplicateFiles++
 		}
 		r.Groups = append(r.Groups, gj)
 		r.Stats.ReclaimableSum += g.Reclaimable
+		r.Stats.ReclaimableActualSum += g.ReclaimableActual
+		if gj.ActualKnown {
+			r.Stats.ActualKnown = true
+		}
 	}
 	r.Stats.Groups = len(groups)
 	r.Stats.FilesFailed = len(failed)
@@ -147,8 +164,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "编码失败: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "完成: %d 组 / 可释放 %s / 失败 %d / 耗时 %s\n",
-		r.Stats.Groups, humanBytes(r.Stats.ReclaimableSum), r.Stats.FilesFailed, elapsed)
+	fmt.Fprintf(os.Stderr, "完成: %d 组 / 可释放 %s（实占 %s）/ 失败 %d / 耗时 %s\n",
+		r.Stats.Groups, humanBytes(r.Stats.ReclaimableSum),
+		humanBytes(r.Stats.ReclaimableActualSum), r.Stats.FilesFailed, elapsed)
 }
 
 func humanBytes(n uint64) string {

@@ -11,12 +11,21 @@ type FileKey struct {
 
 // FileEntry 单个文件条目。
 type FileEntry struct {
-	ID      uint64 // 扫描任务内自增
-	Path    string
-	Size    uint64
-	ModTime int64 // UnixNano，缓存校验用
-	Key     FileKey
-	Ext     string // 小写扩展名（含点，如 ".jpg"；无扩展名为空）
+	ID   uint64 // 扫描任务内自增
+	Path string
+	Size uint64 // 逻辑大小（st_size）：缓存键、预筛分桶、扩展名/大小过滤的口径
+	// Actual/ActualKnown 是磁盘实占（M6-P2）。与实际内容的正确性无关，
+	// 因此**不进缓存表**——它只是"清掉能腾多少"的计量，不参与任何判定。
+	//
+	// ActualKnown=false 表示平台读不到实占（非 NTFS 卷、FUSE 报 0、句柄失效），
+	// 此时 Actual 回退为 Size 作下限参考。界面**必须**区分"实占未知"与
+	// "实占恰好等于/为 0"，否则一个未知文件会被显示成不占空间。
+	// Actual 可以大于 Size（块粒度对齐、预分配），不得封顶。
+	Actual      uint64
+	ActualKnown bool
+	ModTime     int64 // UnixNano，缓存校验用
+	Key         FileKey
+	Ext         string // 小写扩展名（含点，如 ".jpg"；无扩展名为空）
 }
 
 // Filters 扫描过滤器。
@@ -84,10 +93,60 @@ type StageEvent struct {
 
 // DuplicateGroup 最终重复组。
 type DuplicateGroup struct {
-	GroupID     uint64
-	Files       []*FileEntry
-	Reclaimable uint64   // (n-1)*size，硬链接已在阶段 1.5 剔除
-	Hash        [32]byte // 组内容 BLAKE3-256（操作前校验依据，M3）
+	GroupID uint64
+	Files   []*FileEntry
+	// Reclaimable 逻辑口径：(n-1)*size，硬链接已在阶段 1.5 剔除。
+	// 这是**历史表 reclaimable 列的既有语义**，也是既往清理数字的口径，
+	// 因此 M6-P2 引入实占后**不换语义**，改为并列新增 ReclaimableActual
+	// （理由见 docs/superpowers/specs/2026-09-21-m6-implementation-design.md §3.2）。
+	Reclaimable uint64
+	// ReclaimableActual 实占口径：组内**冗余成员**（不含保留项）的 Actual 之和。
+	// 成员实占未知时该项按逻辑大小计入（保守，不虚报为 0）——因此
+	// ReclaimableActual 与 Reclaimable 在"全部未知"时相等，而不是更小。
+	ReclaimableActual uint64
+	Hash              [32]byte // 组内容 BLAKE3-256（操作前校验依据，M3）
+}
+
+// ActualBytes 该条目在实占口径下的计账字节数（M6-P2）。
+//
+// 未知（ActualKnown=false）一律退回逻辑大小，**绝不按 0 计**：按 0 计会让
+// "平台读不到实占"的重复组显示成不占空间，而这正是本轮在修的那类数字失真。
+// 历史恢复的条目、以及未经扫描构造的条目（Actual 为零值）都走这条回退。
+func (e *FileEntry) ActualBytes() uint64 {
+	if e.ActualKnown {
+		return e.Actual
+	}
+	if e.Actual > 0 {
+		return e.Actual
+	}
+	return e.Size
+}
+
+// AnyActualKnown 组内是否**至少有一个**成员读到过实占（M6-P2）。
+// 全 false 时实占数字纯为逻辑口径回退，展示层必须显示"未统计"而不是那个数。
+// 定义在此而非各调用点：界面、CLI、历史三处若各写一遍，"未知"与"为 0"
+// 迟早会在一处被混掉。
+func (g *DuplicateGroup) AnyActualKnown() bool {
+	for _, f := range g.Files {
+		if f.ActualKnown {
+			return true
+		}
+	}
+	return false
+}
+
+// ReclaimActual 组内**冗余成员**的实占之和。约定 files[0] 为保留项，与
+// Reclaimable 的 (n-1) 口径逐字对齐——把保留项计进来会把可释放空间凭空
+// 多报一整份文件（变异 M-P2-c 钉住这一点）。
+func ReclaimActual(files []*FileEntry) uint64 {
+	if len(files) < 2 {
+		return 0
+	}
+	var sum uint64
+	for _, f := range files[1:] {
+		sum += f.ActualBytes()
+	}
+	return sum
 }
 
 // FailedItem 失败清单条目（扫描与操作共用）。

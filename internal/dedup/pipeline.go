@@ -704,10 +704,11 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		}
 		id++
 		groups = append(groups, &model.DuplicateGroup{
-			GroupID:     id,
-			Files:       g,
-			Reclaimable: (uint64(len(g)) - 1) * g[0].Size,
-			Hash:        k.full, // 组内容哈希（M3 操作前校验依据）
+			GroupID:           id,
+			Files:             g,
+			Reclaimable:       (uint64(len(g)) - 1) * g[0].Size,
+			ReclaimableActual: model.ReclaimActual(g),
+			Hash:              k.full, // 组内容哈希（M3 操作前校验依据）
 		})
 	}
 	// 稳定排序：可释放空间降序，其次组大小

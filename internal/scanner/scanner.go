@@ -16,6 +16,7 @@ import (
 	"filededup/internal/filter"
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/realbytes"
 	"filededup/internal/sysguard"
 	"filededup/internal/worktemp"
 )
@@ -369,6 +370,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						Ext:     strings.ToLower(filepath.Ext(full)),
 					}
 					e.Key = keyFromInfo(full, info) // unix 填充；win 返回未解析
+					// M6-P2 实占：复用同一个 info（unix 零额外 syscall，读的是
+					// Stat_t.Blocks）。放在 matcher.Apply **之后**是刻意的——
+					// Windows 腿要按路径查询，被过滤器挡掉的文件不该付这次开销。
+					e.Actual, e.ActualKnown = realbytes.Of(full, size, info)
 					local = append(local, e)
 				}
 			}

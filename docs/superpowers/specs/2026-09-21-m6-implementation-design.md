@@ -331,15 +331,38 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
    会计上必须允许 `Actual > Size`，并在文案里说清"含块对齐"。
    另：#3 与 #5 说明"预分配"在同一系统上都不一致，进一步支持"不许拿 `Size` 当实占"。
 
+**实施期补充实测（2026-09-21，同一台机器同一卷，Go `os.File` + `WriteAt` 造夹具）**：
+上表是 shell 工具（`dd`/`mkfile`/`cp`）做的，落到 Go 夹具时又量出两条会影响用例的事实：
+
+| 夹具 | 逻辑 | `st_blocks×512` | 判读 |
+|---|---|---|---|
+| truncate 到 1/2/4/8/12/16 MiB 后在尾部写 1 KiB | 1 MiB…16 MiB | **等于逻辑大小** | APFS 对 ≤16 MiB 的文件把洞**落地分配**，稀疏要 24 MiB 以上才出现 |
+| 同上，24/32/64/128/256 MiB | ≥24 MiB | 16,384 | 真的留洞 |
+| truncate 到任意尺寸、**一个字节都不写**（全洞） | 8…256 MiB | **0** | 全洞文件的 0 blocks 与"故障卷恒报 0"在单文件上不可区分 → 见 §3.4 |
+
+两条直接影响实现与用例：① 稀疏夹具必须 ≥ 32 MiB，否则用例会在一台**正常**的 mac 上
+正确地红（本轮取 64 MiB）；② 全洞文件的处置必须显式选边，见 §3.4 的取舍记录。
+
 ### 3.1 采集分层（对齐 §1 约束 1）
 
 新增叶子包 `internal/realbytes`，形状与 `internal/worktemp`、`internal/sysguard` 同族：
 
 | 文件 | tag | 内容 |
 |---|---|---|
-| `realbytes.go` | 无 | `From(size, reported uint64, ok bool) (actual uint64, known bool)` 纯函数：`!ok` 或 `reported==0 && size>0` → 回退 `size` 且 `known=false`；否则原样返回。**不做封顶**（§3.0 结论 3） |
-| `realbytes_unix.go` | `!windows` | 从 `os.FileInfo.Sys().(*syscall.Stat_t)` 取 `Blocks*512`。零额外 syscall：遍历期已经 `de.Info()` 过 |
-| `realbytes_windows.go` | `windows` | `GetCompressedFileSizeW`，挂在 `internal/fsid` 已打开的句柄上；句柄不可用则返回 `ok=false` 走回退 |
+| `realbytes.go` | 无 | `From(size, reported uint64, ok bool) (actual uint64, known bool)` 纯函数：`!ok` 或 `reported==0 && size>0` → 回退 `size` 且 `known=false`；否则原样返回。**不做封顶**（§3.0 结论 3）。另给调用方一个入口 `Of(path, size, info)`，把"读一个数"与"判一个数"串起来 |
+| `realbytes_unix.go` | `darwin \|\| linux` | 从 `os.FileInfo.Sys().(*syscall.Stat_t)` 取 `Blocks*512`。零额外 syscall：遍历期已经 `de.Info()` 过 |
+| `realbytes_other.go` | `!darwin && !linux && !windows` | 恒 `ok=false`（freebsd 等 `Stat_t` 布局不通用）。与 `internal/fsid/fsid_other.go` 同一处置 |
+| `realbytes_windows.go` | `windows` | **按路径**调 `GetCompressedFileSizeW`（该 API 本身就收路径，内部以 `FILE_READ_ATTRIBUTES` 打开）；失败（目录、ACL、超 `MAX_PATH` 且未加 `\\?\`）→ `ok=false` 走回退 |
+
+> **§3.1 的一处实施期修正（原设计的前提不成立，留字而不是悄悄改口径）**：
+> 原写 Windows 腿"挂在 `internal/fsid` 已打开的句柄上"。**扫描路径上没有那样的句柄**——
+> Windows 的遍历阶段刻意不开句柄（每文件开一次代价过高，故身份按需解析，
+> 见 `internal/scanner/filekey_windows.go`）。因此改为按路径查询，代价是
+> Windows 上每个"通过过滤器的候选文件"多一次元数据查询（采集点排在
+> `matcher.Apply` 之后，被过滤掉的文件不付）。这一开销已登记为待评估项（04 §6.9.3
+> 的 M29），且"未兑现真机验证"照实记。
+> 另：tag 从 `!windows` 收窄为 `darwin || linux` + 一个恒 false 的兜底文件，
+> 理由是 `Blocks` 字段在其它 unix 变体上布局不同，宁可不读也不按猜的偏移读。
 
 带 tag 的两个文件只做"读一个数"，判定与回退规则全部在无 tag 层——这样
 `From` 的回退分支在 Linux 主门禁里就是可执行断言，Windows 的 NTFS 压缩语义虽然
@@ -364,17 +387,36 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
 
 ### 3.3 探针（修前必红清单）
 
-| # | 用例 | 断言 | 修前为什么红 |
+| # | 用例（实施后的真名） | 断言 | 修前为什么红 |
 |---|---|---|---|
-| U1 | `realbytes.From` 回退规则（无 tag） | `ok=false` → `(size,false)`；`reported=0 && size>0` → 回退；`reported>size` → **原样返回不封顶** | 包不存在 → 编译红 |
-| U2 | 稀疏文件端到端（`os.Truncate` 造 8 MiB 洞 + 尾部写 1 KiB） | `Actual < Size`（实占远小于逻辑），组级 `ReclaimableActual < Reclaimable` | 修前无 `Actual` 字段 → 编译红 |
-| U3 | 普通文件两数关系 | `Actual >= Size`（块粒度）且 `Actual <= Size + 4096×len(extents)` 级别；核心断言只写"相等或略大"，不把块大小钉进断言（不同卷 512/4096 都会出现） | 同上 |
-| U4 | 组会计 | 3 成员组（1 保留 + 2 冗余）→ `Reclaimable = 2×Size`、`ReclaimableActual = 2×Actual` | 同上 |
-| U5 | 平台读数的"只登记不测"边界 | 克隆场景（#2/#4）在 CI 上不可造（Go 无 `clonefile` 绑定） → 不写断言，只在 04 记 ID | 不适用 |
+| U1 | `internal/realbytes`：`TestFromFallsBackWhenUnreported` / `TestFromFallsBackWhenPlatformReportsZero` / `TestFromDoesNotCapAtLogicalSize` / `TestFromPassesThroughSparseReported` | `ok=false` → `(size,false)`；`reported=0 && size>0` → 回退；`reported>size` → **原样返回不封顶**；稀疏读数原样通过 | 包不存在 → 编译红（实测读数：`undefined: From` ×6，`[build failed]`） |
+| U2 | `TestWalkRecordsSparseActualBelowSize`（遍历腿）+ `TestGroupSparseReclaimsFarLessThanLogical`（组腿） | 64 MiB 洞 + 尾部写 1 KiB → `Actual*4 < Size`、组级 `ReclaimableActual*4 < Reclaimable`，同时 `Size`/`Reclaimable` 一字不动 | 修前无 `Actual` 字段 → 编译红 |
+| U3 | `TestWalkActualKnownForPlainFile` | `ActualKnown=true`、`Actual >= Size`、`Actual <= 2×Size + 64 KiB`（只防"读错字段"，不钉块大小） | 同上 |
+| U4 | `TestGroupReclaimableActualExcludesKeep` | 3 成员组 → `Reclaimable = 2×Size`、`ReclaimableActual = Σ files[1:].ActualBytes()`，且**不等于**全组成员之和 | 同上 |
+| U5 | 平台读数的"只登记不测"边界 | 克隆场景（§3.0 #2/#4）在 CI 上不可造（Go 无 `clonefile` 绑定） → 不写断言，只在 04 记 ID | 不适用 |
+| U6 | 实施新增：`TestWalkAllHoleFileNeverReportsZeroActual` | 全洞文件的条目**绝不**以 `Actual=0` 出厂（任何卷上都成立，无需环境探测） | 修前无字段 → 编译红 |
+| U7 | 实施新增：`internal/cache`：`TestHashCacheColumnSetIsExactly` | `hash_cache` 列集合逐项等于显式清单（钉住"实占不进缓存表"） | 修前用例不存在 → 不红；它的作用是**让下面第 4 条变异真的会红** |
+| U8 | 实施新增：`TestWalkZeroSizeFileStillSkipped` | 0 字节文件不因实占采集而回到语料 | 同上 |
 
-**变异验证方向**（实施后逐条跑，读数进划账）：把封顶写进 `From` → U1 红；
-把 `known=false` 当成 `actual=0` → U1/U2 红；`ReclaimableActual` 误用保留项参与求和
-（应当只有冗余成员）→ U4 红；把 `Actual` 写进缓存表迁移 → 现有缓存用例红（钉住"不加列"）。
+> 稀疏类用例（U2 两腿）带 `requireTailSparse` / `requireU4Sparse` 环境前提核查，
+> 不满足时 `t.Skipf`。这**不是**豁免：无稀疏支持的卷上这条断言本身没有意义，
+> 而"卷不支持稀疏"不是代码缺陷。按 `scripts/test-windows-quarantine.sh` 头部的既有
+> 约定，环境差异在使用点自探，隔离清单只装代码已知缺陷。**留此记录以免将来被当成
+> "悄悄跳过"**：本机（APFS）实测为 PASS 而非 SKIP，Linux 门禁同样应 PASS；
+> 若哪天它变成 SKIP，要查的是夹具尺寸（§3.0 补充实测的 24 MiB 阈值）。
+
+**变异验证（实施后逐条跑，读数进 04 §6.9.3）**：
+
+| # | 变异（把正确写法改坏） | 应变红的用例 |
+|---|---|---|
+| M-P2-a | `From` 里加 `if reported > size { return size, true }`（封顶） | `TestFromDoesNotCapAtLogicalSize` |
+| M-P2-b | `From` 的 `!ok` 分支改成 `return 0, false`（未知当 0） | `TestFromFallsBackWhenUnreported`、`TestWalkActualKnownForPlainFile`、`TestWalkAllHoleFileNeverReportsZeroActual` |
+| M-P2-c | `ReclaimActual` 从 `files[0]` 起算（把保留项算进可释放量） | `TestGroupReclaimableActualExcludesKeep` |
+| M-P2-d | 给 `hash_cache` 加一列 `actual` | `TestHashCacheColumnSetIsExactly` |
+| M-P2-e | 把 `e.Actual, e.ActualKnown = realbytes.Of(...)` 从 `matcher.Apply` **之后**挪到**之前** | **预期不红**（Linux 上采集零成本、无语义差异），只作为 Windows 开销的读码约束记录，见 §3.1 修正段 |
+
+M-P2-e 是这张表里唯一"做不到红"的一条，如实标出而不是删掉：它是本轮设计自我
+修正的产物（原前提不成立），约束只能靠代码位置与注释承载。
 
 ### 3.4 未兑现与边界
 
@@ -384,3 +426,11 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
 - **UI 双数呈现属 M8**（裁定 ③）：本轮只到 JSON 与 CLI 字段为止。
 - 若某卷 `st_blocks` 语义不可信（部分 FUSE/NFS 报 0）→ 走 `known=false` 回退，
   界面须能区分"实占未知"与"实占=0"，这一点写进字段注释而不是靠猜。
+- **全洞文件（一个字节都没写）判为"未统计"，是刻意放弃的一类收益**：`st_blocks==0`
+  在"真全洞"与"该卷不跟踪块数"之间单文件不可区分，选边只能选"不新增错误结论"
+  这一侧——故障卷上"1 GB 重复组实占 0"是一个自信的错误数字，而退回逻辑口径
+  至多是"这一类没拿到收益"。要两者兼得需按卷判 `st_blocks` 可信度
+  （`statfs` 的 `f_type` + 每卷一次探测），登记为开放项 M28。
+- **APFS 的 16 MiB 落地阈值**（§3.0 补充实测）意味着"小文件稀疏"在本机根本不存在，
+  实占=逻辑；这一类不是缺陷，但会让用户在 mac 上看到"两个数一样"，文案须说明。
+- **Windows 每候选文件多一次元数据查询**（§3.1 修正段）：真机未测，登记为 M29 待评估。

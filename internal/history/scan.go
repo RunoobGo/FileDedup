@@ -198,6 +198,10 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 	groups := make([]*model.DuplicateGroup, 0, len(grs))
 	for _, gr := range grs {
 		g := &model.DuplicateGroup{GroupID: uint64(gr.id), Reclaimable: gr.reclaimable}
+		// 实占（M6-P2）：库里没有这个口径，恢复时**不拿逻辑值冒充已统计的实占**，
+		// 而是让成员全部保持 ActualKnown=false——组的实占因此恒等于逻辑口径，
+		// 且界面可凭"组内无一成员 known"如实显示"实占未统计"。
+		g.ReclaimableActual = gr.reclaimable
 		copy(g.Hash[:], gr.hash)
 		frows, err := s.db.Query(`SELECT id, path, size, mtime_ns FROM hist_files
 			WHERE group_id = ? ORDER BY id`, gr.id)
@@ -217,7 +221,12 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 			}
 			g.Files = append(g.Files, &model.FileEntry{
 				ID: uint64(fid), Path: path, Size: size, ModTime: mtime,
-				Ext: strings.ToLower(filepath.Ext(path)), // 结果页扩展名筛选依赖
+				// 实占（M6-P2）：历史表**没有**这一列，故 ActualKnown=false，
+				// 计账退回逻辑大小。这里显式把 Actual 填成 size 只是为了让
+				// "恢复后的条目"与"平台读不到的新扫描条目"在实占口径上
+				// 走同一条回退路径，不留两个零值分支。
+				Actual: size,
+				Ext:    strings.ToLower(filepath.Ext(path)), // 结果页扩展名筛选依赖
 			})
 		}
 		if err := frows.Err(); err != nil {

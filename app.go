@@ -75,10 +75,17 @@ type FileView struct {
 
 // GroupView 重复组视图。
 type GroupView struct {
-	GroupID     uint64     `json:"groupID"`
-	Reclaimable uint64     `json:"reclaimable"`
-	Size        uint64     `json:"size"`
-	Files       []FileView `json:"files"`
+	GroupID     uint64 `json:"groupID"`
+	Reclaimable uint64 `json:"reclaimable"`
+	// ReclaimableActual/ActualKnown 实占口径（M6-P2）。ActualKnown=false 表示
+	// 组内**没有任一成员**读到过实占（历史恢复、或该卷不提供 st_blocks/
+	// 压缩尺寸），此时 ReclaimableActual 完全来自逻辑回退，界面必须显示
+	// "实占未统计"而不是这个数。部分成员 unknown 时按逻辑大小计入，
+	// 数字仍是可信下界（宁可少说，不把未知算成 0）。
+	ReclaimableActual uint64     `json:"reclaimableActual"`
+	ActualKnown       bool       `json:"actualKnown"`
+	Size              uint64     `json:"size"`
+	Files             []FileView `json:"files"`
 }
 
 // KeepOutcome 保留策略结果（2026-09-18 审查 I4）。
@@ -99,10 +106,13 @@ type ResultQuery struct {
 
 // PagedResult 分页结果（01 §7.2）。
 type PagedResult struct {
-	Total            uint64      `json:"total"`
-	Page             int         `json:"page"`
-	TotalReclaimable uint64      `json:"totalReclaimable"` // 全量口径（含未加载页，M4 审查修订）
-	Groups           []GroupView `json:"groups"`
+	Total            uint64 `json:"total"`
+	Page             int    `json:"page"`
+	TotalReclaimable uint64 `json:"totalReclaimable"` // 全量口径（含未加载页，M4 审查修订）
+	// TotalReclaimableActual 实占口径的全量合计（M6-P2），口径与上一行一致。
+	// 注意它**可能大于** TotalReclaimable：实占含块对齐与预分配，逻辑大小不含。
+	TotalReclaimableActual uint64      `json:"totalReclaimableActual"`
+	Groups                 []GroupView `json:"groups"`
 }
 
 // sortKey 结果视图缓存键（Y3）：排序方式 + 归一化扩展名筛选。
@@ -123,8 +133,12 @@ type viewCacheEntry struct {
 type ScanSummary struct {
 	Groups      int    `json:"groups"`
 	Reclaimable uint64 `json:"reclaimable"`
-	FilesFailed int    `json:"filesFailed"`
-	Elapsed     string `json:"elapsed"`
+	// ReclaimableActual 实占口径合计（M6-P2）。与 Reclaimable 并列而非替换：
+	// 后者是历史表与既往清理数字的口径，换语义会让"上次 8 GB 这次 300 MB"
+	// 看起来像回归。两数之差就是稀疏/压缩文件被逻辑口径虚报的部分。
+	ReclaimableActual uint64 `json:"reclaimableActual"`
+	FilesFailed       int    `json:"filesFailed"`
+	Elapsed           string `json:"elapsed"`
 
 	// M6-P4（2026-09-21）系统保护清单的可见计数：被剪枝的目录数、被跳过的
 	// 盘根伪文件与 Windows 保留名文件数。引擎内置的排除**不许静默**——
@@ -573,8 +587,10 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			}
 		}
 		var reclaim uint64
+		var reclaimActual uint64
 		for _, g := range groups {
 			reclaim += g.Reclaimable
+			reclaimActual += g.ReclaimableActual
 		}
 		a.scanInFlight = false
 		a.mu.Unlock()
@@ -609,13 +625,14 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		unprot := a.pipe.UnprotectedRoots()
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
-			Groups:           len(groups),
-			Reclaimable:      reclaim,
-			FilesFailed:      len(failed),
-			Elapsed:          elapsed.String(),
-			ProtectedDirs:    pDirs,
-			ProtectedFiles:   pFiles,
-			UnprotectedRoots: unprot,
+			Groups:            len(groups),
+			Reclaimable:       reclaim,
+			ReclaimableActual: reclaimActual,
+			FilesFailed:       len(failed),
+			Elapsed:           elapsed.String(),
+			ProtectedDirs:     pDirs,
+			ProtectedFiles:    pFiles,
+			UnprotectedRoots:  unprot,
 		})
 	})
 	return taskID, nil
@@ -740,10 +757,13 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	gs := entry.groups
 
 	total := uint64(len(gs))
-	// 全量可释放空间（含未加载页）：统计条与 totalGroups 同口径
-	var totalReclaim uint64
+	// 全量可释放空间（含未加载页）：统计条与 totalGroups 同口径。
+	// M6-P2：实占口径必须同样走全量——只给当页之和会让统计条在翻页时数字
+	// 跳动，正是 M4 审查修过的那类"部分当全部"。
+	var totalReclaim, totalReclaimActual uint64
 	for _, g := range gs {
 		totalReclaim += g.Reclaimable
+		totalReclaimActual += g.ReclaimableActual
 	}
 	// M10a（2026-09-21 全仓审计 §五 10）：起点必须**溢出安全**。
 	// q.Page/q.PageSize 是绑定层入参（int），前端能给任意值：修正前直接
@@ -753,11 +773,11 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	// 用 math.MaxInt 而非 MaxInt64：切片下标是平台 int，32 位目标上
 	// 天花板是 MaxInt32，按 64 位判会把"已经回绕"的乘积放过去。
 	if q.Page > 0 && q.PageSize > math.MaxInt/q.Page {
-		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
+		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, TotalReclaimableActual: totalReclaimActual, Groups: []GroupView{}}, nil
 	}
 	start := q.Page * q.PageSize
 	if start >= len(gs) {
-		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: []GroupView{}}, nil
+		return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, TotalReclaimableActual: totalReclaimActual, Groups: []GroupView{}}, nil
 	}
 	end := start + q.PageSize
 	if end > len(gs) {
@@ -767,7 +787,7 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 	for _, g := range gs[start:end] {
 		views = append(views, toGroupView(g, a.keepIDs))
 	}
-	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, Groups: views}, nil
+	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, TotalReclaimableActual: totalReclaimActual, Groups: views}, nil
 }
 
 // buildSortedGroupsLocked 执行一次扩展名筛选 + 排序（调用方须持 a.mu）。
@@ -861,10 +881,12 @@ func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
 		return GroupView{GroupID: g.GroupID, Files: []FileView{}}
 	}
 	v := GroupView{
-		GroupID:     g.GroupID,
-		Reclaimable: g.Reclaimable,
-		Size:        g.Files[0].Size,
-		Files:       make([]FileView, 0, len(g.Files)),
+		GroupID:           g.GroupID,
+		Reclaimable:       g.Reclaimable,
+		ReclaimableActual: g.ReclaimableActual,
+		ActualKnown:       g.AnyActualKnown(),
+		Size:              g.Files[0].Size,
+		Files:             make([]FileView, 0, len(g.Files)),
 	}
 	keep := -1
 	for i, f := range g.Files {
@@ -1416,8 +1438,14 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 	}
 	byID := make(map[uint64]*model.FileEntry, meta.Files)
 	var reclaim uint64
+	var reclaimActual uint64
 	for _, g := range groups {
 		reclaim += g.Reclaimable
+		// M6-P2：历史库没有实占口径，LoadScan 按"成员全部 unknown"回填，
+		// 所以这里两数**必然相等**。相等不是"实占恰好等于逻辑大小"的结论，
+		// 而是"没统计过"——界面须靠成员的 ActualKnown 判定并显示"未统计"，
+		// 不得把这个数当成实占播报（与 M6-P4 三项计数同一处置）。
+		reclaimActual += g.ReclaimableActual
 		for _, f := range g.Files {
 			byID[f.ID] = f
 		}
@@ -1458,7 +1486,8 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 	a.mu.Unlock()
 
 	return ScanSummary{
-		Groups: len(groups), Reclaimable: reclaim, FilesFailed: len(meta.Failed),
+		Groups: len(groups), Reclaimable: reclaim, ReclaimableActual: reclaimActual,
+		FilesFailed: len(meta.Failed),
 	}, nil
 }
 
@@ -1758,6 +1787,9 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			if len(files) >= 2 {
 				g.Files = files
 				g.Reclaimable = (uint64(len(files)) - 1) * files[0].Size
+				// 实占必须同步重算：不清零/不沿用旧值的话，清理掉一半成员后
+				// 结果页仍显示清理前的可释放量（同一类"数字比盘上多"）。
+				g.ReclaimableActual = model.ReclaimActual(files)
 				kept = append(kept, g)
 			}
 		}
