@@ -824,6 +824,12 @@ default:
 `newFolder`，而 `needFold=false` 后这个值不再参与折叠。保留它是因为该返回值与多根路径
 共用同一条签名；它是**诚实值**（"我们没测"），不是假装测过。改动处会写明这一点。
 
+**实施后追记（2026-09-21，M36 交付）**：表内方案 C 的"**本轮不做**"是 C1 交付当时的结论；
+本项（M36）随后就按它实施了，设计段见 §10。三点随之变化：① 遍历键**一律**不折叠，
+`folder` 类型与四个方法整体删除；② `sens` 不再出参（方案 B 留下的那处"已知不美"消失）；
+③ 三条直接戳 `folder` 的用例被一条更强的纯断言替换（§10.3 V1）。方案 A 的结论不变
+（仍被 E5 推翻），方案 B 单根那一半的结论也不变（仍是"单根不折"的特例）。
+
 ### 6.3 改动面（`internal/scanner/scanner.go`，两处 + 一条注释）
 
 1. `newFolder`：`len(roots) <= 1` → 直接返回（不设 `needFold`）。
@@ -861,8 +867,10 @@ default:
 
 ### 6.5 未兑现与边界
 
-- **E6 / M36 不修**：≥2 根、且其中某根的子树里嵌着另一卷（大小写敏感）时，按根折叠
-  仍会把该子树里的 `alpha`/`ALPHA` 折成一棵。修法是方案 C，本轮按"不扩大改动面"只登记。
+- **E6 / M36**：≥2 根、且其中某根的子树里嵌着另一卷（大小写敏感）时，按根折叠
+  仍会把该子树里的 `alpha`/`ALPHA` 折成一棵。~~修法是方案 C，本轮按"不扩大改动面"只登记。~~
+  **（2026-09-21 追记）已按方案 C 实施，见 §10**；本条其余结论（当时只登记、真读数
+  `ED-two-roots files_total=2`）不变。
 - **Windows 与 Linux 两条腿未取真读数**：本机是 darwin。Windows 的"每目录大小写敏感"
   （WSL `fsutil file setCaseSensitiveInfo`）会让**敏感目录嵌在不敏感卷里**——这正是
   E5 的同族构型，单根已被 B 治好；≥2 根的同类缺口并入 M36。Linux 的 casefold/CIFS
@@ -1270,3 +1278,107 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
 9. **M26 的判据面只覆盖 `dedupeRoots` 与既有两个键比较点**：`rootPrefixes`（`scanner.go:582-589`）
    用的仍是"根 + `filepath.Separator`"，那是**原始路径**上的前缀（不是折叠键），
    与 M26 不同族，本项不动（登记 M36 是另一回事：≥2 根时子树里嵌着另一卷的语义，仍留账）。
+
+---
+
+## 10. M36：≥2 根路径上的按根折叠缺口（04 §6.8.8 M36）
+
+> 修的是什么：遍历期的 `visited` 去重键此前是**按根所在卷的语义折叠**过的（`folder.fold`）。
+> 而折叠键描述的是**根所在卷**，一棵根的子树却在**任意深度**上都可能嵌着另一卷——
+> 把一棵大小写敏感卷挂进任意普通目录即得此构型（本机可自建，E1）。
+> 于是"父根在不敏感卷上"这条判定被错误地施加到整棵子树：`alpha/` 与 `ALPHA/` 两棵
+> **不同**子树被折成一个键，后遇到的那棵整棵不进语料，**且一条失败都不记**（E3）。
+> 这是 C1（§6 单根）的同族缺口，修法就是 §6.2 早已预告并登记的**方案 C**。
+
+### 10.0 动手前取证（2026-09-21，本机实测 + 读码）
+
+| # | 取证项 | 读数 | 出处 |
+|---|---|---|---|
+| E1 | 构型能不能自建（不需要 root） | 能：`hdiutil create -size 20m -fs "Case-sensitive APFS" -volname FDDSEN` rc=0；`hdiutil attach <dmg> -mountpoint <普通目录>/sen -nobrowse` rc=0，`mount` 回显 `<…>/host/sen (apfs, local, nodev, nosuid, journaled, noowners, nobrowse, mounted by just)` | 本机执行 |
+| E2 | 构型的两个卷语义各自确认 | 父卷不敏感：`test -d <EV>/HOST` 为真（`host` 与 `HOST` 是同一目录）；子卷敏感：`<EV>/host/sen/ALPHA/a.txt` **不存在**而 `alpha/a.txt` 存在，且 `ls` 同时列出 `ALPHA` 与 `alpha` | 本机执行 |
+| E3 | ★ 修前真读数（两根 = 不敏感父目录 + 另一无关目录；真值 3 = 敏感卷内 2 + 另一根 1） | `files_total=2`、`files_failed=0`、`protected_dirs=1`（= 敏感卷根上的 `.fseventsd`，与本项无关） | `fdd-cli`，本轮重取（与 04 §6.9.6 `ED` 行读数一致） |
+| E4 | 单根对照（方案 B 已治） | **同一台机器、同一刻、同一构型**，只给父目录一个根：`files_total=2`（真值 2）——单根已收齐，两根仍漏 | `fdd-cli`，本轮 |
+| E5 | 遍历期折叠的消费点到底有几处 | 两处**判重**（`visited` 的发现键 `scanner.go:405`、种子键 `:289`）＋两处**键空间**（逃逸判据的 `rawKeys` `:269`、dirKey `:388`）。除这四处外无消费方；`res.Visited` 只是 `len(visited)` | 读码 |
+| E6 | 折叠撤掉后还需不需要它 | 需要，但只剩**合并用户给的根**一处：`dedupeRoots:582-586` 的 `fr/fk` 比较——"同一目录的两种拼写"只在用户手输时出现 | 读码 |
+| E7 | `folder` 类型还剩什么 | 只剩 `prefixes`（G2 预计算，`WalkWithGate:253` 直接当 `prefixes` 用）；`roots`/`sens`/`def`/`needFold` 与四个方法在方案 C 下全无消费方 | 读码 |
+| E8 | 危害能不能在**主门禁**（Linux CI）上复现，而不只靠挂卷 | 能：`probeCaseSensitive` 是包级接缝，注入"不敏感"就能让父根被判为不敏感，而 Linux 的 tmpfs/ext4 上 `alpha/` 与 `ALPHA/` 可以真并存 ⇒ 与 E3 **同形**（根卷判定 ≠ 子树现实）。本轮落地为 V2 | 读码 + 设计 |
+| E9 | 折叠错了的代价不对称（承 §6.0 E9） | 折错 = 静默丢语料、下游补不回来；不折错 = 同一目录走两遍，由阶段 1.5 的物理身份去重吸收 | 读码 |
+| E10 | 逃逸判据的键也随之变精确 | `rawKeys`/dirKey 由"折叠键"改为**原样拼写键** ⇒ 用户手输的拼写与盘上拼写**仅大小写不同**时不再匹配 ⇒ 不再放行保护剪枝（剪枝 + `ProtectedDirs` 计数）。这是本项**新引入**的一处行为变化，登记 **M44**（§10.5-1） | 读码 |
+| E11 | 既有用例里哪些会被推翻 | 直接戳 `folder` 的三条：`TestFolderSingleRootNeverFolds`、`TestFolderMultiRootStillFolds`、`TestFolderFoldPerRoot`——正是 §6.2 方案 C 预告的代价。**端到端那几条不受影响**（`TestWalkCaseSensitivityIsProbed`、`TestWalkSingleRootSkipsProbe`、`TestWalkSingleRootKeepsCaseVariantSubtrees`、`TestRootInsideProtectedDirStillScanned`），因为 `dedupeRoots` 的合并折叠保留 | 读码 |
+
+### 10.1 判据：折叠的两个用途，只有一个是遍历期的
+
+折叠把路径归一到"同一棵树的同一个键"。它在本代码里只有两个真实用途：
+
+1. **合并用户给的根**（`dedupeRoots`）：用户可能把同一棵树以两种拼写各给一次（手输、
+   从两个方向点进来）。这里折叠是**必需**的，且是"探测"存在的唯一理由。**保留。**
+2. **遍历期去重**（`visited`）：从根出发，每个子路径都由 `filepath.Join(父, ReadDir 得到的名字)`
+   生成，链接/junction 已在 `:294` 被跳过 ⇒ 同一目录在一趟遍历里**只会以唯一拼写出现**，
+   没有可并之物。此时任何折叠都只剩一种可能的作用：把大小写不同的两棵**不同**目录
+   误并成一棵。**撤掉。**
+
+两种错法的代价不对称（E9）：折错 = 静默丢语料且不可恢复；不折错 = 同一目录走两遍，
+结果被阶段 1.5 的物理身份去重吸收。**不确定时倾向不折叠**——这正是 C1 已经采用的口径
+（§6.1），M36 只是把它从"单根"推广到"全部遍历键"，让判据不再依赖根本身的卷属性。
+
+一句话：**探测只描述根本身所在的卷，而遍历会走进任意深度的别的卷**（E5/E8 的构型）。
+把"根卷"的语义施加到子树上，前提本身就是错的；既然遍历期没有可并之物，最省事的正确
+做法就是不折，而不是去猜每一个子目录的卷语义。
+
+### 10.2 改动面（`internal/scanner/scanner.go` + 三个测试文件）
+
+1. **删** `folder` 类型与 `newFolder`/`fold`/`foldRoot`/`key`（`:139-:220` 一带的折叠段）。
+2. **增** `visitKey(p string) string { return keyOf(p, string(filepath.Separator)) }`——
+   遍历期唯一的键构造入口（只归一分隔符，不动大小写）。`keyOf`/`underKey` 的文档随之改写
+   （"折叠后的路径"→"路径"）。
+3. **`WalkWithGate` 换键**：
+   - `cleaned, all := dedupeRoots(roots)`（sens 不再出参）；`prefixes := rootPrefixes(cleaned)`
+   - `rawKeys[i] = visitKey(all[i])`；逃逸判据 `rootsUnder(rawKeys, all, visitKey(full))`
+   - `visited[visitKey(cleaned[i])]` 种子；目录发现处 `key := visitKey(full)`
+4. **`dedupeRoots` 收窄签名**：返回 `(kept, all)`——`sens` 变成纯内部值（只在合并时用）。
+   单根早退分支**保留**（它的作用是不探测，`TestWalkSingleRootSkipsProbe` 钉着它），
+   只是不再为出参构造 sens。§6.2 方案 B 留下的那处"已知不美"（sens 是"没测过"的诚实值
+   却要随签名传出）随之消失。
+5. **不动**：`fscase` 包、`probeCaseSensitive` 接缝、`rootPrefixes`、`sysguard`、
+   阶段 1.5 的物理身份去重。
+6. **三条 `folder` 用例作废并原位替换**（E11）：它们的断言对象（`newFolder`/`fold`/`foldRoot`）
+   在本项被删除，属 §6.2 预告的"推翻 I2 当年定的机制"那一半。替换物是一条约**更强**的
+   纯断言（V1：遍历键在任何根数、任何卷语义下都拼写精确），I2 的实质（探测决定**合并**）
+   继续由 `TestDedupeRootsFoldsByProbedVolume` 钉住。原位留说明块，不做静默删除。
+
+### 10.3 探针（修前必红清单）
+
+| # | 用例 | 断言 | 修前为什么红 |
+|---|---|---|---|
+| V1 | `scanner`：`TestVisitKeyNeverFolds`（原位替换三条 `folder` 用例） | 遍历键 = 原样拼写 + 分隔符归一：`visitKey(p) == keyOf(p, sep)`、`visitKey(lower) != visitKey(upper)`（不折）、`keyOf` 的 Windows 真值形态（注入 `\`）；新 API 无根数/卷语义参数 ⇒ 与平台无关 | 修前**编译红**（`visitKey` 不存在）＋语义相反：同位置的旧断言钉的是"两根且有一根不敏感时**要**折叠"，与本节判据正相反 |
+| V2 | `scanner`：`TestMultiRootWalkKeepsCaseVariantSubtrees`（E8 构型，Linux 主门禁可跑） | 两根 + 注入"不敏感"：父根下 `alpha/`、`ALPHA/` 各 1 文件 + 另一根 1 文件 → 收 **3** 个（修前 2），`Failed` 空；无敏感卷时 skip | 修前遍历键折叠 ⇒ 两棵并成一棵 ⇒ 2 |
+| V3 | `scanner`：`TestCaseMismatchedRootUnderProtectedDirIsNotRescued`（E10/M44 判据钉） | 两根：宽根 + 保护清单内目录（拼写与盘上**仅大小写不同**）⇒ 剪枝生效、`ProtectedDirs>=1`、`UnprotectedRoots` 空（fail-closed） | 修前折叠键让两者匹配 ⇒ 逃逸放行、文件进语料 |
+| V4 | 既有两条**保持绿**（反向对照，证明不是"取消折叠"） | `TestDedupeRootsFoldsByProbedVolume`（说不敏感 ⇒ 两根并成一棵）、`TestWalkCaseSensitivityIsProbed`（端到端 2 / 4） | 绿 |
+| V5 | 既有四条**保持绿**（遍历键换名不得伤及行为） | `TestWalkSingleRootSkipsProbe`（单根零探测）、`TestWalkSingleRootKeepsCaseVariantSubtrees`、`TestRootInsideProtectedDirStillScanned`（拼写一致时逃逸照旧放行）、`TestExplicitProtectedRootIsReported` | 绿 |
+| V6 | 真构型复跑（非用例，E1 的 `hdiutil` 构型） | 两根构型 `files_total=3 failed=0`（真值 3）；单根仍 2 | 修前 `files_total=2`（E3 读数） |
+
+### 10.4 变异（逐条改坏 → 应红）
+
+| # | 变异 | 应变红 |
+|---|---|---|
+| M-M36-a | `visitKey` 内部改回折叠（`keyOf(fscase.Fold(p,false), sep)`） | V1、V2 |
+| M-M36-b | 只把目录发现处的键改回折叠（`key := visitKey(full)` 处），V1 的直接靶子不动 | V2（V1 应仍绿——两条各自盯一个面） |
+| M-M36-c | 逃逸判据的键改回折叠（`rootsUnder(rawKeys, all, …)` 处） | V3 |
+| M-M36-d | 顺带把 `dedupeRoots` 的合并折叠也删掉（**过度删除**方向） | V4（`TestDedupeRootsFoldsByProbedVolume`、`TestWalkCaseSensitivityIsProbed`） |
+| M-M36-e | 种子键改回折叠（`visited[visitKey(cleaned[i])]` 处） | **预期不可杀**：合并后根集两两不成嵌套，遍历走不到第二个拼写 ⇒ 无危害。如实记录（与 M-M26-b 同款处理），不写成"已验证" |
+
+### 10.5 未兑现与边界
+
+1. **逃逸判据不再容忍大小写拼写差异**（E10）：不敏感卷上，用户**手输**一个与盘上拼写仅
+   大小写不同的保护清单内路径作根时，剪枝不再放行（fail-closed），后果是剪枝 + `ProtectedDirs`
+   计数，而不是"他点名的根本被拒"的专门提示。**与 §6.1"不确定时倾向不折叠"同一口径**，
+   且方向是安全侧（宁可少放行，不可误放行——误放行会走进用户从没点过的保护目录）。
+   新增登记 **M44**，V3 把这条口径钉成断言。
+2. **Windows / Linux 真机读数未取**：本机是 darwin，遍历键的精确比较在 Windows 上只是
+   "不比大小写"，但**未在真机取读数**（与 §6.5-2 同档，不写作已通过）。
+3. **`res.Visited` 口径再变**：多根时不再按折叠键计数。消费方只有取消用例的松断言，无依赖。
+4. **E9 那条兜底未实测**：Linux casefold/CIFS 上"该折没折 ⇒ 同一棵收两遍"由阶段 1.5 的
+   物理身份去重吸收，属"有理有据但未实测"（与 §6.5-2 同档）。
+5. **V2 在 macOS 上 skip**：父卷不敏感 ⇒ 两棵真目录无法并存，兑现环境是 Linux CI
+   （与 C1 的 V3 正好互补：那条在 macOS 因不敏感而 skip、在 Linux 兑现；本条同）。
+   本机证据由 V6 的 `hdiutil` 真构型读数承担。
