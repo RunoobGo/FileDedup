@@ -41,8 +41,25 @@ export interface StageEvent {
 export interface ScanSummary {
   groups: number
   reclaimable: number
+  // 实占口径合计（M6-P2）：与 reclaimable 并列而非替换——后者是历史表与既往
+  // 清理数字的口径，换语义会让"上次 8 GB 这次 300 MB"看起来像回归。
+  // 两数之差就是稀疏/压缩文件被逻辑口径虚报的部分。
+  reclaimableActual: number
   filesFailed: number
   elapsed: string
+  // 系统保护清单的可见计数（M6-P4）：被剪枝的目录数 / 被跳过的盘根伪文件与
+  // Windows 保留名文件数。引擎内置排除不许静默——结果比盘上少就得有地方说明。
+  protectedDirs: number
+  protectedFiles: number
+  // 本轮因"云端占位"跳过的文件数（M6-P1）。AllowCloudHydration=true 时恒为 0。
+  // ★ history.db 没存这三项（含下面两条），从记录页恢复时只能显示"未统计"，
+  //   不得用零值冒充"这一轮没有云端文件"。
+  skippedCloudFiles: number
+  // 本轮按 worktemp.IsTempName 跳过的工作临时名文件数（M21）。
+  // ★ 判据是名字形态，分不出"我们的残留"与"用户恰好这样命名的文件"。
+  skippedWorkTempFiles: number
+  // 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名了保护清单内路径）。
+  unprotectedRoots?: string[]
 }
 
 // HistoryMeta 扫描历史列表项（与 app.go HistoryMeta json tag 一致）。
@@ -79,6 +96,12 @@ export interface FileView {
 export interface GroupView {
   groupID: number
   reclaimable: number
+  // 实占口径（M6-P2）。actualKnown=false 表示组内**没有任一成员**读到过实占
+  // （历史恢复、或该卷不提供 st_blocks/压缩尺寸）：此时 reclaimableActual 完全
+  // 来自逻辑回退，界面须显示"实占未统计"而不是这个数。部分成员 unknown 时
+  // 按逻辑大小计入，数字仍是可信下界（宁可少说，不把未知算成 0）。
+  reclaimableActual: number
+  actualKnown: boolean
   size: number
   files: FileView[]
 }
@@ -94,6 +117,9 @@ export interface PagedResult {
   total: number
   page: number
   totalReclaimable: number // 全量口径（含未加载页，与 Go json tag 一致）
+  // 实占口径的全量合计（M6-P2），口径同上。注意它**可能大于** totalReclaimable：
+  // 实占含块对齐与预分配，逻辑大小不含。
+  totalReclaimableActual: number
   groups: GroupView[]
 }
 
