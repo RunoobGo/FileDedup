@@ -16,6 +16,7 @@ import (
 	"filededup/internal/filter"
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/sysguard"
 	"filededup/internal/worktemp"
 )
 
@@ -69,6 +70,21 @@ type Result struct {
 	Files   []*model.FileEntry
 	Failed  []model.FailedItem
 	Visited int // 实际访问目录数（诊断用）
+
+	// M6-P4（2026-09-21，04 §6.7 C 组 4）系统保护清单的三类可见计数。
+	//
+	// 为什么必须独立成数而不是并入 Failed：受保护目录被剪枝是**引擎有意为之**，
+	// 混进失败清单会把真正的"你的文件读不了"淹没在系统噪声里（修正前盘根扫描
+	// 就是这个样子）。但静默跳过同样不行——用户看到的结果比盘上的东西少，
+	// 必须有一个地方解释少了多少、为什么少。
+	//
+	// ProtectedDirs 只数**目录**：剪枝没有下潜，报"跳过了 N 个文件"就是编数。
+	ProtectedDirs  int
+	ProtectedFiles int
+	// UnprotectedRoots 是"因为用户显式指定了它，所以保护对它失效"的根路径。
+	// 界面必须据此警示（M8）：这些根扫出来的东西可能全是系统元数据，
+	// 也可能是用户唯一真正想扫的——两种情况下他都该知道自己脱离了保护范围。
+	UnprotectedRoots []string
 }
 
 // Waiter 暂停闸门（②-S）：dedup.Gate 实现本接口。扫描器不 import dedup
@@ -76,6 +92,11 @@ type Result struct {
 type Waiter interface {
 	Wait(ctx context.Context) error
 }
+
+// guard 系统保护清单。抽成包级变量供测试换装别的平台清单（与
+// probeCaseSensitive 同一手法）：盘根伪文件与 Windows 保留名只在 Windows 清单里，
+// 不能注入就永远只能在 Windows 上才有断言机会，而那是"等于没测"。
+var guard = sysguard.New(sysguard.Current)
 
 // probeCaseSensitive 按卷探测入口；抽成变量供测试扮演敏感/不敏感卷
 // （真实大小写敏感卷需要专门格式化的卷，本机与 CI 都无法现造）。
@@ -122,6 +143,26 @@ func (f *folder) fold(p string) string {
 // 故单独按该根卷的语义折叠。
 func (f *folder) foldRoot(i int) string { return fscase.Fold(f.roots[i], f.sens[i]) }
 
+// key 折叠 + 分隔符统一为 "/" 的**比较键**。
+// 不能拿 fold 的结果直接做前缀比较：fold 在不敏感卷上会把 "\" 换成 "/"，
+// 在敏感卷上原样返回，两种形态混在一起比较时前缀判定会静默失效
+// （04 §6.8.8 登记的 dedupeRoots 同类问题正是这一条）。
+func (f *folder) key(p string) string {
+	return strings.ReplaceAll(f.fold(p), string(filepath.Separator), "/")
+}
+
+// rootsUnder 返回位于 dir（含自身）之下的那些用户原始根。
+// dirKey 必须是 folder.key 的产物；paths 与 keys 同序，是要展示给界面的原样路径。
+func rootsUnder(keys []string, paths []string, dirKey string) []string {
+	var out []string
+	for i, k := range keys {
+		if k == dirKey || strings.HasPrefix(k, dirKey+"/") {
+			out = append(out, paths[i])
+		}
+	}
+	return out
+}
+
 // Walk 并行遍历 roots（无暂停闸门）。
 func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *Result {
 	return WalkWithGate(ctx, roots, f, workers, nil)
@@ -138,12 +179,35 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		workers = 4
 	}
 	res := &Result{}
-	cleaned, sens := dedupeRoots(roots)
+	cleaned, sens, all := dedupeRoots(roots)
 	// I2：折叠按各根所在卷探测；G2：根前缀预计算一次，供每个文件的 relativeTo 复用
 	fld := newFolder(cleaned, sens)
 	prefixes := fld.prefixes
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
 	matcher := filter.Compile(f)
+
+	// M6-P4：盘根伪文件的锚点。**原样字符串**比对即可，不必折叠：遍历期的 dir
+	// 只有两种来源——用户给的根（就是这份字符串本身）或 filepath.Join(父, 名字)，
+	// 后者永远不等于任何根。做折叠反而会引入"根的两种拼写谁赢"的无谓分支。
+	scanRoots := make(map[string]bool, len(cleaned))
+	for _, r := range cleaned {
+		scanRoots[r] = true
+	}
+	// M6-P4 逃逸判据要用**用户原始指定的全部根**（含被宽根覆盖而丢弃的子根）：
+	// "已被宽根覆盖"这条推断在遇到保护剪枝时并不成立——宽根走不进受保护目录里面。
+	// 折叠键统一走 folder.key（见它注释里的那条分隔符陷阱）。
+	rawKeys := make([]string, len(all))
+	for i, r := range all {
+		rawKeys[i] = fld.key(r)
+	}
+	// (1) 用户点名的根本身就是清单内路径：照他的意思扫，但这份"已脱离系统保护"
+	// 必须留痕，界面据此警示（M8）。剪枝不参与，故不计入 ProtectedDirs。
+	startUnprot := make(map[string]struct{})
+	for _, r := range cleaned {
+		if guard.Dir(r, filepath.Base(r)).Skip {
+			startUnprot[r] = struct{}{}
+		}
+	}
 
 	var (
 		mu      sync.Mutex
@@ -165,6 +229,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 
 	locals := make([][]*model.FileEntry, workers)
 	fails := make([][]model.FailedItem, workers)
+	// 保护计数按 worker 记账、收口时合并（与 locals/fails 同一手法，不加锁）。
+	protDirs := make([]int, workers)
+	protFiles := make([]int, workers)
+	escapedRoots := make([][]string, workers)
 	var workerWg sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
@@ -230,6 +298,22 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						continue
 					}
 					if typ.IsDir() {
+						// M6-P4（04 §6.7 C 组 4）：系统保护清单**排在隐藏规则之前**。
+						// 既属"系统保护"又属"隐藏"的条目（.Spotlight-V100 一类）若先被
+						// 隐藏规则拦下，"已保护跳过 N" 会随用户勾选"包含隐藏文件"而变小，
+						// 读起来像保护失效；两类计数也就此分不清谁挡的。
+						//
+						// 命中后唯一的放行通道是"用户显式把该目录（或其内部）设为扫描根"：
+						// 保护是为了挡住误伤，不是为了否决专家的指名请求。放行时把涉及的
+						// 根记进 UnprotectedRoots，界面必须警示"这一片已脱离系统保护"。
+						if d := guard.Dir(full, de.Name()); d.Skip {
+							if esc := rootsUnder(rawKeys, all, fld.key(full)); len(esc) > 0 {
+								escapedRoots[idx] = append(escapedRoots[idx], esc...)
+							} else {
+								protDirs[idx]++
+								continue
+							}
+						}
 						if !f.IncludeHidden && strings.HasPrefix(de.Name(), ".") {
 							continue
 						}
@@ -253,6 +337,14 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						continue
 					}
 					// 普通文件（Type 未知时用 Info 兜底）
+					//
+					// M6-P4：保护判定放在 Info() **之前**是刻意的——Windows 上
+					// 保留名（CON、NUL.dat）的 stat 本身就可能返回设备信息或报错，
+					// 先判定就一次盘都不碰。命中同样**不记 Failed**：它不是失败。
+					if d := guard.File(de.Name(), scanRoots[dir]); d.Skip {
+						protFiles[idx]++
+						continue
+					}
 					info, err := de.Info()
 					if err != nil {
 						fails[idx] = append(fails[idx], model.FailedItem{Path: full, Stage: "scan", Err: err.Error()})
@@ -310,14 +402,47 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		res.Failed = append(res.Failed, fl...)
 	}
 	res.Visited = len(visited)
+
+	for _, n := range protDirs {
+		res.ProtectedDirs += n
+	}
+	for _, n := range protFiles {
+		res.ProtectedFiles += n
+	}
+	// 逃逸根去重后排序：多个 worker 可能各自报同一个根，而 worker 完成顺序
+	// 不确定——不排序就是同一份输入两次扫描给出两份清单（回归无法断言，
+	// 界面上还会看到顺序抖动）。
+	seenUnprot := map[string]struct{}{}
+	var unprot []string
+	addUnprot := func(r string) {
+		if _, ok := seenUnprot[r]; ok {
+			return
+		}
+		seenUnprot[r] = struct{}{}
+		unprot = append(unprot, r)
+	}
+	for r := range startUnprot {
+		addUnprot(r)
+	}
+	for _, es := range escapedRoots {
+		for _, r := range es {
+			addUnprot(r)
+		}
+	}
+	sort.Strings(unprot)
+	res.UnprotectedRoots = unprot
 	return res
 }
 
 // dedupeRoots 规范化并剔除被其他根包含的子根（a 与 a/b 同扫时丢弃 a/b），
-// 返回与保留根同序的「该根所在卷是否区分大小写」。
+// 返回与保留根同序的「该根所在卷是否区分大小写」，以及**去重前的全部规范化根**。
+//
+// 第三个返回值单独给出是 M6-P4 的逃逸判据要用：保护清单会把宽根的一条子树剪掉，
+// 此时"子根已被宽根覆盖"并不成立（宽根走不进受保护目录里面），被丢弃的子根
+// 仍须作为"用户显式指定过"的依据放行。
 //
 // I2：判重前按各根所在卷的语义折叠。单根无从判重，也就不必为它写探测文件。
-func dedupeRoots(roots []string) ([]string, []bool) {
+func dedupeRoots(roots []string) ([]string, []bool, []string) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -335,7 +460,7 @@ func dedupeRoots(roots []string) ([]string, []bool) {
 		for i := range sens {
 			sens[i] = fscase.Default()
 		}
-		return out, sens
+		return out, sens, out
 	}
 	sens := make([]bool, len(out))
 	for i, r := range out {
@@ -359,7 +484,7 @@ func dedupeRoots(roots []string) ([]string, []bool) {
 			keepSens = append(keepSens, sens[i])
 		}
 	}
-	return kept, keepSens
+	return kept, keepSens, out
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

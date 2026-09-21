@@ -1,0 +1,299 @@
+# M6 实施细化设计（真实工况安全 · 逐项设计段）
+
+- 日期：2026-09-21
+- 上位依据：`2026-09-20-scenario-optimization-design.md`（工况总纲）§2.1~§2.4、§4、§5；
+  登记处 `docs/04-开发与测试计划.md` §6.7 C 组 1~4 项
+- 状态：**按实施顺序逐节追加**。本文只写"动手前必须定死"的判据、接入点与探针设计；
+  实施后的兑现记录写在 04 §6.9 划账，不写在本文
+- 用户裁定（三条，约束本文全部章节）：① 每项实施前各写一段细化设计（即本文）；
+  ② 本轮只做 M6 后端，M8 前端体验项不做；③ 云占位默认跳过 + 可见计数
+
+## 0. 实施顺序与本文进度
+
+| 序 | 项 | 总纲编号 | 04 §6.7 | 本文小节 | 设计 | 实施 |
+|---|---|---|---|---|---|---|
+| 1 | 系统保护清单 + Windows 保留名 | §2.4 | C 组 4 | §2 | ✅ | ✅（划账见 04 §6.9.1） |
+| 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ⬜ | ⬜ |
+| 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ⬜ | ⬜ |
+| 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ⬜ | ⬜ |
+| 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ⬜ | ⬜ |
+
+## 1. 适用于全部四项的通用约束
+
+1. **判定逻辑必须是无 build tag 的纯函数**，平台差异以**参数注入**而非 `//go:build` 分流
+   （H6 分层教训，04 §6.8.0 约束 5 / 总纲 §4.2）。带 tag 的文件只允许出现
+   "系统调用胶水 + 常量真值"，其行数越少，进 Linux CI 主门禁的可验证面越大。
+2. **计数不许说谎**（§6.6.2 三层计数原则）：新增的每一类"没进语料"都必须有独立计数与
+   独立文案，且**计数口径要说明数的是什么**（目录数 vs 文件数 vs 字节数）。
+   剪枝掉的目录只能计目录数——我们没有下潜，报"跳过了 N 个文件"就是编数。
+3. **修前必红**：每项的每个探针必须先在不改生产代码的前提下红一次，读数落进划账；
+   关键判据函数做变异验证（改坏 → 变红），沿用 H6 的六重变异记录表格式。
+4. **UI 边界**（裁定 ②）：本轮新计数只到 `ScanSummary` JSON 与 `fdd-cli` 报告为止。
+   结果页横幅属 M8。**划账时必须写"UI 未呈现"，不得因后端字段齐了就记兑现**。
+5. **不改既有登记行**：实施中发现的新缺陷新增 ID 登记（04 §6.8.0.5），
+   不改写 §6.7/§6.8 已有结论。
+
+---
+
+## 2. M6-P4：系统保护清单 + Windows 保留名（总纲 §2.4 / 04 §6.7 C 组 4）
+
+### 2.1 现状与危害（逐条实测/读码确认）
+
+现状是**零内置排除**。遍历期仅有的三道剪枝/跳过：
+
+| 现有规则 | 锚点 | 挡住了什么 | 挡不住什么 |
+|---|---|---|---|
+| 名字以 `.` 开头的目录不深入 | `internal/scanner/scanner.go:233-235` | macOS `.Trash`/`.Spotlight-V100`（**仅在 `IncludeHidden=false` 时**） | Windows `$Recycle.Bin`（首字符是 `$`）、`System Volume Information`、`WindowsApps`；用户勾选"包含隐藏文件"后 macOS 那几项也漏 |
+| 用户 `ExcludePaths` 剪枝 | `scanner.go:240-242` + `internal/filter/filter.go:162-176` | 用户主动写了的那些 | 前端默认 `ExcludePaths: []`（`frontend/src/stores/scan.ts:18`）——**默认配置下等于没有** |
+| `worktemp.IsTempName` | `scanner.go:229` | 应用自己的 `.fdd-*` 残留 | 与系统目录无关 |
+
+由此得到三类**具体**危害（不是"可能有噪声"这种含糊话）：
+
+1. **回收站内容被当语料，可导致二次删除**：Windows 移入回收站走 Shell
+   `IFileOperation`（`internal/ops/trash_windows.go`），文件实际落到该卷
+   `$Recycle.Bin\<SID>\`。该名字不以 `.` 开头，而扫描器**完全不看文件属性**
+   （只看 `de.Type()`/`info.Mode()`，没有隐藏位判定）。因此"扫 `D:\` → 移入回收站
+   → 再扫 `D:\`"这条完全正常的动线，会把回收站里那份副本重新收进语料、
+   和原位残留/其他卷的同内容文件配成重复组。Linux/macOS 侧同一动线落在
+   `~/.local/share/Trash/files`（`internal/ops/trash_linux.go:15`）与 `.Trash`，
+   今天**只靠 `.` 前缀规则顺带挡住**，用户一旦勾选"包含隐藏文件"即失效。
+   补一条实测事实：这条链在 Windows 上**没有第二道防线**——Go 的
+   `fs.FileMode` 根本不暴露隐藏位（stdlib 全仓无 `ModeHidden`；
+   `os/types_windows.go` 只把 `FILE_ATTRIBUTE_DIRECTORY/DEVICE/REPARSE_POINT/VOLUME`
+   与 `ModeIrregular` 映射进 Mode），所以"按属性挡隐藏目录"不是可选方案，
+   要么显式 `GetFileAttributesEx`，要么走名字清单（本设计取后者，理由见 §2.9）。
+2. **盘根扫描的海量 Failed**：`System Volume Information`、`WindowsApps` 是 ACL
+   拒绝遍历的目录，整棵子树每一层都产生一条 `Stage:"scan"` 失败项
+   （`scanner.go:200-204`、`:256-260`），失败抽屉被系统性噪声灌满，
+   真正的"你的文件读不了"淹没在里面。
+3. **Windows 保留名**：从 exFAT/Linux 卷拷来的 `CON.txt`、`NUL.dat` 这类名字，
+   Win32 打开时会解析到设备而不是文件；今天它会正常进语料、正常参与分组，
+   删除/移动走的是设备路径语义——**操作结果与用户预期完全脱节**。
+
+> **实施时要新增登记**（按 §1 约束 5，不改写 §6.7）：危害 1（`$Recycle.Bin` 进语料）
+> 是本轮读码新查出的独立缺陷，严重度高于"噪声"，登记为 §6.8.8 新 ID，
+> 并说明它由 M6-P4 顺带闭环。
+
+### 2.2 判据模型：四类条目，不要一个通配引擎
+
+总纲 §2.4 给的是一份平铺清单。平铺实现只有两种收场：要么全部按"路径段名字"匹配
+（于是 `/System` 会误伤 `D:\System`、`/mnt/x/system`），要么引入 glob（于是多一套
+要测的语义）。这里改成**四类条目、四种判据**，每类的适用面写死，清单里逐项标注归属：
+
+| 类型 | 判据 | 大小写 | 用哪些条目 |
+|---|---|---|---|
+| `dirName` | 路径**最后一段**等于/前缀命中该名字，出现在任意深度即剪枝 | 不敏感比对（`strings.EqualFold`） | `$Recycle.Bin`、`System Volume Information`、`WindowsApps`、`lost+found`、`.Spotlight-V100`、`.fseventsd`、`.Trashes`、`.DocumentRevisions-V100`、TM 快照目录（前缀+后缀式） |
+| `absPath` | 折叠后的**绝对路径**等于该值或是其后代（`p==e \|\| HasPrefix(p, e+"/")`） | **精确**比对 | Linux `/proc`、`/sys`、`/dev`、`/run`；macOS `/private`、`/System` |
+| `pseudoFileAtRoot` | 文件名相等 **且** 其父目录恰是本次的某个扫描根 | 不敏感比对 | `pagefile.sys`、`hiberfil.sys`、`swapfile.sys`、`DumpStack.log.tmp` |
+| `winReservedName` | 去扩展名后的主体 ∈ {CON,PRN,AUX,NUL,COM1-9,LPT1-9}，仅当平台为 Windows | 不敏感比对 | 保留名 |
+
+四条"为什么这样切"的理由，实现时不得反过来：
+- **`dirName` 用不敏感、`absPath` 用精确**，方向不同是刻意的。`dirName` 命中的是
+  文件名模式，多匹配一份的代价极低（这些名字不会是用户数据），
+  而**少匹配**才是事故（`$RECYCLE.BIN`、`SYSTEM VOLUME INFORMATION` 在 Windows 上
+  就是同一个对象）；`absPath` 命中的是"这条绝对路径本身"，放宽成不敏感就会误伤
+  真实的用户路径（大小写敏感卷上的 `/system` 镜像根目录）。
+- **`pseudoFileAtRoot` 只认"父目录是扫描根"**，不做"是不是卷根"判定。卷根判定在
+  Windows 上是真麻烦（`D:\` 的 Clean 形态、UNC、卷 GUID 路径、挂载点目录），
+  而危害只发生在"用户把盘根设成了扫描根"这一种情形——用扫描根集合当锚，
+  一条 `map[string]bool` 查表就够，且完全可测。
+  代价如实写明：嵌套目录里的 `D:\data\backup\pagefile.sys`（虚拟机镜像备份常见）
+  **不**被保护，仍按普通文件参与去重。这是本设计的边界，不是漏实现。
+- **`winReservedName` 必须以平台参数生效**，绝不在 Linux CI 上按宿主平台判定：
+  平台常量由 `platform_windows.go`/`platform_darwin.go`/`platform_linux.go` 三个
+  各三行的胶水文件提供，判据本体无 tag，因此"Windows 保留名规则"这件事本身
+  在 Linux 上就有回归覆盖（否则它永远只在 Windows 编译，等于没测）。
+- **不用"读 Windows 隐藏属性"替代名字清单**（第四条，因为它看起来更"正统"）：
+  `fs.FileMode` 无隐藏位（§2.1 末），要拿属性就得为**每个目录**加一次
+  `GetFileAttributesEx`——目录级遍历是本项目最热的路径，为一个判据给全盘加 syscall
+  不划算；而名字清单是纯字符串、零 syscall、跨平台可在 Linux 门禁断言。
+  更根本的理由：隐藏属性属于**用户偏好**（Windows 上大量用户数据被标隐藏），
+  把它接进 `IncludeHidden` 会改变既有过滤器语义；受保护清单要的是"不可关闭"，
+  两者不是一回事。
+
+### 2.3 清单初版（逐项附"为什么是它"）
+
+**Windows**
+
+| 条目 | 类型 | 理由 |
+|---|---|---|
+| `$Recycle.Bin` | dirName | 回收站实体（危害 1）；所有版本、所有卷同名 |
+| `System Volume Information` | dirName | 卷影复制/索引数据库，ACL 拒绝且全是系统卷元数据 |
+| `WindowsApps` | dirName | Store 应用包，受 DACL 保护，进去只产 Failed |
+| `pagefile.sys` / `hiberfil.sys` / `swapfile.sys` | pseudoFileAtRoot | 盘根伪文件，逻辑大小巨大且内容随时变 |
+| `DumpStack.log.tmp` | pseudoFileAtRoot | 盘根 0 头页文件，恒被占用 |
+| `CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9` | winReservedName | §2.1 危害 3 |
+
+**macOS**
+
+| 条目 | 类型 | 理由 |
+|---|---|---|
+| `/.Spotlight-V100`、`/.fseventsd`、`/.Trashes`、`/.DocumentRevisions-V100` | dirName | 每卷都有的元数据目录（注意：外接卷根同样有，故按名字而非按 `/` 绝对路径） |
+| `System Volume Information` | dirName | 扫 NTFS 外接盘时同一条规则直接复用，不必为 macOS 另写 |
+| `/private`、`/System` | absPath | `/System/Volumes/Data` 是 Firmlink 下真实数据的挂载点，**从 `/` 扫会走两遍用户数据**；`/private` 下是 `var/folders` 等运行时垃圾 |
+| `.com.apple.TimeMachine-*.snapshots` | dirName（前缀+后缀） | TM 本地快照，整卷的历史副本——不挡的话"重复文件"里全是快照，删了等于删备份 |
+
+**Linux**
+
+| 条目 | 类型 | 理由 |
+|---|---|---|
+| `/proc`、`/sys`、`/dev`、`/run` | absPath | 伪文件系统。`/proc` 下的 regular + 非 0 size 文件读起来是内核生成物，且 `/proc/self/fd/*` 会牵回真实文件 |
+| `/lost+found` | dirName | ext4 修复目录，空或全是 inode 残骸 |
+
+**明确不进清单**（写下来防下一轮加回来）：
+
+- `node_modules`、`.git`、`build`、`dist`：这是**用户偏好**不是系统保护，
+  已有 `ExcludePaths` 通道，混进引擎就会变成关不掉的偏执；
+- macOS `/Library`、`/Applications`：里面有真实用户数据（App Support 的镜像、
+  用户安装的 app），排除它们会造成静默漏扫，比噪声更糟；
+- Windows `C:\Windows`：整目录排除会让"扫盘根"这一常见动线的结果少得反常，
+  而它的危害已经由上面五条根级条目挡住了绝大部分。**登记为开放项**：
+  是否给 `Windows` 目录一个"提示级"处理，留待 M7 真机取证后再定。
+
+### 2.4 包与 API 形状
+
+新增叶子包 `internal/sysguard`（与 `internal/worktemp` 同级同类：不 import 任何
+`internal/` 包，scanner 直接引用）。
+
+```go
+type Kind int
+const (
+    KindNone Kind = iota // 不保护，照常遍历
+    KindProtectedDir     // 目录被剪枝
+    KindProtectedFile    // 盘根伪文件
+    KindReservedName     // Windows 保留名
+)
+
+type Decision struct {
+    Skip   bool
+    Kind   Kind
+    Reason string // 进日志/报告的短句，不含路径（调用方拼）
+}
+
+// Guard 由 New(platform) 编译出清单，只读复用（对齐 filter.Matcher 的做法）。
+func New(p Platform) *Guard
+func (g *Guard) Dir(absPath, name string) Decision
+func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
+```
+
+- `Dir` 不带 `isScanRootChild`：清单里没有任何"根级目录"条目（根级限定只属于
+  `pseudoFileAtRoot`，那全是文件），多一个恒不被读的参数只会让"这条判据其实没生效"
+  看不出来。
+
+- `Platform` 常量：`PlatformWindows/PlatformDarwin/PlatformLinux`，
+  由三个各 3 行的 tagged 文件给出 `const Current = ...`；
+  **测试一律显式传 `PlatformWindows`**，这样保留名/`$Recycle.Bin` 规则在
+  Linux 门禁里就是可执行断言。
+- `Dir`/`File` 分开而不是一个 `Apply`：目录判据不含 `absPath` 之外的文件语义，
+  合并会让"伪文件条目不小心写成目录"这类错误没有类型层面的阻力。
+- `isScanRootChild` 由调用方给（scanner 持有折叠后的根集合），
+  sysguard 自己**不做**任何路径解析——它是纯字符串判定器，这是"能进 Linux CI"的前提。
+- 归一化在 sysguard **内部**做（`filepath.Clean` + `\`→`/`），不要求调用方先归一：
+  判据的正确性不能依赖"每个调用点都记得先 Clean"。`absPath` 条目按精确比对，
+  `dirName`/`pseudoFile`/`winReservedName` 用 `strings.EqualFold`。
+
+### 2.5 接入点与既有规则的先后
+
+`WalkWithGate` 内两处，顺序是设计的一部分：
+
+1. **目录分支**：在 `scanner.go:233` 的隐藏规则**之前**插入保护判定。
+   理由：`.Spotlight-V100`、`/System/Volumes/Data` 这些既属"系统保护"又属"隐藏"，
+   判定顺序决定它被记进哪个计数。保护在前，计数才不随 `IncludeHidden`
+   开关漂移——否则"已保护跳过 N"会在用户勾一下复选框后变小，读起来像保护失效。
+2. **文件分支**：在 `scanner.go:229` 的 `IsTempName` **之后**、`Info()` **之前**插入
+   `File` 判定。放在 `Info()` 之前是刻意的：保留名文件在 Windows 上
+   `de.Info()` 本身可能返回设备信息或报错，先判定就一次盘都不碰。
+
+命中即 `continue`，同时 `local`/`fails` 都不写——**保护跳过不是失败**，
+不产生 `FailedItem`（否则又造出一类噪声，与危害 2 同形）。
+
+目录剪枝不进 `visited`：保护判定在 `visited` 之前短路，`Visited` 语义
+（"实际访问目录数"，`Result.Visited`）不受影响。
+
+### 2.6 逃逸通道：唯一例外是用户显式设为扫描根
+
+总纲 §2.4 要求"清单不可关闭，唯一例外是用户显式把清单内路径本身设为扫描根时放行"。
+实现成一条可判定的规则，而不是一个特判列表：
+
+> **规则**：对被判定为保护的目录 `D`，若本次任一扫描根 `R` 满足
+> `R == D` 或 `R` 在 `D` 之下，则**不剪枝 `D`**（必须下潜才够得着 `R`），
+> 并把 `D` 记入 `UnprotectedRoots`。
+
+这一条同时覆盖两种情形，且不需要"清单内路径"的可得性判断：
+
+- 用户直接把 `C:\Windows\System Volume Information` 设为根 → `R == D`；
+- 用户设在保护目录**内部**（`/System/Volumes/Data`、`/proc/self/task`）→ `R` 在 `D` 下。
+  修前的直觉实现"只有根恰好在清单里才放行"在这里会失效：`/System/Volumes/Data`
+  不在清单里，于是 `/System` 被剪枝、用户指定的根**一个文件都扫不到**，
+  结果页显示"0 组"而没有任何解释——这是必须写进探针的场景。
+
+`pseudoFileAtRoot` 与 `winReservedName` **不参与逃逸**：即使根就是 `D:\`，
+`pagefile.sys` 仍然跳过（它不可读，放行只会换回一条 Failed），保留名仍然跳过
+（它不是"一个文件"而是一个设备别名）。**清单里没有任何"可关"开关**，
+`Settings` 不新增字段，用户配置也无法清空这份清单。
+
+### 2.7 计数与载荷
+
+| 层 | 新增 | 口径 |
+|---|---|---|
+| `scanner.Result` | `ProtectedDirs int` / `ProtectedFiles int` / `UnprotectedRoots []string` | 目录数、文件数；不估文件总量 |
+| `dedup.Pipeline` | `ProtectedDirs()` / `ProtectedFiles()` / `UnprotectedRoots()`（`atomic` + `Load`，与 `ScannedFiles`/`CacheHits` 同族：按轮归零） | 同上 |
+| `app.go` `ScanSummary` | `protectedDirs` / `protectedFiles` / `unprotectedRoots`（JSON tag 小驼峰，与既有 `filesFailed` 同风格） | 结果页横幅的数据源（**M8 才呈现**） |
+| `cmd/fdd-cli` report `stats` | `protected_dirs` / `protected_files` | 冒烟与脚本可比对 |
+
+`scripts/smoke-cli.sh` 的一致性比较键**不加**这两项（benchgen 语料里没有受保护名字，
+加了等于把脚本钉在"永远 0"上，没有信息量）；改为在 §2.8 的 T7 里用真实夹具断言非零。
+
+### 2.8 测试方案（修前必红清单）
+
+纯逻辑用例放在 `internal/sysguard/sysguard_test.go`（无 tag，Linux 门禁全量执行）；
+集成用例放在 `internal/scanner/scanner_guard_test.go`（无 tag，靠显式传平台跑 Windows 规则）。
+
+| # | 用例 | 断言 | 为何"修前必红" |
+|---|---|---|---|
+| T1 | `TestGuardRecycleBinDirNameIsCaseInsensitive` | `Platform=windows` 下 `$RECYCLE.bin`、`$Recycle.Bin`、`system volume information` 全部 `KindProtectedDir` | 包不存在 → 编译红 |
+| T2 | `TestGuardAbsPathIsExactCase` | `Platform=linux` 下 `/proc` 命中、`/PROC` 不命中、`/mnt/x/proc` 不命中、`/proc/1/task` 命中（后代规则，纵深防御） | 同上 |
+| T3 | `TestGuardPseudoFileOnlyAtScanRoot` | `isScanRootChild=true` 时 `pagefile.sys` 命中；`false`（嵌套 `data/backup/pagefile.sys`）时不命中 | 同上；同时钉住 §2.3 的边界不外溢 |
+| T4 | `TestGuardReservedNameWindowsOnly` | `Platform=windows` 时 `CON`、`NUL.txt`、`com1.log`、`LPT9` 命中 `KindReservedName`，`CONTRADICTION.md`、`notes.txt`、`COM0.dat`、`LPT0.dat` 不命中；`Platform=linux` 时**同一批名字全部不命中** | 同上；"Linux 上放行"是平台不外溢的反向断言 |
+| T5 | `TestGuardTMAndDotDirsPrunedRegardlessOfHiddenFlag` | `.com.apple.TimeMachine-09-20-2026-010203.snapshots` 命中；`.Spotlight-V100` 命中 | 同上 |
+| T6 | `TestWalkPrunesProtectedDirAndCountsIt`（集成，真夹具） | temp 根下建 `$Recycle.Bin/sub/dup.bin` + `keep/a.bin`；扫描后 `Files` 不含前者、`ProtectedDirs>=1`、`Failed` **为空** | 修前 `$Recycle.Bin` 会进语料 → `Files` 含 dup.bin → 红 |
+| T7 | `TestWalkCountsRootPseudoFileOnly`（集成） | 根下建 `pagefile.sys`（非 0 字节）→ `ProtectedFiles==1` 且不在 `Files`；`sub/pagefile.sys` → 在 `Files` | 修前 `ProtectedFiles` 字段不存在 → 编译红；同时锁住 T3 的边界在遍历层成立 |
+| T8 | `TestRootInsideProtectedDirStillScanned`（§2.6 逃逸，集成） | 把清单内某目录（用夹具版条目，见下）**内部**的子目录设为唯一扫描根 → `Files` 非空、`UnprotectedRoots` 含该祖先、`Failed` 为空 | 修前无逃逸概念；修后若逃逸写坏，这条会在"根在保护目录内部时扫不到东西"上红 |
+| T9 | `TestHiddenFlagDoesNotMoveProtectedCount`（集成） | 同一夹具跑 `IncludeHidden=false` 与 `true` 两轮，`ProtectedDirs` 两轮**相等** | 顺序若写反（隐藏规则在前），`true` 轮才第一次把 `.Spotlight-V100` 记成保护 → 两轮不等 → 红。这条是 §2.5 顺序决策的守卫 |
+
+**夹具可移植性**：T6/T7 用的 `$Recycle.Bin`、`pagefile.sys` 在 Linux/macOS 上是
+**完全合法的普通名字**，因此这三条不需要任何平台豁免，天然进 Linux 主门禁——
+这正是 §2.2 把判据做成纯字符串的直接收益。T8 需要"祖先在清单里、且能在 temp 下造出来"
+的名字，用 `lost+found`（dirName，任意平台可造）：根 = `tmp/lost+found/inner`，
+断言 `inner` 里的文件仍然被采集。
+
+**实际落地用例名与上表的对应**：`internal/sysguard/sysguard_test.go` 6 例
+（T1~T5 加 `TestGuardNoEmptyEntriesAndReasonNonEmpty`：清单不许有空条目、每条必须给得出
+理由，Kind 与 Reason 关键词一一对应）；`internal/scanner/scanner_guard_test.go` 7 例
+（T6~T9 加 `TestWalkReservedNameWindowsGuardOnly`（保留名在遍历层的正反向）、
+`TestExplicitProtectedRootIsReported`（根自身命中清单时只留痕不剪、且不计数）、
+`TestProtectedDirsCountIsDirCountNotFileGuess`（钉住 §1 约束 2 的计数口径））。
+兑现读数与变异表见 04 §6.9.1。
+
+**变异验证**（改坏判据 → 必须变红，逐条记录读数，格式对齐 H6 六重变异表）：
+
+1. `dirName` 比对改成大小写敏感 → T1 红；
+2. `absPath` 放宽为"任意路径段相等" → T2 红（`/mnt/x/proc` 被误伤）；
+3. `pseudoFileAtRoot` 去掉 `isScanRootChild` 条件 → T3/T7 红（备份里的 `pagefile.sys` 被吞）；
+4. 保留名清单去掉"NUL" → T4 红；
+5. 保留名判定不看平台 → T4 的 linux 反向断言红；
+6. 逃逸规则反转为"根在保护目录内部也剪枝" → T8 红；
+7. 保护判定挪到隐藏规则之后 → T9 红；
+8. 命中保护时同时写 `FailedItem` → T6 的 `Failed 为空` 红。
+
+### 2.9 本轮不做（写清边界，防止划账时被当成已交付）
+
+- **结果页横幅"已保护跳过 N 个目录 / M 个文件"与逃逸警示的 UI**：属 M8（裁定 ②）。
+  本轮只交付 JSON/CLI 字段；`unprotectedRoots` 非空时用户当前**看不到任何提示**，
+  划账须记为"UI 未兑现"。
+- `Settings` 新增开关：明确不做（清单不可关闭是本项的立论前提）。
+- `ops` 侧的二次防线：语料里既然没有受保护文件，就发不出对它的操作请求；
+  唯一残余风险是"扫描后用户在盘根手动建了同名文件再执行操作"，
+  该窗口由 `ops/verify.go` 的身份复核兜着，不为它另加判据。
+- Windows 保留名的**尾随空格/尾点变体**（`"CON "`、`"NUL."`）与 `$I`/`$R` 回收站
+  元数据文件：登记为 M7 真机清单项，本机无法实证其 Win32 行为，不做纸面修复。

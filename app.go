@@ -125,6 +125,19 @@ type ScanSummary struct {
 	Reclaimable uint64 `json:"reclaimable"`
 	FilesFailed int    `json:"filesFailed"`
 	Elapsed     string `json:"elapsed"`
+
+	// M6-P4（2026-09-21）系统保护清单的可见计数：被剪枝的目录数、被跳过的
+	// 盘根伪文件与 Windows 保留名文件数。引擎内置的排除**不许静默**——
+	// 用户看到的结果比盘上少，就得有一个地方说明少掉的是什么、为什么。
+	ProtectedDirs  uint64 `json:"protectedDirs"`
+	ProtectedFiles uint64 `json:"protectedFiles"`
+	// UnprotectedRoots 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名
+	// 了清单内的路径或其内部）。警示文案属 M8（本轮只有 JSON 与 CLI 报告）。
+	//
+	// ★ 口径：从记录页恢复历史扫描走的是 OpenHistory，那条路径上这三项
+	// **没有可信来源**（history.db 未存该口径，见 04 §6.9 的 M6-P4 划账）：
+	// 届时只能整格显示"未统计"，不得沿用零值冒充"这一轮没跳过任何东西"。
+	UnprotectedRoots []string `json:"unprotectedRoots,omitempty"`
 }
 
 // PreviewData PreviewFile 返回（M2：text/hex/image-base64；M4 缩略图）。
@@ -586,12 +599,23 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		}
 		a.resultsReady = true
 		a.curHistID = histID
+		// M6-P4：三个保护清单口径在与 superseded() 判定同一临界区内取。
+		// 为什么不能留到锁外的 emit 里现取：Run 一开始就把按轮计数器归零，
+		// 而 a.scanInFlight 在扫描体第一行就复位（新扫描因此可通过在途检查，
+		// 只靠 resultGen 判取代）。锁内取数等于把结论钉死成"未被取代 ⇒
+		// 没有新的 StartScan ⇒ 没有新一轮 Run ⇒ 这几个值仍是本轮的"。
+		pDirs := a.pipe.ProtectedDirs()
+		pFiles := a.pipe.ProtectedFiles()
+		unprot := a.pipe.UnprotectedRoots()
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
-			Groups:      len(groups),
-			Reclaimable: reclaim,
-			FilesFailed: len(failed),
-			Elapsed:     elapsed.String(),
+			Groups:           len(groups),
+			Reclaimable:      reclaim,
+			FilesFailed:      len(failed),
+			Elapsed:          elapsed.String(),
+			ProtectedDirs:    pDirs,
+			ProtectedFiles:   pFiles,
+			UnprotectedRoots: unprot,
 		})
 	})
 	return taskID, nil

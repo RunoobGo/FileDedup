@@ -43,6 +43,16 @@ type Pipeline struct {
 	// 有了这个正向信号，"没命中"才第一次会变成红。
 	cacheHits atomic.Uint64
 
+	// M6-P4（2026-09-21，04 §6.7 C 组 4）系统保护清单的可见计数，与 scannedFiles
+	// 同为按轮归零。为什么要经 Pipeline 而不是只留在 scanner.Result：绑定层的
+	// scan:done 载荷与 CLI 报告都从 Pipeline 取数，而扫描结果在流水线里会被
+	// 过滤/分组改写，事后拿不到"剪了多少"这件事。
+	protectedDirs  atomic.Uint64
+	protectedFiles atomic.Uint64
+	// unprotectedRoots 是"因用户显式指定而脱离系统保护"的根，界面须警示。
+	// 它是字符串集合而非计数，故不塞进 atomic；只在扫描收尾写一次，读在 Run 之后。
+	unprotectedRoots []string
+
 	OnProgress func(model.ProgressEvent) // 可选：进度回调
 	OnStage    func(model.StageEvent)    // 可选：阶段回调
 }
@@ -69,6 +79,22 @@ func (p *Pipeline) ScannedFiles() uint64 { return p.scannedFiles.Load() }
 // 与 ScannedFiles 同为"按轮归零"的口径：跨轮累加会让"这一跑到底有没有吃到
 // 缓存"看不出来（AS-K1）。
 func (p *Pipeline) CacheHits() uint64 { return p.cacheHits.Load() }
+
+// ProtectedDirs 返回本轮被系统保护清单剪掉的**目录**数（Run 结束后读取）。
+// 只数目录：剪枝没有下潜，报成"跳过了 N 个文件"就是编数。
+func (p *Pipeline) ProtectedDirs() uint64 { return p.protectedDirs.Load() }
+
+// ProtectedFiles 返回本轮被保护清单跳过的文件数（盘根伪文件、Windows 保留名）。
+func (p *Pipeline) ProtectedFiles() uint64 { return p.protectedFiles.Load() }
+
+// UnprotectedRoots 返回"因用户显式指定而脱离系统保护"的扫描根（Run 结束后读取）。
+// 非空即意味着这一轮有一部分扫描是在保护清单之外跑的，界面必须警示：
+// 用户可能是故意的，也可能是误选了系统目录。
+func (p *Pipeline) UnprotectedRoots() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.unprotectedRoots
+}
 
 // Status 当前状态。
 func (p *Pipeline) Status() model.TaskStatus {
@@ -196,9 +222,15 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	}
 	p.cancel = cancel
 	p.afterResume = ""
+	// M6-P4：与 scannedFiles/cacheHits 同口径按轮归零。上一轮的逃逸根若不清，
+	// 本轮即便什么都没逃逸，界面也会继续挂着上一条扫描的"已脱离系统保护"警示。
+	// 切片归零与其余状态一样在 mu 内完成（访问器同一把锁读）。
+	p.unprotectedRoots = nil
 	p.mu.Unlock()
 	p.scannedFiles.Store(0)
 	p.cacheHits.Store(0) // AS-K1：按轮归零，见 CacheHits 注释
+	p.protectedDirs.Store(0)
+	p.protectedFiles.Store(0)
 	// 闸门复位：上一轮若在 Paused 下被取消（父 ctx 直接取消、未走 CancelScan），
 	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
 	p.gate.Resume()
@@ -239,6 +271,12 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	failed = scan.Failed
 	files := scan.Files
 	p.scannedFiles.Store(uint64(len(files)))
+	// M6-P4：保护清单的计数与逃逸根随本轮结果一起记账。
+	p.protectedDirs.Store(uint64(scan.ProtectedDirs))
+	p.protectedFiles.Store(uint64(scan.ProtectedFiles))
+	p.mu.Lock()
+	p.unprotectedRoots = scan.UnprotectedRoots
+	p.mu.Unlock()
 	tracker.SetTotal(uint64(len(files)), sumSize(files))
 
 	// ---------- 阶段 1：size 分组，淘汰独 size ----------

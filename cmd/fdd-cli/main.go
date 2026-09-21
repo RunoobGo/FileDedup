@@ -43,6 +43,10 @@ type report struct {
 		// CacheHits：本轮在哈希缓存里查到记录的候选文件数（AS-K1）。
 		// 冒烟脚本据此断言"复扫必须真命中"——三跑结论一致并不能证明缓存生效。
 		CacheHits int `json:"cache_hits"`
+		// M6-P4（2026-09-21）系统保护清单的剪枝量。口径是"目录数/文件数"，
+		// 不折算成被剪走的文件总量——剪枝没下潜，估出来的就是假数。
+		ProtectedDirs  int `json:"protected_dirs"`
+		ProtectedFiles int `json:"protected_files"`
 	} `json:"stats"`
 	Groups []*groupJSON       `json:"groups"`
 	Failed []model.FailedItem `json:"failed"`
@@ -124,6 +128,8 @@ func main() {
 	// 复扫时远小于语料数，双跑比对会误报漂移。
 	r.Stats.FilesTotal = int(p.ScannedFiles())
 	r.Stats.CacheHits = int(p.CacheHits())
+	r.Stats.ProtectedDirs = int(p.ProtectedDirs())
+	r.Stats.ProtectedFiles = int(p.ProtectedFiles())
 
 	var w io.Writer = os.Stdout
 	if *out != "" {
