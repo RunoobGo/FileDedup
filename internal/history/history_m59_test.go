@@ -50,8 +50,12 @@ func readPragmas(t *testing.T, q rowQueryer) (fk, busy, synchronous int64) {
 
 // TestEveryLedgerConnectionCarriesPragmas P-19-1。
 //
-// 前提自检与断言分离：先用 OpenedConnections 的增量证明"第二次读确实落在一条新建
-// 连接上"，否则整条用例可能只是在重复读同一条连接，红了也不说明 M59 成立。
+// 前提自检与断言分离：先证明"第二次读确实落在一条新建连接上"（判据是本文件头部
+// 记的那两步：取连接前池里 OpenConnections 已为 0 ⇒ 再取必新建，取到后用 InUse=1
+// 复核读的是 checkout 中的那条），否则整条用例可能只是在重复读同一条连接，
+// 红了也不说明 M59 成立。
+// （M99：此处原先写"用 OpenedConnections 的增量证明"，那是被否决的旧稿说法——
+// Go 1.27 的 sql.DBStats 根本没有这个字段，代码从未这么做过。）
 func TestEveryLedgerConnectionCarriesPragmas(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "history.db"))

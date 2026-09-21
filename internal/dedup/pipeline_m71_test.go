@@ -120,7 +120,12 @@ func TestCorruptCacheNoticeWording(t *testing.T) {
 		t.Errorf("措辞必须说清『确证损坏 + 已停用』：%q", msg)
 	}
 	if !strings.Contains(msg, "7") {
-		t.Errorf("计数要说真数（本轮库错误次数）：%q", msg)
+		t.Errorf("计数要说真数（库错误次数）：%q", msg)
+	}
+	// M95 补强：这个 7 是 Cache.dbErrs 的进程期累计（无轮内重置点），
+	// 文案称"本轮"就是说谎 —— 停用是粘滞位，第 2 轮起每轮都会把总数再说一遍。
+	if strings.Contains(msg, "本轮") {
+		t.Errorf("计数口径越界（dbErrs 是进程期累计，不得称本轮）：%q", msg)
 	}
 	for _, lie := range []string{"已隔离", "已重建", "已自愈", "已恢复"} {
 		if strings.Contains(msg, lie) {

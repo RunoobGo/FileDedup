@@ -272,12 +272,16 @@ func cacheOpErrText(op string, e error) (string, bool) {
 // Lookup 侧只计数不造句（几万条点查会刷几万条失败清单），所以"至多一条"
 // 是结构保证而不是概率。内容边界：只说"已停用"，不得出现"已隔离/已重建/已自愈"
 // ——运行期重建没做（§18.6 → 新登记 M87），说了就是假话。
+//
+// M95：计数取自 Cache.dbErrs 的 Load()，而它**没有任何轮内重置点**（全仓只有
+// Add/Load 两个访问点）⇒ 文案不得称"本轮"。corrupt 是粘滞位，从第 2 轮起每轮末
+// 都会把进程启动以来的总数再报一遍；写成"本轮"等于让同一个数字每轮都变大还自称本轮。
 func corruptCacheNotice(dbErrs int64, corrupted bool) string {
 	if !corrupted {
 		return ""
 	}
-	return fmt.Sprintf("哈希缓存在本轮被确证损坏，已停用（本轮累计库错误 %d 次）："+
-		"去重结果不受影响，但缓存不再命中，之后每轮都要重算哈希（重建需重启应用）", dbErrs)
+	return fmt.Sprintf("哈希缓存被确证损坏，已停用（进程启动以来累计库错误 %d 次）："+
+		"去重结果不受影响，但缓存不再命中，之后每轮都要重算哈希（重启应用才会重新开库）", dbErrs)
 }
 
 // Run 执行完整流水线。返回重复组与失败清单；ctx 取消返回 context 错误。
@@ -761,7 +765,6 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	}
 
 	// ---------- 输出 ----------
-	id := uint64(0)
 	for k, g := range finalGroups {
 		if len(g) < 2 {
 			continue
@@ -788,22 +791,30 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				continue
 			}
 		}
-		id++
 		groups = append(groups, &model.DuplicateGroup{
-			GroupID:           id,
 			Files:             g,
 			Reclaimable:       (uint64(len(g)) - 1) * g[0].Size,
 			ReclaimableActual: model.ReclaimActual(g),
 			Hash:              k.full, // 组内容哈希（M3 操作前校验依据）
 		})
 	}
-	// 稳定排序：可释放空间降序，其次组大小
+	// 稳定排序：可释放空间降序，其次组大小，再次组内最小路径。
+	// M94：三级键缺一个都会把上面那个 map 的随机遍历序漏进输出——改前的次级键写的是
+	// GroupID，而 GroupID 那时已由遍历序发放，等于"用一个随机量去消随机"。
+	// 最小路径这一级是**全序收尾**：一个路径只属于一个组，故三级用尽后不再有平手。
 	sort.Slice(groups, func(i, j int) bool {
 		if groups[i].Reclaimable != groups[j].Reclaimable {
 			return groups[i].Reclaimable > groups[j].Reclaimable
 		}
-		return groups[i].GroupID < groups[j].GroupID
+		if ni, nj := len(groups[i].Files), len(groups[j].Files); ni != nj {
+			return ni > nj
+		}
+		return groups[i].Files[0].Path < groups[j].Files[0].Path
 	})
+	// 组号在排序**之后**按序号发放（1..N）：同输入两跑的组序与组号因此都一致。
+	for i := range groups {
+		groups[i].GroupID = uint64(i + 1)
+	}
 	// M4：写回与命中续期统一在 defer 中执行（含 Cancelled 路径）
 	p.setStatus(model.StatusDone)
 	return groups, failed, nil

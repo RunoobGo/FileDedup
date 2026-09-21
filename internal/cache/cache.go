@@ -1,7 +1,9 @@
 // Package cache 哈希缓存（04 M4-T01，01 §7.3）：
 // SQLite WAL；键 (path, size, mtime_ns, dev, ino, ctime_ns)；
 // 命中后仍须四点采样比对，全一致才复用 full；
-// 批量 UPSERT 单事务写回；last_hit 上限淘汰；损坏自愈（确证损坏时隔离重建）。
+// 批量 UPSERT 单事务写回；last_hit 上限淘汰。
+// 损坏处理分两层，都不是"自愈"（M96）：**打开时**确证影像损坏 ⇒ 改名隔离后重建；
+// **运行期**确证损坏 ⇒ 只停用（不再发 SQL），要恢复必须重启应用（M87 未做）。
 package cache
 
 import (
@@ -82,11 +84,13 @@ type Cache struct {
 	// M74：运行期库错误的证据位。改前 Lookup 把一切 Scan 错误折成"未命中"，
 	// 于是"库中途坏了"这件事只有 Store 每轮报一次错、Lookup 永远沉默，
 	// 且没有任何地方再判损坏（IsCorruption 只在 Open 跑过一次）。
-	dbErrs  atomic.Int64 // Lookup 遇到的非 ErrNoRows DB 错误条数（本轮累计）
+	dbErrs  atomic.Int64 // Lookup 遇到的非 ErrNoRows DB 错误条数（进程启动以来累计，M95）
 	corrupt atomic.Bool  // 确证损坏 ⇒ 不再向库发 SQL（停用，不是自愈）
 }
 
 // DBErrors 返回 Lookup 累计到的运行期 DB 错误条数（M74；不含正常的"未命中"）。
+// 口径与上面的字段一致：**进程启动以来**的累计，不随扫描轮次归零（M95）——
+// 全仓只有 Add 与 Load 两个访问点，没有任何重置点，所以"本轮"这个说法是假的。
 func (c *Cache) DBErrors() int64 { return c.dbErrs.Load() }
 
 // Corrupted 返回本库是否已被确证损坏并停用（M74）。

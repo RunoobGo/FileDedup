@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"filededup/internal/model"
+	"filededup/internal/ops"
 )
 
 // eventRecorder 替换 a.emit，记录终止事件。
@@ -91,12 +94,107 @@ func newProbeApp(t *testing.T) (*App, *eventRecorder, string) {
 	os.MkdirAll(filepath.Join(root, "sub"), 0o755)
 	os.WriteFile(filepath.Join(root, "sub", "b.bin"), payload, 0o644)
 
-	a := NewApp()
-	a.ctx = context.Background() // emit 已替换，不再要求 Wails 内部 context
-	a.cfgDir = t.TempDir()
-	rec := &eventRecorder{done: make(chan string, 8)}
-	a.emit = rec.emit
+	// M93：App 构造收归 newHistApp（原先这里自己复制了一份四行构造，
+	// 且**从不接 a.hist**。写前账本是 fail-closed 的，无账本的 App 永远走不到
+	// 互斥门的下游，于是三条互斥用例的绿全部来自别的门 —— 见 §22.2 变异取证）。
+	a, rec := newHistApp(t)
 	return a, rec, root
+}
+
+// newOperableApp 在 newProbeApp 之上把 App 铺成「结果集就绪、清理请求能一路走到
+// 互斥门」的状态，返回一个结果集内可操作文件的 id。
+//
+// 为什么必须一起铺三件（resultsReady / groups / 账本）：ExecuteOperation 的门禁链
+// 是 opsRunning → scanInFlight → resultsReady → len(groups) → 写前账本
+// （app.go:1805-1820、:1776-1787）。缺一件，请求就停在互斥门**下游**，
+// 把 `if a.scanInFlight` 整条删掉用例也不会红（改前真读数：**-count=6 全绿）。
+//
+// 组内两个成员都指向不存在的路径：清理必然 ENOENT → Skipped，不必真造文件
+// 就能走完受理与收尾路径（app_history_test.go:35 mkHistGroup 的既有手法）。
+func newOperableApp(t *testing.T) (*App, string, uint64) {
+	t.Helper()
+	a, _, root := newProbeApp(t)
+	dir := t.TempDir()
+	g := mkGroup(1, 100, filepath.Join(dir, "gone-a"), filepath.Join(dir, "gone-b"))
+	a.mu.Lock()
+	a.resultsReady = true
+	a.groups = []*model.DuplicateGroup{g}
+	a.byID[g.Files[1].ID] = g.Files[1]
+	a.mu.Unlock()
+	return a, root, g.Files[1].ID
+}
+
+// assertIdleAppAcceptsOps 前提自检（独立于被测门禁）：什么都不钉时，
+// 一个可操作请求必须**真的被受理**。
+//
+// 自检失败即当场红，不允许继续往下断言 —— 那意味着夹具穿不过某道下游门，
+// 于是「被拒」这个结果无法归因给互斥门禁，正是 M93 改前那种「恒绿却什么都没测」
+// 的形状。判据本身不依赖被测代码的行为，只依赖门禁链的形状。
+func assertIdleAppAcceptsOps(t *testing.T) {
+	t.Helper()
+	a, _, id := newOperableApp(t)
+	if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{id}}); err != nil {
+		t.Fatalf("前提自检失败：空闲 App 的可操作请求应被受理，实际被拒：%v"+
+			"（夹具穿不过互斥门下游的某道门 ⇒ 本文件的互斥断言无法归因到被测门禁）", err)
+	}
+	a.wg.Wait() // 不等到收尾就返回，会让下一段的在途标志不再是「真实空闲」
+}
+
+// fireOps / fireScans 并发发 n 个请求，逐格回收结果。
+//
+// 每个 goroutine 只写 errs[i] 自己那一格，受理计数走 atomic ——
+// M92 那次 CI DATA RACE 就是裸 ++（run 35644606017，读/写同指一行）。
+func fireOps(t *testing.T, a *App, id uint64, n int) (int64, []error) {
+	t.Helper()
+	var accepted atomic.Int64
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{id}})
+			if err == nil {
+				accepted.Add(1)
+			}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	return accepted.Load(), errs
+}
+
+func fireScans(a *App, root string, n int) (int64, []error) {
+	var accepted atomic.Int64
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := a.StartScan(model.ScanConfig{Roots: []string{root}})
+			if err == nil {
+				accepted.Add(1)
+			}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	return accepted.Load(), errs
+}
+
+// assertAllRejected 双条件判据：一条都不许受理，**且每条拒因都必须是那句互斥文案**。
+// 只断「被拒」是不够的：任何一道别的门替它挡下请求，用例都会绿而产品门禁可以已被拆掉。
+func assertAllRejected(t *testing.T, tag string, accepted int64, errs []error, wantReason string) {
+	t.Helper()
+	if accepted != 0 {
+		t.Fatalf("%s: 应零受理，实际受理 %d 次", tag, accepted)
+	}
+	for i, err := range errs {
+		if err == nil || !strings.Contains(err.Error(), wantReason) {
+			t.Fatalf("%s: 第 %d 条拒因不是被测互斥门（期望含 %q）：%v", tag, i, wantReason, err)
+		}
+	}
 }
 
 // P0-1：连续两次扫描都必须正常完成（修正前第二次被状态机拒绝，
@@ -162,69 +260,120 @@ func TestScanAfterCancel(t *testing.T) {
 }
 
 // P1-1：清理操作在途时不得开启新扫描（否则 ops goroutine 收尾会覆盖新结果集）。
+//
+// M93 补强（不是修死门禁 —— 变异 M-R1-c 下改前这条也 6/6 转红，它一直是活的；
+// 这里只把**归因**从侥幸变成保证）：改前只断「err != nil」而不看拒因，并用
+// sleep+轮询 Status 等上一次扫描收尾，而 Status 变 Done 早于 scanInFlight 复位
+// （复位在 app.go:669）。落在那个窗口里时，拒因来自上游的 scanInFlight 门，
+// 删掉 opsRunning 门禁这条也不会红。现在等终止事件（scan:done 必晚于复位）
+// 并断拒因，另加一条锁内自检钉住「上游门是开的」。
 func TestStartScanRejectedWhileOpsRunning(t *testing.T) {
-	a, _, root := newProbeApp(t)
+	a, rec, root := newProbeApp(t)
 	if _, err := a.StartScan(model.ScanConfig{Roots: []string{root}}); err != nil {
 		t.Fatal(err)
 	}
-	// 等扫描完成
-	time.Sleep(50 * time.Millisecond)
-	for a.GetStatus() != string(model.StatusDone) {
-		time.Sleep(20 * time.Millisecond)
+	if ev := rec.waitTerminal(t, "scan#1"); ev != "scan:done" {
+		t.Fatalf("scan#1 终止事件 = %s", ev)
+	}
+	a.mu.Lock()
+	// 前提自检：拒因归因要求 scanInFlight 这道上游门此刻是开的。
+	if a.scanInFlight {
+		a.mu.Unlock()
+		t.Fatal("前提自检失败：scan:done 之后 scanInFlight 仍为真，无法把拒因归到 opsRunning 门")
 	}
 	a.opsRunning = true // 模拟 ops goroutine 在途
-	if _, err := a.StartScan(model.ScanConfig{Roots: []string{root}}); err == nil {
+	a.mu.Unlock()
+	_, err := a.StartScan(model.ScanConfig{Roots: []string{root}})
+	if err == nil {
 		t.Fatal("P1-1: 操作执行中应拒绝新扫描（结果集会被陈旧回写覆盖）")
 	}
+	if !strings.Contains(err.Error(), "清理操作执行中") {
+		t.Fatalf("P1-1: 拒因不是 opsRunning 门（互斥门禁可能已被别的门替挡）：%v", err)
+	}
+	a.mu.Lock()
 	a.opsRunning = false
+	a.mu.Unlock()
 	if _, err := a.StartScan(model.ScanConfig{Roots: []string{root}}); err != nil {
 		t.Fatalf("空闲时应可扫描: %v", err)
 	}
+	if ev := rec.waitTerminal(t, "scan#2"); ev != "scan:done" && ev != "scan:cancelled" {
+		t.Fatalf("scan#2 终止事件 = %s", ev)
+	}
 }
 
-// P1-1 对称：扫描在途时不得开启清理操作。
+// P1-1 对称（phase A）：扫描在途时不得开启清理操作。
+//
+// M93 重写。改前判据只有「err == nil ⇒ Fatal」一条，而该夹具因缺 a.hist 与
+// resultsReady 根本走不到互斥门：把 `if a.scanInFlight` 整条删掉，
+// 用例 -count=6 仍然全绿（§22.2 变异 M-R1-a/M-R1-b 真读数）。
+// 现在换成双条件：零受理 **且** 每条拒因含"扫描进行中"，并加两条前提自检
+// （空闲时可受理 / 解除钉住后立刻恢复受理），使「被拒」这一结果只能来自互斥门。
 func TestExecuteOperationRejectedWhileScanInFlight(t *testing.T) {
-	a, _, root := newProbeApp(t)
-	if _, err := a.StartScan(model.ScanConfig{Roots: []string{root}}); err != nil {
-		t.Fatal(err)
-	}
+	assertIdleAppAcceptsOps(t)
+	a, _, id := newOperableApp(t)
+
 	a.mu.Lock()
-	a.groups = []*model.DuplicateGroup{mkGroup(1, 100, "a", "b")}
-	a.byID[101] = a.groups[0].Files[0]
 	a.scanInFlight = true // 模拟扫描 goroutine 收尾在途
 	a.mu.Unlock()
-	if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{101}}); err == nil {
-		t.Fatal("P1-1: 扫描在途时应拒绝清理操作")
+
+	accepted, errs := fireOps(t, a, id, 6)
+	assertAllRejected(t, "P1-1 phase A（扫描在途 ⇒ 拒清理）", accepted, errs, "扫描进行中")
+
+	// 前提自检的另一半：放开钉住后同一 App 必须立刻恢复受理。
+	// 不放开就直接红 ⇒ 排除「夹具本身就永远拒」这种假绿。
+	a.mu.Lock()
+	a.scanInFlight = false
+	a.mu.Unlock()
+	if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{id}}); err != nil {
+		t.Fatalf("P1-1: 解除 scanInFlight 后应恢复受理，实际仍被拒：%v", err)
 	}
+	a.wg.Wait()
 }
 
-// P1-1：并发「扫描 + 清理」不得同时被受理（互斥必须双向闭合）。
+// P1-1（phase B）：清理在途时不得开新扫描，双向闭合的另一半。
+//
+// M93 重写。原用例判据是 `scanOK>0 && opsOK>0`，把两类**先后**各受理一次当成违规；
+// 实测三次里两次两侧全 0（整条用例什么都没断言），第三次证明的那格也不是它声称的那一格
+// （§22.2 表 4）。改后：用 opsExecuteFn 接缝让一次**真实受理**的清理停在执行器内，
+// opsRunning 不再手写，然后要求每条 StartScan 零受理且拒因含"清理操作执行中"。
+//
+// ★ 设计段 §22.2 另规划的「不钉标志、两侧并发、断受理数 <= 1」那一格
+// **未实现**：正确实现下扫描足够快时第二个扫描被先后受理属正常，
+// 该判据必然假红（详见 §6.18 的偏离交代）。
 func TestScanAndOpsAreMutuallyExclusive(t *testing.T) {
-	a, _, root := newProbeApp(t)
-	var scanOK, opsOK int
-	var wg sync.WaitGroup
-	for i := 0; i < 12; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if i%2 == 0 {
-				if _, err := a.StartScan(model.ScanConfig{Roots: []string{root}}); err == nil {
-					scanOK++
-				}
-				return
-			}
-			a.mu.Lock()
-			a.groups = []*model.DuplicateGroup{mkGroup(1, 100, "a", "b")}
-			a.byID[101] = a.groups[0].Files[0]
-			a.mu.Unlock()
-			if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{101}}); err == nil {
-				opsOK++
-			}
-		}(i)
+	assertIdleAppAcceptsOps(t)
+	a, root, id := newOperableApp(t)
+
+	enter, release := make(chan struct{}), make(chan struct{})
+	prev := opsExecuteFn
+	opsExecuteFn = func(o ops.Options, op model.OpRequest) model.OpsResult {
+		close(enter)
+		<-release
+		return prev(o, op)
 	}
-	wg.Wait()
-	// 允许其中一类成功，但两者同时成功说明互斥有洞
-	if scanOK > 0 && opsOK > 0 {
-		t.Fatalf("P1-1: 扫描与清理同时被受理 scanOK=%d opsOK=%d", scanOK, opsOK)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		opsExecuteFn = prev
+	})
+
+	if _, err := a.ExecuteOperation(model.OpRequest{Kind: "trash", FileIDs: []uint64{id}}); err != nil {
+		t.Fatalf("前提自检失败：清理请求应被受理，实际被拒：%v", err)
+	}
+	<-enter // 确认真的进到执行器内部（不是被某道门拒掉后空等）
+
+	accepted, errs := fireScans(a, root, 6)
+	assertAllRejected(t, "P1-1 phase B（清理在途 ⇒ 拒扫描）", accepted, errs, "清理操作执行中")
+
+	close(release)
+	a.wg.Wait()
+	a.mu.Lock()
+	stillRunning := a.opsRunning
+	a.mu.Unlock()
+	if stillRunning {
+		t.Fatal("前提自检失败：ops goroutine 已收尾而 opsRunning 未复位（后续断言的拒因无从归因）")
 	}
 }

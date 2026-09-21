@@ -52,8 +52,12 @@ const findStreamInfoStandard = 0
 // errno（交给 Classify），而 .Call 返回的是 error 接口、还要断言回落；SyscallN 直接
 // 给 syscall.Errno，且变参长度显式传给 runtime（不存在历史上 Proc.Call 的三参截断问题）。
 //
-// ★ 本文件的真机行为**未兑现验证**（M32）：darwin/linux 主门禁只能做到
-// `GOOS=windows go vet` 的交叉编译检查 + 尺寸钉。胶水层唯一的真机判据是 V8。
+// ★ 真机验证状态（M100 更正）：本文件的胶水层**已经在 CI 的 windows 真机腿跑过**
+// （run 35642706382：`ok  filededup/internal/ads  0.021s`），凭据是无 Skip 分支的 V8，
+// 它钉的正是下面的结构偏移。darwin/linux 主门禁这一侧仍只有
+// `GOOS=windows go vet` 的交叉编译检查 + 尺寸钉。
+// 端到端那一半（"有一条真命名流被拦住"= V8b）**仍未兑现**：V8b 有两条合法 Skip
+// 出口，而 CI 三条腿都不带 -v，从 `ok` 行分不出真绿还是跳过（M32 保持部分兑现）。
 func enumerateStreams(path string) ([]string, uintptr) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {

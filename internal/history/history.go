@@ -20,7 +20,12 @@ import (
 // MaxScanHistory 扫描历史上限，超出淘汰最旧（CASCADE 清组/文件行）。
 const MaxScanHistory = 20
 
-// SchemaVersion 库结构版本（PRAGMA user_version）。
+// SchemaVersion 写进 PRAGMA user_version 的库结构版本号。
+//
+// M97 如实限定：**目前只写不读** —— Open 全路径没有一处读回比对，因此它
+// **不构成版本门禁**，改结构时旧库不会被自动作废或迁移（对照 cache 侧的
+// enforceAlgoVersion，那才是真门禁：不符即整表作废）。
+// 补真门禁属改行为，本批不做；在此之前不得把这个常量读成"有版本校验"。
 const SchemaVersion = 1
 
 // op_items.state 取值（写前日志状态机，spec §7）。

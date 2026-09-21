@@ -15,7 +15,13 @@ import (
 // "没有任何命名流"，守卫恒放行，而它在 Linux 主门禁里**全绿**（那里测的是手写的
 // 名字列表，不是胶水真读到的字节）。所以偏移这件事只有真机能证。
 //
-// ★ 未兑现（M32）：本仓无 Windows runner，本条至今没有过真机读数。
+// ★ 兑现进度（M100 更正，原句"本仓无 Windows runner、至今没有真机读数"已过期）：
+// 本仓 CI **有** windows 腿，green run 35642706382 的该腿日志第 644 行是
+// `ok  filededup/internal/ads  0.021s`，而本条用例通篇只有 t.Fatalf、
+// 没有任何 Skip 分支 ⇒ 它在那台真机 NTFS 上跑过并绿，**偏移层已兑现**。
+// 仍**未兑现**的是端到端那一半：V8b（TestDetectsRealNamedStreamOnNTFS）有两条
+// 合法 Skip 出口，而三条腿都不带 -v ⇒ 从 `ok` 行分不出真绿还是跳过。
+// 划账见 04 §6.11 的 M32 行括注与 §6.18。
 func TestFirstStreamNameIsDefaultOnRealNTFS(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "probe.txt")
