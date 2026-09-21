@@ -475,6 +475,16 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 								"（若不在回收站，请停止后续操作并考虑用数据恢复工具找回）"})
 						return
 					}
+					// OPS-7（2026-09-21 全量审查）：pre-pass 的 identityStill 与这次
+					// 单独派发之间隔着**整批 trash 的 I/O** + 逐个分支的并发排队，
+					// 是全仓唯一"复核不紧贴动作"的时序（delete/hardlink/symlink/move
+					// 都在动手前一行复核）。批量失败到逐个重试这段延迟不是零，
+					// 窗口内第三方顶替后，我们照旧把顶替者派进回收站。
+					if !identityStill(p, procIDs[i]) {
+						settle(i, outcome{code: ocFailed, stage: "verify",
+							err: "文件在扫描后被替换（inode 已变化），已拦截"})
+						return
+					}
 					if m, err := trash([]string{p}); err != nil {
 						settle(i, outcome{code: ocFailed, err: err.Error()})
 					} else {

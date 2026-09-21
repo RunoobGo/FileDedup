@@ -57,6 +57,15 @@ tags = ["cold", "cache1", "cache2"]
 def sig(tag):
     r = json.loads((work / f"{tag}.json").read_text())
     s = r["stats"]
+    # APP-10（2026-09-21 全量审查）：列表字段必须是 JSON 数组。原先这里写的是
+    # `len(r["failed"] or [])`——一个替后端把契约违约藏下来的兜底：空失败表序列化成
+    # null 时冒烟照样绿，而外部按 `for x in r["failed"]` 消费的机器读者直接 TypeError。
+    # 去掉兜底、改成显式形状断言，null 即红。
+    for key in ("groups", "failed"):
+        if not isinstance(r[key], list):
+            print(f"\nFAIL: {key} 序列化为 {type(r[key]).__name__}，应为数组"
+                  "（空列表必须是 []，不能是 null）", file=sys.stderr)
+            sys.exit(1)
     groups = []
     for g in r["groups"]:
         paths = sorted(f["path"] for f in g["files"])
@@ -68,7 +77,7 @@ def sig(tag):
         "reclaimable": s["reclaimable_bytes"],
         "dup_files": s["duplicate_files"],
         "files_total": s["files_total"],
-        "failed": len(r["failed"] or []),
+        "failed": len(r["failed"]),
         "digest": hashlib.sha256(blob).hexdigest()[:16],
     }
     # cache_hits **不进比较键**：冷扫/首扫/复扫三者的命中数本就应不同

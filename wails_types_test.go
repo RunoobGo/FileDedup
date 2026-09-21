@@ -353,26 +353,64 @@ type jsonNameSynthEmbeddedPtr struct {
 	PromotedPtr string `json:"PromotedPtr"`
 }
 
-// TestWailsTypesCoverGoFields 逐对双向比对（§12.3 V2）。
+// compareMirrorPair 比对一对镜像面：Go 有效 JSON 名 ↔ TS 接口字段名。
+//
+// GATE-2（2026-09-21 全量审查）：第三个返回值 vacuous 标的是「这一对其实一个名字
+// 都没比」。missing / extra 两条判据在**两侧皆空**时同时静默通过——字段面门禁可以
+// 绿得一次比对都没发生。同一把锁在方法面上早就有了（本文件
+// TestBackendAPIMatchesGoExportedMethods 里那句 len(tsMethods)==0 ⇒ t.Fatal，
+// 理由是「解析器失效会让本项静默通过」），字段面漏了对称的那一份。
+func compareMirrorPair(p mirrorPair, src string) (missing, extra, vacuous []string, compared int) {
+	tsFields, err := tsInterfaceFields(src, p.ts)
+	if err != nil {
+		// 接口体取不到也算空转：它同样导致「比了 0 个字段却报绿」。
+		return nil, nil, []string{p.ts + "（接口体解析失败：" + err.Error() + "）"}, 0
+	}
+	goNames := goJSONNames(p.goType)
+	switch {
+	case len(goNames) == 0:
+		vacuous = append(vacuous, p.ts+"（Go 侧 "+p.goType.String()+" 反射出 0 个 JSON 字段名）")
+	case len(tsFields) == 0:
+		vacuous = append(vacuous, p.ts+"（TS 侧接口体解析出 0 个字段）")
+	}
+	miss, ext := compareFieldSets(goNames, tsFields)
+	for _, f := range miss {
+		missing = append(missing, p.ts+"."+f)
+	}
+	for _, f := range ext {
+		extra = append(extra, p.ts+"."+f)
+	}
+	return missing, extra, vacuous, len(goNames)
+}
+
+// TestWailsTypesCoverGoFields 逐对双向比对（§12.3 V2）+ 空转自检（GATE-2）。
 func TestWailsTypesCoverGoFields(t *testing.T) {
 	src := readWailsTS(t)
-	var missing, extra []string
+	var missing, extra, vacuous []string
+	pairs, compared := 0, 0
 	for _, p := range wailsMirrors {
 		if p.exempt != "" {
 			continue
 		}
-		tsFields, err := tsInterfaceFields(src, p.ts)
-		if err != nil {
-			t.Errorf("TS 接口 %s：%v", p.ts, err)
-			continue
-		}
-		miss, ext := compareFieldSets(goJSONNames(p.goType), tsFields)
-		for _, f := range miss {
-			missing = append(missing, p.ts+"."+f)
-		}
-		for _, f := range ext {
-			extra = append(extra, p.ts+"."+f)
-		}
+		pairs++
+		m, e, v, n := compareMirrorPair(p, src)
+		missing = append(missing, m...)
+		extra = append(extra, e...)
+		vacuous = append(vacuous, v...)
+		compared += n
+	}
+	// 两条下界的取值依据（本轮实测）：**24 对 / 130 个名字**。
+	// 留的是"字段增减不误报、表面塌陷必报"的余量——少一两个字段由 missing/extra
+	// 负责，这里只挡"整片比对没了"这一档，所以地板远低于实测、又高于任何合理子集。
+	if len(vacuous) > 0 {
+		t.Errorf("有 %d 对镜像面空转（一个字段都没比，却不会让本项变红）：%s",
+			len(vacuous), strings.Join(vacuous, "; "))
+	}
+	if pairs < 20 {
+		t.Errorf("字段面只登记了 %d 对参与比对（基线 24 对）：映射表被清空时本项不得读作通过", pairs)
+	}
+	if compared < 100 {
+		t.Errorf("字段面合计只比了 %d 个 Go 字段名（基线 130 个）：解析器或反射失效会让本项静默通过", compared)
 	}
 	if len(missing) > 0 {
 		t.Errorf("TS 侧缺 %d 个 Go 下发字段（前端按类型取不到）：%s",
@@ -381,6 +419,34 @@ func TestWailsTypesCoverGoFields(t *testing.T) {
 	if len(extra) > 0 {
 		t.Errorf("TS 侧多 %d 个 Go 侧不存在的字段（前端读到的是永远 undefined）：%s",
 			len(extra), strings.Join(extra, ", "))
+	}
+}
+
+// TestCompareMirrorPairFlagsVacuous 空转自检本身要被测到：
+// 判据若不报警，GATE-2 就只是句注释。这里喂一对"Go 侧没有任何导出字段"的镜像面，
+// 它必须落在 vacuous 里（而不是因为"两边都空所以没差异"而通过）。
+type noExportedJSONFields struct {
+	hidden     int
+	alsoHidden string //nolint:unused // 刻意造一个无导出字段的类型，供 vacuous 自检用
+}
+
+func TestCompareMirrorPairFlagsVacuous(t *testing.T) {
+	src := readWailsTS(t)
+	p := mirrorPair{ts: "FailedItem", goType: reflect.TypeOf(noExportedJSONFields{})}
+	_, _, vacuous, compared := compareMirrorPair(p, src)
+	if len(vacuous) != 1 {
+		t.Fatalf("Go 侧 0 字段名却未被标为空转（vacuous=%v）——GATE-2 的锁是空的", vacuous)
+	}
+	if !strings.Contains(vacuous[0], "FailedItem") || !strings.Contains(vacuous[0], "0 个") {
+		t.Errorf("空转报告没点名是哪一对、为什么：%q", vacuous[0])
+	}
+	if compared != 0 {
+		t.Errorf("compared = %d，应为 0（Go 侧本来就没名字）", compared)
+	}
+	// 正对照：真表里的 FailedItem 一侧不许被标空转。
+	real := mirrorPair{ts: "FailedItem", goType: reflect.TypeOf(model.FailedItem{})}
+	if _, _, v, n := compareMirrorPair(real, src); len(v) != 0 || n == 0 {
+		t.Errorf("正常的 FailedItem 对被误标为空转（vacuous=%v compared=%d）", v, n)
 	}
 }
 

@@ -114,6 +114,9 @@ func TestExecuteOperationLedgerFailureIsVisible(t *testing.T) {
 	}
 	t.Cleanup(func() { opsExecuteFn = prev })
 
+	got, restoreErrs := captureAppErrors(a) // 全部 app:error，不看末条（见下方更正）
+	t.Cleanup(restoreErrs)
+
 	a.mu.Lock()
 	var sel []uint64
 	for _, f := range a.groups[0].Files {
@@ -125,15 +128,28 @@ func TestExecuteOperationLedgerFailureIsVisible(t *testing.T) {
 	}
 	waitOpsDone(t, rec)
 
-	if got := countEvent(rec, "app:error"); got < 2 {
-		t.Fatalf("app:error 只有 %d 条：条目收口与账本收尾必须各自留痕（只报收尾等于把逐条失败藏起来）", got)
+	if n := countEvent(rec, "app:error"); n < 2 {
+		t.Fatalf("app:error 只有 %d 条：条目收口与账本收尾必须各自留痕（只报收尾等于把逐条失败藏起来）", n)
 	}
-	txt := ledgerErrText(t, rec) // 最后一条 = 收尾那条
-	if !strings.Contains(txt, "收尾") {
-		t.Fatalf("末条告警应指向 FinalizeOp: %q", txt)
+	// ★ 2026-09-21 APP-3 就地更正（设计稿 §15.0-A）：这里原先取 rec 的**末条**
+	//   app:error 并断言它含「收尾」。那不是钉错了语义，而是钉错了**载体**——
+	//   eventRecorder.payloads 按事件名只留最后一条载荷，于是"FinalizeOp 失败必须
+	//   可见"这一条性质被实现成"收尾那条必须是最后一条"。APP-3 把 ExecuteOperation
+	//   收尾之后的 PruneScanFiles 失败也接进统一出口（它此前只写 stderr），末条
+	//   因此合法地换成了裁剪告警，原断言就把"多留了一处痕"读成"少了收尾那条"。
+	//   现在按集合断言：收尾那条必须在场、必须说到"收尾"与"计划中"；顺序不钉。
+	var finalizeTxt string
+	for _, txt := range *got {
+		if strings.Contains(txt, "收尾") {
+			finalizeTxt = txt
+			break
+		}
 	}
-	if !strings.Contains(txt, "计划中") {
-		t.Fatalf("收尾失败必须说明后果（残留 planned 影响回撤范围）: %q", txt)
+	if finalizeTxt == "" {
+		t.Fatalf("没有任何一条告警指向 FinalizeOp（账本收尾失败被吞掉）: %q", strings.Join(*got, " | "))
+	}
+	if !strings.Contains(finalizeTxt, "计划中") {
+		t.Fatalf("收尾失败必须说明后果（残留 planned 影响回撤范围）: %q", finalizeTxt)
 	}
 }
 

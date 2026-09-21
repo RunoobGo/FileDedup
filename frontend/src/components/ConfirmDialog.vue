@@ -33,7 +33,13 @@ const meta = computed(() => {
         '或它所在的磁盘被拔出，这些路径就会失效（打不开）。' +
         '需要管理员权限（或已开启开发者模式）；同卷文件请优先用硬链接。',
     }
-    default: return { title: '硬链接合并', danger: false, desc: '冗余路径将替换为指向保留文件的硬链接（仅同卷可用）。' }
+    case 'hardlink': return { title: '硬链接合并', danger: false, desc: '冗余路径将替换为指向保留文件的硬链接（仅同卷可用）。' }
+    default: {
+      // FE-2 穷尽断言：原先 hardlink 住在 default 里，给 OpKind 新增一类却不补分支，
+      // 它就会默默拿到"硬链接合并"这个标题和说明——用户看到的将是他没做过的那件事。
+      const _exhaustive: never = props.kind
+      return { title: '未知操作', danger: false, desc: '未登记的操作类型（' + String(_exhaustive) + '），请升级应用后再执行。' }
+    }
   }
 })
 

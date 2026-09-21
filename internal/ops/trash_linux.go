@@ -101,11 +101,6 @@ func moveIntoTrash(src, dst string) error {
 	return os.Remove(src)
 }
 
-// xdgNameMaxTry 重名递增上限。不设上限时任何"永远查不出 NotExist"的环境
-// （如 files/ 所在目录被 chmod 000，Stat 恒返回 EACCES）都会让循环无限转，
-// 且循环整体持锁 → 全部并发 trash goroutine 一起挂死。
-const xdgNameMaxTry = 10000
-
 // nameFree 判定候选名可用：Lstat 报 NotExist 才算空位。
 // 悬空符号链接（目标不存在）Lstat 成功返回 → 视为占用：rename 会把它连同
 // 链接本身一起移走，若当作空位则目标端语义丢失。
@@ -137,7 +132,7 @@ func uniqueXDG(dir, name string) (string, error) {
 	} else if free {
 		return dst, nil
 	}
-	for i := 2; i <= xdgNameMaxTry+1; i++ {
+	for i := 2; i <= nameMaxTry+1; i++ {
 		dst = filepath.Join(dir, fmt.Sprintf("%s.%d", name, i))
 		free, err := nameFree(dst)
 		if err != nil {
@@ -147,7 +142,7 @@ func uniqueXDG(dir, name string) (string, error) {
 			return dst, nil
 		}
 	}
-	return "", fmt.Errorf("回收站中 %s 的重名条目已达上限 %d，拒绝继续递增", name, xdgNameMaxTry)
+	return "", fmt.Errorf("回收站中 %s 的重名条目已达上限 %d，拒绝继续递增", name, nameMaxTry)
 }
 
 // writeTrashInfo 生成规范 .trashinfo。

@@ -435,7 +435,15 @@ function onConfirm(targetDir?: string) {
           <Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（已移入回收站 {{ humanBytes(store.opsResult.TrashedBytes) }}，清空回收站后才释放空间）
         </span>
         <span v-else class="ok"><Icon name="check" :size="13" /> 成功 {{ formatCount(store.opsResult.OK.length) }}（释放 {{ humanBytes(store.opsResult.Reclaimed) }}）</span>
-        <button class="btn-ghost" @click="store.openTrash()">打开回收站</button>
+        <!-- FE-1（2026-09-21 全量审查）：按钮按"本次是否真有东西进了回收站"显示，
+             而不是无条件挂在结果条上。修正前 hardlink / symlink / delete / 卷内 move
+             的结果条也挂着「打开回收站」——那类操作一个文件都没进回收站，点了只会
+             把系统回收站翻开来给用户看"里面是空的"。
+             判据取后端回包的 TrashedBytes（不是前端自己记"我刚才请求了哪种操作"）：
+             它是逐项累计出来的实测值，Go 侧有 executor_account_test 钉住
+             "trash 记它、delete/move 恒为 0"，所以这一句不会说谎。 -->
+        <button v-if="store.opsResult.TrashedBytes" class="btn-ghost"
+          @click="store.openTrash()">打开回收站</button>
       </template>
       <span v-if="store.opsResult.Skipped.length" class="skip"><Icon name="skip" :size="13" /> 已跳过 {{ formatCount(store.opsResult.Skipped.length) }}（文件已消失）</span>
       <!-- P2：中止后必须说清"还有多少没处理"，否则用户无法判断是否需要重跑 -->

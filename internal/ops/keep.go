@@ -23,6 +23,19 @@ type KeepDecision struct {
 // 指定保留目录」的组 ID。修正前这类组被静默 continue，整组一个保留者都不标，
 // 用户以为「应用过策略 = 已保护」，实际整组都可被清掉——必须回给调用方明示。
 func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) (decisions []KeepDecision, unmatched []uint64) {
+	return ApplyKeepPolicyWith(groups, policy, nil)
+}
+
+// ApplyKeepPolicyWith 是 ApplyKeepPolicy 的持锁安全版本（APP-1，2026-09-21 全量审查）：
+// 卷语义由调用方在**取锁之前**用 WarmSensitivity 预热好传进来。
+//
+// 为什么要有这个变体：AS-R3 只修了处理策略那半边（ApplyProcessPolicyWith），
+// 保留策略的 directory 分支经 pickInDirectory 同样会就地调 fscase.Sensitive，
+// 而那是**往用户目录写探测文件**的 I/O。app.go 的 ApplyKeepPolicy 全程持 a.mu，
+// 一个死挂载就能把整把锁连同全部 Wails 绑定卡住。
+// resolve 为 nil 时按需就地实测（与 ApplyProcessPolicyWith 同一口径）。
+func ApplyKeepPolicyWith(groups []*model.DuplicateGroup, policy model.KeepPolicy,
+	resolve SensResolver) (decisions []KeepDecision, unmatched []uint64) {
 	for _, g := range groups {
 		if len(g.Files) < 2 {
 			continue
@@ -34,7 +47,7 @@ func ApplyKeepPolicy(groups []*model.DuplicateGroup, policy model.KeepPolicy) (d
 		case "oldest":
 			keep = pickBy(g, func(a, b *model.FileEntry) bool { return a.ModTime < b.ModTime })
 		case "directory":
-			keep = pickByDirectoryPriority(g, policy.Directories)
+			keep = pickByDirectoryPriority(g, policy.Directories, resolve)
 			if keep < 0 {
 				// 无匹配：该组保持现状（用户未选择），并计入 unmatched
 				unmatched = append(unmatched, g.GroupID)
@@ -108,13 +121,13 @@ func hidden(p string) bool {
 
 // pickByDirectoryPriority 按目录优先级顺序取首个命中目录的保留者，
 // 全部未命中返回 -1。dirs 中空/纯空白项忽略。
-func pickByDirectoryPriority(g *model.DuplicateGroup, dirs []string) int {
+func pickByDirectoryPriority(g *model.DuplicateGroup, dirs []string, resolve SensResolver) int {
 	for _, d := range dirs {
 		d = strings.TrimSpace(d)
 		if d == "" {
 			continue
 		}
-		if i := pickInDirectory(g, d); i >= 0 {
+		if i := pickInDirectory(g, d, resolve); i >= 0 {
 			return i
 		}
 	}
@@ -138,11 +151,11 @@ func HasUsableDir(dirs []string) bool {
 // /Users/X/Docs，整组匹配不上 → 整组不受保护；Windows 上 "\" 与 "/" 混用同理。
 //
 // 路径归属判据统一走 inDir——本函数只负责"取最深的那一个"。
-func pickInDirectory(g *model.DuplicateGroup, dir string) int {
+func pickInDirectory(g *model.DuplicateGroup, dir string, resolve SensResolver) int {
 	if dir == "" {
 		return -1
 	}
-	sensitive := fscase.Sensitive(dir)
+	sensitive := resolveOf(resolve, dir)
 	best, bestLen := -1, 0
 	for i, f := range g.Files {
 		p := fscase.Fold(f.Path, sensitive)
@@ -154,6 +167,15 @@ func pickInDirectory(g *model.DuplicateGroup, dir string) int {
 		}
 	}
 	return best
+}
+
+// resolveOf 取某目录的卷语义：预热过就查表，没预热（resolve==nil）才就地实测。
+// 与 normalizeDirs 的 nil 处理同一条规则，收在一处避免两边各写一遍。
+func resolveOf(resolve SensResolver, dir string) bool {
+	if resolve == nil {
+		return fscase.Sensitive(dir)
+	}
+	return resolve(dir)
 }
 
 // inDir 报告路径 p 是否位于 dir 之下（含 dir 自身）。

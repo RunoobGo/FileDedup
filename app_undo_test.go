@@ -580,9 +580,12 @@ func TestUndoableReasonExplainsAndGivesNextStep(t *testing.T) {
 
 // TestUndoableMatchesKindAndPlatform 钉死 undoable 判定与文案分流的对应关系，
 // 防止「判定说可撤、文案说不可撤」这类自相矛盾。
+// ★ APP-6（2026-09-21 全量审查）：本用例原先自带一份 `undoableOf` 内联判据，
+// 于是"生产改了、测试没改"这类漂移它自己永远看不见——第三条判据就在断言里。
+// 现在改问生产那一份 undoableFor，断言内容一字未动。
 func TestUndoableMatchesKindAndPlatform(t *testing.T) {
 	undoableOf := func(kind string) bool {
-		return kind != "delete" && !(kind == "trash" && runtime.GOOS == "windows")
+		return undoableFor(kind, runtime.GOOS)
 	}
 	if undoableOf("delete") {
 		t.Fatal("delete 必须不可回撤")

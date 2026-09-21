@@ -85,6 +85,24 @@ wiring 'src/components/GroupCard.vue' 'store.groupSelCount(group)' 'group.files.
 	'组内冗余项数取自 store.groupSelCount（M18：组件不得自算）'
 wiring 'src/components/ConfirmDialog.vue' 'reclaimLine(' 'humanBytes' \
 	'确认框字节口径取自 utils/opdisplay（M15：组件不得自行格式化并配文案）'
+# FE-1（2026-09-21 全量审查）：「打开回收站」原先无条件挂在结果条上，
+# hardlink/delete 这类"一个文件都没进回收站"的操作也照挂。锚的是"按钮问过 TrashedBytes"
+# 这件事本身——判据在 Go 侧（executor_account_test 钉死 trash 记它、delete/move 恒 0），
+# 前端只许引用它，不许自己另记"我刚才请求了哪种操作"。
+wiring 'src/views/ResultView.vue' 'v-if="store.opsResult.TrashedBytes"' '' \
+	'「打开回收站」按回收站实测字节显示（FE-1：不得无条件挂在结果条上）'
+# FE-2（穷尽断言在位）：真正的守卫是 vue-tsc —— 变异取证见 04 §6.11（给 OpKind
+# 加一类 archive 却不补 switch 分支，两处各报一次 TS2322）。这里再锚一刀防的是
+# 「把断言删掉、连 default 一起删」让类型检查重新变绿：两把锁互相兜。
+wiring 'src/utils/opdisplay.ts' 'const _exhaustive: never = kind' '' \
+	'opdisplay 的 switch 带 never 穷尽断言（FE-2）'
+wiring 'src/components/ConfirmDialog.vue' 'const _exhaustive: never = props.kind' '' \
+	'确认框的 switch 带 never 穷尽断言（FE-2）'
+# FE-3：历史行三个按钮的禁用态收在 store.histBusy 一份。禁掉的正是那句
+# 「组件自己拼 store.scanning || store.opsRunning」——它既是 store.busy 的第二实现，
+# 又各自漏项（重扫漏 histLoading、删除什么都没挡），是「能点但点了出事」的温床。
+wiring 'src/views/RecordsView.vue' 'store.histBusy' 'store.scanning || store.opsRunning' \
+	'历史行禁用态取自 store.histBusy（FE-3：组件不得自拼互斥判据）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

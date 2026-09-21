@@ -133,8 +133,12 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	}
 	// 合并成功：删除原独立副本的备份。删除失败与"backup 位被第三方顶替"
 	// 都不推翻结果，但必须如实回报残留（理由见 removeOwnBackup 与 merge_guard.go）。
+	//
+	// OPS-1（2026-09-21 全量审查）：这里原先跟一句 `_ = os.Remove(tmp)`。tmp 这个
+	// 名字已在上面被 hardlinkRename(tmp, dup) **消耗**，此后该路径上是谁的东西本函数
+	// 一无所知——那一句删的可能是第三方刚落在这个名字上的文件，且完全没有证据支撑。
+	// 软链接侧（SymlinkMerge）从一开始就没有这一行，两条腿至此对称。
 	if err := removeOwnBackup(backup, dupID); err != nil {
-		_ = os.Remove(tmp) // 确保临时硬链接不残留（本已不指向任何用户可见名）
 		return err
 	}
 	return nil
@@ -277,7 +281,7 @@ type claimedDst struct {
 func claimDst(dir, name string) (claimedDst, error) {
 	ext := filepath.Ext(name)
 	base := name[:len(name)-len(ext)]
-	for i := 0; ; i++ {
+	for i := 0; i < nameMaxTry; i++ {
 		n := name
 		if i > 0 {
 			// 序号插在扩展名**之前**（a.fdd-restored_1.bin）：扫描侧按同一
@@ -285,7 +289,7 @@ func claimDst(dir, name string) (claimedDst, error) {
 			n = fmt.Sprintf("%s_%d%s", base, i, ext)
 		}
 		p := filepath.Join(dir, n)
-		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		f, err := openExclusive(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		switch {
 		case err == nil:
 			_ = f.Close()
@@ -302,6 +306,11 @@ func claimDst(dir, name string) (claimedDst, error) {
 			return claimedDst{}, fmt.Errorf("无法占用目标名 %s: %w", p, err)
 		}
 	}
+	// OPS-10（2026-09-21 全量审查）：循环原先写成 `for i := 0; ; i++`，无上限。
+	// 同包 uniqueXDG 对**同形状**的递增循环已经给过结论并在 nameMaxTry 处收口
+	// （"永远查不出 NotExist 的环境会让全部并发 goroutine 一起挂死"）。
+	// 同一条理由在本包成立过两次，第二处属漏改而不是取舍。
+	return claimedDst{}, fmt.Errorf("目标目录中 %s 的重名条目已达上限 %d，拒绝继续递增", name, nameMaxTry)
 }
 
 // stillOurs 占位是否仍是我们创建的那一个。
@@ -362,6 +371,18 @@ func isCrossDevice(err error) bool {
 	}
 	return errors.Is(le.Err, syscall.EXDEV) || isCrossDeviceExtra(le.Err)
 }
+
+// nameMaxTry 重名递增循环的统一上限（原先只叫 xdgNameMaxTry、只服务回收站一条腿）。
+// 不设上限时任何"永远查不出 NotExist"的环境（如 files/ 所在目录被 chmod 000，
+// Stat 恒返回 EACCES）都会让循环无限转，且循环整体持锁 → 全部并发 goroutine 一起挂死。
+// 放在无 build tag 的文件里，是为了让同形状的 uniqueXDG 与 claimDst 共用同一个数
+// 而不是各写一个（OPS-10）。
+const nameMaxTry = 10000
+
+// openExclusive 是占位抢名的唯一落点：默认 os.OpenFile。
+// 抽成 var 不改变任何行为，只是让"候选名永远查不出可用"这一环境（名字被截断的
+// 文件系统、被第三方持续抢占的目录）成为可在测试里构造的形状——见 claimNameMaxTry。
+var openExclusive = os.OpenFile
 
 // hardlinkRename 默认等于 os.Rename，测试可临时替换以模拟重命名失败，
 // 用于验证 HardlinkMerge 的回滚路径不会丢失数据。

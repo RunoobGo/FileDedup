@@ -102,6 +102,9 @@ func sampleOffsets(size int64) [4]int64 {
 //
 // 短读语义见 Result.Short：读不满不算错误，用实际读到的字节算哈希并如实标记。
 func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
+	if size < 0 {
+		return Result{}, declaredSizeErr(size)
+	}
 	if size <= SmallFileMax {
 		n, err := io.ReadFull(f, buf[:size])
 		if !shortReadOK(err) {
@@ -145,6 +148,15 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 		*dst[i] = xxhash.Sum64(buf[:n])
 	}
 	r.Short = short
+	// AS-H2 的第四入口（2026-09-21 全仓审查）：变长守卫此前只挂在小文件一趟与两条
+	// 全量路径上，**采样分支不在场**。这不只是"少检一次"——阶段 2 命中哈希缓存且
+	// 四点采样相符时，pipeline 会跳过阶段 3（唯一会调 HashFull 的地方），于是
+	// 扫描期间被追加的大文件可以拿着上一轮的 full 哈希直接进组。采样偏移由**声明
+	// size** 决定，追加的尾巴恰好落在四点之外，覆盖率是 0 而不是"低"。
+	// 短读时这一探也无害：探测偏移在声明长度处，比声明短的文件读到 0 字节即放行。
+	if gerr := rejectGrowthBeyond(f, size); gerr != nil {
+		return Result{}, gerr
+	}
 	if !short {
 		r.ActualSize = size
 		return r, nil
@@ -159,8 +171,11 @@ func HashHeadTail(f *os.File, size int64, buf []byte) (Result, error) {
 	// 取**全部读不满的点里最小的 off+n**。注意 n=0 的点（偏移已越过 EOF）
 	// 给出的 off 只是**上界**而非真值：当真实长度落在所有未读满点偏移之下时，
 	// 这里只能得到"最小的越界偏移"这一偏大的估计。因此 ActualSize 的契约
-	// 是「不低于真实长度的保守上界」，调用方不得将其当作精确值持久化
-	// （pipeline 的短读纠偏会在阶段 3 以实际读量再校正）。
+	// 是「不低于真实长度的保守上界」，调用方不得将其当作精确值持久化。
+	//
+	// （本注释此前写"短读纠偏会在**阶段 3** 以实际读量再校正"——阶段错了：纠偏发生在阶段 2
+	// 拿到 r.Short 之后（pipeline.go 的 `e.Size = actual`）；阶段 3 只按 e.Size 调 HashFull，
+	// ActualSize 仍高估时走的是 `n != size` 报错剔除那一支。2026-09-21 审查 DOC-1。）
 	//
 	// 边界：若四个点全部读满却仍被判 short（不可能，short 的定义就是有读不满的
 	// 点），此处 best 保持 -1 → 归 0，由调用方按"不可读"处理。
@@ -208,6 +223,24 @@ func rejectGrowthBeyond(f *os.File, size int64) error {
 	return nil
 }
 
+// RejectGrowthBeyond 是「声明长度之后是否还有内容」的对外出口（2026-09-21 全仓审查）。
+//
+// 为什么导出：dedup 的 paranoid 逐字节比对同样按声明 size 收尾，需要同一道探测；
+// 在调用方再写一遍 ReadAt 就是 I5 的第二份实现——两处一旦措辞或判据分叉，
+// 「预筛拦得住、paranoid 拦不住」这类差别就没人说得清。
+func RejectGrowthBeyond(f *os.File, size int64) error { return rejectGrowthBeyond(f, size) }
+
+// declaredSizeErr 声明长度本身不可信时的错误（负数/畸形 st_size）。
+//
+// 为什么单独一档：损坏的目录项、畸形 FUSE/SMB 实现会把长度报成负数。负数走
+// 「短读」分支会被读成"声明 -1、实际 0"，走 `size <= SmallFileMax` 又会让
+// `buf[:size]` 直接越界 panic——而 worker panic 会让**整轮扫描**作废
+// （pipeline 的 workerPanic 收口），一个坏卷就足以打死全部结果。
+// 因此在入口 fail-closed，交给调用方按单文件 FailedItem 处置。
+func declaredSizeErr(size int64) error {
+	return fmt.Errorf("hasher: 声明长度不可信（%d 字节）: %w", size, io.ErrUnexpectedEOF)
+}
+
 // HashFull 顺序流式全量 BLAKE3（默认路径）。
 //
 // 2026-09-19 修复：修正前用 io.LimitReader(f, size) 包一层，而 LimitReader 读
@@ -219,6 +252,9 @@ func rejectGrowthBeyond(f *os.File, size int64) error {
 // AS-H2（2026-09-20）：同一条理由覆盖反向情形——变长时 LimitReader 同样静默切尾，
 // 故 n == size 之后还要探测「size 处是否仍可读到字节」。
 func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
+	if size < 0 {
+		return [32]byte{}, declaredSizeErr(size)
+	}
 	h := blake3.New(32, nil)
 	n, err := io.CopyBuffer(h, io.LimitReader(f, size), buf)
 	if err != nil {
@@ -245,6 +281,9 @@ func HashFull(f *os.File, size int64, buf []byte) ([32]byte, error) {
 // 注意：环形池由本函数自管理，depth>0 时 buf 参数不再参与（仅 depth<=0 的顺序
 // 退化路径使用），因此调用方无需为大文件路径预借读缓冲。
 func HashFullSegmented(f *os.File, size int64, seg int64, depth int, buf []byte) ([32]byte, error) {
+	if size < 0 {
+		return [32]byte{}, declaredSizeErr(size)
+	}
 	if seg <= 0 {
 		seg = LargeSeg
 	}

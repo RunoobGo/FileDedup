@@ -484,6 +484,13 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				preMu.Unlock()
 				// 就地纠正：size 是分桶键，必须与哈希所依据的内容一致。
 				e.Size = actual
+				// REAL-1（2026-09-21 审查）：实占栏必须同步作废。Actual 是按**截断前
+				// 那份**测得的读数，留着它就成了"逻辑栏已纠正、实占栏没纠正"——
+				// 双口径并存的前提是两个口径各自说真话（I6），否则界面上一栏说真话、
+				// 另一栏冒充，比两处都错更难查。作废后按 ActualBytes() 的回退口径
+				// 退回逻辑大小，并由 AnyActualKnown 如实显示"未统计"。
+				e.ActualKnown = false
+				e.Actual = 0
 			}
 			if cacheOn {
 				if ent, hit, fullValid := p.cch.Lookup(e.Path, e.Size, e.ModTime, ids[i]); hit {
@@ -811,6 +818,13 @@ func (v *verifier) group(ctx context.Context, g []*model.FileEntry, failed []mod
 // equal 复用 v 的缓冲逐字节比对两个等长流（顺序读，非并发安全）。
 // ②-B：每块（256KiB）之间检查取消——单对超大文件也不能拖住取消路径。
 func (v *verifier) equal(ctx context.Context, a, b *os.File, size int64) (bool, error) {
+	// HASH-1（2026-09-21 审查）：负数声明长度下 `remain > 0` 一次都不成立，
+	// 修正前的实现会**一个字节都不读就 return true**——内容完全不同的两个文件
+	// 被判一致，最后防线反过来成了唯一的放行口。坏卷/畸形 FUSE-SMB 挂载确实会
+	// 报出负的 st_size，故入口 fail-closed。
+	if size < 0 {
+		return false, fmt.Errorf("逐字节比对无法进行：声明长度不可信（%d 字节）", size)
+	}
 	buf1, buf2 := v.buf1, v.buf2
 	remain := size
 	for remain > 0 {
@@ -831,6 +845,14 @@ func (v *verifier) equal(ctx context.Context, a, b *os.File, size int64) (bool, 
 			return false, nil
 		}
 		remain -= n
+	}
+	// PARA-1（2026-09-21 审查）：只比 size 字节会在「比对期间文件被追加」时给出
+	// 假的一致结论（size 来自更早的 stat，追加的尾巴落在比较范围之外）。
+	// 与预筛层共用 hasher 的同一份探测，不再各写一遍（I5）。
+	for _, f := range []*os.File{a, b} {
+		if gerr := hasher.RejectGrowthBeyond(f, size); gerr != nil {
+			return false, gerr
+		}
 	}
 	return true, nil
 }

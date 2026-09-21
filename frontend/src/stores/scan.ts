@@ -139,6 +139,17 @@ export const useScanStore = defineStore('scan', () => {
   const busyTip = computed(() => busyReason() ?? '')
   const busy = computed(() => busyTip.value !== '')
 
+  // histBusy 历史结果行上三个动作（恢复/重扫/删除）的禁用态。
+  //
+  // 为什么在 busy 之外单列一条（FE-3）：还多一个"正在把某条历史载入结果集"的窗口
+  // ——openHistory 期间界面仍停在记录页，重扫/删除照样能点，一点就让载入回包与
+  // 新扫描同时写同一批状态。这条判据原先散在模板里（恢复写
+  // `loading || store.scanning || store.opsRunning`、重扫写
+  // `store.scanning || store.opsRunning`，少一条 loading），两份都还是 store.busy
+  // 的第二实现；现在收在 store 里一份，模板只许引用。
+  const histBusy = computed(() => busy.value || histLoading.value)
+
+
   // B3-2：结果集代际号。后端已用同一思路弃写陈旧收尾（C7），前端必须配套：
   // 一次分页请求在途时可能启动新扫描或改开另一条历史，返回的页属于已作废的
   // 集合，照写会把旧结果盖回界面——此时界面上的 fileID 已失效，勾选即可对
@@ -308,14 +319,22 @@ export const useScanStore = defineStore('scan', () => {
 
   // ---------- v0.5.0 功能 3：扫描历史 ----------
 
+  // 历史列表代际号（FE-3，与 B3-2 的 resultGen 同一把锁）：onMounted 那趟与
+  // 删除/清空后补的那趟可以重叠，回包到达顺序没有保证。不复核的话，先发后回的
+  // 那趟会拿着**删除前的列表**整体覆盖 histList —— 刚删掉的行原地复活。
+  let histGen = 0
+
   async function refreshHistory() {
     if (!isBackendAvailable()) return
+    const gen = ++histGen
     try {
       // `?? []` 兜底：Go 的 nil slice 序列化成 JSON 是 null 而非 []。
       // 后端已保证返回 []（见 internal/history/emptyslice_test.go），
       // 这里再兜一层——列表状态一旦是 null，模板里取 .length 就抛 TypeError，
       // 整个页面渲染中断，用户看到一片空白。
-      histList.value = (await api.listScanHistory()) ?? []
+      const list = (await api.listScanHistory()) ?? []
+      if (gen !== histGen) return // 已有更新的一趟在途或已落笔：本趟作废
+      histList.value = list
     } catch {
       // 历史库不可用（如浏览器 dev 模式）：保持现有列表
     }
@@ -911,7 +930,7 @@ export const useScanStore = defineStore('scan', () => {
     opList, refreshOps, undoRecord, undoItem, clearOps,
     failed, failedOpen, confirmOpen, preview, settings, appVersion,
     selection, opsRunning, opsProgress, opsResult, currentFileID,
-    busy, busyTip,
+    busy, busyTip, histBusy,
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
     // 处理策略只导出 add/remove/clear —— 没有 move 是有意的，见 procDirs 注释
     procDirs, addProcDir, removeProcDir, clearProcDirs,

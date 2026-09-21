@@ -129,7 +129,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	r := report{Groups: make([]*groupJSON, 0, len(groups)), Failed: failed}
+	// 两个列表字段都必须预置成非 nil 切片（APP-10）：`failed` 直接收 Pipeline 的
+	// 返回值，无失败时它是 nil，JSON 里就成了 "failed": null。同一条报告里
+	// groups 恒为数组、failed 却会为 null，机器读者按 `for x in r["failed"]` 消费
+	// 即 TypeError；冒烟此前用 `or []` 把这个差别兜住了，等于替后端藏契约违约。
+	r := report{
+		Groups: make([]*groupJSON, 0, len(groups)),
+		Failed: append([]model.FailedItem{}, failed...),
+	}
 	r.Scan.Roots = roots
 	r.Scan.Threads = cfg.Threads
 	r.Scan.Paranoid = *paranoid

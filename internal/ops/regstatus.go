@@ -3,7 +3,6 @@ package ops
 import (
 	"errors"
 	"fmt"
-	"syscall"
 )
 
 // 本文件承载注册表读数的**错误分类**，刻意与 winreg_windows.go 分开。
@@ -15,13 +14,15 @@ import (
 // 而 winNukeStatusOf 用的是泛化 fall-through：新增一类错误时不会被任何
 // 测试提醒。把判据抽到本文件后，分类表可在任意平台断言。
 
-// regErrNotFound = ERROR_FILE_NOT_FOUND：RegOpenKeyExW（键不存在）与
+// regErrNotFound 即 ERROR_FILE_NOT_FOUND：RegOpenKeyExW（键不存在）与
 // RegQueryValueExW（值不存在）都返回它。★ 这是「用户没设过」这一**正常
 // 情形**与「读不到」（ACL 拒绝、类型不符）的唯一分界，必须与后者区分：
 // 前者可判 nukeOff，后者只能判 nukeUnknown。
 //
-// 值取 winreg.h 的 2；此处只在错误分类里使用，系统调用侧仍自带常量。
-const regErrNotFound = syscall.Errno(2)
+// OPS-9（2026-09-21 全量审查，I5）：数值此前在本包**另有两套命名**
+// （本文件的 Errno(2)/裸 Errno(3) 与 symlink_windows.go 的具名表）。
+// 现在统一指向 winerrno.go（无 build tag），本文件不再自带数字。
+const regErrNotFound = errFileNotFound
 
 // errRegTypeMismatch 值类型不是 REG_DWORD（registryGetDWORD 专用）。
 var errRegTypeMismatch = errors.New("注册表值类型不是 REG_DWORD")
@@ -29,7 +30,7 @@ var errRegTypeMismatch = errors.New("注册表值类型不是 REG_DWORD")
 // regIsNotFound 判定注册表错误是否为「键/值不存在」。
 // 注：ERROR_PATH_NOT_FOUND(3) 在父键不存在时出现，同样属于"没有这个设置"。
 func regIsNotFound(err error) bool {
-	return errors.Is(err, regErrNotFound) || errors.Is(err, syscall.Errno(3))
+	return errors.Is(err, regErrNotFound) || errors.Is(err, errPathNotFound)
 }
 
 // regIsMismatch 判定 registryGetDWORD 是否因值类型不符而失败。

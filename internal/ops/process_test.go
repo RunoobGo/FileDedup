@@ -278,7 +278,7 @@ func TestInDirAgreesWithPickInDirectory(t *testing.T) {
 
 			// 构造"只有这一个文件"的组：pickInDirectory 命中 ⟺ inDir 为真
 			g := dirGroup(1, p)
-			got := pickInDirectory(g, dir) >= 0
+			got := pickInDirectory(g, dir, nil) >= 0
 
 			if want != got {
 				t.Errorf("口径不一致：路径 %q 目录 %q —— inDir=%v 但 pickInDirectory=%v\n"+
@@ -300,7 +300,7 @@ func TestPickInDirectoryPrefersDeepest(t *testing.T) {
 	deep := "/proc/sub/dir/verydeep/b.bin"
 	g := dirGroup(1, shallow, deep)
 
-	idx := pickInDirectory(g, "/proc")
+	idx := pickInDirectory(g, "/proc", nil)
 	if idx < 0 {
 		t.Fatal("/proc 应命中，实得 -1")
 	}

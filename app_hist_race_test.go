@@ -141,11 +141,54 @@ func TestHistFieldNotReadOutsideLock(t *testing.T) {
 	}
 }
 
-func isHistSel(e ast.Expr) bool {
+func isHistSel(e ast.Expr) bool { return isFieldSel(e, "hist") }
+
+// isFieldSel 报告表达式是否为 `a.<field>` 形式的字段选择器。
+func isFieldSel(e ast.Expr, field string) bool {
 	sel, ok := e.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	return ok && id.Name == "a" && sel.Sel.Name == "hist"
+	return ok && id.Name == "a" && sel.Sel.Name == field
+}
+
+// TestCchFieldNotReadOutsideLock APP-2（2026-09-21 全量审查）：同一条门禁扩到 `a.cch`。
+//
+// M9 只把 `a.hist` 钉住了，而 `a.cch` 是**同一个生命周期**的另一个受保护句柄
+// （shutdown 锁内 Close + 置空）。CacheStats/CacheClear 原先锁外二次解引用它，
+// -race 探针实测复现（见 app_cch_race_test.go）——同文件里两条标准不一致，
+// 漏的那条就出事。白名单只给生命周期两端与唯一快照出口。
+func TestCchFieldNotReadOutsideLock(t *testing.T) {
+	allowed := map[string]bool{
+		"startup": true, "openCache": true, "shutdown": true, "cchSnapshot": true,
+	}
+	offenders := fieldRefsOutsideAllowlist("app.go", "cch", allowed)
+	if len(offenders) > 0 {
+		t.Fatalf("a.cch 被锁外读取（APP-2 回归）；请改走 a.cchSnapshot()：%s",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// fieldRefsOutsideAllowlist 收集 file 中所有 `a.<field>` 引用里、落在 allow 之外的位置。
+func fieldRefsOutsideAllowlist(file, field string, allow map[string]bool) []string {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		return []string{"解析失败: " + err.Error()}
+	}
+	var out []string
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || allow[fn.Name.Name] {
+			continue
+		}
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && isFieldSel(sel, field) {
+				out = append(out, fn.Name.Name+": "+fset.Position(sel.Pos()).String())
+			}
+			return true
+		})
+	}
+	return out
 }

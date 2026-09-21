@@ -134,8 +134,21 @@ func (e *FileEntry) ActualBytes() uint64 {
 // 全 false 时实占数字纯为逻辑口径回退，展示层必须显示"未统计"而不是那个数。
 // 定义在此而非各调用点：界面、CLI、历史三处若各写一遍，"未知"与"为 0"
 // 迟早会在一处被混掉。
+//
+// ★ 总体必须与 ReclaimActual 一致，只看 files[1:]（MODEL-1，2026-09-21 审查）。
+// 本标志是**那个数字**的"已统计"标记，不是"组里有任何一条读数"：保留项 files[0]
+// 从不参与可释放量，把它算进来会造出"标志为真、数字纯是回退值"的跨卷形状
+// （界面把回退值显示成已统计，正是 M6-P2 立双口径要防的互相冒充）。
 func (g *DuplicateGroup) AnyActualKnown() bool {
-	for _, f := range g.Files {
+	return actualKnownIn(g.Files)
+}
+
+// actualKnownIn 与 ReclaimActual 共用同一段下标约定（从 1 起 = 只看冗余项）。
+func actualKnownIn(files []*FileEntry) bool {
+	if len(files) < 2 {
+		return false
+	}
+	for _, f := range files[1:] {
 		if f.ActualKnown {
 			return true
 		}

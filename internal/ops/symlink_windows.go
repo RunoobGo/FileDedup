@@ -46,17 +46,6 @@ const (
 	symlinkFlagAllowUnprivilegedCreate = 0x2
 )
 
-// Win32 错误码（syscall 未导出这两个，按其数值直接构造）。
-const (
-	errInvalidParameter    = syscall.Errno(87)   // ERROR_INVALID_PARAMETER
-	errPrivilegeNotHeld    = syscall.Errno(1314) // ERROR_PRIVILEGE_NOT_HELD
-	errFileNotFound        = syscall.Errno(2)    // ERROR_FILE_NOT_FOUND
-	errPathNotFound        = syscall.Errno(3)    // ERROR_PATH_NOT_FOUND
-	errAlreadyExists       = syscall.Errno(183)  // ERROR_ALREADY_EXISTS
-	errNotSupportedByFS    = syscall.Errno(50)   // ERROR_NOT_SUPPORTED（FAT/exFAT 等）
-	errAccessDeniedWindows = syscall.Errno(5)    // ERROR_ACCESS_DENIED
-)
-
 // ErrSymlinkNeedsPrivilege 表示"环境不具备创建符号链接的权限"。
 //
 // 单独成类型（而非只给一段文案）：调用方需要把这种情况与"路径冲突、

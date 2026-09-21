@@ -56,8 +56,19 @@ export function reclaimLine(kind: OpKind, bytes: number): ReclaimLine {
         bytes: n,
         tail: ' 将移入回收站（清空回收站后才真正释放空间）',
       }
-    default:
+    case 'delete':
+      // 只有这一类是"数据真的从磁盘消失"，所以"可释放"这几个字归它专属。
+      // 原先它住在 default 里（FE-2）：新增一类操作若忘了补 case，就会默默继承
+      // 这句措辞——hardlink 那句"占用不变"翻了车正是同一族缺陷，措辞必须逐类显式。
       return { lead: '共 ', bytes: n, tail: ' 空间可释放' }
+    default: {
+      // FE-2 穷尽断言：OpKind 是联合类型，上面把五类都列全后 kind 在这里是 never。
+      // 将来给 OpKind 加一类却不补分支，这一行就过不了 vue-tsc（门禁第 8 行），
+      // 而不是悄悄走兜底措辞。下面的返回值仍保留，防的是"运行时收到未登记的 kind"
+      // （后端加了类型、前端没跟上）——那种情况下宁可说一句不确定的话，也不能编一句。
+      const _exhaustive: never = kind
+      return { lead: '共 ', bytes: n, tail: ' 空间口径未登记（' + String(_exhaustive) + '）' }
+    }
   }
 }
 

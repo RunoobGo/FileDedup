@@ -451,7 +451,9 @@ func (a *App) cancelInFlight() {
 func (a *App) shutdown(ctx context.Context) {
 	a.cancelInFlight()
 	if !waitGroupTimeout(&a.wg, inflightDrainGrace) {
-		fmt.Fprintf(os.Stderr, "[app] 在途任务未在 %s 内收口，句柄先行释放（本次落账可能缺失）\n", inflightDrainGrace)
+		// APP-3：同样走统一出口。这一条说的直接就是"本次落账可能缺失"，
+		// 与 M7 那四处是同一件事，没有理由只留在看不见的 stderr 里。
+		a.warnLedger(fmt.Sprintf("在途任务未在 %s 内收口，句柄先行释放（本次落账可能缺失，历史记录未必完整）", inflightDrainGrace))
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -755,7 +757,10 @@ func (a *App) goTask(kind string, reset, body func()) {
 
 // inflightDrainGrace 退出前等在途任务收口的上限。超过它说明有不可中断的
 // 单次系统调用卡住（网络卷、回收站服务），此时宁可放行退出也不能让窗口关不掉。
-const inflightDrainGrace = 10 * time.Second
+//
+// var 而非常量（APP-3 探针）：取值一字未改，只是让"超时真的发生"成为单测里
+// 可构造的形状——否则那条留痕路径要拿 10 秒的真实等待去换一次断言。
+var inflightDrainGrace = 10 * time.Second
 
 // waitGroupTimeout 等待 wg 归零，返回是否在期限内完成。
 func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration) bool {
@@ -1381,6 +1386,15 @@ func (a *App) FilterInDirs(dirs []string, paths []string) []int {
 // 遍历阶段全程持锁（须与操作 goroutine 的结果集清理写互斥）；
 // 历史持久化放到放锁之后（hist 自有锁，禁止与 a.mu 嵌套）。
 func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) (KeepOutcome, error) {
+	// ★ APP-1（2026-09-21 全量审查）：AS-R3 的同一件事在处理策略侧已修，
+	// 保留策略侧漏了。directory 分支要按卷问 fscase.Sensitive，而它**要往用户
+	// 目录写探测文件**——落在下面的持锁窗口里，一个死挂载就能把 a.mu 连同
+	// 全部 Wails 绑定一起卡住。预热之后锁内只剩纯查表 + 纯比较。
+	var resolve ops.SensResolver
+	if policy.Kind == "directory" && len(policy.Directories) > 0 {
+		resolve = ops.WarmSensitivity(policy.Directories)
+	}
+
 	a.mu.Lock()
 	if a.opsRunning {
 		a.mu.Unlock()
@@ -1394,7 +1408,7 @@ func (a *App) ApplyKeepPolicy(policy model.KeepPolicy) (KeepOutcome, error) {
 		a.mu.Unlock()
 		return KeepOutcome{}, fmt.Errorf("请至少添加一个保留目录")
 	}
-	decisions, unmatched := ops.ApplyKeepPolicy(a.groups, policy)
+	decisions, unmatched := ops.ApplyKeepPolicyWith(a.groups, policy, resolve)
 	a.keepIDs = make(map[uint64]bool, len(decisions))
 	for _, d := range decisions {
 		a.keepIDs[d.KeepID] = true
@@ -1600,6 +1614,17 @@ func (a *App) ClearScanHistory() error {
 	return nil
 }
 
+// undoableFor 报告「这类操作在这个平台上能不能应用内回撤」——全包唯一实现。
+//
+// APP-6（2026-09-21 全量审查，I5 + H6）：这条判据原先有**两份内联写法**：
+// beginJournal 落库的 `OpMeta.Undoable` 一处、undoableReason 的文案分流一处。
+// 两份必须同源，否则会出现"账本说可撤、界面说不可撤"（或反过来）。
+// 更要紧的是两处都直接读 `runtime.GOOS`，Windows 那条腿在本机永远断言不到；
+// 现在平台真值经参数注入，纯函数在三平台同一份代码上可测。
+func undoableFor(kind, goos string) bool {
+	return kind != "delete" && !(kind == "trash" && goos == "windows")
+}
+
 // undoableReason 解释「这条记录为什么不可回撤」，并给出可执行的下一步。
 //
 // 2026-09-19 改进：原文案是「该记录不可回撤（永久删除与 Windows 回收站不支持
@@ -1615,7 +1640,18 @@ func (a *App) ClearScanHistory() error {
 //
 // 二者都「不可应用内回撤」，但用户的可行动作截然不同，故分别成文。
 func undoableReason(kind string) string {
-	if kind == "trash" && runtime.GOOS == "windows" {
+	return undoableReasonFor(kind, runtime.GOOS)
+}
+
+// undoableReasonFor 是 undoableReason 的平台参数注入版（APP-6 + H6）。
+//
+// 为什么再拆一层：原文案分流直接读 runtime.GOOS，于是"Windows 上该说清落点映射
+// 缺失"这条分支在本机**只能 t.Skip**（既有用例 TestUndoableReasonExplainsAndGivesNextStep
+// 里的 windows 子用例就是这么写的）。平台真值进参数后，三平台的文案与判据
+// 是否自相矛盾，在任何一台机器上都能一次性断言。
+func undoableReasonFor(kind, goos string) string {
+	// 判据本身问 undoableFor（APP-6）；这里只决定"不可撤的原因是哪一种"。
+	if kind == "trash" && !undoableFor(kind, goos) {
 		return "Windows 回收站操作不支持应用内回撤：系统 API 不返回" +
 			"「每个文件落在回收站的哪个位置」的映射，应用无法定位文件而把它搬回原处。" +
 			"文件本身仍在回收站里，请点上方「打开系统回收站」，右键选择「还原」即可取回。"
@@ -1637,6 +1673,19 @@ func (a *App) histSnapshot() *history.Store {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.hist
+}
+
+// cchSnapshot 在锁内取哈希缓存句柄（APP-2，2026-09-21 全量审查）。
+//
+// 与 M9 的 histSnapshot 逐字同形、同一条理由：`a.cch` 由 `a.mu` 保护
+// （shutdown 在锁内 Close 并置空），而绑定层入口原先写的是
+// `if a.cch == nil {...}; return a.cch.GetStats()`——锁外解引用两次，
+// -race 下是一次真竞争（本仓已用探针复现，见 app_cch_race_test.go 的改前读数）。
+// M9 的 AST 门禁白名单只管 `a.hist`，所以同一类缺陷的第二例一路漏到本轮。
+func (a *App) cchSnapshot() *cache.Cache {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cch
 }
 
 // warnLedger 是"账本没写进去"的统一出口（M7，2026-09-21）：stderr + app:error 双通道。
@@ -1671,7 +1720,7 @@ func (a *App) beginJournal(hs *history.Store, histID int64, op model.OpRequest,
 	if len(plans) == 0 {
 		return 0, fmt.Errorf("无可操作文件（所选 id 均不在当前结果集，或均为保留项）")
 	}
-	undoable := op.Kind != "delete" && !(op.Kind == "trash" && runtime.GOOS == "windows")
+	undoable := undoableFor(op.Kind, runtime.GOOS)
 	jid, jerr := func() (int64, error) {
 		if hs == nil {
 			return 0, fmt.Errorf("history.db 未就绪")
@@ -1877,7 +1926,11 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		// 属可忽略的陈旧关联，留痕即可。
 		if hs != nil && histID != 0 && len(gone) > 0 {
 			if perr := hs.PruneScanFiles(histID, gone); perr != nil {
-				fmt.Fprintf(os.Stderr, "[history] 历史裁剪失败: %v\n", perr)
+				// APP-3（2026-09-21 全量审查）：原先只写 stderr。M7 已裁定过
+				// "打包 GUI 没有控制台，只写 stderr 等于没写"，本处是同族漏网。
+				// 后果不是崩溃而是账本与盘上不一致：历史行仍列着已删文件，
+				// 下次从历史页恢复会得到一批不存在的路径。
+				a.warnLedger(fmt.Sprintf("历史裁剪失败（记录 %d）：%v，该条历史仍可能列出已清理的文件，从历史页恢复前请先重扫", histID, perr))
 			}
 		}
 		// M8：终止事件必须在复位之后发。结果集回写已完成（上面解锁那一刻起
@@ -2002,9 +2055,10 @@ func (a *App) ClearOpRecords() error {
 
 // UndoOperation 回撤一条清理记录：入口同步校验（历史库/互斥/记录可撤性），
 // 通过后异步逐项执行，进度复用 ops:progress，终止发 ops:undo:done。
-// 只处理 state=done 的条目——失败/跳过/取消项本就没动过文件系统，
-// 回撤失败的项保持 undo_failed，用户可修正后再次回撤（done 项已转 undone，
-// 天然幂等）。结果集不动：恢复的文件需要重新扫描确认状态。
+// 处理 state=done 与 state=undo_failed 的条目——失败/跳过/取消项本就没动过
+// 文件系统，不在此列；而回撤失败的项确实动过、只是没撤成，必须留在批量范围里
+// 供用户修正后重试（APP-4；原先只收 done，把文档承诺的那条路堵死了）。
+// done 项撤完转 undone，天然幂等。结果集不动：恢复的文件需要重新扫描确认状态。
 func (a *App) UndoOperation(opLogID int64) (string, error) {
 	a.mu.Lock()
 	if a.opsRunning {
@@ -2047,7 +2101,12 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 	a.goTask("ops", release, func() {
 		var todo []history.OpItem
 		for _, it := range items {
-			if it.State == history.StateDone {
+			// APP-4（2026-09-21 全量审查）：undo_failed 也要收。函数文档一直写着
+			// "回撤失败的项保持 undo_failed，用户可修正后再次回撤"，单项通道也确实
+			// 放行 done || undo_failed，只有这里把失败项永久排除在批量之外——
+			// 于是"修好问题再点一次全部回撤"一个条目都不动。
+			// undone / undoing / 未执行态仍然排除：那三类要么已撤成、要么没动过文件。
+			if it.State == history.StateDone || it.State == history.StateUndoFailed {
 				todo = append(todo, it)
 			}
 		}
@@ -2216,20 +2275,22 @@ func (a *App) ExportReport(format, path string) (string, error) {
 	return "", fmt.Errorf("报告导出将在 M5 提供")
 }
 
-// CacheStats 缓存统计（M4-T01）。
+// CacheStats 缓存统计（M4-T01）。句柄经 cchSnapshot 取，锁外只读快照。
 func (a *App) CacheStats() (cache.Stats, error) {
-	if a.cch == nil {
+	cch := a.cchSnapshot()
+	if cch == nil {
 		return cache.Stats{}, fmt.Errorf("缓存不可用")
 	}
-	return a.cch.GetStats()
+	return cch.GetStats()
 }
 
-// CacheClear 清空缓存（M4-T01）。
+// CacheClear 清空缓存（M4-T01）。同上（APP-2）。
 func (a *App) CacheClear() error {
-	if a.cch == nil {
+	cch := a.cchSnapshot()
+	if cch == nil {
 		return fmt.Errorf("缓存不可用")
 	}
-	return a.cch.Clear()
+	return cch.Clear()
 }
 
 // thumbnail 生成缩略图（M4-T04）：解码（jpeg/png/gif 首帧）→ 最近邻缩放 → JPEG。

@@ -597,13 +597,22 @@ func rootPrefixes(roots []string) []string {
 	sep := string(filepath.Separator)
 	out := make([]string, len(roots))
 	for i, r := range roots {
-		out[i] = r + sep
+		// SCN-3（2026-09-21 全仓审查）：根已以分隔符结尾时**不能再追加**。
+		// 无条件追加会让盘根（Clean 后就是 "/"）变成 "//"，该根下任何文件都
+		// 匹配不上 ⇒ relativeTo 落到 filepath.Base 兜底 ⇒ 含 "/" 的 ExcludePaths
+		// 静默永不命中（用户写了排除、界面没说错、盘上一个没排，方向是放行）。
+		// relativeTo 靠 len(rp) 切片，少这一位只是偏移变短，不需要配套改动。
+		if strings.HasSuffix(r, sep) {
+			out[i] = r
+		} else {
+			out[i] = r + sep
+		}
 	}
 	return out
 }
 
 // relativeTo 计算 full 相对最近扫描根的路径（过滤 glob 用）。
-// rootPrefixes 为 rootPrefixes() 的产物；len(rp) 恰为「根长 + 1」，
+// rootPrefixes 为 rootPrefixes() 的产物；len(rp) 恰为「根长（+ 必要时的一位分隔符）」，
 // 故用 full[len(rp):] 切片即可，无需再算偏移。
 func relativeTo(rootPrefixes []string, full string) string {
 	for _, rp := range rootPrefixes {

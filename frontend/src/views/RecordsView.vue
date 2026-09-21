@@ -243,12 +243,18 @@ function danglingTitle(it: OpRecordItem): string {
             </td>
             <td class="num">{{ humanBytes(m.reclaimable) }}</td>
             <td class="ops-col">
-              <button class="btn-primary" :disabled="loading || store.scanning || store.opsRunning"
-                :title="store.scanning ? '扫描进行中' : store.opsRunning ? '清理操作进行中' : '恢复该结果并可继续清理'"
+              <!-- FE-3（2026-09-21 全量审查）：禁用态只问 store.histBusy。
+                   原先这三个按钮各自拼表达式，且拼的是**两份不一致**的判据：
+                   恢复漏了 histLoading 之外的写法、重扫漏了 histLoading、删除什么都没挡。
+                   openHistory 期间界面仍停在记录页（视图切换在回包之后），
+                   于是"载入中"照样能点重扫/删除——新扫描与载入回包同时写同一批状态。 -->
+              <button class="btn-primary" :disabled="store.histBusy"
+                :title="store.scanning ? '扫描进行中' : store.opsRunning ? '清理操作进行中' : loading ? '正在载入历史结果' : '恢复该结果并可继续清理'"
                 @click="open(m)">恢复</button>
-              <button class="btn-ghost" :disabled="store.scanning || store.opsRunning"
+              <button class="btn-ghost" :disabled="store.histBusy"
                 title="按此配置重新扫描" @click="rescan(m)">重扫</button>
-              <button class="btn-ghost del" title="删除该条历史" @click="del(m)">删除</button>
+              <button class="btn-ghost del" :disabled="store.histBusy"
+                title="删除该条历史" @click="del(m)">删除</button>
             </td>
           </tr>
         </tbody>
@@ -285,7 +291,7 @@ function danglingTitle(it: OpRecordItem): string {
               <td class="num">{{ humanBytes(m.reclaimable) }}</td>
               <td class="ops-col">
                 <button v-if="undoLeft(m) > 0" class="btn-primary"
-                  :disabled="store.opsRunning || store.scanning"
+                  :disabled="store.busy"
                   :title="store.opsRunning ? '操作执行中' : `恢复 ${undoLeft(m)} 项文件`"
                   @click="askUndo(m)">
                   {{ confirmUndoId === m.id ? `确认回撤 ${undoLeft(m)} 项` : '回撤' }}
@@ -322,7 +328,7 @@ function danglingTitle(it: OpRecordItem): string {
                       <td class="err-cell" :title="it.err">{{ it.err }}</td>
                       <td class="ops-col">
                         <button v-if="canUndoItem(m, it)" class="btn-ghost xs"
-                          :disabled="store.opsRunning || store.scanning"
+                          :disabled="store.busy"
                           :title="store.opsRunning ? '操作执行中' : '仅回撤此文件（恢复回原位置）'"
                           @click="undoOne(m, it)">
                           {{ undoingItem === it.id ? '执行中…' : (it.state === 'undo_failed' ? '重试回撤' : '回撤') }}

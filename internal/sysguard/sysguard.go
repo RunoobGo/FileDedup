@@ -79,6 +79,7 @@ const (
 
 // entry 一条清单登记。prefix/suffix 只用于 eDirName 的"前后缀式"条目
 // （TM 本地快照那种带时间戳的名字）；两者皆空即整段名相等。
+// prefix/suffix 在 New() 装配时被折成小写，登记时按直觉写大小写即可（APP-9）。
 type entry struct {
 	kind   entryKind
 	plat   uint8
@@ -89,14 +90,20 @@ type entry struct {
 }
 
 // hits 名字类判定（eDirName / ePseudoFile 共用）：大小写不敏感。
+//
+// 前提是登记值已被 New() 折成小写（APP-9）：这里只对**待判名字**做 ToLower，
+// 登记值一侧不再比较原文，所以归一必须发生在装配时、且只发生一次。
+// 名字一次 ToLower 复用于前缀与后缀两趟——这个函数在遍历期每个目录都要跑，
+// 原先逐趟各折一次，等于把同一条热路径上的分配翻了一倍。
 func (e entry) hits(name string) bool {
 	if e.prefix == "" && e.suffix == "" {
 		return strings.EqualFold(name, e.name)
 	}
-	if len(name) <= len(e.prefix) || !strings.HasPrefix(strings.ToLower(name), e.prefix) {
+	lower := strings.ToLower(name)
+	if len(lower) <= len(e.prefix) || !strings.HasPrefix(lower, e.prefix) {
 		return false
 	}
-	return e.suffix == "" || strings.HasSuffix(strings.ToLower(name), e.suffix)
+	return e.suffix == "" || strings.HasSuffix(lower, e.suffix)
 }
 
 // table 是**唯一**的清单来源：新增一条只在这里登记。
@@ -162,6 +169,12 @@ func New(p Platform) *Guard {
 		if e.plat&bit == 0 {
 			continue
 		}
+		// 登记值统一折成小写再入桶（APP-9）：hits 把待判名字 ToLower 后与登记值
+		// 直接比，登记成 ".com.apple.TimeMachine-" 这种"看着最自然"的大小写就会
+		// 让规则永不命中且毫无征兆——保护清单静默失效是最坏的一类缺陷，
+		// 所以在装配处兜住，而不是靠注释提醒人肉核对。
+		e.prefix = strings.ToLower(e.prefix)
+		e.suffix = strings.ToLower(e.suffix)
 		switch e.kind {
 		case eDirName:
 			g.dirNames = append(g.dirNames, e)
@@ -236,18 +249,24 @@ func (g *Guard) File(fileName string, isScanRootChild bool) Decision {
 	return Decision{}
 }
 
-const windowsReservedWhy = "Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9），它不是一个文件"
+// windowsReservedWhy 的清单必须与 isReservedName 的集合逐项对应（APP-7）：
+// 少列一项，用户看到"这文件被跳过了"却在本包别处找不到它的登记。
+const windowsReservedWhy = "Windows 保留设备名（CON/PRN/AUX/CLOCK$/NUL/COM1-9/LPT1-9），它不是一个文件"
 
 // isReservedName 按 Win32 的名字归一取词干：先剥掉尾随的空格与点（这些在
 // Win32 里与不含它们的写法是同一个名字），再取第一个点之前的部分。
 // COM0/LPT0 **不是**保留名（保留区间是 1-9），别顺手扩成 0-9。
+//
+// CLOCK$ 是 MS-DOS 实时时钟设备别名，微软的保留名清单里一直挂着它（APP-7 补）：
+// 带 $ 是它的名字本身，不是"扩展名"，所以它落在裸名分支而不是 COM/LPT 那条
+// 按位置取字符的分支。
 func isReservedName(name string) bool {
 	s := strings.ToUpper(strings.TrimRight(name, " ."))
 	if i := strings.IndexByte(s, '.'); i >= 0 {
 		s = s[:i]
 	}
 	switch {
-	case s == "CON", s == "PRN", s == "AUX", s == "NUL":
+	case s == "CON", s == "PRN", s == "AUX", s == "CLOCK$", s == "NUL":
 		return true
 	}
 	// 端口号只有 1-9 是保留名：COM0/LPT0 在 Win32 里不是设备别名，

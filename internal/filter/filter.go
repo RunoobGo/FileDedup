@@ -36,6 +36,38 @@ type Matcher struct {
 // 属于性能倒退（实测 N08：6.19 vs 4.70 ns）。
 const extSetMapMin = 12
 
+// normalizeExtList 把**用户输入侧**的扩展名归一为 filepath.Ext 的形态（FLT-1）。
+//
+// 为什么放在 Compile 而不是 newExtSet：newExtSet 的契约是"入参已是 .ext 形态，
+// 只做小写与选表"，它另有一份与朴素实现逐位等价的回归用例
+// （filter_test.go TestExtSetEquivalence）；在 newExtSet 里补点会让那份基准
+// 反过来钉住错误语义。用户输入只在 Compile 这一处进来，归一放这里同样是
+// 一处判定一处实现（I5），且不用改那份等价性基准。
+//
+// 修前的形状：用户在界面/CLI 里写 "tmp"（两处都只 trim 空格、不补点），
+// 而 has() 拿到的是 filepath.Ext 的产物 ".tmp" ⇒ 永不相等 ⇒ 这条排除
+// **整条 fail-open**：界面登记着、盘上一个没排、也不报错。
+//
+// 空白项按"未配置"处理（丢弃）：不归一它们会留下一个匹配不上任何文件的
+// 空串条目，使 inactive() 判假 ⇒ 包含列表变成"一个都不放行"。
+func normalizeExtList(list []string) []string {
+	if len(list) == 0 {
+		return list
+	}
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // extSet 预编译的扩展名集合（两种表示二选一，均已在编译期小写）。
 type extSet struct {
 	list []string            // 短列表：线性扫（元素已小写）
@@ -95,8 +127,8 @@ func Compile(f *model.Filters) *Matcher {
 	}
 	return &Matcher{
 		f:        f,
-		incExt:   newExtSet(f.IncludeExts),
-		excExt:   newExtSet(f.ExcludeExts),
+		incExt:   newExtSet(normalizeExtList(f.IncludeExts)),
+		excExt:   newExtSet(normalizeExtList(f.ExcludeExts)),
 		excPaths: excPaths,
 	}
 }
