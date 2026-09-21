@@ -286,20 +286,62 @@ func (a *App) startup(ctx context.Context) {
 		_ = os.MkdirAll(a.cfgDir, 0o755)
 	}
 	// M4：哈希缓存（确证损坏时隔离重建；打开失败不阻塞应用）
-	if a.cfgDir != "" {
-		dbPath := filepath.Join(a.cfgDir, "cache.db")
-		if cch, err := cache.Open(dbPath); err == nil {
-			a.cch = cch
-			a.pipe = a.pipe.WithCache(cch)
-		} else {
-			// 缓存不可用只影响二次扫描速度（功能不受损），但静默吞掉会让"为何每次都要重新
-			// 哈希"无从排查——这里显式留痕。不去重、不降级退出，只在启动时说一次。
-			fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
-		}
-	}
+	a.openCache()
 	// v0.5.0：扫描历史/清理账本（独立 history.db，确证损坏时隔离重建）
 	a.openLedger()
 	a.emit(a.ctx, "app:ready", AppVersion)
+}
+
+// openCache 打开哈希缓存；失败时除 stderr 外**还必须留一条界面提示**（M25）。
+//
+// 从 startup 里抽出来与 openLedger 同理（见其注释）：startup 会解析真实的
+// os.UserConfigDir，单测调用它就会动到用户机器上的 cache.db。
+//
+// 2026-09-21（M25，04 §6.8.8）：修正前这里只写 stderr。GUI 没有终端 ⇒ 等于没说，
+// 而后果不是崩溃而是**永久变慢且无从排查**：缓存没开成，每次扫描都全量重算，
+// 用户只知道"这软件越来越慢"。与 M7（账本落账失败只写 stderr）同病。
+// 本方法对 a.cch / a.pipe 的直接写在 M9 白名单同档（启动前置，无并发读者）。
+func (a *App) openCache() {
+	if a.cfgDir == "" {
+		return
+	}
+	dbPath := filepath.Join(a.cfgDir, "cache.db")
+	cch, err := cache.Open(dbPath)
+	if err != nil {
+		// 不去重、不降级退出，只在启动时说一次：功能不受损，受损的是速度。
+		fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用，本次运行将全量重算: %v (path=%s)\n", err, dbPath)
+		a.addStartupNotice(cacheUnavailableNotice(dbPath, err))
+		return
+	}
+	a.cch = cch
+	a.pipe = a.pipe.WithCache(cch)
+}
+
+// cacheUnavailableNotice 把"哈希缓存打不开"翻成界面文案（纯函数）。
+// 三件事缺一不可：出了什么事、对用户意味着什么（每次扫描重新算，慢；功能不受损）、
+// 在哪个文件上。不写"永久变慢"——重启后可能就好了，说死就成了另一句无法证伪的话。
+func cacheUnavailableNotice(dbPath string, err error) string {
+	return "哈希缓存不可用（" + filepath.Base(dbPath) + "），本次运行的每次扫描都要重新计算，速度会变慢；" +
+		"不影响去重结果。原因：" + err.Error()
+}
+
+// addStartupNotice 追加一条启动期提示（空串忽略）。
+//
+// 2026-09-21（M25）：槽位原来是"后写覆盖先写"，于是两个启动期问题同时发生时，
+// 界面只显示后一个（登记原文的次生问题）。改为累积：先写的不再被挤掉，
+// GetStartupNotice 的绑定形状与前端消费方式都不变（多条以 \n 分隔）。
+// 调用点是"启动前置"（startup → openCache/openLedger），与既有写者同档。
+func (a *App) addStartupNotice(msg string) {
+	if msg == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.startupNotice == "" {
+		a.startupNotice = msg
+	} else {
+		a.startupNotice += "\n" + msg
+	}
+	a.mu.Unlock()
 }
 
 // openLedger 打开账本库，并在"确证损坏→隔离重建"发生时把原因留给界面。
@@ -318,6 +360,7 @@ func (a *App) openLedger() {
 		// 2026-09-18 审查 C3 之后这里不再只是"失去历史/回撤能力"：账本不可用时
 		// 回收站/移动/硬链接会被拒绝执行（仅永久删除照常），见 beginJournal。
 		// 留痕必须说清后果，否则用户只看到"清理报账本不可用"而不知所以然。
+		// （只写 stderr 这一半仍是缺口：GUI 无终端 ⇒ 登记 M43，本项不动。）
 		fmt.Fprintf(os.Stderr, "[history] 历史库不可用：本次运行不保存历史，且回收站/移动/硬链接清理将被拒绝执行: %v (path=%s)\n", err, histPath)
 		return
 	}
@@ -327,9 +370,7 @@ func (a *App) openLedger() {
 	// 不能用 emit：此刻前端的监听器还没注册（bind 在 store.init 里，早于挂载的
 	// 事件都会丢），所以存进 startupNotice，由前端初始拉取取走。
 	if q := hs.QuarantinedTo(); q != "" {
-		a.mu.Lock()
-		a.startupNotice = ledgerQuarantineNotice(q)
-		a.mu.Unlock()
+		a.addStartupNotice(ledgerQuarantineNotice(q))
 	}
 }
 
