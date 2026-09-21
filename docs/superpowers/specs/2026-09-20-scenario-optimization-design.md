@@ -90,6 +90,23 @@
   文案必须写明"会产生下载流量与耗时"。
 - 哈希短读兜底不动：现有短读处理（S1 相关回归）继续兜 macOS 判定漏网的情形。
 
+> **实施回执（2026-09-21，`676f673` / 04 §6.9.4）**：本节的**两条判据前提都被取证推翻**，
+> 实现按修订后的判据落地（逐条证据见实施稿 §4.0 的 E1~E9）：
+>
+> - Windows 不走 `FSCTL_GET_REPARSE_POINT`：扫描阶段刻意不开句柄，而
+>   `IO_REPARSE_TAG_CLOUD` 既无现成常量、也不随 `os.FileInfo.Sys()` 回吐。改用
+>   `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`(0x00400000) / `RECALL_ON_OPEN`(0x00040000)，
+>   值就在 `FindFirstFile` 已给的 `Win32FileAttributeData` 里，**零额外 syscall**。
+> - macOS 不走 `getattrlist`/`ATTR_FILE_DATALESS`：那个常量不存在（`attr.h` 里没有
+>   DATALESS 一项）。真判据是 `st_flags` 的 `SF_DATALESS`(0x40000000)，本机实测**零额外
+>   syscall** 即可从 `de.Info()` 的 `*syscall.Stat_t` 读到，因此不需要 `probe_cloud_darwin.go`。
+> - 接入点与登记口径相反：判定必须排在 `IsRegular` **之前**而不是"放行后追加"——
+>   Windows 占位正是被 `!IsRegular()` 顺带丢掉的，放后面这条腿的可见性价值直接归零。
+>
+> 其余按本节落地：`SkippedCloudFiles` 单独计数不记 `Failed`、`AllowCloudHydration`
+> 默认 false（落 `model.Filters` 而非 Settings，Go 零值即安全档）、哈希短读兜底未动。
+> 结果页横幅属 M8（裁定③），本轮只到 JSON/CLI。**Windows 腿代码已改、真机验证未兑现。**
+
 ### 2.2 实占口径（P0-2）
 
 - 新增采集：unix `st_blocks×512`（`fstat` 顺带，零额外 syscall）、Windows

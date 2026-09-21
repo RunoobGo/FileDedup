@@ -14,7 +14,7 @@
 |---|---|---|---|---|---|---|
 | 1 | 系统保护清单 + Windows 保留名 | §2.4 | C 组 4 | §2 | ✅ | ✅（划账见 04 §6.9.1） |
 | 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ✅（含 §3.0 实测证据） | ✅（划账见 04 §6.9.3） |
-| 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ✅（含 §4.0 取证，并**推翻总纲两条判据前提**） | ⬜ |
+| 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ✅（含 §4.0 取证，并**推翻总纲两条判据前提**） | ✅（划账见 04 §6.9.4；§4.4 末尾有本稿首版预测的两处修正） |
 | 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ⬜ | ⬜ |
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ⬜ | ⬜ |
 
@@ -554,6 +554,25 @@ blob，`history/scan.go:20`）、前端 `emptyFilters()` 缺字段，三种情�
 | M-P1-f | `AllowCloudHydration` 语义反转（true=跳过） | V5 |
 | M-P1-g | 计数改在目录分支累加（把"跳过文件数"数成目录数） | V2/V4 的精确值断言 |
 
+**本表相对首版的两处修正**（2026-09-21 实施后按真读数回填，04 §6.9.4 有完整变异表）：
+
+1. **M-P1-i 的预期写错了，补 M-P1-i2**。首版把"接缝接错"写成会红掉 V2~V6；实测
+   `var cloudCheck = func(os.FileInfo) bool { return false }` 得到的是
+   `FAIL filededup/internal/scanner [build failed]`——`cloudfile` 在 `scanner.go` 里
+   只被这一处引用，改成常量闭包就成了未使用 import，编译器先拦下。要测出**行为**红
+   必须让变异体仍可编译，故补 **M-P1-i2**（`cloudfile.From(0, cloudfile.Current)`，
+   看着在调真判据、实为恒 false）：只有 `TestCloudCheckSeamUsesRealJudgment` 的函数指针
+   断言认得它（真读数 `cloudCheck 未接到 cloudfile.Of（got=1044c7f90 want=1044ba320）`，
+   其余用例全绿）。这条断言的存在理由与 §3.3 的 M-P2-b2 同源：注入点覆盖一切时，
+   出厂接线没人查。
+2. **§4.2 承诺"三条顺序理由逐条对应变异"，首版表里只给两条**（M-P1-c、M-P1-d），
+   0 字节那条既无断言也无变异。补法：V2 夹具放一个 0 字节占位（机型取自 E5 的
+   `.localized`）+ 新增 **M-P1-h**（判定挪到 0 字节跳过之后）。实测它红在
+   `SkippedCloudFiles = 3, want 4`，但**不隔离**——这一挪顺带越过了 `IsRegular`，
+   所以 V3 同时红；它的独占断言只有那条 4→3。
+
+九条变异（a/b/c/d/e/f/g/h/i2）全部在 detached worktree 上取到真读数，逐条见 04 §6.9.4。
+
 ### 4.5 未兑现与边界
 
 - **Windows 真机未兑现**：RECALL 属性位是否出现在 `FindFirstFile` 的
@@ -565,6 +584,15 @@ blob，`history/scan.go:20`）、前端 `emptyFilters()` 缺字段，三种情�
 - **macOS 真机正例只有 0 字节样本**（E5 是 `.localized`）：本机 iCloud Drive 里
   没有非空 dataless 文件，所以"省下一次真实下载"在本机**未被读数证明**，
   只证明了位可读、可二分、mode 是普通文件。
+  **实施后复测确认**（V7 真机腿 `-v` 读数）：`真机取样 3 个文件，其中 dataless 占位 2 个`，
+  两个都是 0 字节 `.localized`——首版的这条判断成立，且现在有用例把它变成每次跑都出数的
+  常驻断言（M-P1-a/b 两条变异同时红到 V7，说明这条腿真的有鉴别力）。
+- **CLI 级端到端只在临时语料上验过字段下发**（实读 `"skipped_cloud_files": 0`）：
+  扫真云盘会把目录下**非占位**文件全部预筛采样（`os.Open`+`ReadAt`），等于替用户批量
+  拉取云端内容，故**刻意不做** → 登记 04 §6.8.8 **M31**。
+- **`wails.ts` 的 `ScanSummary` 缺四个后端字段**（`protectedDirs`/`protectedFiles`/
+  `reclaimableActual`/`skippedCloudFiles`）：属 M8 开工时一次对齐的既有欠账，
+  登记 **M30**，本轮不因"顺手"而补（补了无人读取，只会把"类型齐全"变成新错觉）。
 - **判定不覆盖 ADS/扩展属性、不改 `!IsRegular()` 的既有静默跳过**（除 V3 那一类
   被本项认领的占位外，其余 irregular 文件仍无声丢弃 → 属 M21 同族的既有开放项，不并案）。
 - **UI 未呈现**（裁定③）：`skippedCloudFiles` 只到 JSON/CLI。前端仅补
