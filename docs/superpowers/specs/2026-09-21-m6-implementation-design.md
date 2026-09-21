@@ -13,7 +13,7 @@
 | 序 | 项 | 总纲编号 | 04 §6.7 | 本文小节 | 设计 | 实施 |
 |---|---|---|---|---|---|---|
 | 1 | 系统保护清单 + Windows 保留名 | §2.4 | C 组 4 | §2 | ✅ | ✅（划账见 04 §6.9.1） |
-| 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ✅（含 §3.0 实测证据） | ⬜ |
+| 2 | 实占口径（稀疏/压缩） | §2.2 | C 组 2 | §3 | ✅（含 §3.0 实测证据） | ✅（划账见 04 §6.9.3） |
 | 3 | 云占位检测 | §2.1 | C 组 1 | §4 | ⬜ | ⬜ |
 | 4 | Windows ADS 防护 | §2.3 | C 组 3 | §5 | ⬜ | ⬜ |
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ⬜ | ⬜ |
@@ -407,13 +407,22 @@ func (g *Guard) File(absPath, name string, isScanRootChild bool) Decision
 
 **变异验证（实施后逐条跑，读数进 04 §6.9.3）**：
 
-| # | 变异（把正确写法改坏） | 应变红的用例 |
-|---|---|---|
-| M-P2-a | `From` 里加 `if reported > size { return size, true }`（封顶） | `TestFromDoesNotCapAtLogicalSize` |
-| M-P2-b | `From` 的 `!ok` 分支改成 `return 0, false`（未知当 0） | `TestFromFallsBackWhenUnreported`、`TestWalkActualKnownForPlainFile`、`TestWalkAllHoleFileNeverReportsZeroActual` |
-| M-P2-c | `ReclaimActual` 从 `files[0]` 起算（把保留项算进可释放量） | `TestGroupReclaimableActualExcludesKeep` |
-| M-P2-d | 给 `hash_cache` 加一列 `actual` | `TestHashCacheColumnSetIsExactly` |
-| M-P2-e | 把 `e.Actual, e.ActualKnown = realbytes.Of(...)` 从 `matcher.Apply` **之后**挪到**之前** | **预期不红**（Linux 上采集零成本、无语义差异），只作为 Windows 开销的读码约束记录，见 §3.1 修正段 |
+| # | 变异（把正确写法改坏） | 应变红的用例 | 实测 |
+|---|---|---|---|
+| M-P2-a | `From` 里加 `if reported > size { return size, true }`（封顶） | `TestFromDoesNotCapAtLogicalSize` | 红 1 例 |
+| M-P2-b | `From` 的 `!ok` 分支改成 `return 0, false`（未知当 0，规则 1） | `TestFromFallsBackWhenUnreported` | 红 1 例 |
+| M-P2-b2 | 删掉 `reported==0 && size>0` 整段（规则 2 失效，恒信平台读数） | `TestFromFallsBackWhenPlatformReportsZero`、`TestWalkAllHoleFileNeverReportsZeroActual` | 红 2 例 |
+| M-P2-c | `ReclaimActual` 从 `files[0]` 起算（把保留项算进可释放量） | `TestGroupReclaimableActualExcludesKeep` | 红 1 例（`921600` vs `want 614400`） |
+| M-P2-d | 给 `hash_cache` 加一列 `actual` | `TestHashCacheColumnSetIsExactly` | 红 1 例 |
+| M-P2-e | 把 `e.Actual, e.ActualKnown = realbytes.Of(...)` 从 `matcher.Apply` **之后**挪到**之前** | **预期不红**（Linux 上采集零成本、无语义差异），只作为 Windows 开销的读码约束记录，见 §3.1 修正段 | 不红（三包全 `ok`），预期成立 |
+
+> **本表相对首版的两处修正（留字以免被当成"事后凑红的表"）**：
+> 1. 首版把 M-P2-b 的预期写成 3 个用例（含 `TestWalkActualKnownForPlainFile`、
+>    `TestWalkAllHoleFileNeverReportsZeroActual`）。实测只红 1 个，**是预期错而非用例弱**：
+>    这两个用例的文件走的是 `ok=true` 路径，打 `!ok` 分支（规则 1）根本碰不到它们。
+> 2. 顺此暴露出一个真实缺口：`From` 的规则 2（`reported==0 && size>0` → 判不可信）
+>    原先**没有任何变异条目覆盖**，即"删掉规则 2"能过全套门禁。补 M-P2-b2 后规则 1
+>    与规则 2 各有独立杀手，二者不再互相顶包。
 
 M-P2-e 是这张表里唯一"做不到红"的一条，如实标出而不是删掉：它是本轮设计自我
 修正的产物（原前提不成立），约束只能靠代码位置与注释承载。
