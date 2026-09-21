@@ -5,17 +5,21 @@
 package cache
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"filededup/internal/dbfile"
 	"filededup/internal/fsid"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // Entry 缓存条目：Partial 必有（预筛指纹），Full 可选（全量哈希，NULL 表示上次未算到）。
@@ -75,6 +79,41 @@ type Cache struct {
 	cnt      int  // 条目总数（≈ COUNT(*)）
 	cntFull  int  // 含全量哈希的条目数（≈ COUNT(full)）
 	cntValid bool // cnt/cntFull 是否有效
+
+	// M74：运行期库错误的证据位。改前 Lookup 把一切 Scan 错误折成"未命中"，
+	// 于是"库中途坏了"这件事只有 Store 每轮报一次错、Lookup 永远沉默，
+	// 且没有任何地方再判损坏（IsCorruption 只在 Open 跑过一次）。
+	dbErrs  atomic.Int64 // Lookup 遇到的非 ErrNoRows DB 错误条数（本轮累计）
+	corrupt atomic.Bool  // 确证损坏 ⇒ 不再向库发 SQL（停用，不是自愈）
+}
+
+// DBErrors 返回 Lookup 累计到的运行期 DB 错误条数（M74；不含正常的"未命中"）。
+func (c *Cache) DBErrors() int64 { return c.dbErrs.Load() }
+
+// Corrupted 返回本库是否已被确证损坏并停用（M74）。
+// 措辞约束：置位只代表"不再用它"，不代表"已隔离/已重建"——那一步没有做（§18.6 → M87）。
+func (c *Cache) Corrupted() bool { return c.corrupt.Load() }
+
+// ErrCorruptDisabled 库被确证损坏后的自我停用（M74）。句子是完整的，调用方原样上报即可。
+var ErrCorruptDisabled = errors.New("哈希缓存库在运行期确证损坏，已停用：不影响去重结果，只是每次扫描都要重算")
+
+// ErrEvictFailed 写回已 Commit 成功、只有 LRU 淘汰失败（M75(a)）。
+// 上游必须据此分岔文案——把它报成"缓存写回失败"是一句假话（条目已经在库里）。
+var ErrEvictFailed = errors.New("缓存 LRU 淘汰失败")
+
+// noteDBError 记一次运行期库错误（M74）：计数 + 确证损坏时置停用位。
+// 计数用原子、不持 c.mu：Lookup 的读侧持 RLock，这里若在持锁路径上再取写锁会自锁。
+func (c *Cache) noteDBError(err error) {
+	c.dbErrs.Add(1)
+	c.markCorruption(err)
+}
+
+// markCorruption 只在 SQLite 原文确指"库本身损坏"时停用；BUSY/只读/满盘等暂时性
+// 故障不置位（判据与 Open 那条同源于 dbfile.IsCorruption，不另起一套）。
+func (c *Cache) markCorruption(err error) {
+	if dbfile.IsCorruption(err) {
+		c.corrupt.Store(true)
+	}
 }
 
 // Open 打开或创建缓存库。
@@ -165,15 +204,72 @@ func createSchema(tx *sql.Tx) error {
 	return nil
 }
 
-func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+// connPragmas 是**每条连接**都要执行的会话级 PRAGMA。
+//
+//	busy_timeout=5000  跨进程（fdd-cli 与 GUI 并存）瞬时占用时让路 5s，别把 BUSY 报成故障。
+//	synchronous=NORMAL 缓存是可再生件，NORMAL 足够；账本库刻意用 FULL，两库口径不同
+//	                   是裁定不是疏漏（见 history.go 的 M11 注释）。
+//
+// journal_mode=WAL 不在这里：它是文件级持久属性，建库时执行一次即可（实测新连接直接读到 wal）。
+var connPragmas = []string{"PRAGMA busy_timeout=5000", "PRAGMA synchronous=NORMAL"}
+
+// pragmaConnector 把 connPragmas 绑到"每条新建连接"上。
+//
+// 为什么不用登记原文建议的两种修法（04 §6.11 M73，实测读数见设计段 §18.0 取证 #3/#4）：
+//   - DSN URI 形（`file:...?_pragma=`）：含 `#` 的路径会被当成 URI fragment，实测库
+//     建到了 `…/a b` 而不是 `…/a b#c中文/cache.db`；Windows 路径经 url.URL 还会把
+//     `C:` 吃成 authority。缓存悄悄建到别处 = 每轮白算且永不自愈。
+//   - SetMaxOpenConns(1)（照抄 history）：实测 8 worker × 3000 次主键点查
+//     139.1ms → 289.8ms（2.08 倍），本包"Lookup 用 RLock 并行"是承重的。
+//
+// 走 Connector 包装还有一条附带好处：路径始终以**纯文件名**交给驱动，与改前同形，
+// 因此不存在"新平台 URI 解析差异"这种无法在本机验证的面。
+type pragmaConnector struct{ base driver.Connector }
+
+func (pc pragmaConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := pc.base.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// PRAGMA（01 §7.3）
+	if err := applyConnPragmas(ctx, conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (pc pragmaConnector) Driver() driver.Driver { return pc.base.Driver() }
+
+func applyConnPragmas(ctx context.Context, conn driver.Conn) error {
+	for _, p := range connPragmas {
+		if ex, ok := conn.(driver.ExecerContext); ok {
+			if _, err := ex.ExecContext(ctx, p, nil); err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+			continue
+		}
+		stmt, err := conn.Prepare(p)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		_, err = stmt.Exec(nil)
+		_ = stmt.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func openDB(path string) (*sql.DB, error) {
+	base, err := sqlite.NewConnector(path)
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(pragmaConnector{base: base})
+	// 文件级 PRAGMA 与表结构（01 §7.3）；会话级的两条见 connPragmas（M73）。
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
 		`CREATE TABLE IF NOT EXISTS hash_cache (
 			path     TEXT    NOT NULL PRIMARY KEY,
 			size     INTEGER NOT NULL,
@@ -209,6 +305,9 @@ func openDB(path string) (*sql.DB, error) {
 // 完全一致。id 未解析（Windows）时身份比较平凡通过，兜底仍靠四点采样。
 // 返回条目与 full 是否有效（决定阶段 3 是否跳过）。
 func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Entry, bool, bool) {
+	if c.corrupt.Load() {
+		return Entry{}, false, false // M74：已确证损坏 ⇒ 不再发 SQL（当次未命中，重算即可）
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	row := c.db.QueryRow(
@@ -218,6 +317,12 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 	var dev64, ino64 int64
 	e.Path = path
 	if err := row.Scan(&e.Size, &e.MtimeNs, &partial, &e.Full, &dev64, &ino64, &e.CtimeNs); err != nil {
+		// M74：改前这里一律折成"未命中"，于是"库坏了"与"这条没有"在证据上完全等价，
+		// 而损坏判定只在 Open 跑过一次 ⇒ 库中途坏了永不自愈，Lookup 侧全程沉默。
+		// 未命中仍然是正确的兜底行为（宁可重算），但必须留下证据、且确证损坏时停用。
+		if !errors.Is(err, sql.ErrNoRows) {
+			c.noteDBError(err)
+		}
 		return Entry{}, false, false
 	}
 	e.Dev, e.Ino = uint64(dev64), uint64(ino64)
@@ -244,12 +349,21 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 
 // Store 批量 UPSERT（任务结束单事务写回，01 §7.3）。
 // last_hit 统一刷新为当前时间；超上限时按 last_hit 淘汰最旧。
-func (c *Cache) Store(entries []Entry) error {
+func (c *Cache) Store(entries []Entry) (err error) {
 	if len(entries) == 0 {
 		return nil
 	}
+	if c.corrupt.Load() {
+		return ErrCorruptDisabled // M74：停用后不再发 SQL，也不每轮重犯
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// M74：Store/Touch 的错误本来就会上报给用户，这里只补"确证损坏 ⇒ 停用"这一半。
+	defer func() {
+		if err != nil {
+			c.markCorruption(err)
+		}
+	}()
 	now := time.Now().Unix()
 	tx, err := c.db.Begin()
 	if err != nil {
@@ -282,18 +396,31 @@ func (c *Cache) Store(entries []Entry) error {
 		return err
 	}
 	c.cntValid = false // C5：写入后计数失效，下次统计/淘汰判定重算一次
-	return c.evictLocked()
+	// M75(a)：走到这里**哈希已经落库**，淘汰失败是另一件事。改前这里直接
+	// `return c.evictLocked()`，上游把两种失败一律写成"缓存写回失败"（假话）。
+	if e := evictFn(c); e != nil {
+		return fmt.Errorf("%w：哈希条目已写回，仅 LRU 淘汰未完成（%v）", ErrEvictFailed, e)
+	}
+	return nil
 }
 
 // Touch 批量刷新命中条目的 last_hit（LRU 语义：命中即续期）。
 // R1 修复：此前命中条目永不续期，高频命中的热文件反而最先被淘汰。
 // 单事务执行；空列表无操作。
-func (c *Cache) Touch(paths []string) error {
+func (c *Cache) Touch(paths []string) (err error) {
 	if len(paths) == 0 {
 		return nil
 	}
+	if c.corrupt.Load() {
+		return ErrCorruptDisabled // M74：同上，停用后不再发 SQL
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer func() {
+		if err != nil {
+			c.markCorruption(err)
+		}
+	}()
 	now := time.Now().Unix()
 	tx, err := c.db.Begin()
 	if err != nil {
@@ -323,6 +450,14 @@ func (c *Cache) LastHit(path string) (int64, bool) {
 	}
 	return ts, true
 }
+
+// evictFn 是淘汰步骤的注入点（测试接缝，惯例同 ops.verifyFileFn / scanner.probeCaseSensitive）。
+// 生产恒等于 evictLocked。为什么要接缝：Store 在 Commit 之后会把 cntValid 置回 false，
+// evictLocked 于是先重算 COUNT、只有真超限才发 DELETE —— 想稳定造出"已写回、淘汰失败"
+// 这一档，就得往库里塞 50 万条（MaxEntries），或留一个把计数伪造成超限的口子；
+// 两者都比一条接缝贵。"DELETE 确实会失败"这件事另有独立自检（见 cache_m73_m75_test.go
+// 的触发器用例），不靠这条接缝自证。
+var evictFn = func(c *Cache) error { return c.evictLocked() }
 
 // evictLocked 超上限淘汰（last_hit 最旧优先）。调用方须持写锁。
 func (c *Cache) evictLocked() error {

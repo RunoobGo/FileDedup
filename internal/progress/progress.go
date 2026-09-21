@@ -25,6 +25,11 @@ type Tracker struct {
 	interval time.Duration
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// M69：节流 goroutine 的收口凭据。改前 Stop 只 close(stopCh) 就取终值外发，
+	// 而 ticker 那条路径是"锁内取快照 → 释锁 → 锁外 cb"，两者互不排斥：
+	// ticker 取到较旧快照 S1 后还没来得及 cb，Stop 已经 cb 了更新的 S2，
+	// 然后 ticker 才把 S1 发出去 —— 界面最后一条进度反而是较旧的那条。
+	wg sync.WaitGroup
 }
 
 // New 创建 Tracker。interval 为节流间隔（生产 500ms，测试可调小）。
@@ -46,7 +51,9 @@ func (t *Tracker) Start(ctx context.Context) {
 	t.mu.Lock()
 	t.start = time.Now()
 	t.mu.Unlock()
+	t.wg.Add(1)
 	go func() {
+		defer t.wg.Done()
 		ticker := time.NewTicker(t.interval)
 		defer ticker.Stop()
 		for {
@@ -71,8 +78,13 @@ func (t *Tracker) Start(ctx context.Context) {
 }
 
 // Stop 停止推送并返回终值；若设置回调则先推送终值（"节流不丢终值"）。
+//
+// M69：先等节流 goroutine 收口再取终值。它可能已经取到一个较旧的快照、正卡在
+// 释锁与 cb 之间；不 Wait 的话那条旧值就会压在终值之后发出，界面最后看到的是
+// 进度倒退。cb 一律在锁外调用（这条不变），否则等于把 Wails 的 emit 拉进临界区。
 func (t *Tracker) Stop() model.ProgressEvent {
 	t.stopOnce.Do(func() { close(t.stopCh) })
+	t.wg.Wait()
 	t.mu.Lock()
 	now := time.Now()
 	t.lastEmit = now

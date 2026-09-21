@@ -4,6 +4,7 @@ package dedup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -218,11 +219,16 @@ func (p *Pipeline) setStatus(s model.TaskStatus) {
 	}
 }
 
-// Run 执行完整流水线。返回重复组与失败清单；ctx 取消返回 context 错误。
-// 命名返回值：defer 中的缓存写回（含 Cancelled 路径，01 §5.5）需修改返回值。
-func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*model.DuplicateGroup, failed []model.FailedItem, err error) {
-	ctx, cancel := context.WithCancel(parent)
-	p.mu.Lock()
+// claimRunLocked 认领这一轮扫描：终态复位 → 状态机校验 → **当场写入** Scanning → 存 cancel。
+//
+// M71：判与写必须在同一个 p.mu 临界区内。改前这一段只判不写，Scanning 要等到
+// 释锁、六个原子计数归零、gate.Resume() 之后由 setStatus 第二次取锁才写进去；
+// 那个窗口里 Pause() 读到 Idle 便回"当前不在扫描中"、Cancel() 读到 running=false
+// 便回"没有进行中的扫描任务"——两句都是假话，用户按字面理解会以为按钮没反应。
+// app 层的 scanInFlight 挡板（app.go:591）只是把这条路堵在界面侧，判据本身仍不闭合。
+//
+// 调用方须持 p.mu。返回非 nil 即未认领成功，状态与 cancel 一律不留痕（可安全重试）。
+func (p *Pipeline) claimRunLocked(cancel context.CancelFunc) error {
 	// P0-1：终态（Done/Cancelled/Failed）自动经 Idle 复位，使「再次扫描」成为
 	// 受支持的路径。状态机表本身不动（仍只允许 Idle→Scanning 进入运行态），
 	// 因此 Done→Scanning 依旧非法——复位是一次显式的 Done→Idle→Scanning。
@@ -232,18 +238,59 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		p.status = model.StatusIdle
 	}
 	if !model.ValidateTransition(p.status, model.StatusScanning) {
-		from := p.status
-		p.mu.Unlock()
-		cancel()
-		return nil, nil, fmt.Errorf("非法状态转换: %s → Scanning", from)
+		return fmt.Errorf("非法状态转换: %s → Scanning", p.status)
 	}
+	p.status = model.StatusScanning
 	p.cancel = cancel
 	p.afterResume = ""
 	// M6-P4：与 scannedFiles/cacheHits 同口径按轮归零。上一轮的逃逸根若不清，
 	// 本轮即便什么都没逃逸，界面也会继续挂着上一条扫描的"已脱离系统保护"警示。
 	// 切片归零与其余状态一样在 mu 内完成（访问器同一把锁读）。
 	p.unprotectedRoots = nil
+	return nil
+}
+
+// cacheOpErrText 把 cache.Store/Touch 的错误分诊成一句**符合事实**的话（M75a / M74）。
+// 判据用哨兵错误而不是重新解释 SQLite 文本（I5：分类只在 cache 侧做一次）。
+// ok=false 表示这件事已由轮末那条停用说明统一交代，再报一条"失败"反倒成假话。
+func cacheOpErrText(op string, e error) (string, bool) {
+	switch {
+	case errors.Is(e, cache.ErrCorruptDisabled):
+		return "", false
+	case errors.Is(e, cache.ErrEvictFailed):
+		// 哨兵自带"哈希条目已写回，仅 LRU 淘汰未完成"——改前这里一律写成
+		// "缓存写回失败"，而 Commit 早就成功了（§18.0 取证 #8）。
+		return e.Error(), true
+	default:
+		return op + "失败: " + e.Error(), true
+	}
+}
+
+// corruptCacheNotice 生成轮末那条"库被确证损坏 ⇒ 停用"的说明（M74）。
+//
+// 措辞边界钉在这里，且**全轮只有这一个造句点、在 Run 的 defer 里**：
+// Lookup 侧只计数不造句（几万条点查会刷几万条失败清单），所以"至多一条"
+// 是结构保证而不是概率。内容边界：只说"已停用"，不得出现"已隔离/已重建/已自愈"
+// ——运行期重建没做（§18.6 → 新登记 M87），说了就是假话。
+func corruptCacheNotice(dbErrs int64, corrupted bool) string {
+	if !corrupted {
+		return ""
+	}
+	return fmt.Sprintf("哈希缓存在本轮被确证损坏，已停用（本轮累计库错误 %d 次）："+
+		"去重结果不受影响，但缓存不再命中，之后每轮都要重算哈希（重建需重启应用）", dbErrs)
+}
+
+// Run 执行完整流水线。返回重复组与失败清单；ctx 取消返回 context 错误。
+// 命名返回值：defer 中的缓存写回（含 Cancelled 路径，01 §5.5）需修改返回值。
+func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*model.DuplicateGroup, failed []model.FailedItem, err error) {
+	ctx, cancel := context.WithCancel(parent)
+	p.mu.Lock()
+	claimErr := p.claimRunLocked(cancel)
 	p.mu.Unlock()
+	if claimErr != nil {
+		cancel()
+		return nil, nil, claimErr
+	}
 	p.scannedFiles.Store(0)
 	p.cacheHits.Store(0) // AS-K1：按轮归零，见 CacheHits 注释
 	p.protectedDirs.Store(0)
@@ -254,6 +301,9 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
 	p.gate.Resume()
 	defer cancel()
+	// M71 后这里不再是"写入 Scanning"的落点（认领时已写），只剩一格真实职责：
+	// 若在释锁与本行之间被 Pause() 抢走，setStatus 见 Paused 会把它记进 afterResume，
+	// Resume 后回到 Scanning 而不是把暂停态吞掉。
 	p.setStatus(model.StatusScanning)
 
 	tracker := progress.New(500*time.Millisecond, p.OnProgress)
@@ -400,13 +450,21 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		if len(pending) > 0 {
 			if e := p.cch.Store(pending); e != nil {
 				// 缓存失败不影响结果正确性：计入失败清单提示
-				failed = append(failed, model.FailedItem{Stage: "cache", Err: "缓存写回失败: " + e.Error()})
+				if text, ok := cacheOpErrText("缓存写回", e); ok {
+					failed = append(failed, model.FailedItem{Stage: "cache", Err: text})
+				}
 			}
 		}
 		if len(hitPaths) > 0 {
 			if e := p.cch.Touch(hitPaths); e != nil {
-				failed = append(failed, model.FailedItem{Stage: "cache", Err: "缓存命中续期失败: " + e.Error()})
+				if text, ok := cacheOpErrText("缓存命中续期", e); ok {
+					failed = append(failed, model.FailedItem{Stage: "cache", Err: text})
+				}
 			}
+		}
+		// M74：本轮把库确证成损坏 ⇒ 至多**一条**说明（造句点见 corruptCacheNotice）。
+		if msg := corruptCacheNotice(p.cch.DBErrors(), p.cch.Corrupted()); msg != "" {
+			failed = append(failed, model.FailedItem{Stage: "cache", Err: msg})
 		}
 	}()
 	runWorkers(ctx, workers, stagePanicHandler("prefilter"), func() error {

@@ -381,13 +381,22 @@ export const useScanStore = defineStore('scan', () => {
   // （startScan 出口统一 ×1024），这里回填为 KB。
   function rescanHistory(m: HistoryMeta) {
     roots.value = [...m.roots]
-    Object.assign(filters, emptyFilters(), {
-      IncludeExts: m.filters?.IncludeExts ?? [],
-      ExcludeExts: m.filters?.ExcludeExts ?? [],
+    // M78（2026-09-21 审查）：改前这里逐字段手抄 6 位，而 emptyFilters() 有 7 位，
+    // 漏的正是 AllowCloudHydration —— 用"允许读取云端占位"的历史配置重扫，会被
+    // 悄悄降级成安全档，用户看到的却是同一份配置。透传不再靠抄清单：
+    // 以 emptyFilters() 为底 + 整体覆盖历史 filters，只另写需要换算的两字段。
+    //
+    // 为什么还要先滤掉 null/undefined：Go 侧 model.Filters 无 omitempty，
+    // 空切片回包是 JSON null，直接透传会把 store 里的数组写成 null（下游 .join 即炸），
+    // 改前的 `?? []` 恰好挡住了这一手。滤完由 base 兜底，比逐字段 `?? []` 更能
+    // 覆盖将来新增的字段。
+    const hist: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(m.filters ?? {})) {
+      if (v !== null && v !== undefined) hist[k] = v
+    }
+    Object.assign(filters, emptyFilters(), hist, {
       MinSize: Math.round((m.filters?.MinSize ?? 0) / 1024),
       MaxSize: Math.round((m.filters?.MaxSize ?? 0) / 1024),
-      ExcludePaths: m.filters?.ExcludePaths ?? [],
-      IncludeHidden: !!m.filters?.IncludeHidden,
     })
     threads.value = m.threads
     paranoid.value = m.paranoid
