@@ -487,6 +487,14 @@ export const useScanStore = defineStore('scan', () => {
     return n === 0 ? 'none' : n === c.length ? 'all' : 'some'
   }
 
+  // groupSelCount 是"点这一下会勾上几项"的唯一答案：组内全选框的 aria-label 用它，
+  // 不再由组件自己按 files.length - 1 猜。M18 的原始缺陷就是这个猜测——
+  // I4 场景（组内一个保留项都没有）下它少报 1 项，而 aria-label 是屏幕阅读器
+  // 唯一的说明来源，等于只对不可见的用户说假话。
+  function groupSelCount(g: GroupView): number {
+    return groupSelCandidates(g).length
+  }
+
   function toggleGroupSelection(g: GroupView) {
     const c = groupSelCandidates(g)
     const sel = selection.value
@@ -909,7 +917,7 @@ export const useScanStore = defineStore('scan', () => {
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     effectiveFiles, effectiveBytes, effectiveCount,
-    groupSelState, toggleGroupSelection,
+    groupSelState, groupSelCount, toggleGroupSelection,
     applyKeep, clearKeep, executeOp, openTrash, cancelOp,
     running, startScan, pauseScan, resumeScan, cancelScan,
     loadResultPage, loadMore, reloadResults, switchView, bindEvents, saveSettings, applyTheme, openPreview,

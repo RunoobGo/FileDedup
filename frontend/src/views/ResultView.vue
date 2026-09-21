@@ -336,8 +336,15 @@ function onConfirm(targetDir?: string) {
         </div>
       </div>
       <div class="ops">
+        <!-- M18：全选的范围是**整个结果集**，包含被折叠起来的组。这里刻意不改成
+             "只选可见项"——折叠只是显示状态，静默少选会让用户以为整组都勾上了，
+             比"看得见数字、展开能复核"的少报更危险（漏清理是无声的）。
+             代价是这个数在收起状态下无法逐项核对，所以必须把范围写在按钮自己身上。
+             彻底解决要把各组的折叠态收进 store（现在它是 GroupCard 的局部 ref），
+             那是一项独立改动，已另登 M24，不在本条里顺手做。 -->
         <button class="btn-ghost" :class="{ 'btn-emph': store.selectedFiles.length === 0 }"
-          title="选中全部冗余项（保留项不可勾选）" @click="store.selectAll()">全选</button>
+          title="选中全部冗余项（保留项不可勾选；含已折叠的组，展开后逐项可复核）"
+          @click="store.selectAll()">全选</button>
         <button class="btn-ghost" @click="store.clearSelection()">清除</button>
         <button class="btn-primary" :disabled="opDisabled"
           :title="opDisabledTip || '把所选重复文件移入系统回收站'" @click="confirmKind = 'trash'">移入回收站</button>

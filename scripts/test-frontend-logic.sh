@@ -14,7 +14,13 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FE="$REPO_ROOT/frontend"
+# 可覆盖（FRONTEND_DIR）：负控制要拿"故意改坏的那份"跑本套断言，证明门禁真的会红。
+# 先例见 smoke-symlink-assert.sh 的 SMOKE_TARGET。
+FE="${FRONTEND_DIR:-$REPO_ROOT/frontend}"
+# 归一成绝对路径：下面要 `cd "$FE"` 跑 node，而接线断言在这之后仍按 $FE 找文件，
+# 相对路径会在新 cwd 下错位（负控制实测：报"找不到文件"而不是报"写法被回退"）。
+FE_ABS="$(cd "$FE" 2>/dev/null && pwd)" || { printf 'test-frontend-logic: 找不到前端目录 %s\n' "$FE" >&2; exit 2; }
+FE="$FE_ABS"
 
 skip() {
 	printf 'SKIP: %s\n' "$1" >&2
@@ -51,4 +57,35 @@ if [ -z "$count" ] || [ "$count" -lt 1 ]; then
 	printf 'test-frontend-logic: 未能确认有测试被执行（计数行：[%s]）\n' "$tests_line" >&2
 	exit 1
 fi
-printf 'test-frontend-logic: %s 个用例全部通过\n' "$count"
+# ---- 静态接线断言（M15 / M18）----
+# 探针钉得住"判据本身对不对"，钉不住"组件有没有去用这个判据"：模板退回自己拼
+# 字符串时，node 用例与 vue-tsc 都照样绿。这里补一刀最小必要的文本锚点。
+# ★ 只锚标识符引用、不锚中文文案——改措辞是安全的，锚文案会误报。
+wiring_fail=0
+wiring() { # $1=文件 $2=必须出现 $3=禁止出现（可空） $4=说明
+	local file="$1" want="$2" forbid="$3" why="$4"
+	if [ ! -f "$FE/$file" ]; then
+		printf '  \033[31m✗ 找不到 %s，接线断言无法执行\033[0m\n' "$file" >&2
+		wiring_fail=$((wiring_fail + 1))
+		return
+	fi
+	if ! grep -qF -- "$want" "$FE/$file"; then
+		printf '  \033[31m✗ %s（未引用 %s）\033[0m\n' "$why" "$want" >&2
+		wiring_fail=$((wiring_fail + 1))
+	elif [ -n "$forbid" ] && grep -qF -- "$forbid" "$FE/$file"; then
+		printf '  \033[31m✗ %s（出现被禁写法：%s）\033[0m\n' "$why" "$forbid" >&2
+		wiring_fail=$((wiring_fail + 1))
+	else
+		printf '  ✓ %s\n' "$why"
+	fi
+}
+wiring 'src/components/GroupCard.vue' 'store.groupSelCount(group)' 'group.files.length - 1' \
+	'组内冗余项数取自 store.groupSelCount（M18：组件不得自算）'
+wiring 'src/components/ConfirmDialog.vue' 'reclaimLine(' 'humanBytes' \
+	'确认框字节口径取自 utils/opdisplay（M15：组件不得自行格式化并配文案）'
+
+if [ "$wiring_fail" -ne 0 ]; then
+	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
+	exit 1
+fi
+printf 'test-frontend-logic: %s 个用例全部通过（含 2 条接线断言）\n' "$count"

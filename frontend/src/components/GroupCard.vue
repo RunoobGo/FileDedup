@@ -40,7 +40,7 @@ function reveal(id: number) {
           class="check"
           type="checkbox"
           :checked="selState === 'all'"
-          :aria-label="`全选该组待清理项（${group.files.length - 1} 个冗余项）`"
+          :aria-label="`全选该组待清理项（${store.groupSelCount(group)} 个冗余项）`"
           @change="store.toggleGroupSelection(group)"
         />
       </label>
