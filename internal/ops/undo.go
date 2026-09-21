@@ -133,8 +133,18 @@ func undoTrash(it UndoItem) (string, error) {
 	}
 	target := it.OrigPath
 	var claim claimedDst
-	if _, err := os.Lstat(it.OrigPath); err == nil || !os.IsNotExist(err) {
-		// Lstat 报非 ENOENT 的错误时同样另名恢复：rename 会静默覆盖已存在目标
+	if c, ok, _ := claimExact(it.OrigPath); ok {
+		// M19（2026-09-21，设计稿 §8）：原位这个**确切名字**先被我们抢下（0 字节
+		// 占位），随后的改名替换的是我们自己的占位，而不是"赌窗口里没人落子"。
+		// 抢到即意味着这次恢复回原路径——名字就是结果本身，不能换名。
+		//
+		// 残余窗口（不可消除，同 claimDst 注释）：第三方先删掉我们的占位、再在
+		// 同一位置建自己的文件，随后改名覆盖。那需要针对本次操作做删除+重建，
+		// 不属于同步盘/下载器被动落子的形态。
+		claim = c
+	} else {
+		// 名字被占（含悬空链接与目录）或连能否占用都没问出来（错误被丢弃的理由
+		// 见 claimExact 注释）：一律改落 name.fdd-restored.ext。宁另名，不覆盖。
 		base := filepath.Base(it.OrigPath)
 		ext := filepath.Ext(base)
 		name := strings.TrimSuffix(base, ext) + FddRestoreMark + ext

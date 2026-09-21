@@ -119,9 +119,66 @@ func abandonForeignBackup(backup, dup, tmp string) error {
 		"（不属于本次操作，扫描会自动忽略此名，请自行核对后再处置）", backup)
 }
 
+// requireOriginalInBackup 在**动手还原之前**核对：backup 位上装的仍是本次操作
+// 那个原文件。是则放行；不是（或证明不了）则返回包装后的 cause，一个字节都不碰。
+//
+// M20（2026-09-21，设计稿 §8）：两条回滚分支原先都直接
+// `hardlinkRename(backup, dup)`——把 backup 位上的**任何**东西搬回用户眼皮底下。
+// backup 名（.fdd-old）扫描器按 worktemp.IsTempName 忽略，用户平时看不到它，
+// 于是"顶替发生在回滚窗口里"这种时序（同步盘把新版本落到该名、用户手动把别的
+// 文件移成该名）会让一个从未授权我们处置的文件被搬到 dup 位，且带着成功路径的
+// 文案。回滚分支与成功路径的 removeOwnBackup 是同一类动作、同一份风险，
+// 守卫自然也该同一份口径。
+//
+// ★ 这里的判据是 identityStill（fail-open），**刻意不同于**删文件侧的
+// slotProvesHardlink（fail-closed）。理由：零值 dupID（卷不提供稳定身份）时，
+// 前者放行 → 行为退回修复前，最坏是"搬错一个文件"；后者拦截 → 会把**全部**
+// 零 ID 的合并回滚永久堵死（既有测试正以零 ID 覆盖这些分支）。方向由
+// "判错的代价"决定：这里判错只是少检出一次顶替，不等于销毁数据。
+func requireOriginalInBackup(backup, dup string, dupID fsid.ID, cause error) error {
+	if backupOwnershipStill(backup, dupID) {
+		return nil
+	}
+	return fmt.Errorf("%w；且 %s 上的文件已不是本次操作的原文件（疑似被第三方顶替）："+
+		"为避免把陌生文件搬到 %s，本次未做任何还原动作，请人工核对后再处理", cause, backup, dup)
+}
+
+// rollbackUnverifiedSwap 处理「终局复核失败」：dup 上是刚放上去的**假链接**，
+// backup 里是真原文件，要做的是把假的挪开、把真的放回 dup（步骤 5 的原地舞）。
+//
+// 舞步与原先逐字一致（move.go / symlink.go 两份重复已随本次修复收归此处，
+// I5）：唯一的加固是在动手前先过 requireOriginalInBackup——被顶替时宁可
+// 停在失败现场并指认位置，也不把陌生文件搬到用户眼皮底下。
+func rollbackUnverifiedSwap(verifyErr error, backup, dup string, dupID fsid.ID) error {
+	if err := requireOriginalInBackup(backup, dup, dupID, verifyErr); err != nil {
+		return err
+	}
+	if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
+		if berr := hardlinkRename(backup, dup); berr != nil {
+			// 还原失败：至少保证两份都存在（数据不丢），并明确指出残留位置。
+			// 注意路径归属：真原文件在 backup；backup+".undo" 里是刚被
+			// 挪开的**假链接**。恢复现场必须指向 backup（2026-09-20 修正：
+			// 此前消息把两者说反）。
+			return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失；假链接残留在 %s，可自行删除）",
+				verifyErr, backup, backup+".undo")
+		}
+		_ = os.Remove(backup + ".undo")
+		return verifyErr
+	}
+	return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", verifyErr, backup)
+}
+
 // rollbackAfterSwapFailure 处理「窗口 B 落位改名失败」：把原文件还原回 dup，
 // 清理临时链接；还原也失败时**必须**把数据留在哪里说清楚（M3）。
-func rollbackAfterSwapFailure(backup, dup, tmp string, swapErr error) error {
+//
+// M20（2026-09-21）：还原动作同样先过 requireOriginalInBackup。被顶替时
+// 仍要清掉我们的 tmp（它不指向任何用户可见名，且本次操作已放弃），
+// 但绝不碰 backup 位上的陌生文件。
+func rollbackAfterSwapFailure(backup, dup, tmp string, dupID fsid.ID, swapErr error) error {
+	if err := requireOriginalInBackup(backup, dup, dupID, swapErr); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	restoreErr := hardlinkRename(backup, dup)
 	_ = os.Remove(tmp)
 	if restoreErr != nil {

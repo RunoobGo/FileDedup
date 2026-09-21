@@ -122,25 +122,14 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		return abandonForeignBackup(backup, dup, tmp)
 	}
 	if err := hardlinkRename(tmp, dup); err != nil {
-		return rollbackAfterSwapFailure(backup, dup, tmp, err)
+		return rollbackAfterSwapFailure(backup, dup, tmp, dupID, err)
 	}
 	// 收尾复核（见函数头注释）：确认 dup 现在真的是 keep 的那个文件。
 	// 这里的证据是「同文件」而非「无错误」——两者在 Windows 上不等价。
 	if err := verifyHardlinked(keep, dup); err != nil {
 		// 未真正建立链接：把 dup 还原为原来的独立文件，不留假成功的账。
-		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
-			if berr := hardlinkRename(backup, dup); berr != nil {
-				// 还原失败：至少保证两份都存在（数据不丢），并明确指出残留位置。
-				// 注意路径归属：真原文件在 backup；backup+".undo" 里是刚被
-				// 挪开的**假链接**。恢复现场必须指向 backup（2026-09-20 修正：
-				// 此前消息把两者说反）。
-				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失；假链接残留在 %s，可自行删除）",
-					err, backup, backup+".undo")
-			}
-			_ = os.Remove(backup + ".undo")
-			return err
-		}
-		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", err, backup)
+		// 舞步已收归 rollbackUnverifiedSwap（move/symlink 原先各一份逐字重复）。
+		return rollbackUnverifiedSwap(err, backup, dup, dupID)
 	}
 	// 合并成功：删除原独立副本的备份。删除失败与"backup 位被第三方顶替"
 	// 都不推翻结果，但必须如实回报残留（理由见 removeOwnBackup 与 merge_guard.go）。
@@ -326,6 +315,38 @@ func (c claimedDst) release() {
 		return
 	}
 	_ = os.Remove(c.path)
+}
+
+// claimExact 原子抢占一个**确切名字**：O_CREATE|O_EXCL 建 0 字节占位，抢到即拥有。
+//
+// 与 claimDst 的唯一差别：**名字被占时不递增**，把 ok 置 false 交调用方换路。
+// 用于"这个名字就是结果本身、换名即换语义"的场合——目前只有回收站回撤的原位恢复
+// （undo.go：抢到 → 恢复回原路径；抢不到 → 另落 name.fdd-restored.ext）。
+//
+// M19（2026-09-21，设计稿 §8）：那一支原先用 `os.Lstat(OrigPath)` 判空后**不认领**
+// 直接改名，而 os.Rename 对已存在的普通文件是**静默替换**（Windows 腿是
+// MoveFileEx + MOVEFILE_REPLACE_EXISTING）——Lstat 与改名之间第三方落子，
+// 它连名字带 inode 一起消失。抢到占位之后，随后的改名替换的是**我们自己的
+// 0 字节占位**，不再赌"没人来"。
+//
+// 返回的 error 只在"连能不能占用都问不出来"时非空（目录不可写、只读卷等）；
+// 调用方对它与 ok=false 的处置相同（走另名恢复），真正的错误会在同一个目录上
+// 以同样的原因再报一次——与 claimDst 分支对 Lstat 异常的处理同口径。
+func claimExact(path string) (claimedDst, bool, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	switch {
+	case err == nil:
+		_ = f.Close()
+		id, ierr := pathIdentity(path)
+		if ierr != nil {
+			return claimedDst{path: path}, true, nil
+		}
+		return claimedDst{path: path, id: id}, true, nil
+	case errors.Is(err, os.ErrExist):
+		return claimedDst{}, false, nil
+	default:
+		return claimedDst{}, false, err
+	}
 }
 
 // isCrossDevice 仅把真实的 EXDEV 判定为跨卷。

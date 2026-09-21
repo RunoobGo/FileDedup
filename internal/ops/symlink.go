@@ -104,7 +104,7 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 
 	// ---- 步骤 4：临时链接原子顶替 dup 位置 ----
 	if err := hardlinkRename(tmp, dup); err != nil {
-		return rollbackAfterSwapFailure(backup, dup, tmp, err)
+		return rollbackAfterSwapFailure(backup, dup, tmp, dupID, err)
 	}
 
 	// ---- 步骤 5：终局复核 ----
@@ -119,17 +119,8 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	}
 	if step5Err != nil {
 		// 未真正建立：把 dup 还原成原来的独立文件，不留"假成功"的账。
-		if rerr := hardlinkRename(dup, backup+".undo"); rerr == nil {
-			if berr := hardlinkRename(backup, dup); berr != nil {
-				// 真原文件在 backup；backup+".undo" 里是被挪开的假链接。
-				// 恢复现场必须指向 backup（2026-09-20 修正：此前说反）。
-				return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失；假链接残留在 %s，可自行删除）",
-					step5Err, backup, backup+".undo")
-			}
-			_ = os.Remove(backup + ".undo")
-			return step5Err
-		}
-		return fmt.Errorf("%w；且还原 dup 失败，原文件保留在 %s（数据未丢失）", step5Err, backup)
+		// 舞步已收归 rollbackUnverifiedSwap（move/symlink 原先各一份逐字重复）。
+		return rollbackUnverifiedSwap(step5Err, backup, dup, dupID)
 	}
 
 	// ---- 成功：删除备份 ----
