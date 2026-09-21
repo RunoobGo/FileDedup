@@ -128,6 +128,16 @@ type folder struct {
 
 func newFolder(roots []string, sens []bool) *folder {
 	f := &folder{roots: roots, prefixes: rootPrefixes(roots), sens: sens, def: fscase.Default()}
+	// C1（2026-09-21，设计稿 §6.1）：**单根不做折叠**。折叠唯一的真实用途是把"同一棵树
+	// 的两种拼写"并成一个键，而单根出发的遍历里每个目录只会以唯一拼写出现（队列只投
+	// 原样根，其后每个路径都是 filepath.Join(父, ReadDir 得到的名字)，链接/junction 已
+	// 被跳过）——没有可并之物，折叠只可能把大小写不同的两棵**不同**目录误并成一棵。
+	// 实测：单根扫大小写敏感卷上的 alpha/ 与 ALPHA/，只收得到一棵子树，且 files_failed=0。
+	// 反方向的错法（该折没折 → 同一棵收两遍）由流水线阶段 1.5 的物理身份去重兜底，
+	// 代价不对称，故不确定时倾向不折。sens 此处保留不参与折叠：它是"没测过"的诚实值。
+	if len(roots) <= 1 {
+		return f
+	}
 	for _, s := range f.sens {
 		if !s {
 			f.needFold = true // 有不敏感卷 → 必须按其语义折叠
@@ -154,8 +164,14 @@ func (f *folder) fold(p string) string {
 }
 
 // foldRoot 折叠第 i 个根本身：根路径不带尾分隔符，命中不了自身的 root+sep 前缀，
-// 故单独按该根卷的语义折叠。
-func (f *folder) foldRoot(i int) string { return fscase.Fold(f.roots[i], f.sens[i]) }
+// 故单独按该根卷的语义折叠。单根时与 fold 同口径地原样返回——否则 visited 的种子键
+// 会被平台默认小写化，而其后每个目录的键不折，两套键打架（C1，见 newFolder 注释）。
+func (f *folder) foldRoot(i int) string {
+	if !f.needFold {
+		return f.roots[i]
+	}
+	return fscase.Fold(f.roots[i], f.sens[i])
+}
 
 // key 折叠 + 分隔符统一为 "/" 的**比较键**。
 // 不能拿 fold 的结果直接做前缀比较：fold 在不敏感卷上会把 "\" 换成 "/"，
@@ -476,7 +492,12 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 // 此时"子根已被宽根覆盖"并不成立（宽根走不进受保护目录里面），被丢弃的子根
 // 仍须作为"用户显式指定过"的依据放行。
 //
-// I2：判重前按各根所在卷的语义折叠。单根无从判重，也就不必为它写探测文件。
+// I2：判重前按各根所在卷的语义折叠。
+//
+// C1（2026-09-21）：单根不探测，理由**不是**"无从判重所以折叠无关紧要"——单根扫描照样
+// 要用折叠键（`visited` 去重），只是它**不需要**折叠（设计稿 §6.1：单根遍历里每个目录
+// 只会以唯一拼写出现）。不探测是为了不给最常用的一条路（只选一个目录）平白往用户目录里
+// 写探测文件；折叠本身由 newFolder 对单根整个关掉。
 func dedupeRoots(roots []string) ([]string, []bool, []string) {
 	var out []string
 	for _, r := range roots {

@@ -184,7 +184,11 @@ func filePaths(entries []*model.FileEntry) []string {
 	return out
 }
 
-// TestWalkSingleRootSkipsProbe 单根无从判重，不该往用户目录里写探测文件。
+// TestWalkSingleRootSkipsProbe 单根不往用户目录里写探测文件。
+// C1（2026-09-21）：**理由已修，断言不变**——此前写的是"单根无从判重，也就不必探测"，
+// 但单根扫描照样要用折叠键（visited 去重），它只是**不需要**折叠（单根遍历里每个目录
+// 只会以唯一拼写出现，设计稿 §6.1）。折叠因此对单根整个关掉（见 TestFolderSingleRootNeverFolds），
+// 于是探测也确实没有存在意义了。
 func TestWalkSingleRootSkipsProbe(t *testing.T) {
 	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
 	root := t.TempDir()
@@ -199,6 +203,65 @@ func TestWalkSingleRootSkipsProbe(t *testing.T) {
 	}
 	if n := probed.Load(); n != 0 {
 		t.Fatalf("单根扫描触发了 %d 次卷探测，应为 0", n)
+	}
+}
+
+// TestFolderSingleRootNeverFolds C1（设计稿 §6.4 V1）：**单根不折叠**是结构性结论
+// （单根遍历里每个目录只会以唯一拼写出现），不是"这台机器恰好如此"，故直接对 newFolder
+// 断言、不依赖任何卷属性。sens 故意给 false（darwin/windows 的平台默认）——修前正是它
+// 让单根的键全部小写化，把被折叠的两棵**不同**目录并成一棵。
+func TestFolderSingleRootNeverFolds(t *testing.T) {
+	sep := string(filepath.Separator)
+	root := filepath.Join(sep, "X", "Docs")
+	f := newFolder([]string{root}, []bool{false})
+	if f.needFold {
+		t.Fatal("单根扫描不应启用折叠：启用后大小写不同的两棵子树会被并成一棵（静默漏扫）")
+	}
+	sub := filepath.Join(root, "Sub", "F.TXT")
+	if got := f.fold(sub); got != sub {
+		t.Errorf("单根 fold(%q) = %q, want 原样（改大小写即折叠没关掉）", sub, got)
+	}
+	if got := f.foldRoot(0); got != root {
+		t.Errorf("单根 foldRoot(0) = %q, want %q（visited 种子键必须与 fold 同口径）", got, root)
+	}
+}
+
+// TestFolderMultiRootStillFolds C1（设计稿 §6.4 V2）：反向对照——两根时 I2 的按卷折叠
+// 一字不动，证明修的是"单根"而不是"取消折叠"。
+func TestFolderMultiRootStillFolds(t *testing.T) {
+	sep := string(filepath.Separator)
+	senRoot := filepath.Join(sep, "sen")
+	insRoot := filepath.Join(sep, "ins")
+	f := newFolder([]string{senRoot, insRoot}, []bool{true, false})
+	if !f.needFold {
+		t.Fatal("两根且有一根不敏感时必须启用折叠（I2 语义不得被 C1 改动）")
+	}
+	p := filepath.Join(insRoot, "Dir", "F.TXT")
+	want := strings.ToLower(strings.ReplaceAll(p, sep, "/"))
+	if got := f.fold(p); got != want {
+		t.Errorf("两根时不敏感根下的路径仍应折叠: got %q, want %q", got, want)
+	}
+}
+
+// TestWalkSingleRootKeepsCaseVariantSubtrees C1 端到端（设计稿 §6.4 V3）：
+// alpha/ 与 ALPHA/ 是两棵**不同**子树，单根扫两棵都要收齐。
+// 夹具需要所在卷区分大小写（否则两个名字无法并存），没有就跳过——本机 APFS 默认卷
+// 与 CI 都会跳过，真读数由设计稿 §6.0 E3/E5 的 CLI 跑取（用 hdiutil 临时挂一棵
+// Case-sensitive APFS，不需要 root）。
+func TestWalkSingleRootKeepsCaseVariantSubtrees(t *testing.T) {
+	root := t.TempDir()
+	if !fscase.Sensitive(root) {
+		t.Skipf("临时目录所在卷不区分大小写（%s）：alpha/ 与 ALPHA/ 无法并存", root)
+	}
+	mkDirFiles(t, filepath.Join(root, "alpha"), "a.txt")
+	mkDirFiles(t, filepath.Join(root, "ALPHA"), "b.txt")
+	res := Walk(context.Background(), []string{root}, &model.Filters{}, 2)
+	if len(res.Files) != 2 {
+		t.Fatalf("单根扫敏感卷收文件数 = %d, want 2（修前 1：后遇到的那棵子树被折叠丢掉，且不记失败）: %v",
+			len(res.Files), filePaths(res.Files))
+	}
+	if len(res.Failed) != 0 {
+		t.Fatalf("不应有失败项（修前也是 0——这正是本项「静默」的地方）: %+v", res.Failed)
 	}
 }
 
