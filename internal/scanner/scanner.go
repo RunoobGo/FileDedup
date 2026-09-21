@@ -70,9 +70,13 @@ func (q *dirQueue) close() {
 
 // Result 扫描结果。
 type Result struct {
-	Files   []*model.FileEntry
-	Failed  []model.FailedItem
-	Visited int // 实际访问目录数（诊断用）
+	Files  []*model.FileEntry
+	Failed []model.FailedItem
+	// Visited 是**真正 ReadDir 成功过**的目录数（诊断用；M67 起的口径）。
+	// 不含"登记过但没读/读失败"的目录——那类在改前也算进来，让诊断数偏高。
+	// 生产侧目前没有消费者（只有测试读它），所以本批只让它变成真话，
+	// 不新增界面呈现位（裁定③；§19.6-6）。
+	Visited int
 
 	// M6-P4（2026-09-21，04 §6.7 C 组 4）系统保护清单的三类可见计数。
 	//
@@ -261,6 +265,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	protFiles := make([]int, workers)
 	cloudSkipped := make([]int, workers)
 	wtSkipped := make([]int, workers)
+	// M67（04 §6.11 SCN-5）：Visited 的口径是"真读过一次的目录数"，与 visited
+	// 那张**去重集**不是一回事（去重集在 submit 时就登记，且无条件预置全部根），
+	// 所以另计一份，按 worker 记账、收口求和（同上，不加锁）。
+	accessed := make([]int, workers)
 	escapedRoots := make([][]string, workers)
 	// M28 卷级证据与"报 0 待判"条目：同样按 worker 记账、收尾合并（不加锁：
 	// 热路径每文件一次 Observe，锁会把并发 worker 串在同一把锁上）。
@@ -273,6 +281,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		go func(idx int) {
 			defer workerWg.Done()
 			local := make([]*model.FileEntry, 0, 1024)
+			// M67：本 worker 真正 ReadDir 成功的目录数（Visited 的唯一来源）。
+			var myAccessed int
 			// handle 处理单个目录。I3（2026-09-18 审查）：逐目录 recover——
 			// 修正前 worker 无任何兜底，阶段 0 一个 panic（异常 DirEntry 的 Info、
 			// 底层 FS 返回的畸形项等）就把整个进程带走，与手册 §7「panic 转 Failed、
@@ -303,6 +313,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					fails[idx] = append(fails[idx], model.FailedItem{Path: dir, Stage: "scan", Err: err.Error()})
 					return
 				}
+				// M67：读过成功才算"访问过"。取消排空（上面那条 return）与
+				// ReadDir 失败都不走到这里，于是 Visited 自然是 0 —— 它同时是
+				// "取消后零磁盘 I/O"的正证，不再靠 visited 那张去重集去猜。
+				myAccessed++
 				for j, de := range entries {
 					if j&1023 == 512 && ctx.Err() != nil {
 						break // 单个超大目录内的取消粒度（目录级检查之间最长 1024 项）
@@ -452,6 +466,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 				handle(dir)
 			}
 			locals[idx] = local
+			accessed[idx] = myAccessed
 		}(i)
 	}
 
@@ -486,7 +501,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	for _, fl := range fails {
 		res.Failed = append(res.Failed, fl...)
 	}
-	res.Visited = len(visited)
+	// M67：Visited = 真正 ReadDir 成功过的目录数（逐 worker 计数后求和）。
+	// 改前这里是 len(visited)，而 visited 兼任去重集且无条件预置全部根，
+	// 于是"根读失败了""取消后一次都没读"两档都被报成访问过（§19.0-3）。
+	// visited 本身**不动**：去重职责（子目录登记晚了会重复入队）与计数无关。
+	for _, n := range accessed {
+		res.Visited += n
+	}
 
 	for _, n := range protDirs {
 		res.ProtectedDirs += n

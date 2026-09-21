@@ -12,8 +12,9 @@ import (
 	"sync"
 
 	"filededup/internal/dbfile"
+	"filededup/internal/sqlconn"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // MaxScanHistory 扫描历史上限，超出淘汰最旧（CASCADE 清组/文件行）。
@@ -110,29 +111,47 @@ CREATE TABLE IF NOT EXISTS op_items (
 CREATE INDEX IF NOT EXISTS idx_op_items_op ON op_items(op_id, state);
 `
 
-// initConn 单连接：本库写入频率极低（扫描/清理各一次批量），
-// 单连接从根上消除 SQLITE_BUSY 面，也让外键开关必然生效。
+// connPragmas 是账本库的**会话级** PRAGMA，逐连接重放（机制见 internal/sqlconn）。
+//
+// M59（04 §6.11 APP-11，实测读数见设计段 §19.0-1）：改前这三条只在开池时 db.Exec
+// 一遍，而池的连接一旦被回收（空闲超时 / SetConnMaxLifetime 到期 / ErrBadConn），
+// 新建的连接就读回 SQLite 默认值 —— database/sql 不会重放任何会话级语句。
+// 本机实测：foreign_keys 1→0、busy_timeout 5000→0；synchronous 恰好默认就是 FULL，
+// 这一条侥幸无损，所以划账时不得把三条一并说成"全部失效"。
+// foreign_keys 归零不是"约束没了"那么轻：本库四处 ON DELETE CASCADE 静默失效，
+// 删扫描历史只删主表、子表留孤儿行，LoadScan 还能按旧 hist_id 捞出残留组。
+var connPragmas = []string{
+	// M11（2026-09-21 全仓审计 §五 11）：账本必须 FULL，**不与 cache 同口径**。
+	// NORMAL 下 commit 只写 WAL 不 fsync，掉电/内核崩溃时最近的 BeginOp/FinishItem
+	// 随 WAL 一起丢——而**删除动作已经生效**，账本丢了就等于永久失去撤销依据。
+	// （进程崩溃不受影响，WAL 会回放；这里防的是断电那一档。）
+	// cache 是可再生件（丢了重算即可），同一参数对它成立、对账本不成立。
+	// 代价实测可忽略（本机 APFS，2026-09-21）：500 条 FinishItem 逐条提交
+	// NORMAL 64.9ms → FULL 79.6ms，约 30µs/条，而每条对应的文件操作本身就要
+	// 一次落盘；全仓 5 个基准无一涉及账本写入路径，不存在以 NORMAL 为前提的性能结论。
+	"PRAGMA synchronous=FULL",
+	"PRAGMA foreign_keys=ON",
+	// 跨进程（fdd-cli 与 GUI 并存）瞬时占用时让路 5s，别把 BUSY 报成故障。
+	"PRAGMA busy_timeout=5000",
+}
+
+// initConn 打开账本库。
+//
+// 连接池限 1 的理由（与 M59 无关，是另一件事）：本库写入频率极低（扫描/清理各一次
+// 批量），单连接从根上消除 SQLITE_BUSY 面。M59 之前它还被当成"会话级 PRAGMA 必然
+// 生效"的依据，那个依据已在连接被回收时证伪，故收归到 connPragmas 逐连接重放；
+// 缩池本身保留（§19.6-7：不做"把池改大"，避免把 M73 的实测代价搬到账本上瞎猜）。
 func initConn(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	base, err := sqlite.NewConnector(path)
 	if err != nil {
 		return nil, err
 	}
+	db := sql.OpenDB(sqlconn.WithPragmas(base, connPragmas))
 	db.SetMaxOpenConns(1)
+	// 只留**文件级**的两条：journal_mode=WAL 是持久属性（实测新连接直接读到 wal），
+	// user_version 是库头里的整数，二者都不需要逐连接重放。
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL",
-		// M11（2026-09-21 全仓审计 §五 11）：账本必须 FULL，**不与 cache 同口径**。
-		// NORMAL 下 commit 只写 WAL 不 fsync，掉电/内核崩溃时最近的 BeginOp/FinishItem
-		// 随 WAL 一起丢——而**删除动作已经生效**，账本丢了就等于永久失去撤销依据。
-		// （进程崩溃不受影响，WAL 会回放；这里防的是断电那一档。）
-		// cache 是可再生件（丢了重算即可），同一参数对它成立、对账本不成立。
-		// 代价实测可忽略（本机 APFS，2026-09-21）：500 条 FinishItem 逐条提交
-		// NORMAL 64.9ms → FULL 79.6ms，约 30µs/条，而每条对应的文件操作本身就要
-		// 一次落盘；全仓 5 个基准无一涉及账本写入路径，不存在以 NORMAL 为前提的性能结论。
-		"PRAGMA synchronous=FULL",
-		"PRAGMA foreign_keys=ON",
-		// 跨进程（fdd-cli 与 GUI 并存）瞬时占用时让路 5s，别把 BUSY 报成故障。
-		// 本库连接池限 1，故 Exec 设置的会话级 PRAGMA 对该库所有语句都生效。
-		"PRAGMA busy_timeout=5000",
 		fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion),
 	} {
 		if _, err := db.Exec(p); err != nil {

@@ -1151,7 +1151,10 @@ func (a *App) RevealInFolder(id uint64) error {
 	if err != nil {
 		return err
 	}
-	return startCmd(cmd)
+	// M58：定位命令"起得来但立刻非零退出"过去完全静默，现象是点一下没反应。
+	return startCmd(cmd, func(werr error) {
+		a.warnBackground("reveal", fmt.Sprintf("打开所在文件夹失败（%s）：%v", e.Path, werr))
+	})
 }
 
 // revealCmd 组装"定位并选中"命令。
@@ -1190,21 +1193,52 @@ func revealCmd(path string) (*exec.Cmd, error) {
 
 // startCmd 启动外部定位命令并异步回收：
 // Start 后不 Wait 会累积僵尸进程，Wait 同步阻塞调用方，故后台回收。
-func startCmd(cmd *exec.Cmd) error {
+//
+// M58（04 §6.11 APP-8）：改前的 goroutine 写的是 `_ = cmd.Wait()`，退出状态整个
+// 丢掉。而"Start 成功、子进程随即非零退出"恰是这类命令最常见的失败形态
+// （Finder/Dolphin/Finder AppleScript 拒绝、xdg-open 没有 handler、
+// 回收站后端脚本缺失），现象就是**点一下没任何反应**——界面没说失败，
+// stderr 上也没有痕迹。现在非零退出经 onExit 上报（出口见 warnBackground）。
+//
+// onExit 只在"启动成功但没成"时调用；Start 本身失败仍走 error 返回值，
+// 两条通道不重复报同一件事。退出码 0 时**一次都不调**（反面钉见 P-19-2b：
+// 否则每开一次 Finder 就弹一条提示）。
+func startCmd(cmd *exec.Cmd, onExit func(error)) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	go func() { _ = cmd.Wait() }()
+	go func() {
+		if err := cmd.Wait(); err != nil && onExit != nil {
+			onExit(err)
+		}
+	}()
 	return nil
 }
 
 // ---------- 设置（单一事实源，01 §7.3） ----------
 
-func (a *App) settingsPath() string { return filepath.Join(a.cfgDir, "settings.json") }
+// settingsPath 给出 settings.json 的路径；配置目录不可用时以错误收口。
+//
+// M60（04 §6.11 APP-12）：cfgDir 在 startup 取不到用户配置目录时留空串
+// （app.go:278-288）。改前无条件 filepath.Join(a.cfgDir, "settings.json")，
+// 空串时返回的是**相对路径** "settings.json" ⇒ 配置被写进进程 CWD。
+// GUI 打包后 CWD 通常是只读目录或 "/"：写失败静默，而读又会把同目录下
+// **别的程序**留下的同名文件当成本应用的用户配置（实测：CWD 里放一份
+// {"theme":"dark"} 就会被读回来）。openCache:305 / openLedger:365 同档都有
+// `if a.cfgDir == ""` 的兜底，唯独这一条漏了。
+func (a *App) settingsPath() (string, error) {
+	if a.cfgDir == "" {
+		return "", fmt.Errorf("配置目录不可用（拿不到用户配置目录），本次不读写 settings.json")
+	}
+	return filepath.Join(a.cfgDir, "settings.json"), nil
+}
 
 // GetSettings 读取设置：要么完整解析的配置，要么**纯**默认值。
 func (a *App) GetSettings() Settings {
-	path := a.settingsPath()
+	path, perr := a.settingsPath()
+	if perr != nil {
+		return defaultSettings() // 目录不可用：磁盘上没有属于本应用的证据
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return defaultSettings() // 首次运行/读不到：磁盘上没有证据，静默回默认
@@ -1243,7 +1277,11 @@ func (a *App) SaveSettings(s Settings) (Settings, error) {
 	if err != nil {
 		return s, err
 	}
-	if err := os.WriteFile(a.settingsPath(), b, 0o644); err != nil {
+	path, perr := a.settingsPath()
+	if perr != nil {
+		return s, perr
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		return s, err
 	}
 	return s, nil
@@ -1688,18 +1726,32 @@ func (a *App) cchSnapshot() *cache.Cache {
 	return a.cch
 }
 
-// warnLedger 是"账本没写进去"的统一出口（M7，2026-09-21）：stderr + app:error 双通道。
+// warnBackground 是"后台动作没成，但不影响主流程结论"的统一出口：
+// stderr + app:error 双通道，同一句话。
 //
-// 为什么必须发事件：打包后的 GUI 没有控制台，只写 stderr 等于没写。修正前
-// FinishItem/FinalizeOp/persistKeepPaths/MarkItemUndo 四处落账失败都只写 stderr，
+// 为什么必须发事件：打包后的 GUI 没有控制台，只写 stderr 等于没写。
+// 出口本身只保证一件事：**绝不静默**；"哪一笔、后果是什么"由调用方写进 userMsg。
+//
+// M58 前只有 warnLedger 一个出口，M58（定位命令失败）复用同一条通道时才发现它
+// 把 "[history]" 与"账本写入失败："写死了 —— 直接复用会造出一句假话
+// （一条 Finder 启动失败被报成"账本写入失败"）。故抽出本函数，warnLedger 退居一行包装。
+func (a *App) warnBackground(tag, userMsg string) {
+	fmt.Fprintf(os.Stderr, "[%s] %s\n", tag, userMsg)
+	if a.emit != nil && a.ctx != nil {
+		a.emit(a.ctx, "app:error", map[string]string{"error": userMsg})
+	}
+}
+
+// warnLedger 是"账本没写进去"的统一出口（M7，2026-09-21）。
+//
+// 修正前 FinishItem/FinalizeOp/persistKeepPaths/MarkItemUndo 四处落账失败都只写 stderr，
 // 磁盘满时条目停在 planned、`ops:done` 横幅照报"成功"，用户按 09 §6.7
 // 「动手之前先写账本」预期可回撤，实际无账本可撤。
 //
 // 口径与 SaveScan 一致（本函数即从那里抽出），失败原因逐点由调用方写清"哪一笔、
-// 后果是什么"；这里只保证一件事：**绝不静默**。
+// 后果是什么"。
 func (a *App) warnLedger(msg string) {
-	fmt.Fprintf(os.Stderr, "[history] %s\n", msg)
-	a.emit(a.ctx, "app:error", map[string]string{"error": "账本写入失败：" + msg})
+	a.warnBackground("history", "账本写入失败："+msg)
 }
 
 // beginJournal 在任何文件系统动作之前把本次清理的完整计划落盘（写前账本）。
@@ -1774,6 +1826,19 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	if op.Kind == "move" && !a.moveTargetAllowed(op.TargetDir) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("移动目标无效或未经选择目录对话框授权，请重新选择目标目录")
+	}
+	// M61（04 §6.11 APP-13）：S4「永久删除须显式确认」原先只在执行器里
+	//（internal/ops/executor.go 的 delete 分支），而本函数的写前账本 beginJournal
+	// 在它**上游**。delete 走 undoable=false 那一档，beginJournal 不会因账本问题
+	// 拒绝 ⇒ 未确认的删除照样先在 op_records 落一条，执行器整批拒掉后再由
+	// FinalizeOp 收成一个"什么都没动"的记录，最后仍走完 ops:done 横幅。
+	// 用户从历史页读到的是"做过一次删除"。
+	// 现在把这道判断前移到置 opsRunning 之前：拒绝时既不落账、不派发、也不占互斥。
+	// 执行器那道**照旧保留** —— Execute 是导出 API，任何调用方都可能绕过 app 层
+	// 直接进（既有钉子 TestS4DeleteRequiresConfirm 钉的正是那道）。
+	if op.Kind == "delete" && !op.ConfirmDanger {
+		a.mu.Unlock()
+		return "", fmt.Errorf("永久删除需要显式确认（ConfirmDanger），已拒绝且未写入历史记录")
 	}
 	groups := a.groups
 	keepIDs := a.keepIDs
@@ -2119,7 +2184,7 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 			a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: i, Total: total, Current: it.OrigPath})
 			restored, uerr := a.undoExecuteItem(hs, meta.Kind, it)
 			if uerr != nil {
-				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
+				res.Failed = append(res.Failed, undoFailure(it, restored, uerr))
 				continue
 			}
 			res.OK++
@@ -2132,6 +2197,23 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 		a.emit(a.ctx, "ops:undo:done", res)
 	})
 	return undoID, nil
+}
+
+// undoFailure 组装一条回撤失败项（批量与单项两条通道共用，I5）。
+//
+// M86（04 §6.11 OPS-14b）：restored 非空表示"数据已经回到盘上、只是收尾失败"
+// （两份并存那一类）。ops 层的三条部分成功路径各自把落点写进了错误文本，
+// 但那是**约定**而不是**强制** —— 漏一条就又变成"报错了却不知道数据在哪"。
+// 这里兜一层：落点没出现在文本里就补上，app 层不再丢第二次。
+//
+// Path 一格**保持 OrigPath**：它标识"哪一条账目失败"，换成落点会让失败清单
+// 对不上记录明细；落点走 Err（FailedDrawer.vue 原样渲染 Err）。
+func undoFailure(it history.OpItem, restored string, uerr error) model.FailedItem {
+	msg := uerr.Error()
+	if restored != "" && !strings.Contains(msg, restored) {
+		msg += fmt.Sprintf("（数据已在 %s）", restored)
+	}
+	return model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: msg}
 }
 
 // undoOneFn 回撤执行入口的间接引用：测试据此断言"账本先落、文件后动"的先后顺序。
@@ -2167,7 +2249,10 @@ func (a *App) undoExecuteItem(hs *history.Store, kind string, it history.OpItem)
 		if merr := hs.MarkItemUndo(it.ID, history.StateUndoFailed, uerr.Error()); merr != nil {
 			a.warnLedger(fmt.Sprintf("回撤失败态落库出错 %s：%v，该条可能停留在「回撤中」，重试前请核对文件实际状态", it.OrigPath, merr))
 		}
-		return "", uerr
+		// M86（04 §6.11 OPS-14b）：restored 非空 = 数据已经回到盘上、只是收尾动作失败
+		//（两份并存那一类）。改前这里 `return "", uerr` 把落点就地丢掉，调用方只剩
+		// OrigPath 可报，用户不知道文件现在在哪。结构上保留，展示走 FailedItem.Err。
+		return restored, uerr
 	}
 	if merr := hs.MarkItemUndo(it.ID, history.StateUndone, ""); merr != nil {
 		a.warnLedger(fmt.Sprintf("回撤成功态落库出错 %s：%v，文件已还原但记录未更新，历史页可能仍显示为可回撤", it.OrigPath, merr))
@@ -2239,7 +2324,7 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 		if opCtx.Err() == nil {
 			restored, uerr := a.undoExecuteItem(hs, meta.Kind, it)
 			if uerr != nil {
-				res.Failed = append(res.Failed, model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: uerr.Error()})
+				res.Failed = append(res.Failed, undoFailure(it, restored, uerr))
 			} else {
 				res.OK++
 				res.Restored = append(res.Restored, restored)
@@ -2254,19 +2339,24 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 
 // OpenTrash 打开系统回收站（M3-T06：恢复引导）。
 func (a *App) OpenTrash() error {
+	// M58：三平台共用一句失败文案与同一条出口。回收站打不开时用户正需要它
+	//（清理完想找回东西），静默等于把恢复引导变成"点了没反应"。
+	onExit := func(werr error) {
+		a.warnBackground("trash", fmt.Sprintf("打开系统回收站失败：%v", werr))
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		home, _ := os.UserHomeDir()
-		return startCmd(exec.Command("open", filepath.Join(home, ".Trash")))
+		return startCmd(exec.Command("open", filepath.Join(home, ".Trash")), onExit)
 	case "windows":
-		return startCmd(exec.Command("explorer", "shell:RecycleBinFolder"))
+		return startCmd(exec.Command("explorer", "shell:RecycleBinFolder"), onExit)
 	default:
 		root := os.Getenv("XDG_DATA_HOME")
 		if root == "" {
 			home, _ := os.UserHomeDir()
 			root = filepath.Join(home, ".local", "share")
 		}
-		return startCmd(exec.Command("xdg-open", filepath.Join(root, "Trash", "files")))
+		return startCmd(exec.Command("xdg-open", filepath.Join(root, "Trash", "files")), onExit)
 	}
 }
 

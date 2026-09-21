@@ -5,9 +5,7 @@
 package cache
 
 import (
-	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +16,7 @@ import (
 
 	"filededup/internal/dbfile"
 	"filededup/internal/fsid"
+	"filededup/internal/sqlconn"
 
 	"modernc.org/sqlite"
 )
@@ -211,10 +210,12 @@ func createSchema(tx *sql.Tx) error {
 //	                   是裁定不是疏漏（见 history.go 的 M11 注释）。
 //
 // journal_mode=WAL 不在这里：它是文件级持久属性，建库时执行一次即可（实测新连接直接读到 wal）。
+//
+// 逐连接重放的**机制**在 internal/sqlconn（M59 收归，I5）；这里留的是本库的**策略**：
+// 两个库的 synchronous 取值本来就不同（缓存 NORMAL / 账本 FULL），把清单也搬进
+// sqlconn 就成了"一份代码写死两个库的口径"，那是假收归。
 var connPragmas = []string{"PRAGMA busy_timeout=5000", "PRAGMA synchronous=NORMAL"}
 
-// pragmaConnector 把 connPragmas 绑到"每条新建连接"上。
-//
 // 为什么不用登记原文建议的两种修法（04 §6.11 M73，实测读数见设计段 §18.0 取证 #3/#4）：
 //   - DSN URI 形（`file:...?_pragma=`）：含 `#` 的路径会被当成 URI fragment，实测库
 //     建到了 `…/a b` 而不是 `…/a b#c中文/cache.db`；Windows 路径经 url.URL 还会把
@@ -223,50 +224,13 @@ var connPragmas = []string{"PRAGMA busy_timeout=5000", "PRAGMA synchronous=NORMA
 //     139.1ms → 289.8ms（2.08 倍），本包"Lookup 用 RLock 并行"是承重的。
 //
 // 走 Connector 包装还有一条附带好处：路径始终以**纯文件名**交给驱动，与改前同形，
-// 因此不存在"新平台 URI 解析差异"这种无法在本机验证的面。
-type pragmaConnector struct{ base driver.Connector }
-
-func (pc pragmaConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	conn, err := pc.base.Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := applyConnPragmas(ctx, conn); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-func (pc pragmaConnector) Driver() driver.Driver { return pc.base.Driver() }
-
-func applyConnPragmas(ctx context.Context, conn driver.Conn) error {
-	for _, p := range connPragmas {
-		if ex, ok := conn.(driver.ExecerContext); ok {
-			if _, err := ex.ExecContext(ctx, p, nil); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
-			}
-			continue
-		}
-		stmt, err := conn.Prepare(p)
-		if err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-		_, err = stmt.Exec(nil)
-		_ = stmt.Close()
-		if err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-	}
-	return nil
-}
-
+// 因此不存在"新平台 URI 解析差异"这种无法在本机验证的面。包装本体见 sqlconn.WithPragmas。
 func openDB(path string) (*sql.DB, error) {
 	base, err := sqlite.NewConnector(path)
 	if err != nil {
 		return nil, err
 	}
-	db := sql.OpenDB(pragmaConnector{base: base})
+	db := sql.OpenDB(sqlconn.WithPragmas(base, connPragmas))
 	// 文件级 PRAGMA 与表结构（01 §7.3）；会话级的两条见 connPragmas（M73）。
 	for _, p := range []string{
 		"PRAGMA journal_mode=WAL",

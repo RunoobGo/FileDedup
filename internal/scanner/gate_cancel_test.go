@@ -124,7 +124,17 @@ func TestWalkWithGateCancelDrainsWithoutIO(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("取消后 Walk 未在 5s 内返回")
 	}
-	if len(res.Files) == 120 && res.Visited > 0 {
+	// M67 后的**补强**（设计段 §19.3 P-19-5，就地论证，不是放松）：
+	// 原句是 `if len(res.Files) == 120 && res.Visited > 0`，那个 `Visited > 0` 合取
+	// 钉的正是被 M67 推翻的旧口径（visited 当去重集 ⇒ 取消排空也至少报 1）。
+	// 新口径下取消排空恒为 0，于是整条合取**永不成立** —— 用例变成空转的假绿。
+	// 现在拆成两格：files 收齐 120 直接判失败（不再要求 visited 陪证），
+	// visited==0 另作"零磁盘 I/O"的正证。前者在改前也会红（files=0 时不触发，
+	// 触发条件是行为真的复发），后者由 scanner_m67_test.go 的 P-19-5 取到修前红。
+	if len(res.Files) == 120 {
 		t.Errorf("取消后仍完成了全部遍历（应快速 drain）: files=%d visited=%d", len(res.Files), res.Visited)
+	}
+	if res.Visited != 0 {
+		t.Errorf("取消排空阶段不得有任何一次成功的 ReadDir，实测 Visited=%d", res.Visited)
 	}
 }

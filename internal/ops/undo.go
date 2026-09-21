@@ -175,7 +175,12 @@ func undoTrash(it UndoItem) (string, error) {
 				"为避免误删第三方文件**未清理回收站侧**，两份并存，请核对后自行处理其一: %s", target, it.DestPath)
 		}
 		if err := removeSrc(it.DestPath); err != nil {
-			return target, fmt.Errorf("已复制但清理回收站侧失败（两份并存）: %w", err)
+			// M86（04 §6.11 OPS-14b，设计段 §19.0-2）：数据已经在家、只是回收站侧
+			// 没清掉，盘上是两份。这句原先只说"两份并存"却不给落点，用户既不知道
+			// 哪份是真的、也不知道该去哪删多余的一份 —— 与同函数 :174 那条同型
+			// 分支的写法不对称。补上 target 与残留位置。
+			return target, fmt.Errorf("已复制但清理回收站侧失败（两份并存，已恢复的文件在 %s，"+
+				"回收站侧残留 %s，请核对后自行删去其一）: %w", target, it.DestPath, err)
 		}
 	}
 	applyMtime(target, it.MtimeNs)

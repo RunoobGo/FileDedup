@@ -21,6 +21,18 @@ func isDefaultSettings(s Settings) bool {
 	return reflect.DeepEqual(s, defaultSettings())
 }
 
+// mustSettingsPath 跟随 M60 的签名变化（cfgDir 未初始化时不再静默返回相对路径，
+// 而是回 error）。这里把 error 直接判死：这几个用例走 newHistApp，cfgDir 必然已设，
+// 回 error 就是用例前提塌了。
+func mustSettingsPath(t *testing.T, a *App) string {
+	t.Helper()
+	path, err := a.settingsPath()
+	if err != nil {
+		t.Fatalf("settingsPath() 报错（本文件用例的 cfgDir 应已初始化）：%v", err)
+	}
+	return path
+}
+
 // ---------- M10a ----------
 
 // pagedNoPanic 把" panic 即失败"写成断言，让 RED 的读数是一句话而不是堆栈。
@@ -113,7 +125,7 @@ func TestGetSettingsCorruptIsPureDefaultAndVisible(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a, rec := newHistApp(t)
-			path := a.settingsPath()
+			path := mustSettingsPath(t, a)
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -152,7 +164,7 @@ func TestGetSettingsCorruptIsPureDefaultAndVisible(t *testing.T) {
 // （首次运行是常态，报"设置损坏"是假警）。
 func TestGetSettingsValidAndMissingUnaffected(t *testing.T) {
 	a, rec := newHistApp(t)
-	if err := os.MkdirAll(filepath.Dir(a.settingsPath()), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(mustSettingsPath(t, a)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,7 +187,7 @@ func TestGetSettingsValidAndMissingUnaffected(t *testing.T) {
 	if countEvent(rec, "app:error") != 0 {
 		t.Fatalf("合法配置不该报错：%s", ledgerErrText(t, rec))
 	}
-	if _, err := os.Stat(a.settingsPath() + ".corrupt"); err == nil {
+	if _, err := os.Stat(mustSettingsPath(t, a) + ".corrupt"); err == nil {
 		t.Fatal("合法配置被误改名为 .corrupt")
 	}
 }

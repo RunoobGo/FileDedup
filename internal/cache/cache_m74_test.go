@@ -19,6 +19,7 @@ import (
 
 	"filededup/internal/dbfile"
 	"filededup/internal/fsid"
+	"filededup/internal/sqlconn"
 
 	"modernc.org/sqlite"
 )
@@ -90,7 +91,7 @@ func newCacheOn(path string) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Cache{db: sql.OpenDB(pragmaConnector{base: base}), path: path}, nil
+	return &Cache{db: sql.OpenDB(sqlconn.WithPragmas(base, connPragmas)), path: path}, nil
 }
 
 // corruptionEvidence 另开一个与实例无关的句柄去查同一张表，取回底层错误原文。
