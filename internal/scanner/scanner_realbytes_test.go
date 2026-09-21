@@ -1,13 +1,14 @@
 package scanner
 
 // M6-P2（2026-09-21）实占口径的遍历层探针（设计稿 §3.3 的 U2 遍历腿 + U3，
-// 外加实施中新增的两条边界用例）。
+// 外加实施中新增的两条边界用例）。M28（2026-09-21）在其上补三条：卷级证据成立 /
+// 不成立 / 与被过滤文件无关（设计稿 §11.3 的 V5~V7）。
 //
 // 这一层钉住的是"扫描器有没有把平台读数如实带进条目"：
 //   - 稀疏文件：实占显著小于逻辑大小——本口径的全部收益所在；
 //   - 普通文件：实占可读，且不小于逻辑大小（块对齐只会更大）；
-//   - 全洞文件：实占**判为未知**而非 0（刻意取舍，理由见
-//     TestWalkAllHoleFileNeverReportsZeroActual 的注释）。
+//   - 全洞文件：**无证据的卷**上判为未知（M6-P2 的取舍），**有证据的卷**上
+//     采信为真 0（M28 解锁的收益）——两侧各有一条用例，互为反向对照。
 //
 // 断言里刻意**不出现块大小常量**：512 与 4096 在不同卷上都会出现，把块尺寸
 // 钉进断言等于把一个平台事实伪装成跨平台事实。
@@ -54,14 +55,39 @@ func mkSparse(t *testing.T, path string, size int64, tailLen int64) {
 	}
 }
 
-// probeActual 走被测链路（realbytes）读一个夹具的实占。
+// probeActual 读一个夹具的实占（不带卷级证据的单文件口径）。
+// M28 之后没有"一步到位"的入口可用了，这里显式写两步：读原始读数 + 按
+// "本卷未被证明"判定——正是 requireTailSparse 想问的那个问题。
 func probeActual(t *testing.T, path string) (actual uint64, known bool) {
 	t.Helper()
 	st, err := os.Stat(path)
 	if err != nil {
 		t.Skipf("探针 stat 失败，跳过：%v", err)
 	}
-	return realbytes.Of(path, uint64(st.Size()), st)
+	rep, ok := realbytes.Reported(path, st)
+	return realbytes.From(uint64(st.Size()), rep, ok, false)
+}
+
+// requireAllHoleReportsZero 环境前提（M28）：本卷对"一个字节都不写"的文件
+// 报 0 blocks。不满足（把洞落地分配、或根本读不到）时 skip——判据在这种卷上
+// 没有可断言的对象（照 scripts/test-windows-quarantine.sh 的约定：环境不满足
+// 在使用点自探，不进隔离清单）。
+//
+// 这里**直接看原始读数**而不是走 realbytes.From：要问的正是"平台报了什么"，
+// 而不是"判定成了什么"（后者正是 M28 要改的那一步）。
+func requireAllHoleReportsZero(t *testing.T, path string) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("夹具 stat 失败：%v", err)
+	}
+	rep, ok := realbytes.Reported(path, st)
+	if !ok {
+		t.Skipf("本平台读不到实占（ok=false），全洞判据的前提不成立")
+	}
+	if rep != 0 {
+		t.Skipf("本卷把全洞文件落地分配（报 %d 字节），全洞判据的前提不成立", rep)
+	}
 }
 
 // requireTailSparse 环境前提：本卷对"大文件 + 尾部写"确实按稀疏计账。
@@ -106,7 +132,7 @@ func TestWalkRecordsSparseActualBelowSize(t *testing.T) {
 	}
 }
 
-// TestWalkAllHoleFileNeverReportsZeroActual 全洞文件（不写任何数据）的处置。
+// TestWalkAllHoleFileNeverReportsZeroActual 全洞文件（不写任何数据）在**无证据**卷上的处置。
 //
 // 这是 M6-P2 里唯一一处**故意放弃收益**的判定，必须留字：
 // st_blocks==0 有两种成因——① 文件全是洞（真占 0 字节）；② 该卷压根不跟踪
@@ -117,8 +143,11 @@ func TestWalkRecordsSparseActualBelowSize(t *testing.T) {
 //     不新增任何错误结论，只是这一类收益拿不到。
 //
 // 选后者的依据是本轮贯穿全仓的一条纪律：数字宁可说"不知道"，不许说"知道且错"。
-// 想同时拿到收益与正确性，需要按卷判 st_blocks 是否可信（statfs 的 f_type +
-// 每卷一次探测），已登记为开放项，不在本轮范围。
+//
+// ★ M28（2026-09-21）更新了这条注释（**断言一字未动**）：本用例的目录里只有全洞
+// 文件，因此本卷在本趟遍历里**没有任何非零证据**，正好落在"未统计"一侧——它从
+// "唯一可能的处置"变成了"无证据一侧的钉子"。有证据一侧（真 0）由
+// TestWalkAllHoleOnProvenVolumeReportsRealZero 钉，两侧互为反向对照。
 //
 // 本用例不做环境探测、任何卷上都成立：全洞文件的 Actual 在两种卷行为下都必然
 // 等于 Size（报 0 blocks → 回退逻辑；把洞落地 → 实占本来就等于逻辑）。
@@ -143,7 +172,8 @@ func TestWalkAllHoleFileNeverReportsZeroActual(t *testing.T) {
 	if e.ActualKnown {
 		t.Log("本卷把全洞落地分配：实占确实等于逻辑，known=true 合理")
 	} else {
-		t.Log("本卷对全洞报 0 blocks：按『未统计』回退逻辑口径（刻意放弃这一类收益，见函数注释）")
+		t.Log("本卷对全洞报 0 blocks 且本趟无任何非零证据：按『未统计』回退逻辑口径" +
+			"（M6-P2 的取舍；M28 只对有证据的卷解锁真 0）")
 	}
 }
 
@@ -192,5 +222,97 @@ func TestWalkZeroSizeFileStillSkipped(t *testing.T) {
 	res := Walk(context.Background(), []string{root}, &model.Filters{}, 2)
 	if len(res.Files) != 0 {
 		t.Fatalf("0 字节文件进了语料：%+v", res.Files)
+	}
+}
+
+// TestWalkAllHoleOnProvenVolumeReportsRealZero M28（设计稿 §11.3 V5）：本卷已有
+// "会报非零实占"的证据时，全洞文件的 0 采信为真读数。
+//
+// 证据就是同目录那枚普通文件——它报出非零即证明本卷在 st_blocks 里报真实分配，
+// 于是全洞文件的 0 不再是"故障卷恒报 0"的可疑形态。这条与 U6 是同一枚夹具的
+// 两个世界：U6 的目录里只有全洞文件（无证据 ⇒ 未统计），本用例多一枚普通文件。
+func TestWalkAllHoleOnProvenVolumeReportsRealZero(t *testing.T) {
+	root := t.TempDir()
+	hole := filepath.Join(root, "holes.bin")
+	mkSparse(t, hole, sparseSize, 0)
+	requireAllHoleReportsZero(t, hole)
+	if err := os.WriteFile(filepath.Join(root, "plain.bin"), make([]byte, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := Walk(context.Background(), []string{root}, &model.Filters{}, 2)
+	if len(res.Files) != 2 {
+		t.Fatalf("收集数 = %d, want 2", len(res.Files))
+	}
+	for _, e := range res.Files {
+		switch filepath.Base(e.Path) {
+		case "holes.bin":
+			if !e.ActualKnown {
+				t.Fatal("全洞条目 ActualKnown = false：同卷普通文件的非零读数没有构成证据")
+			}
+			if e.Actual != 0 {
+				t.Errorf("全洞条目实占 = %d, want 0", e.Actual)
+			}
+			if e.ActualBytes() != 0 {
+				t.Errorf("ActualBytes = %d, want 0（组级可释放量由此归零）", e.ActualBytes())
+			}
+		case "plain.bin":
+			if !e.ActualKnown || e.Actual == 0 {
+				t.Errorf("普通条目 = (%d,%v), want 非零且 known", e.Actual, e.ActualKnown)
+			}
+		default:
+			t.Errorf("意外条目 %s", e.Path)
+		}
+	}
+}
+
+// TestWalkAllHoleOnUnprovenVolumeStaysUnknown M28（设计稿 §11.3 V6）：**没有**任何
+// 非零证据的卷上，全洞文件的 0 一律判"未统计"（fail-closed）——这正是"恒报 0 的
+// 故障卷"在读数上的形态，也是 M6-P2 规则 2 的全部理由。
+//
+// 它是 V5 的反向对照：证据机制被拆掉（M-M28-a/c）时本用例仍绿、V5 红；
+// 而"信任判据放宽"（M-M28-b/c）时本用例红。两条各守一边，缺一条就等于没有判据。
+func TestWalkAllHoleOnUnprovenVolumeStaysUnknown(t *testing.T) {
+	root := t.TempDir()
+	hole := filepath.Join(root, "holes.bin")
+	mkSparse(t, hole, sparseSize, 0)
+	requireAllHoleReportsZero(t, hole)
+
+	res := Walk(context.Background(), []string{root}, &model.Filters{}, 2)
+	if len(res.Files) != 1 {
+		t.Fatalf("收集数 = %d, want 1", len(res.Files))
+	}
+	e := res.Files[0]
+	if e.ActualKnown {
+		t.Error("ActualKnown = true：本趟没有任何非零证据，0 却被采信了")
+	}
+	if e.Actual != uint64(sparseSize) {
+		t.Errorf("Actual = %d, want %d（未统计退回逻辑口径）", e.Actual, sparseSize)
+	}
+}
+
+// TestWalkEvidenceIgnoresFilters M28（设计稿 §11.1 的口径选择，§11.3 V7）：卷证据的
+// 采集**不看用户过滤**——被 ExcludeExts 挡掉的文件同样构成证据（卷会不会报非零
+// 实占，与该卷上用户想不想要某类文件无关）。采集点若退回 matcher.Apply 之后，
+// 本例即红（变异 M-M28-g）。
+func TestWalkEvidenceIgnoresFilters(t *testing.T) {
+	root := t.TempDir()
+	hole := filepath.Join(root, "holes.bin")
+	mkSparse(t, hole, sparseSize, 0)
+	requireAllHoleReportsZero(t, hole)
+	if err := os.WriteFile(filepath.Join(root, "plain.txt"), make([]byte, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := Walk(context.Background(), []string{root}, &model.Filters{ExcludeExts: []string{".txt"}}, 2)
+	if len(res.Files) != 1 {
+		t.Fatalf("收集数 = %d, want 1（.txt 已被排除，证据不该把文件带进语料）", len(res.Files))
+	}
+	e := res.Files[0]
+	if filepath.Base(e.Path) != "holes.bin" {
+		t.Fatalf("意外条目 %s", e.Path)
+	}
+	if !e.ActualKnown || e.Actual != 0 {
+		t.Errorf("全洞条目 = (%d,%v), want (0,true)：被排除的普通文件也是本卷证据", e.Actual, e.ActualKnown)
 	}
 }

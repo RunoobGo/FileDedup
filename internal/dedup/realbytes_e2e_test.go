@@ -146,7 +146,8 @@ func requireU4Sparse(t *testing.T, dir string) {
 	if err != nil {
 		t.Skipf("探针 stat 失败：%v", err)
 	}
-	actual, known := realbytes.Of(probe, uint64(u4SparseSize), st)
+	rep, rok := realbytes.Reported(probe, st)
+	actual, known := realbytes.From(uint64(u4SparseSize), rep, rok, false)
 	if !known {
 		t.Skipf("本平台读不到实占，本用例前提不成立")
 	}

@@ -3,7 +3,9 @@
 package realbytes
 
 import (
+	"hash/fnv"
 	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -34,7 +36,7 @@ var (
 // "低 32 位恰好全是 1"的合法尺寸，故必须靠 GetLastError 二选一，不能只看返回值。
 const invalidFileSize = 0xFFFFFFFF
 
-func reported(path string, info os.FileInfo) (uint64, bool) {
+func Reported(path string, info os.FileInfo) (uint64, bool) {
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, false // 含 NUL 等非法路径：不猜，走回退
@@ -49,4 +51,19 @@ func reported(path string, info os.FileInfo) (uint64, bool) {
 		return 0, false
 	}
 	return uint64(high)<<32 | uint64(low), true
+}
+
+// VolumeID windows：filepath.VolumeName 给出 "C:" / "\\server\share" /
+// "\\?\Volume{…}" 一类稳定前缀，FNV-1a 成 uint64 只为与 unix 的 st_dev
+// 共用一套键类型（M28）。空前缀（相对路径一类）⇒ (0,false)——拿不到卷标识
+// 就永远不给卷级证据（fail-closed）。哈希冲突概率约 2⁻⁶⁴，方向是"两卷证据
+// 混池"，见设计稿 §11.5-6。
+func VolumeID(path string, info os.FileInfo) (uint64, bool) {
+	vol := filepath.VolumeName(path)
+	if vol == "" {
+		return 0, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(vol))
+	return h.Sum64(), true
 }

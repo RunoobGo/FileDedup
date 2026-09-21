@@ -192,6 +192,13 @@ func Walk(ctx context.Context, roots []string, f *model.Filters, workers int) *R
 	return WalkWithGate(ctx, roots, f, workers, nil)
 }
 
+// zeroCase 一条"平台报 0 实占"的待判条目（M28）：遍历期证据还不全（证据可能来自
+// 尚未遍历到的文件），收尾拿到卷级证据后再定它是不是真 0。vid 是该条目的卷标识。
+type zeroCase struct {
+	e   *model.FileEntry
+	vid uint64
+}
+
 // WalkWithGate 并行遍历 roots：
 //   - 跳过符号链接与 0 字节文件（内置行为）
 //   - 应用过滤器
@@ -261,6 +268,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	cloudSkipped := make([]int, workers)
 	wtSkipped := make([]int, workers)
 	escapedRoots := make([][]string, workers)
+	// M28 卷级证据与"报 0 待判"条目：同样按 worker 记账、收尾合并（不加锁：
+	// 热路径每文件一次 Observe，锁会把并发 worker 串在同一把锁上）。
+	tracking := make([]realbytes.Tracking, workers)
+	pendZero := make([][]zeroCase, workers)
 	var workerWg sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
@@ -406,6 +417,16 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					if size == 0 {
 						continue // 0 字节内置跳过
 					}
+					// M28 实占读数与卷证据，**排在 matcher.Apply 之前**：卷会不会
+					// 报非零实占与用户勾了什么过滤无关，被挡掉的文件同样作数
+					// （设计稿 §11.1）。unix 上零额外 syscall——读数与卷标识都
+					// 来自同一个 Stat_t；Windows 腿因此多一次按路径查询，
+					// M29 记的那项开销随之从"每候选"扩到"每普通文件"（§11.5-1）。
+					rep, rok := realbytes.Reported(full, info)
+					vid, vok := realbytes.VolumeID(full, info)
+					if vok {
+						tracking[idx].Observe(vid, rep, rok)
+					}
 					rel := relativeTo(prefixes, full)
 					if !matcher.Apply(de.Name(), rel, size) {
 						continue
@@ -419,9 +440,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					}
 					e.Key = keyFromInfo(full, info) // unix 填充；win 返回未解析
 					// M6-P2 实占：复用同一个 info（unix 零额外 syscall，读的是
-					// Stat_t.Blocks）。放在 matcher.Apply **之后**是刻意的——
-					// Windows 腿要按路径查询，被过滤器挡掉的文件不该付这次开销。
-					e.Actual, e.ActualKnown = realbytes.Of(full, size, info)
+					// Stat_t.Blocks）。M28 起遍历期一律按"本卷未被证明会报非零"
+					// 判定（= M6-P2 的原口径）——此刻定论会让读数取决于并发时序，
+					// 有证据的卷在收尾重判（见 workerWg.Wait 之后）。
+					e.Actual, e.ActualKnown = realbytes.From(size, rep, rok, false)
+					if vok && rok && rep == 0 {
+						pendZero[idx] = append(pendZero[idx], zeroCase{e: e, vid: vid})
+					}
 					local = append(local, e)
 				}
 			}
@@ -447,6 +472,19 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}()
 
 	workerWg.Wait()
+
+	// M28 收尾：卷级证据收齐后重判"报 0 实占"的条目（设计稿 §11.1 不变式 3）。
+	// 必须在所有 worker 结束后做——证据可能来自任何一个 worker 见到的文件，
+	// 遍历中定论会让同一语料两次扫描因线程时序不同而读数不同。重判仍走 From
+	// （一处判定一处实现）：有证据的卷采信为真 0，无证据的维持 M6-P2 的回退。
+	for i := 1; i < workers; i++ {
+		tracking[0].Merge(&tracking[i])
+	}
+	for _, zs := range pendZero {
+		for _, z := range zs {
+			z.e.Actual, z.e.ActualKnown = realbytes.From(z.e.Size, 0, true, tracking[0].Trust(z.vid))
+		}
+	}
 
 	for _, l := range locals {
 		res.Files = append(res.Files, l...)
