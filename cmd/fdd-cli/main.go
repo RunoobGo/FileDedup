@@ -55,6 +55,12 @@ type report struct {
 		// 占位文件，或用户用 -allow-cloud-hydration 显式允许读取——后者由
 		// 命令行自身知情，报告里不复述，避免为一个大可不必的状态加字段。
 		SkippedCloudFiles int `json:"skipped_cloud_files"`
+		// M21（2026-09-21）工作临时名文件跳过数：应用自己的 .fdd-* 残留
+		// （硬链接合并/回撤的中间产物与崩溃残片）。它们是三类"跳过"里最容易被
+		// 误认成"文件凭空消失"的一类——名字不以 "." 开头，隐藏规则挡不住。
+		// 口径同 protected_files：命中不是失败，但必须看得见。判据是名字形态，
+		// 无法区分"我们的残留"与"用户恰好这样命名的文件"。
+		SkippedWorkTempFiles int `json:"skipped_work_temp_files"`
 		// M6-P2（2026-09-21）实占口径合计。reclaimable_bytes 保留逻辑口径不动
 		// （它是历史数字与既往报表的参照），实占另起一键，两数之差就是稀疏/
 		// 压缩文件此前被虚报的量。
@@ -155,6 +161,7 @@ func main() {
 	r.Stats.ProtectedDirs = int(p.ProtectedDirs())
 	r.Stats.ProtectedFiles = int(p.ProtectedFiles())
 	r.Stats.SkippedCloudFiles = int(p.CloudSkipped())
+	r.Stats.SkippedWorkTempFiles = int(p.WorkTempSkipped())
 
 	var w io.Writer = os.Stdout
 	if *out != "" {

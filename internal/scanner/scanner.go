@@ -90,6 +90,26 @@ type Result struct {
 	// 用户最关心的"能省多少"，所以必须单列一个数，让界面能说清"这次没算的是
 	// 云端文件，共 N 个"。允许水合（AllowCloudHydration）时照常读取、**不计数**。
 	SkippedCloudFiles int
+	// SkippedWorkTempFiles 是 M21 按 worktemp.IsTempName 跳过的工作临时名文件数
+	// （应用自己的 .fdd-* 残留，04 §6.8.8 M21）。
+	//
+	// 为什么这个数必须存在：这类文件**不以 "." 开头**，隐藏规则挡不住它，
+	// 用户视角是"这个文件凭空不参与去重"——修正前它不计语料、不写日志、不进任何
+	// 计数，是三类"跳过"里唯一无声的一类（保护清单见 ProtectedFiles、
+	// 云端占位见 SkippedCloudFiles，都已有数）。GUI 无控制台，唯一的可见面就是计数。
+	//
+	// 口径（与 cloud/protected 同族，逐条见设计稿 §7.1）：
+	//   - 在跳过点自增，排在扩展名/大小过滤与文件侧隐藏规则**之前**——数的是
+	//     "到达的文件项里名字命中"的个数，与用户怎么设过滤无关（放过滤器之后，
+	//     一个 .txt 的残留会被扩展名过滤吃掉，这个数就开始说谎）；
+	//   - 只数**文件**：临时命名的目录不会被跳过（M1 修正），也就没有它的数；
+	//   - 不计 Failed：命中不是失败；
+	//   - 被剪枝/排除的目录没有下潜，其中的临时名文件**不进数**——不知道的不许估。
+	//
+	// ★ 判据是**名字形态**，不是来源标记：用户自己命名为 report.pdf.fdd-old 的
+	// 正常文件同样在这个数里，二者不可分辨。界面文案（M8）不得写成"清理了 N 个
+	// 残留"，只能中性表述。
+	SkippedWorkTempFiles int
 	// UnprotectedRoots 是"因为用户显式指定了它，所以保护对它失效"的根路径。
 	// 界面必须据此警示（M8）：这些根扫出来的东西可能全是系统元数据，
 	// 也可能是用户唯一真正想扫的——两种情况下他都该知道自己脱离了保护范围。
@@ -263,6 +283,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	protDirs := make([]int, workers)
 	protFiles := make([]int, workers)
 	cloudSkipped := make([]int, workers)
+	wtSkipped := make([]int, workers)
 	escapedRoots := make([][]string, workers)
 	var workerWg sync.WaitGroup
 
@@ -325,7 +346,15 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					// 之后），而此处在 IsDir 分支之前执行——修正前一个名为
 					// "album.fdd-old-collection" 的用户目录会让整棵子树静默
 					// 漏扫。目录名含标记时按其内容逐项判定即可。
+					//
+					// M21（2026-09-21）：命中要**计数**。这里自增而非记 Failed
+					// （同保护清单/云端占位：命中不是失败），且刻意排在隐藏规则
+					// 与 matcher.Apply **之前**——数的是"到达的文件项里名字命中"
+					// 的个数，与用户怎么设过滤无关（放之后，一个 .txt 的残留会被
+					// 扩展名过滤吃掉，这个数就开始说谎）。判据分不出"我们的残留"
+					// 与"用户恰好这样命名的文件"，见字段注释。
 					if !typ.IsDir() && worktemp.IsTempName(de.Name()) {
+						wtSkipped[idx]++
 						continue
 					}
 					if typ.IsDir() {
@@ -459,6 +488,9 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}
 	for _, n := range cloudSkipped {
 		res.SkippedCloudFiles += n
+	}
+	for _, n := range wtSkipped {
+		res.SkippedWorkTempFiles += n
 	}
 	// 逃逸根去重后排序：多个 worker 可能各自报同一个根，而 worker 完成顺序
 	// 不确定——不排序就是同一份输入两次扫描给出两份清单（回归无法断言，

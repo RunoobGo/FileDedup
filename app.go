@@ -152,6 +152,17 @@ type ScanSummary struct {
 	// ★ 同 UnprotectedRoots 的口径缺口：history.db 没存这个数，从记录页恢复时
 	// 只能显示"未统计"，不得用零值冒充"这一轮没有云端文件"。
 	SkippedCloudFiles uint64 `json:"skippedCloudFiles"`
+	// SkippedWorkTempFiles 本轮按 worktemp.IsTempName 跳过的工作临时名文件数
+	// （M21，04 §6.8.8）。这是三类"跳过"里最后被点亮的一类：保护清单与云端占位
+	// 早已有数，而应用自己的 .fdd-* 残留此前不计语料、不记日志、不进任何计数。
+	//
+	// ★ 判据是**名字形态**，分不出"我们的残留"与"用户恰好这样命名的文件"——
+	// 横幅文案（M8）不得写成"清理了 N 个残留"，只能中性表述。本条只到 JSON
+	// 与 CLI 报告，界面不呈现（裁定②）。
+	//
+	// ★ 同上面两条的口径缺口：history.db 没存这个数，从记录页恢复时只能显示
+	// "未统计"，不得用零值冒充"这一轮没有工作临时文件"。
+	SkippedWorkTempFiles uint64 `json:"skippedWorkTempFiles"`
 	// UnprotectedRoots 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名
 	// 了清单内的路径或其内部）。警示文案属 M8（本轮只有 JSON 与 CLI 报告）。
 	//
@@ -622,7 +633,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		}
 		a.resultsReady = true
 		a.curHistID = histID
-		// M6-P4：三个保护清单口径在与 superseded() 判定同一临界区内取。
+		// M6-P4 / M21：四个"按轮计数"口径在与 superseded() 判定同一临界区内取。
 		// 为什么不能留到锁外的 emit 里现取：Run 一开始就把按轮计数器归零，
 		// 而 a.scanInFlight 在扫描体第一行就复位（新扫描因此可通过在途检查，
 		// 只靠 resultGen 判取代）。锁内取数等于把结论钉死成"未被取代 ⇒
@@ -630,18 +641,20 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		pDirs := a.pipe.ProtectedDirs()
 		pFiles := a.pipe.ProtectedFiles()
 		cloudSkipped := a.pipe.CloudSkipped()
+		wtSkipped := a.pipe.WorkTempSkipped()
 		unprot := a.pipe.UnprotectedRoots()
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
-			Groups:            len(groups),
-			Reclaimable:       reclaim,
-			ReclaimableActual: reclaimActual,
-			FilesFailed:       len(failed),
-			Elapsed:           elapsed.String(),
-			ProtectedDirs:     pDirs,
-			ProtectedFiles:    pFiles,
-			SkippedCloudFiles: cloudSkipped,
-			UnprotectedRoots:  unprot,
+			Groups:               len(groups),
+			Reclaimable:          reclaim,
+			ReclaimableActual:    reclaimActual,
+			FilesFailed:          len(failed),
+			Elapsed:              elapsed.String(),
+			ProtectedDirs:        pDirs,
+			ProtectedFiles:       pFiles,
+			SkippedCloudFiles:    cloudSkipped,
+			SkippedWorkTempFiles: wtSkipped,
+			UnprotectedRoots:     unprot,
 		})
 	})
 	return taskID, nil

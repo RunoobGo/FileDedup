@@ -288,8 +288,9 @@ func genShapes(out string, rng *mrand.Rand, m *manifest) {
 		m.Shapes.Symlink = true
 	}
 
-	// ③ .fdd-old 残留：与保留文件逐字节相同，且**不计数**（扫描器按
-	// worktemp.IsTempName 忽略）。这正是缺陷 6 的现场：忽略规则一旦失效，
+	// ③ .fdd-old 残留：与保留文件逐字节相同，**不计入 TotalFiles**（扫描器按
+	// worktemp.IsTempName 忽略，且 M21 起计入 skipped_work_temp_files——本语料
+	// 因此是该计数的一个可对账常数 1）。这正是缺陷 6 的现场：忽略规则一旦失效，
 	// 重扫必然多出这个重复组，冒烟的组数对账立刻变红。
 	keep := filepath.Join(dir, keepName)
 	if err := writeRandom(keep, shapeSize, rng); err != nil {
