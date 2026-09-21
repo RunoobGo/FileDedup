@@ -132,6 +132,12 @@ type Options struct {
 // 流），而"该不该拦""拦了之后账怎么记"这两件真正可测的事不该留白。
 var adsCheck = ads.Check
 
+// verifyFileFn 校验入口的间接引用（与 adsCheck、symlinkCreateFn 同族的测试接缝）。
+// M54 用它把"校验通过之后、破坏性动作之前文件才消失"这一窗口做成**确定性**场景：
+// 接缝体先跑真校验，再把文件删掉，于是紧跟着的 identityStatus 必然看到 ENOENT。
+// 没有接缝就只能靠真实并发，那种用例在门禁上是掷硬币。
+var verifyFileFn = VerifyFile
+
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
 // 安全语义（01 §9 / 02 决策 7）：
 //   - 保留项拒绝执行（S2）；delete 必须 ConfirmDanger（S4）
@@ -229,7 +235,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			report(e.Path)
 			continue
 		}
-		v, vid := VerifyFile(e, hashByID[fid], pool)
+		v, vid := verifyFileFn(e, hashByID[fid], pool)
 		switch v {
 		case VerdictSkipped:
 			res.Skipped = append(res.Skipped, e.Path) // S8：已消失 = 目标达成
@@ -239,7 +245,15 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: "校验失败：文件在扫描后被修改"})
 			emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: "校验失败：文件在扫描后被修改"})
 			report(e.Path)
-		default:
+		case VerdictUnverifiable:
+			// M52（04 §6.11 OPS-11）：与上一条**处置相同、表述不同**。"打不开/读不了/
+			// 不是普通文件"没有任何内容级证据，写成"文件在扫描后被修改"会把我们的
+			// 无能为力转嫁成用户的行为，处置建议也跟着错（修权限 vs 重扫）。
+			const msg = "校验无从判定（打不开、读不了或不是普通文件），已拦截：盘上未做任何改动"
+			res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: msg})
+			emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: msg})
+			report(e.Path)
+		case VerdictPass:
 			// M6-P3 备用数据流守卫：内容校验已通过、正要进 toProcess 的那一刻。
 			// 位置只有这一处是有意的——五种 op.Kind（trash/delete/move/hardlink/
 			// symlink）全部只处理进了 toProcess 的项，而 toProcess 唯一来源就是
@@ -257,6 +271,14 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			toProcess = append(toProcess, e)
 			procIDs = append(procIDs, vid)
+		default:
+			// M52 加固腿（判据 4 的第二半）：未知/越界结论一律落 Failed。
+			// 修前这里是"通过"分支——任何新增 Verdict 只要有一处 switch 忘了列，
+			// 文件就被当成"已校验"送进破坏性动作队列（P-5 探针实测真删了文件）。
+			msg := fmt.Sprintf("未知校验结论（值 %d），按失败处理：盘上未做任何改动", int(v))
+			res.Failed = append(res.Failed, model.FailedItem{Path: e.Path, Stage: "verify", Err: msg})
+			emitItem(ItemResult{OrigPath: e.Path, State: "failed", Err: msg})
+			report(e.Path)
 		}
 	}
 
@@ -300,6 +322,29 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "failed", Err: o.err})
 		}
 		report(toProcess[i].Path)
+	}
+
+	// guardIdentity 破坏性动作前的身份复核，六处共用一份处置（M54/OPS-13）。
+	// 返回 true 表示这一项已经记完账、调用方应当跳过。
+	//
+	// 修前六处各自 `if !identityStill(...) { 记 Failed "已被替换" }`，把两件事说成一件事：
+	//   - 路径上的对象**已经没了**（用户自己删了这份 dup）⇒ 与 VerifyFile 的
+	//     VerdictSkipped、delete 分支的 os.IsNotExist→Skipped 同一个形状，目标已达成；
+	//   - 被 rename 换成另一个 inode ⇒ 必须拦截，放行就是错删第三方文件。
+	// 混记 Failed 的代价不只是文案：Skipped 与 OK 同路进 app.go 的 gone 集合去清
+	// 结果集与 byID（app.go:1898-1901），记 Failed 就在结果集里留一个盘上没有的路径。
+	guardIdentity := func(i int, path string) bool {
+		still, gone := identityStatus(path, procIDs[i])
+		if still {
+			return false
+		}
+		if gone {
+			settle(i, outcome{code: ocSkipped})
+		} else {
+			settle(i, outcome{code: ocFailed, stage: "verify",
+				err: "文件在扫描后被替换（inode 已变化），已拦截"})
+		}
+		return true
 	}
 
 	// C7：worker 内 panic 守卫落地。fn（trash/VerifyFile/HardlinkMerge）panic 会
@@ -400,9 +445,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		// 路径可能被换成另一 inode——彼时删的是"第三方文件"，必须拦截。
 		usable := make([]int, 0, len(toProcess))
 		for i, e := range toProcess {
-			if !identityStill(e.Path, procIDs[i]) {
-				settle(i, outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+			if guardIdentity(i, e.Path) { // H2 复核；M54 把"已消失"与"被替换"分开处置
 				continue
 			}
 			usable = append(usable, i)
@@ -480,9 +523,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					// 是全仓唯一"复核不紧贴动作"的时序（delete/hardlink/symlink/move
 					// 都在动手前一行复核）。批量失败到逐个重试这段延迟不是零，
 					// 窗口内第三方顶替后，我们照旧把顶替者派进回收站。
-					if !identityStill(p, procIDs[i]) {
-						settle(i, outcome{code: ocFailed, stage: "verify",
-							err: "文件在扫描后被替换（inode 已变化），已拦截"})
+					if guardIdentity(i, p) { // OPS-7：紧贴动作再复核一次
 						return
 					}
 					if m, err := trash([]string{p}); err != nil {
@@ -499,9 +540,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	case "delete":
 		runIndexed(ctx, len(toProcess), opWorkers, func(i int) {
 			e := toProcess[i]
-			if !identityStill(e.Path, procIDs[i]) { // H2
-				settle(i, outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				return
 			}
 			if err := os.Remove(e.Path); err != nil {
@@ -523,9 +562,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if ctx.Err() != nil {
 				break // move 串行执行，取消后立即停止派发（P2）
 			}
-			if !identityStill(e.Path, procIDs[i]) { // H2
-				settle(i, outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				continue
 			}
 			if dst, err := MoveFile(e.Path, op.TargetDir); err != nil {
@@ -544,9 +581,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			}
 			// H2：dup 在动作前仍须指向校验过的那份内容
-			if !identityStill(e.Path, procIDs[i]) {
-				settle(i, outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				return
 			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
@@ -562,6 +597,20 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			case VerdictFailed:
 				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"})
+				return
+			case VerdictUnverifiable:
+				// M52：与 dup 侧同一分开口径（处置都是拦截，话不能说成"被改过"）。
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "保留源无从校验（打不开、读不了或不是普通文件），已拦截（S1）"})
+				return
+			case VerdictPass:
+				// 通过：显式列出来，好让下面那条 default 真的是"未知"兜底。
+				// 少了这一格，VerdictPass 自己就会掉进 default ⇒ 合并全被拦死。
+			default:
+				// M52 加固腿：这两个 switch 修前**没有** default，新增枚举值会静默
+				// 什么都不做地往下走去改文件——与 :239 那道循环同一个坑。
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: fmt.Sprintf("保留源校验返回未知结论（值 %d），已拦截", int(v))})
 				return
 			}
 			// HardlinkMerge 使用「dup 路径 + .fdd-tmp」临时名，路径互不冲突 → 并发安全
@@ -603,9 +652,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			}
 			// H2：dup 在动作前仍须指向校验过的那份内容
-			if !identityStill(e.Path, procIDs[i]) {
-				settle(i, outcome{code: ocFailed, stage: "verify",
-					err: "文件在扫描后被替换（inode 已变化），已拦截"})
+			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				return
 			}
 			// S1 扩展：keep 源也须内容级校验（源被篡改时链接会指向被改过的
@@ -617,6 +664,20 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			case VerdictFailed:
 				settle(i, outcome{code: ocFailed, stage: "verify", err: "保留源在扫描后被修改，已拦截（S1）"})
+				return
+			case VerdictUnverifiable:
+				// M52：与 dup 侧同一分开口径（处置都是拦截，话不能说成"被改过"）。
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: "保留源无从校验（打不开、读不了或不是普通文件），已拦截（S1）"})
+				return
+			case VerdictPass:
+				// 通过：显式列出来，好让下面那条 default 真的是"未知"兜底。
+				// 少了这一格，VerdictPass 自己就会掉进 default ⇒ 合并全被拦死。
+			default:
+				// M52 加固腿：这两个 switch 修前**没有** default，新增枚举值会静默
+				// 什么都不做地往下走去改文件——与 :239 那道循环同一个坑。
+				settle(i, outcome{code: ocFailed, stage: "verify",
+					err: fmt.Sprintf("保留源校验返回未知结论（值 %d），已拦截", int(v))})
 				return
 			}
 			warn := ""

@@ -16,11 +16,21 @@ const (
 	VerdictPass    Verdict = iota // 通过（可执行操作）
 	VerdictSkipped                // 文件已消失（ENOENT，S8：目标已达成）
 	VerdictFailed                 // 校验失败（文件被修改，S1：拦截）
+
+	// VerdictUnverifiable 「无从判定」（M52/OPS-11，04 §6.11）：打不开、读不了、
+	// 不是普通文件——**没有任何**内容级证据说明文件变过，也没有证据说明它没变。
+	// 修前这些一律折进 VerdictFailed，于是失败抽屉里写着"文件在扫描后被修改"，
+	// 而实际可能只是一个 EACCES 或一个命名管道：文案把"我们查不动"说成
+	// "用户改过文件"，处置建议也就跟着错（前者要修权限/换文件，后者要重扫）。
+	// 拦截动作与 VerdictFailed 完全相同（都不许进 toProcess），本条只分开**表述**。
+	VerdictUnverifiable
 )
 
 // VerifyFile 操作前校验（M3-T02，01 §9）：
 //   - ENOENT → Skipped（不计失败、不计释放空间）
-//   - 非普通文件 / size 与扫描时不一致 → Failed（组内成员 size 恒等，尺寸变了即非原物）
+//   - size 与扫描时不一致 / 内容哈希不一致 → Failed（组内成员 size 恒等，尺寸变了即非原物）
+//   - 打不开（非 ENOENT）、fstat 失败、非普通文件、重算时 I/O 错 → Unverifiable
+//     （M52：这三类是"无从判定"，处置与 Failed 相同但不许共用"被修改"那句话）
 //   - 其余情况一律经同一文件句柄重算 BLAKE3 与组哈希比对：相同通过，不同 Failed
 //
 // P0-3：修正前存在「size+mtime 双一致 → 免重算」的快速路径，隐含前提是
@@ -45,12 +55,16 @@ func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verd
 		if errors.Is(err, os.ErrNotExist) {
 			return VerdictSkipped, fsid.ID{}
 		}
-		return VerdictFailed, fsid.ID{}
+		// M52：EACCES/EBUSY/悬空链接一类"打不开"。这里**没有**任何内容级证据，
+		// 说"被修改"是把我们的无能为力写成用户的行为。
+		return VerdictUnverifiable, fsid.ID{}
 	}
 	defer f.Close()
 	st, err := f.Stat() // fstat：身份与内容出自同一 inode
 	if err != nil || !st.Mode().IsRegular() {
-		return VerdictFailed, fsid.ID{}
+		// M52：stat 失败与"不是普通文件"（目录/FIFO/字符设备）同属无从判定。
+		// 修前这两件与 size 不符挤在相邻两行里，读代码时看不出来。
+		return VerdictUnverifiable, fsid.ID{}
 	}
 	if uint64(st.Size()) != e.Size {
 		return VerdictFailed, fsid.ID{}
@@ -60,7 +74,7 @@ func VerifyFile(e *model.FileEntry, groupHash [32]byte, pool *hasher.Pool) (Verd
 	full, err := hasher.HashFull(f, st.Size(), buf)
 	pool.PutStreamBuf(buf)
 	if err != nil {
-		return VerdictFailed, fsid.ID{}
+		return VerdictUnverifiable, fsid.ID{} // M52：I/O 错同样无从判定
 	}
 	if full == groupHash {
 		// 内容未变（例如仅 touch/chmod）。注意：不回写 e.ModTime/e.Size——
@@ -95,17 +109,40 @@ func pathIdentity(path string) (fsid.ID, error) {
 // 不提供稳定索引），此时无从比对，强行判否会让这些卷上完全无法操作。
 // 内容级证据（VerifyFile）仍是这些平台上的实际防线。
 func identityStill(path string, id fsid.ID) bool {
+	still, _ := identityStatus(path, id)
+	return still
+}
+
+// identityStatus 是 identityStill 的判据本体，多给一条"这个位置上的对象已经没了"
+// 的区分（M54/OPS-13，04 §6.11）。
+//
+// 修前 identityStill 的 `err != nil → false` 把两件事压成一件：
+//   - 用户（或另一个程序）自己把 dup 删了 ⇒ 目标其实**已达成**，与 VerifyFile
+//     返回 VerdictSkipped、以及 delete 分支里 os.Remove 撞 ENOENT 是同一形状，
+//     那两条都记 Skipped，唯独这里记 Failed "已被替换、已拦截"；
+//   - 路径被 rename 换成另一个 inode ⇒ 必须拦截，放行就是错删第三方文件。
+//
+// 混在一起的后果不只是文案难看：Skipped 与 OK 同路进 app.go 的 gone 集合
+// （app.go:1898-1901）去清结果集与 byID，记 Failed 则留下一个盘上已不存在的路径。
+//
+// gone 的判据用 errors.Is(err, os.ErrNotExist)：unix 腿（fsid_unix.go:27）返回
+// os.Lstat 的 *PathError，Windows 腿（fsid_windows.go:128）返回 syscall.Errno，
+// 两侧该判据都成立（Errno 自带 Is）⇒ 一个纯函数跨平台，不需要真机。
+//
+// ★ 本函数只服务 executor 那六处需要区分处置的调用点；其余十处继续用
+// identityStill（各自的"消失"处置语义并不相同，见 merge_guard.go:90 的刻意 fail-closed）。
+func identityStatus(path string, id fsid.ID) (still bool, gone bool) {
 	if !id.Resolved {
-		return true
+		return true, false
 	}
 	cur, err := fsid.FromPathNoFollow(path)
 	if err != nil {
-		return false
+		return false, errors.Is(err, os.ErrNotExist)
 	}
 	if !cur.Resolved {
 		// 原先能解析、现在解析不出：卷行为异常或路径已被换成不支持索引的对象。
 		// 判否——宁可拦一次让用户重扫，也不放行一次可能覆盖他人文件的操作。
-		return false
+		return false, false
 	}
-	return cur.SameIdentity(id)
+	return cur.SameIdentity(id), false
 }

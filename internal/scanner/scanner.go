@@ -195,6 +195,15 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	if workers < 1 {
 		workers = 4
 	}
+	// M70（04 §6.11 FLT-2）：nil Filters 等于"全默认"，与 filter.Compile(nil) 的
+	// 语义对齐。下面的 f.IncludeHidden / f.AllowCloudHydration 两处是无条件解引用，
+	// 修前传 nil 会在第一个条目上 panic，而 I3 的逐目录 recover 把它吞成
+	// "该目录已跳过"的一条 Failed ⇒ 现象是整目录静默漏扫，不是崩。
+	// 兜底放在这里而不是给 filter 的承诺加限定：承诺（Compile/Apply/ExcludeDir
+	// 三处 nil 短路）本来就兑现了，说谎的一直是遍历器自己。
+	if f == nil {
+		f = &model.Filters{}
+	}
 	res := &Result{}
 	cleaned, all := dedupeRoots(roots)
 	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
@@ -542,14 +551,45 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		}
 		out = append(out, filepath.Clean(abs))
 	}
-	sort.Strings(out)
 	if len(out) <= 1 {
 		return out, out
 	}
+	// M66（04 §6.11 SCN-4）：sens 必须在排序**之前**算——排序键要用它。探测与顺序无关，
+	// 所以上移本身不改任何结论；单根提前 return 也保住了 C1（最常走的那条路不写探测文件）。
 	sens := make([]bool, len(out))
 	for i, r := range out {
 		sens[i] = probeCaseSensitive(r)
 	}
+	// M66：入集顺序按**折叠后的串**排。修前这里排原样串，而判重按折叠串 ⇒
+	// 'B'(0x42) < 'b'(0x62) 让子根 "/data/B/A" 抢在宽根 "/data/b" 之前入 kept，
+	// 宽根随后被判成"不在任何 kept 之下"而留下 ⇒ 同一棵树的两种拼写各走一遍
+	// （重复组数、可释放空间与 UnprotectedRoots 一起多计）。
+	// 换成折叠键后判据自洽：fold(父) 是 fold(子) 的前缀 ⇒ fold(父) < fold(子) 恒成立，
+	// 父根必然在前，下面那个单向回看 kept 的循环就足够了。
+	// 折叠键只在这里算一次（下面判重循环仍按 M26 的原样各自 Fold，不动它）；
+	// 根数量为个位数，多余的这次折叠不构成热路径。
+	fkeys := make([]string, len(out))
+	for i, r := range out {
+		fkeys[i] = fscase.Fold(r, sens[i])
+	}
+	order := make([]int, len(out))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		ia, ib := order[a], order[b]
+		if fkeys[ia] != fkeys[ib] {
+			return fkeys[ia] < fkeys[ib]
+		}
+		return out[ia] < out[ib] // 同折叠键（同物两拼写）时按原样串定序，保住确定性
+	})
+	sortedPaths := make([]string, len(out))
+	sortedSens := make([]bool, len(out))
+	for pos, i := range order {
+		sortedPaths[pos] = out[i]
+		sortedSens[pos] = sens[i]
+	}
+	out, sens = sortedPaths, sortedSens
 	var kept []string
 	var keepSens []bool
 	for i, r := range out {
