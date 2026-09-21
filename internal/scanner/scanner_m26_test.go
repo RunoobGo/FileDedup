@@ -14,41 +14,43 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"filededup/internal/pathnorm"
 )
 
 func TestUnderKeyWindowsTruthIsSubroot(t *testing.T) {
 	const sep = `\` // Windows 的分隔符真值（H6：参数注入，不靠 build tag）
 
 	// 1) 不敏感卷形态：Fold 已把整串归一成 "/"，键天然在 "/" 空间里。
-	if !underKey("c:/a/b", "c:/a") {
+	if !pathnorm.Under("c:/a/b", "c:/a") {
 		t.Fatal("不敏感卷形态（c:/a/b 在 c:/a 下）未判出子树")
 	}
 
-	// 2) 敏感卷形态：Fold 原样返回带 "\" 的串，归一必须由 keyOf 完成。
-	//    M-M26-a（keyOf 不归一）的靶子就是这两条等值断言。
-	if got := keyOf(`C:\a\b`, sep); got != "C:/a/b" {
-		t.Fatalf("keyOf 未把分隔符归一到键空间：%q", got)
+	// 2) 敏感卷形态：Fold 原样返回带 "\" 的串，归一必须由 Slash 完成。
+	//    M-M26-a（Slash 不归一）的靶子就是这两条等值断言。
+	if got := pathnorm.Slash(`C:\a\b`, sep); got != "C:/a/b" {
+		t.Fatalf("Slash 未把分隔符归一到键空间：%q", got)
 	}
-	if got := keyOf(`C:\a`, sep); got != "C:/a" {
-		t.Fatalf("keyOf 未把分隔符归一到键空间：%q", got)
+	if got := pathnorm.Slash(`C:\a`, sep); got != "C:/a" {
+		t.Fatalf("Slash 未把分隔符归一到键空间：%q", got)
 	}
-	if !underKey(keyOf(`C:\a\b`, sep), keyOf(`C:\a`, sep)) {
+	if !pathnorm.Under(pathnorm.Slash(`C:\a\b`, sep), pathnorm.Slash(`C:\a`, sep)) {
 		t.Fatal("Windows 敏感卷形态（C:\\a\\b 在 C:\\a 下）未判出子树——这就是 M26 的现场")
 	}
 	// 自身也算"在其下"（rootsUnder 的语义：含 dir 自身）
-	if !underKey(keyOf(`C:\a`, sep), keyOf(`C:\a`, sep)) {
+	if !pathnorm.Under(pathnorm.Slash(`C:\a`, sep), pathnorm.Slash(`C:\a`, sep)) {
 		t.Fatal("键等于根时应判为真（rootsUnder 含自身）")
 	}
 
 	// 3) 兄弟用例：只是名字前缀相同 ≠ 子树。
 	//    M-M26-c（用 strings.Contains 代替前缀）的靶子。
-	if underKey(keyOf(`C:\ab`, sep), keyOf(`C:\a`, sep)) {
+	if pathnorm.Under(pathnorm.Slash(`C:\ab`, sep), pathnorm.Slash(`C:\a`, sep)) {
 		t.Fatal("C:\\ab 被误判成 C:\\a 的子树（前缀判据退化成包含判据）")
 	}
-	if underKey(keyOf(`C:\a`, sep), keyOf(`C:\ab`, sep)) {
+	if pathnorm.Under(pathnorm.Slash(`C:\a`, sep), pathnorm.Slash(`C:\ab`, sep)) {
 		t.Fatal("反向也误判：C:\\a 不该落在 C:\\ab 之下")
 	}
-	if underKey("c:/ab", "c:/a") {
+	if pathnorm.Under("c:/ab", "c:/a") {
 		t.Fatal("不敏感卷形态同样不许把 c:/ab 当成 c:/a 的子树")
 	}
 }

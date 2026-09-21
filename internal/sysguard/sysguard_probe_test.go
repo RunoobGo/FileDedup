@@ -125,3 +125,51 @@ func TestTimeMachineEntryStillPrunesMixedCaseName(t *testing.T) {
 		t.Errorf("用户文件 %q 被 TM 前缀条目误挡", user)
 	}
 }
+
+// TestAbsPathEntryReliesOnConstantBackslashSwap 补强（M64 变异 M-M64-b 暴露的覆盖缺口）。
+//
+// 现场：内置 eAbsPath 六条全是 POSIX 形（/proc /sys /dev /run /private /System），
+// 而 Windows 风格的待判路径命中的是 dirName 条目（$Recycle.Bin 一类），压根走不到
+// absPath 那条循环。于是"Dir 先把反斜杠恒换成 /"这条语义在本包**没有任何用例需要
+// 它成立**——M64 收归时把 Slash 换成 filepath.ToSlash（unix 上即恒等映射）做变异，
+// filter 与 scanner 都红了，sysguard 与 ops 却一路绿。
+//
+// 后果不是纸面的：absPath 是"登记一条就挡一整棵子树"的那一档。下一个登记 Windows
+// 形绝对路径的人（外接卷挂载点、`C:/Windows/Temp` 这类）拿到的会是一条
+// **永远不命中、且一声不响**的保护规则；在 Linux 主门禁上尤其看不出，
+// 因为 CI 就在 unix 上跑。
+//
+// ★ 故意改全局 table 再装配（同 APP-9 探针的写法）：现有 POSIX 条目测不出这条腿。
+// 本包无 t.Parallel（已核），defer 还原，不外溢到同包其它用例。
+func TestAbsPathEntryReliesOnConstantBackslashSwap(t *testing.T) {
+	defer func(orig []entry) { table = orig }(table)
+	table = append(append([]entry{}, table...), entry{
+		kind: eAbsPath, plat: pAll, name: "C:/Windows",
+		why: "探针条目：Windows 形绝对路径锚定",
+	})
+
+	// 非 Windows 宿主上必须照样挡住——判据是纯字符串的，不吃宿主分隔符。
+	g := New(PlatformLinux)
+	for _, p := range []string{
+		`C:\Windows\System32`, // 反斜杠形：只有恒换才成立
+		`C:\Windows`,          // 锚定路径本身
+		`C:/Windows/Temp`,     // 已归一形：恒换对它无影响
+		`C:\Windows\`,         // 尾部斜杠：去尾必须在换分隔符之后仍然保得住匹配
+	} {
+		if d := g.Dir(p, base(p)); d.Kind != KindProtectedDir {
+			t.Errorf("Dir(%q) 未判出受保护（Kind=%v）——absPath 一侧依赖的\"恒换反斜杠\"语义失效了", p, d.Kind)
+		}
+	}
+
+	// 反面对照一：只差一个分隔符不是后代（钉 Under 的边界，M-M64-c 的第二个靶子）。
+	for _, p := range []string{`C:\WindowsExtra\foo`, `C:\Windows.old`} {
+		if d := g.Dir(p, base(p)); d.Skip {
+			t.Errorf("Dir(%q) 被误挡：absPath 只认该路径本身及其以分隔符界定的子项", p)
+		}
+	}
+	// 反面对照二：换分隔符不得顺手把大小写也放宽（absPath 是有意的精确匹配，
+	// 见 table 注释"大小写精确、只认绝对根"）。
+	if d := g.Dir(`C:\windows\system32`, "system32"); d.Skip {
+		t.Error("absPath 变成大小写不敏感：/System 与镜像根目录里的同名目录会互相误伤")
+	}
+}

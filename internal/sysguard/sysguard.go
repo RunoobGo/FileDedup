@@ -11,9 +11,14 @@
 // 唯一例外是用户显式把受保护路径本身（或其内部）设为扫描根——那是专家通道，
 // 由调用方按"根是否落在被剪枝目录内"放行，并把该目录计入 UnprotectedRoots 供界面警示。
 //
-// 分层约定（04 §6.8.0 约束 5）：本包是**纯字符串判据**，无 build tag、无 syscall、
-// 不 import 任何 internal 包；平台差异以 New(platform) 参数注入。因此"Windows 保留名
-// 规则""macOS TM 快照规则"这些只在别的系统上成立的东西，在 Linux 主门禁里就是可执行断言。
+// 分层约定（04 §6.8.0 约束 5）：本包是**纯字符串判据**，无 build tag、无 syscall，
+// 平台差异以 New(platform) 参数注入。因此"Windows 保留名规则""macOS TM 快照规则"
+// 这些只在别的系统上成立的东西，在 Linux 主门禁里就是可执行断言。
+//
+// import 面的口径（2026-09-21 M64 裁定"优先收归路径归一实现，分层约定后补"）：
+// 只允许 **无依赖、无副作用的叶子包**，目前唯一如此的是 pathnorm（只 import strings）。
+// 这条不是洁癖：本包若依赖 fscase 那种要写盘探测的包，"Linux CI 上断言 Windows 清单"
+// 就不成立了。谁改了 pathnorm 的 import 面，本段即为失效声明。
 // 带 tag 的文件只有 platform_*.go 三个，各自唯一的作用是给出 Current 常量。
 //
 // 判据的作用范围刻意分成四种条目类型（设计稿 §2.2），因为"平铺一张清单"只有两种
@@ -26,7 +31,11 @@
 //	reserved    文件与目录，仅 Windows 平台位，大小写不敏感
 package sysguard
 
-import "strings"
+import (
+	"strings"
+
+	"filededup/internal/pathnorm"
+)
 
 // Platform 是保护清单的生效面。由三个 platform_*.go 各按 GOOS 给出 Current。
 type Platform int
@@ -199,8 +208,8 @@ func (g *Guard) Platform() Platform { return g.platform }
 // pseudoFile 是文件级判据，不套用于目录；reserved 对目录同样成立
 // （名为 CON 的目录在 Win32 同样不可寻址）。
 func (g *Guard) Dir(dirAbs, dirName string) Decision {
-	p := normalize(dirAbs)
-	n := normalize(dirName)
+	p := pathnorm.TrimTailKeepRoot(pathnorm.Slash(dirAbs, "\\"))
+	n := pathnorm.Slash(dirName, "\\")
 	if p == "" && n == "" {
 		return Decision{}
 	}
@@ -210,7 +219,7 @@ func (g *Guard) Dir(dirAbs, dirName string) Decision {
 		}
 	}
 	for _, e := range g.absPaths {
-		if p != "" && under(p, e.name) {
+		if p != "" && pathnorm.Under(p, e.name) {
 			return Decision{Skip: true, Kind: KindProtectedDir, Reason: "系统保护目录：" + e.why}
 		}
 	}
@@ -231,7 +240,7 @@ func (g *Guard) Dir(dirAbs, dirName string) Decision {
 // 去重——否则"已脱离系统保护、按你指的根扫"这句话是假的（一个文件都扫不到，
 // 结果页显示 0 组且无任何解释）。
 func (g *Guard) File(fileName string, isScanRootChild bool) Decision {
-	n := normalize(fileName)
+	n := pathnorm.Slash(fileName, "\\")
 	if n == "" {
 		return Decision{}
 	}
@@ -279,23 +288,7 @@ func isReservedName(name string) bool {
 	return false
 }
 
-// normalize 统一分隔符并去掉尾部斜杠（根路径 "/" 本身保留）。
-// 不用 filepath.ToSlash/Clean：它们在 Linux 上把 "\" 当普通字符，
-// 而本包必须在任一 GOOS 上都能判定 Windows 风格路径。
-func normalize(p string) string {
-	if strings.Contains(p, "\\") {
-		p = strings.ReplaceAll(p, "\\", "/")
-	}
-	for len(p) > 1 && strings.HasSuffix(p, "/") {
-		p = p[:len(p)-1]
-	}
-	return p
-}
-
-// under e 是否为 p 本身或其祖先目录（absPath 条目专用，大小写精确）。
-func under(p, e string) bool {
-	if p == e {
-		return true
-	}
-	return strings.HasPrefix(p, e+"/")
-}
+// 本包的键空间规则（分隔符归一 + 尾斜杠 + 前缀判定）全部落在 pathnorm 一份实现里：
+// 条目侧统一走 Slash(p, "\\") 与 TrimTailKeepRoot，前缀走 Under。
+// 之所以给字面 "\" 而不是 filepath.ToSlash：本包必须在任一 GOOS 上都能判定
+// Windows 风格路径，而 ToSlash 在非 Windows 上是恒等映射（"\" 是合法文件名字符）。

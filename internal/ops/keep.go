@@ -7,6 +7,7 @@ import (
 
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/pathnorm"
 )
 
 // KeepDecision 一组文件的保留决策。
@@ -320,7 +321,7 @@ func inDirFold(foldedPath, dir string, sensitive bool) bool {
 	// 归一后剥掉尾分隔符；根目录（"/"）剥完为空串，此时 HasPrefix(p, ""+"/")
 	// 恰好命中全部绝对路径，语义仍是「该卷下全部保留」。
 	prefix := strings.TrimSuffix(fscase.Fold(filepath.Clean(dir), sensitive), "/")
-	return foldedPath == prefix || strings.HasPrefix(foldedPath, prefix+"/")
+	return pathnorm.Under(foldedPath, prefix)
 }
 
 // ProcessPolicyOutcome 处理策略（优先处理的文件夹）的匹配结果。

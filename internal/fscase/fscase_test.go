@@ -130,3 +130,33 @@ func TestProbeGivesUpWithoutTouchingStrangers(t *testing.T) {
 		}
 	}
 }
+
+// TestFoldSwapLegIsPlatformIndependent 补强（M64 变异 M-M64-b 暴露的覆盖缺口）。
+//
+// 现场：本包原先**一条 Fold 用例都没有**。把 Fold 的替换腿换成 filepath.ToSlash
+// （unix 上即恒等映射）做变异，fscase 与 ops 的测试一路绿。这不是纸面风险：
+// M26（04 §6.8.8）的成因正是"折叠串与前缀串的分隔符口径不一致"，而 dedupeRoots
+// 的前缀判据直接吃 Fold 的输出——那条腿断了，Windows 上"同一棵树的两种拼写"
+// 就不再合并，同一目录走两遍，重复组数与可释放空间虚高。
+//
+// 这里锁的是**现状语义**，含 M63（FC-2）那条已知偏差：unix 上 "a\b" 是合法文件名，
+// Fold 仍按分隔符处理。将来若按 M63 改判据，本用例必须变红并在那里重新登记语义。
+func TestFoldSwapLegIsPlatformIndependent(t *testing.T) {
+	// 不敏感卷：反斜杠形与斜杠形必须折成同一个键（大小写也一起折）。
+	if a, b := Fold(`C:\A\b`, false), Fold(`c:/a/B`, false); a != b {
+		t.Errorf("不敏感卷上两种拼写未折成同键：%q vs %q", a, b)
+	}
+	// 敏感卷：只换分隔符、不动大小写——替换腿与折叠腿是两件事，必须各自可钉。
+	if got, want := Fold(`C:\A\b`, true), `C:/A/b`; got != want {
+		t.Errorf("Fold(%q, true) = %q，want %q", `C:\A\b`, got, want)
+	}
+	// 误伤面：敏感卷上大小写不同的两棵目录不得被折成同一棵（M36 的判据前提）。
+	if Fold(`C:\A\b`, true) == Fold(`C:\A\B`, true) {
+		t.Error("敏感卷上 A\\b 与 A\\B 被折成同键：一棵树会整棵静默不被扫描")
+	}
+	// ★ FC-2 偏差钉：本函数不吃宿主分隔符真值，在 unix 上照样把 "\" 当分隔符。
+	// 这是"跨平台清单必须任一 GOOS 都认 Windows 写法"的代价，登记在 M63。
+	if got, want := Fold(`a\b`, true), "a/b"; got != want {
+		t.Errorf("Fold(%q, true) = %q，want %q——替换腿不再平台无关（M63 若改判据请同时更新本用例）", `a\b`, got, want)
+	}
+}

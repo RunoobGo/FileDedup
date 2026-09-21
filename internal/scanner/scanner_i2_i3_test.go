@@ -15,6 +15,7 @@ import (
 
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/pathnorm"
 )
 
 // panicGate 在第 panicOn 次 Wait 时 panic（Wait 位于目录处理内，等价于该目录炸了）。
@@ -234,8 +235,8 @@ func TestVisitKeyNeverFolds(t *testing.T) {
 			visitKey(p))
 	}
 	// 3) 键空间约定不变（M26）：分隔符归一到 "/"，与平台无关。
-	if got := keyOf(`C:\a\B`, `\`); got != "C:/a/B" {
-		t.Errorf("keyOf 在 Windows 真值下未把分隔符归一到键空间：%q", got)
+	if got := pathnorm.Slash(`C:\a\B`, `\`); got != "C:/a/B" {
+		t.Errorf("Slash 在 Windows 真值下未把分隔符归一到键空间：%q", got)
 	}
 }
 

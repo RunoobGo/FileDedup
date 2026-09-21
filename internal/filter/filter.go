@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"filededup/internal/model"
+	"filededup/internal/pathnorm"
 )
 
 // Matcher 预编译的过滤器（G3）。
@@ -122,7 +123,7 @@ func Compile(f *model.Filters) *Matcher {
 	if len(f.ExcludePaths) > 0 {
 		excPaths = make([]string, len(f.ExcludePaths))
 		for i, pat := range f.ExcludePaths {
-			excPaths[i] = toSlashPat(pat)
+			excPaths[i] = pathnorm.Slash(pat, "\\")
 		}
 	}
 	return &Matcher{
@@ -131,16 +132,6 @@ func Compile(f *model.Filters) *Matcher {
 		excExt:   newExtSet(normalizeExtList(f.ExcludeExts)),
 		excPaths: excPaths,
 	}
-}
-
-// toSlashPat 把模式统一为 "/" 分隔（2026-09-18 审查 I1）。
-// 修正前模式按原样参与匹配，Windows 上写的 "a\b" 与遍历产生的 rel 无法对上。
-// 无 "\" 时（unix 全部、Windows 常规输入）原样返回，不产生分配。
-func toSlashPat(s string) string {
-	if !strings.Contains(s, "\\") {
-		return s
-	}
-	return strings.ReplaceAll(s, "\\", "/")
 }
 
 // Apply 判断文件是否通过过滤器。
@@ -172,7 +163,8 @@ func (m *Matcher) Apply(name, rel string, size uint64) bool {
 	}
 	// 路径排除 glob
 	if len(m.excPaths) > 0 {
-		rel = toSlashPat(rel) // Windows 遍历给的是 "\" 分隔，统一后再比对
+		// Windows 遍历给的是 "\" 分隔，统一后再比对（模式侧同一函数 ⇒ 两侧对称）
+		rel = pathnorm.Slash(rel, "\\")
 		for _, pat := range m.excPaths {
 			if matchPath(pat, rel, name) {
 				return false
@@ -195,7 +187,7 @@ func (m *Matcher) ExcludeDir(rel, name string) bool {
 	if m == nil {
 		return false
 	}
-	rel = toSlashPat(rel)
+	rel = pathnorm.Slash(rel, "\\")
 	for _, pat := range m.excPaths {
 		if !prunable(pat) {
 			continue
@@ -269,7 +261,7 @@ func matchPath(pat, rel, name string) bool {
 	// 字面前缀式（无通配）：dir 或 dir/ 递归命中后代
 	if !strings.ContainsAny(pat, "*?[") {
 		prefix := strings.TrimSuffix(pat, "/")
-		if prefix != "" && (rel == prefix || strings.HasPrefix(rel, prefix+"/")) {
+		if prefix != "" && pathnorm.Under(rel, prefix) {
 			return true
 		}
 		return false

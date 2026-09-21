@@ -17,6 +17,7 @@ import (
 	"filededup/internal/filter"
 	"filededup/internal/fscase"
 	"filededup/internal/model"
+	"filededup/internal/pathnorm"
 	"filededup/internal/realbytes"
 	"filededup/internal/sysguard"
 	"filededup/internal/worktemp"
@@ -149,38 +150,22 @@ var probeCaseSensitive = fscase.Sensitive
 // 出现"同一棵树的两种拼写"（用户手输）。两种错法的代价不对称——折错丢语料且不可
 // 恢复；该折没折只是同一目录走两遍，由流水线阶段 1.5 的物理身份去重吸收
 // ——故不确定时倾向不折。
+//
+// 归一走 pathnorm.Slash，sep 传平台真值（H6：差异由参数注入，不靠 build tag 分流）。
+// 为什么非归一不可（M26 的成因，详见 pathnorm 包注释）：路径串里两种分隔符都可能出现，
+// 拿这种串去和"按平台分隔符拼出来的前缀"比较，Windows 上恒不成立，而 darwin/Linux 上
+// 两种写法恰好同值、本机看不出问题。
 func visitKey(p string) string {
-	return keyOf(p, string(filepath.Separator))
-}
-
-// keyOf 把**路径**归一成比较键：平台分隔符一律换成 "/"。
-// sep 是平台分隔符真值（H6：差异由参数注入，不靠 build tag 分流），
-// 生产调用点传 string(filepath.Separator)。
-//
-// 为什么非归一不可：路径串里两种分隔符都可能出现——`fscase.Fold` 只在**不敏感卷**上
-// 顺手把 "\" 换成 "/"（dedupeRoots 的合并判据走的正是它），敏感卷上原样返回。拿这种串
-// 去和"按平台分隔符拼出来的前缀"比较，在 Windows（分隔符 "\"）上就恒不成立
-// ——04 §6.8.8 登记的 M26 正是这一条，而 darwin/Linux 上两种写法恰好同值，看不出问题。
-//
-// 分工写死在这里：filepath.Separator 是**输入侧**的归一真值（本函数的 sep 参数），
-// "/" 是**键空间**的约定。把两者混进同一个表达式，就是 M26 的成因。
-func keyOf(p, sep string) string {
-	return strings.ReplaceAll(p, sep, "/")
-}
-
-// underKey 判断键 key 是否就是 root 本身、或位于其下。两个参数都必须是 keyOf 的产物。
-// 键空间里恒为 "/"，故前缀一律用 "/" 拼——**这里不许出现平台分隔符**（见 keyOf 注释）。
-func underKey(key, root string) bool {
-	return key == root || strings.HasPrefix(key, root+"/")
+	return pathnorm.Slash(p, string(filepath.Separator))
 }
 
 // rootsUnder 返回位于 dir（含自身）之下的那些用户原始根。
-// dirKey 必须是 keyOf（遍历期经 visitKey）的产物；keys 与 paths 同序，
+// dirKey 必须是 Slash 之后的键（遍历期经 visitKey）；keys 与 paths 同序，
 // paths 是要展示给界面的原样路径。
 func rootsUnder(keys []string, paths []string, dirKey string) []string {
 	var out []string
 	for i, k := range keys {
-		if underKey(k, dirKey) {
+		if pathnorm.Under(k, dirKey) {
 			out = append(out, paths[i])
 		}
 	}
@@ -569,14 +554,18 @@ func dedupeRoots(roots []string) ([]string, []string) {
 	var keepSens []bool
 	for i, r := range out {
 		dup := false
-		// M26：比较键先归一（keyOf），前缀判定走 underKey——两者都在 "/" 空间里，
+		// M26：比较键的归一在 fscase.Fold 的替换腿里完成，前缀判定走 pathnorm.Under，
+		// 两者都在 "/" 空间里，
 		// 与平台分隔符无关。修前这里写的是 fk+string(filepath.Separator)，
 		// 而 fr/fk 在 Windows 不敏感卷上是 "c:/a/b" 这种形态 ⇒ 该分支恒不成立。
-		fr := keyOf(fscase.Fold(r, sens[i]), string(filepath.Separator))
+		// Fold 的替换腿已恒把 "\" 换成 "/"（见 fscase.Fold），故这里**不需要**再过
+		// 一次平台分隔符归一——收归前那句 keyOf(..., string(filepath.Separator)) 在
+		// 两条平台上都是空操作（M64 取证 §16.0-1）。别"补回来"。
+		fr := fscase.Fold(r, sens[i])
 		for j, k := range kept {
 			// k 是 r 的前缀目录（各按自身卷的语义折叠后比较）
-			fk := keyOf(fscase.Fold(k, keepSens[j]), string(filepath.Separator))
-			if underKey(fr, fk) {
+			fk := fscase.Fold(k, keepSens[j])
+			if pathnorm.Under(fr, fk) {
 				dup = true
 				break
 			}
