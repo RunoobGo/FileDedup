@@ -4,7 +4,8 @@
 - 上位依据：`2026-09-20-scenario-optimization-design.md`（工况总纲）§2.1~§2.4、§4、§5；
   登记处 `docs/04-开发与测试计划.md` §6.7 C 组 1~4 项；§7 另接 04 §6.8.8 M21
   （登记修法即"并入工况 M6 的计数横幅"，故与本稿同源）；§8 另接 04 §6.8.8 M19/M20
-  （回滚路径的 TOCTOU，与 §2/§6 的 `claimSlot` 是同一条"不替用户处置不属于本次操作的文件"主线）
+  （回滚路径的 TOCTOU，与 §2/§6 的 `claimSlot` 是同一条"不替用户处置不属于本次操作的文件"主线）；
+  §9 另接 04 §6.8.8 M22/M25/M26（假账与静默失败：数字/失败/判据三者都必须在目标环境里**成立**）
 - 状态：**按实施顺序逐节追加**。本文只写"动手前必须定死"的判据、接入点与探针设计；
   实施后的兑现记录写在 04 §6.9 划账，不写在本文
 - 用户裁定（三条，约束本文全部章节）：① 每项实施前各写一段细化设计（即本文）；
@@ -21,6 +22,7 @@
 | 5 | fscase 单根探测 | — | C 组 1(04 §6) | §6 | ✅（含 §6.0 取证，**推翻登记的"最小修法：无条件探测"**；真读数取自本机 hdiutil 造的大小写敏感卷） | ✅（划账见 04 §6.9.6；§6.4 末尾有本稿预测的一处修正） |
 | 6 | worktemp 跳过计数（M21） | — | §6.8.8 M21 | §7 | ✅（含 §7.0 取证 E1~E8；五层管道照抄、计数落在跳过点） | ✅（划账见 04 §6.9.7；M 表无事后修正——M-d 那一行是**跑之前**改准的） |
 | 7 | 回滚路径的 TOCTOU（M19 + M20） | — | §6.8.8 M19/M20 | §8 | ✅（设计：§8.0 取证 E1~E9；实施：六条探针 5 红→全绿 + 变异六条逐条命中，**另补第 7 条变异 M-M20-c′**；顺手消掉 move/symlink 逐字重复的一份） | ✅（划账见 04 §6.9.8；新增登记 M37/M38/M39，见 §8.5） |
+| 8 | 假账与静默失败（M22 + M25 + M26） | — | §6.8.8 M22/M25/M26 | §9 | ✅（含 §9.0 取证 E1~E17；**推翻 M26 登记的"Linux 主门禁可跑出两棵"**） | 见 04 §6.9.9 |
 
 ## 1. 适用于全部四项的通用约束
 
@@ -1099,3 +1101,172 @@ M-M20-c 用的是"查错位置"而不是"删掉判据"：删判据由 V3/V4 逮�
 7. **`rollbackAfterSwapFailure` 的既有语义被原样保留**：临时链接仍在我的名字下（步骤 1 建立、
    步骤 2 复核过），所以拒绝搬运时仍照旧清掉 tmp；文案（含"还原"字样）不动，
    `identity_window_test.go` 的 M3 断言因此保持绿。
+
+---
+
+## 9. M22 + M25 + M26：假账与静默失败（04 §6.8.8 M22、M25、M26）
+
+> 三件同源，都是**事实与呈现分叉**：
+> M22 把**还躺在回收站里**的文件报成"已释放"（数字说谎，且与紧挨着的"打开回收站"按钮自相矛盾）；
+> M25 把启动期的失败只写进 stderr（GUI 没有终端 ⇒ 等于没说，用户只感到"这软件越用越慢"）；
+> M26 把一条**只在 Windows 上失效**的前缀判据当成了跨平台判据（那条分支在 Windows 上等于不存在，
+> 而本机恰好看不出来）。
+> 共同的判据形状：**只有在目标环境里真成立才算数**——数字必须对应磁盘事实（M22）、
+> 失败必须走用户看得见的通道（M25）、判据必须在目标平台上真的命中（M26）。
+
+### 9.0 动手前取证（E1~E17）
+
+**M22（现场 / 后果 / 既有钉法）**
+
+| # | 结论 | 证据（本机读码） |
+|---|---|---|
+| E1 | 现场：trash 与 delete/move 混在同一栏 | `internal/ops/executor.go:343-350`：`switch op.Kind { case "hardlink": …; case "symlink": …; default: res.Reclaimed += e.Size }`。同处注释（`:334-335`）自述口径是"真正从磁盘上消失的数据量（trash/delete/move 出卷）"——**trash 恰恰不消失** |
+| E2 | trash 的真实磁盘效果（逐平台读码） | Linux：`trash_linux.go:83-105` `moveIntoTrash` 同卷 `os.Rename`（数据落 `~/.local/share/Trash`），跨卷退化为"复制+删源"；macOS：Finder `move … to trash`（`trash_darwin.go` 的 AppleScript）；Windows：`$Recycle.Bin`。⇒ 同卷 trash **磁盘占用一分未减**；跨卷 trash 只是把数据搬到另一个卷的回收站，**磁盘总量同样未减**，要等清空才释放 |
+| E3 | 钉住旧口径的断言共 3 处，全是 trash 场景 | `ops_test.go:209`（S7"跳过不计入释放空间"）、`integration_test.go:68`（M3 集成）、`executor_ads_test.go:108`（V5 放行对照）。⇒ 本项必须走上那条既定程序：**改断言前先论证它钉错了语义，并在原位写明** |
+| E4 | 同类口径在账本侧**独立存在**，本项不覆盖 | `RecordsView.vue:268` 的"回收空间"列读 `OpMeta.Reclaimable`，后者来自 `oplog.go:130` 的 `SUM(size) WHERE state=done`——**不分 kind**。⇒ 结果条修好之后，记录页那一列对 trash 操作仍在说"回收空间 X"。新登记（§9.5-2） |
+| E5 | 单列先例现成，照抄即可 | `LinkedBytes`（`model.go:216`）与 `SymlinkedBytes`（`:229`）就在同一个 switch、同一个结构体里，前端各有一段措辞（`ResultView.vue:426-433`、`opdisplay.ts:27-48`）。三者互斥并列，本项加第四个 |
+| E6 | 既有前端措辞把 trash 与 delete 混为一谈 | `opdisplay.ts:49-50` 的 `default` 分支 → "共 X 空间可释放"（`ConfirmDialog.vue:68` 传 `props.kind`，trash 会落到 default）；`frontend/tests/opdisplay.test.ts:51-56` 把 `['trash','delete']` 一起断言成"空间可释放" |
+| E7 | 同卷 move 是同一族缺陷，但不在登记行内 | 同卷 move 也是改名（`move.go:34-35` 的 `renameFile` 快路径），却照样进 `Reclaimed`。与 trash 的差别在于**要先能分辨**（见 §9.5-1），故本项不动它 |
+
+**M25（现场 / 通道 / 夹具）**
+
+| # | 结论 | 证据（本机读码 + 实测） |
+|---|---|---|
+| E8 | 现场 | `app.go:288-299`：`cache.Open` 失败只 `fmt.Fprintf(os.Stderr, "[cache] 哈希缓存不可用…")`。GUI 无终端 ⇒ 用户永远看不到；后果不是崩溃而是**永久变慢且无从排查** |
+| E9 | 启动期唯一的界面通道是**单个字符串槽** | `app.go:223-227`（`startupNotice string`）+ `:1208-1215`（`GetStartupNotice`）。已占用者是 M12b 的账本隔离重建（`:331` 赋值）⇒ 缓存失败若也直接赋值会**互相挤掉**（登记原文的次生问题） |
+| E10 | 可测先例现成 | `openLedger`（`app.go:311-334`）就是同一段"启动前置 + 界面留痕"，M12b 特意从 `startup` 抽出并写明"抽出来是为了可测"（因 `startup` 会解析真实的 `os.UserConfigDir`，单测调它就会动用户机器上的库） |
+| E11 | 夹具可行性（本机真读数） | 把 `<cfgDir>/cache.db` 建成**目录**：`cache.Open` 必失败且**不走隔离重建**——`err=缓存库不可用（未改动任何文件）: 初始化失败: unable to open database file (14)`，目录内无 `.broken-*` 残留 ⇒ **不需要新增接缝变量**。（反面：往 `cache.db` 写垃圾会命中"影像损坏→隔离→重建成功"，反而拿不到失败态） |
+| E12 | 前端消费面只有一处，且不保留换行 | `stores/scan.ts:833` 把整条串丢给一次 `toast().push(msg,'warn',20000)`；`ToastHost.vue:90` 的 `.msg` 没有 `white-space: pre-line` ⇒ 多条用 `\n` 拼接后**会折成空格连成一段**（§9.5-3） |
+| E13 | 同族第三处（本项不修） | `app.go:317-322`（`openLedger` 打开失败）同样只写 stderr，而后果更重：**回收站/移动/硬链接清理会被拒绝执行**（C3 之后）。新登记（§9.5-4） |
+
+**M26（现场 / 推翻 / 定向复现 / 既有正确写法）**
+
+| # | 结论 | 证据（本机读码 + 真读数） |
+|---|---|---|
+| E14 | 现场 | `scanner.go:565`：`strings.HasPrefix(fr, fk+string(filepath.Separator))`，而 `fr`/`fk` 来自 `fscase.Fold`（`fscase.go:31-43`）——**路径含 `\` 时 Fold 把整串换成 `/`**，Windows 的 `filepath.Separator` 却是 `\` |
+| E15 | **登记前提被推翻** | 把 `C:\a` / `C:\a\b` 喂进**生产** `dedupeRoots`，darwin 上读得 `kept=["…/scanner/C:\a"]`（**1 棵**，已合并）——`filepath.Abs`+`Fold` 在本机把 `\` 归成了 `/`，与 `filepath.Separator`（`/`）恰好同值。⇒ 登记的"平台无关，可在 Linux 主门禁跑出两棵"**不成立**：本项在 darwin/Linux 上拿不到生产路径的红读数 |
+| E16 | 定向复现（同一次真读数：把 `:565` 的判据逐字参数化后注入平台真值） | `fr="c:/a/b"`、`fk="c:/a"`：`sep="/"` → **true**；`sep="\\"` → **false**（Windows 不敏感卷的真相）；敏感卷形态（Fold 原样保留：`fr="C:\a\b"`、`fk="C:\a"`）→ **true**（此刻靠"两边都带 `\`"成立）。⇒ 缺陷的准确形态：**Windows 不敏感卷（NTFS 默认）上这条分支恒不成立，敏感卷上靠巧合成立**；今日危害限于"同一棵树被重复遍历 + 按根记账的口径出现宽窄根同时留痕"（登记行原文） |
+| E17 | 同一包里正确写法已经存在 | `folder.key`（`scanner.go:196-202`，M6-P4 加，注释里**就点名了这条登记**）+ `rootsUnder`（`:206-208`，用 `"/"` 拼前缀）。⇒ 本项不是发明判据，而是把 `dedupeRoots` 拉到同一口径，并顺手消掉 I5 的第二份实现 |
+
+### 9.1 判据
+
+**M22 —— trash 单列；`Reclaimed` 的定义不动（登记原话）：**
+
+1. `model.OpsResult` 增 `TrashedBytes uint64`（第四个字节口径，与 `Reclaimed`/`LinkedBytes`/`SymlinkedBytes`
+   **互斥**——同一个成功项只会落进其中一栏）。
+2. `aggregate()` 的 switch 增 `case "trash": res.TrashedBytes += e.Size`；`default`（delete/move）**一字不动**。
+3. 计数口径按 §1 约束 2 写清：**数的是"进回收站的字节数"，不是"释放的字节数"**——
+   回收站里的数据仍在磁盘上，用户清空之后才释放。
+4. 呈现按既有两个口径的形状补第四支：`ResultView.vue` 结果条加 `v-else-if TrashedBytes` 分支；
+   `opdisplay.ts` 加 `case 'trash'`（措辞取自登记："移入回收站（清空后才释放）"），
+   并把文件头那张"口径 → 栏位"对照表补上第四行（那张表正是 M15 立下的"判据只有一份"）。
+5. 既有 3 处 trash 断言（E3）改写 + **原位写明**为什么它钉错了；delete 与跨卷 move 的反向钉法是
+   **新增**（不是改）。
+6. **同卷 move 不在本项**：要分辨必须先让 `MoveFile` 报出"这次是改名还是跨卷"，
+   改返回形状会牵动两处调用点 ⇒ 新登记（§9.5-1）。本项**不碰** move 的任何一行。
+
+**M25 —— 启动期失败走界面通道；槽位由"覆盖"改"累积"：**
+
+1. `startupNotice` 保持 `string` 与 `GetStartupNotice` 的绑定形状（登记允许 `+= "\n"`），
+   但**只许经 `addStartupNotice(msg)` 写**：空则直赋，非空则 `cur + "\n" + msg`（后写不再挤掉先写）。
+2. 新增 `openCache()`（对齐 `openLedger`，E10）：失败时保留既有 stderr 行 **加**一条
+   `addStartupNotice(cacheUnavailableNotice(dbPath, err))`；成功路径一字不动
+   （`a.cch = cch`、`a.pipe = a.pipe.WithCache(cch)`）。
+   它在 M9 白名单上的位置与 `openLedger` 同档（启动前置，那时还没有并发读者）。
+3. 文案是纯函数 `cacheUnavailableNotice(dbPath string, err error) string`（照 `ledgerQuarantineNotice`
+   的形状），必须说清三件事：**出了什么事**（哈希缓存打不开，本次运行不启用缓存）、
+   **对用户意味着什么**（每次扫描都要重新计算，速度变慢；功能不受影响）、**在哪**（缓存文件名）。
+   不写"永久变慢"这类无法证伪的话——重启后可能就好了。
+4. `openLedger` 的隔离重建分支改走 `addStartupNotice`（同一槽位只留一个写入口）。
+5. **不动前端**（E12）：多条的呈现方式属 M8，按 §1 约束 4 登记（§9.5-3）。
+
+**M26 —— 判据搬进 `"/"` 空间，全包只剩一份：**
+
+1. 新增两个纯函数（无 build tag，§1 约束 1）：
+   - `keyOf(folded, sep string) string` = `strings.ReplaceAll(folded, sep, "/")`。**sep 是平台分隔符真值**
+     （H6 注入），生产传 `string(filepath.Separator)`：不敏感卷上 Fold 已归一（此步无操作），
+     **敏感卷上 Fold 原样返回、这一步是真起作用的**（E16 第三行）。
+   - `underKey(key, root string) bool` = `key == root || strings.HasPrefix(key, root+"/")`。
+     两个参数都必须是 `keyOf` 的产物 ⇒ 前缀恒用 `"/"`，与平台无关。
+2. `dedupeRoots` 的两处键构造改走 `keyOf(…, string(filepath.Separator))`，前缀判定改走 `underKey(fr, fk)`。
+3. `folder.key` 改为 `keyOf(f.fold(p), string(filepath.Separator))`；
+   `rootsUnder` 的 `k == dirKey || HasPrefix(k, dirKey+"/")` 改为 `underKey(k, dirKey)`。
+   ⇒ 同一判据在全包**只剩一份**（此前 `dedupeRoots` 与 `rootsUnder` 各写一份，其中一份带缺陷：I5）。
+4. `filepath.Separator` 与 `"/"` 的分工写进注释：前者是**输入侧**的归一真值，
+   后者是**键空间**的约定；把两者混在一个表达式里正是 M26 的成因。
+
+### 9.2 改动面（6 个生产文件 + 4 个测试文件 + 3 个前端文件）
+
+| 文件 | 改动 |
+|---|---|
+| `internal/model/model.go` | `OpsResult` 增 `TrashedBytes` 字段（含与另三口径互斥、为什么 trash 不算"释放"的注释） |
+| `internal/ops/executor.go` | `aggregate()` 增 `case "trash"`；`:334-335` 的口径注释把 trash 从 `Reclaimed` 的成员里删掉 |
+| 新 `internal/ops/executor_account_test.go` | V1~V3 |
+| `internal/ops/ops_test.go`、`integration_test.go`、`executor_ads_test.go` | 三处 trash 断言改写（原位写明）+ ads 拒收断言补 `TrashedBytes == 0` |
+| `app.go` | 新增 `openCache()`、`addStartupNotice()`、`cacheUnavailableNotice()`；`startup` 的缓存段改为调用；`openLedger` 的两条留痕改走新槽位 |
+| 新 `app_m25_test.go` | V4~V6 |
+| `internal/scanner/scanner.go` | `keyOf`/`underKey` 两个纯函数 + 三处调用点（`dedupeRoots`×2、`folder.key`、`rootsUnder`） |
+| 新 `internal/scanner/scanner_m26_test.go` | V7~V8 |
+| `frontend/src/wails.ts` | `OpsResult.TrashedBytes` 镜像 + 口径注释第四行 |
+| `frontend/src/utils/opdisplay.ts` | `case 'trash'` + 头部口径表第四行 |
+| `frontend/src/views/ResultView.vue` | 结果条第四分支 |
+| `frontend/tests/opdisplay.test.ts` | trash 从 `['trash','delete']` 那条用例里拆出（原位写明理由） |
+
+### 9.3 探针（V1~V8）与修前必红
+
+| 探针 | 断言 | 修前读数 |
+|---|---|---|
+| V1 `TestTrashKindReportsTrashedNotReclaimed`（trash + `mockTrash`） | `Reclaimed == 0` 且 `TrashedBytes == Σ size(OK)`；`OK` 集合本身不变 | 编译红（字段不存在）；**补一步真读数**：只加字段、不改 `aggregate` → `Reclaimed=<dup2.Size>、TrashedBytes=0` |
+| V2 `TestDeleteKindStillReclaims`（delete） | `Reclaimed == Σ size`、`TrashedBytes == 0` | 绿（负控制：钉住"没把 delete 一起改掉"） |
+| V3 `TestCrossVolumeMoveStillReclaims`（`forceCrossVolumeRename` + move） | 跨卷 move 照旧 `Reclaimed == Σ`、`TrashedBytes == 0` | 绿（负控制，登记明确要求"反向钉住"） |
+| V4 `TestOpenCacheUnavailableSurfacesNotice` | `cache.db` 建成目录 → `openCache()` 后 `GetStartupNotice()` 非空且含缓存原因与文件名 | 红（抽出 `openCache` 后行为照旧：notice 为空串） |
+| V5 `TestStartupNoticesAccumulate` | 账本隔离重建（垃圾 `history.db`）+ 缓存失败同触 → 两条**都在** | 红（单槽：后写挤掉先写，只剩一条） |
+| V6 `TestOpenCacheQuietWhenHealthy` | 健康路径（新建库）不产生任何提示 | 绿（负控制：防假警——每次都弹的提示会被用户脱敏） |
+| V7 `TestUnderKeyWindowsTruthIsSubroot`（注入 `sep="\\"`） | 不敏感形态 `("c:/a/b","c:/a")` 与敏感形态 `keyOf("C:\a\b","\\")` 都判出子树；`("C:\ab","C:\a")` 与反向**不**误判 | 编译红（`keyOf`/`underKey` 不存在）；抽出后（旧式逐字保留）→ **false**（E16 真读数） |
+| V8 `TestDedupeRootsStillMergesNestedNativeRoots`（真夹具 `tmp/a`、`tmp/a/b`） | 生产 `dedupeRoots` 仍合并为一棵；`sens` 与保留根同序、`all` 仍为去重前的全部规范化根 | 绿（负控制：防"判据搬进 `/` 空间"把本机行为改坏） |
+
+**修前必红**：V1（补一步）、V4、V5、V7 红；V2/V3/V6/V8 是负控制，修前修后都必须绿。
+既有 3 处 trash 断言（E3）改的是**口径**（trash 不再进 `Reclaimed`），不是**事实**
+（`OK`/`Skipped`/`Failed` 集合一字不动）——这一点由 V1 的集合断言与 `executor_ads_test.go:228` 的补强共同钉住。
+
+### 9.4 变异（九条，逐条改坏 → 应红）
+
+| 编号 | 变异 | 应变红 |
+|---|---|---|
+| M-M22-a | 删掉 `case "trash"`（回到 `default`） | V1 |
+| M-M22-b | trash 同时累加 `TrashedBytes` 与 `Reclaimed`（两栏都记） | V1 |
+| M-M22-c | trash 写进 `LinkedBytes`（串栏） | V1 |
+| M-M25-a | `openCache` 失败只写 stderr（不调 `addStartupNotice`） | V4 |
+| M-M25-b | `addStartupNotice` 改回直接赋值（挤掉前一条） | V5 |
+| M-M25-c | 成功路径也留一条提示（假警） | V6 |
+| M-M26-a | `keyOf` 不归一（`return folded`） | V7 —— **本机唯一能杀 M26 的变异** |
+| M-M26-b | `underKey` 的前缀改用 `string(filepath.Separator)` | **本机绿（变异逃逸）**：darwin 上该常量与修法值同为 `"/"`，不可区分 ⇒ 只有 Windows runner 能抓（§9.5-5 如实记录） |
+| M-M26-c | `underKey` 用 `strings.Contains` 代替前缀 | V7 的兄弟用例（`C:\ab` 误判为 `C:\a` 的子树） |
+
+### 9.5 未兑现与边界
+
+1. **同卷 move 仍被算成"已释放"**（E7）：登记只点 trash，而 move 的分辨要先让
+   `MoveFile`（`move.go:22`）报出"这次是改名还是跨卷"——改返回形状会牵动 `executor.go:497`
+   与 `undo.go` 的 `undoMove` 两处调用点，属独立设计决定。新增登记 **M40**。
+2. **记录页"回收空间"列对 trash 操作仍说谎**（E4）：账本 `op_records.reclaimed` 是
+   `SUM(size) WHERE state=done`，不分 kind；修它要么加列（schema 迁移）、要么在读侧按 kind 分述。
+   新增登记 **M41**。
+3. **多条启动提示在 toast 里会连成一段**（E12）：本轮不动前端，`\n` 被折成空格 ⇒
+   两条长句读起来是一段话。呈现方式属 M8，新增登记 **M42**。
+4. **`openLedger` 打开失败仍只写 stderr**（E13）：后果比 M25 更重（回收站/移动/硬链接清理会被拒），
+   修法与 `addStartupNotice` 同形（一行），但不在本项登记行内 ⇒ 按 §1 约束 5 登记 **M43**，
+   不改写既有行、也不在本项实施。
+5. **M26 的 Windows 真机语义未兑现**（与 M32/M33 同档）：修法在 Windows 上的正确性只有
+   "注入真值的等价复现"（E16/V7）与 `GOOS=windows go vet` 两条保证，**没有真机读数**；
+   且 M-M26-b 这一变异在本机**不可杀**（如实记录，不写成"已验证"）。
+6. **M22 的跨卷 trash 细节**：跨卷 trash 在源卷确实腾了空间（复制+删源），数据搬到另一个卷的
+   回收站 ⇒ 磁盘总量未减。措辞"移入回收站（清空后才释放）"对跨卷同样成立，
+   故**不**为跨卷另开一栏。
+7. **M22 只动 trash 这一格**：hardlink/symlink 的既有口径一字不动；ADS 守卫的拒绝路径也不受影响
+   （拒绝项不进任何一栏）。
+8. **M25 的 startup 顺序未变**：仍是 缓存 → 账本 → `app:ready`，故提示的累积顺序
+   （先缓存、后账本）与发生的先后一致；`app:ready` 之后前端才拉 `GetStartupNotice`，
+   不存在"拉取早于写入"的窗口。
+9. **M26 的判据面只覆盖 `dedupeRoots` 与既有两个键比较点**：`rootPrefixes`（`scanner.go:582-589`）
+   用的仍是"根 + `filepath.Separator`"，那是**原始路径**上的前缀（不是折叠键），
+   与 M26 不同族，本项不动（登记 M36 是另一回事：≥2 根时子树里嵌着另一卷的语义，仍留账）。
