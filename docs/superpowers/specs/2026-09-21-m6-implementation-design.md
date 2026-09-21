@@ -3999,3 +3999,214 @@ M114 读不动并回"被替换"
       identity_unknown_m114_test.go:84: 文案应明说「无法确认」…
       identity_unknown_m114_test.go:87: 底层原因必须原样出现在文案里…
 ```
+---
+
+## 24. 三轮全量审查·第 3 轮设计段（2026-09-22）：M89 / M40 / M114 残半的实施判据 + 本轮新增 13 条（M135~M147）
+
+### 24.0 本轮取材与复核纪律
+
+与第 2 轮同法：**每条自己开码复核**，复核为真才分配 ID（§22.8 那条教训的落地）。三个来源：
+
+1. 本轮三个只读审查子代理（甲 / 乙 / 丙）的合并面。本轮没有再出现"整份报告伪造坐标"，
+   但仍有两处坐标误差，均不足以支撑任何结论，只记一笔：乙引 `verify.go:132`
+   （`identityCheck` 的函数行逐字读数是 `:133`）、甲引 `move.go:219`
+   （写着 `undo.go:447` 的那句在 `:218`）。
+   ⇒ 因此 §24.3/§24.4 每条的**依据都是我自己的行级读数**，不按"谁先提出"记账：
+   复核通过后谁提的已经与判据无关，而"按代理记账"正是上一轮甲那份报告能混进来的形状。
+2. §6.19 末"未兑现"清单点名的三件：**M89 原样挂着**、**M114 的两处残半**、
+   **M134 没加的那条静态防回归断言**。三件本轮全部开工（§24.3、§24.5）。
+3. 第 2 轮"登记不修"的 M130/M131/M132 与 M112 背后的 **M40** 形状。本轮只对 M40 开工
+   （§24.3.2）；另三条复核后仍按约束 7 挂着，逐条理由见 §24.6。
+
+本轮登记 **M135~M147** 十三条：十二条修（M135~M146），一条**登记不修行为**（M147，只改话术）。
+`grep -rnoE "M1(3[5-9]|4[0-7])"` 在全仓（含 Go/MD/SH/YML/TS/Vue）**零命中** ⇒ 号段确认可用，
+分配时机在本节落笔之前已完成复核，不是预定区间。
+
+### 24.1 ★ 先记一笔工具事故：变异 harness 的**假绿**（不登记 ID，划账 §6.20 同址引这里）
+
+复算那五个承重变异时，我把仓库 `git archive HEAD | tar -x` 到 `/tmp/r3mut/repo` 再改。
+那棵树**没有 `.git`**，于是脚本里"改完还原"的两句全部静默失效：`git checkout -- <path>`
+无事发生，`git status --porcelain` 打出空串。我把 `reverted; tree clean: True`
+记在了一份**仍然被改坏**的树上，紧接着第二跑便把五个锚点全报成 `count=0`
+（看起来像"锚点被删干净了"，真相是第一跑的改动还原封不动留在树里）。
+
+这就是本仓一轮一轮审出来的同一类缺陷——**判据没被走到却报绿**——只不过这次栽的是我自己的工具。
+登记不修（不属产品面），但三件修法必须写清，缺一不成立：
+
+1. 还原改成 `git -C <真仓> show HEAD:<path>` 写回目标文件，不依赖被改树里的 git；
+2. "树干净"改由**字节比对**的 `dirty()` 自检给出，而不是 `git status`；
+3. 加**负控制**：故意施加一次必须被抓出的改动，确认 harness 真的报 dirty。
+
+修正后的三条自检逐字读数：
+
+```
+restore self-check (must be []): []
+negative control (must list verify.go): ['internal/ops/verify.go']
+after restore (must be []): []
+```
+
+⇒ §24.2 那五条读数是**修正后的 harness** 重跑的结果；第一跑那批（"五个锚点 count=0"）作废，
+不进任何结论、不进登记表。
+
+### 24.2 五个承重变异的真读数：全部存活
+
+每个变异都是"把判据本体的那一格改掉"。若对应断言是活的，包必须红。实得全绿 ⇒ 那一格没人钉。
+
+| 变异 | 改在哪 | 该红在哪 | 实得 ⇒ 去向 |
+|---|---|---|---|
+| R3-MU1 | `verify.go:144-146` 第二条 vUnknown 来路改成 `return vReplaced, ""` | `identity_unknown_m114_test.go`（只钉了第一条来路） | 全绿 ⇒ **M135** |
+| R3-MU2 | `hasher.go:260-262` 删掉 `if err != nil { return … }`（吞读错误） | `TestHashFullReadErrorPropagates`（`hasher_test.go:179`） | 全绿 ⇒ **M136** |
+| R3-MU3 | `pipeline.go:809-811` 删排序第二级键（成员数降序） | `TestGroupOrderAndIDsAreDeterministic` | 全绿 ⇒ **M137** |
+| R3-MU4 | `move.go:63` 部分成功改回 `return "", fmt.Errorf(…)` | `move_crossvolume_identity_test.go:92`（写成 `_, err :=`） | 全绿 ⇒ **M138** |
+| R3-MU5 | `fscase.go:171` 撞名支改成 `return false, true` | `verdict_from_test.go`（三条里没有撞名那一格） | 全绿 ⇒ **M139** |
+
+```
+=== R3-MU1 rc=0 存活(绿) ok filededup/internal/ops 0.921s
+=== R3-MU2 rc=0 存活(绿) ok filededup/internal/hasher 0.493s
+=== R3-MU3 rc=0 存活(绿) ok filededup/internal/dedup 2.825s
+=== R3-MU4 rc=0 存活(绿) ok filededup/internal/ops 0.837s
+=== R3-MU5 rc=0 存活(绿) ok filededup/internal/fscase 0.398s
+final dirty (must be []): []
+```
+
+本批判据的共性，一句总则：**键被执行到 ≠ 键被钉住**；"红过"必须红在**它声称的那一格**。
+（M137 是这句话最干净的样本：`group_order_probe_test.go:32` 自己写着"第二级 ⇒ 只有 A 分出去"，
+而删掉整级之后 A 仍由第三级键（m<y<z）落在原位。）
+
+### 24.3 三条既有登记的实施判据
+
+#### 24.3.1 M89（OPS-14d）：执行器不再丢掉部分成功的落点 —— **不动任何形状**
+
+现状读数（本轮逐字）：`outcome.dst` 早已存在（`executor.go:297`），`settle` 的 ocOK 分支
+已经传 `DestPath: o.dst`（`:318-319`），ocFailed 分支没传（`:322`）；丢字段的那一处就是
+move 分支 `:583-584`（`if dst, err := MoveFile(...); err != nil { settle(i, outcome{code: ocFailed,
+err: err.Error()}) }`）。下游链路本来就是通的：`app.go:1940` 的 OnItem 原样把 `r.DestPath`
+喂给 `hs.FinishItem`，`oplog.go:83-88` 写 `dest_path` 列。⇒ 修法只有一件事：**传值**，
+`MoveFile` 的签名、`outcome` 的形状、账本状态机全不动（登记时那句"修法要动 outcome/FailedItem
+形状或账本状态机"比实际需要的重）。
+
+用户可见面：`model.FailedItem{Path, Stage, Err}`（`executor.go:444`）没有落点位。
+⇒ 沿用 undo 侧那条已被钉住的写法：错误文本追加"（数据已在 %s）"，与 `app.go:2211-2217`
+的 `undoFailure` 同构且**幂等**（文本里已经有那个路径就不重复补）。
+★ 为免同一条判据写两遍（I5 漂移面，甲/乙都点过），把这层抽成 `ops.DestHint(msg, dst string) string`，
+`undoFailure` 改为调用它。动 app.go 的理由在此：**输出串逐字不变**，既有断言一条不动。
+
+**不做**：不给 `FailedItem` 加 `DestPath` 字段（那是 TS 对齐面 M30 的改动，而"文本 + 账本"两件已经
+把信息交出去了）；不改 failed 行的状态。
+
+安全性取证（★ 不写下来，"给 failed 行写 dest_path"看着就像放开了回撤面）：账本两条不变量让
+这一格是**惰性**的——`reclaimed = SUM(size) WHERE state=done`（`oplog.go:129-130`），
+回撤候选只认 `StateDone`（`app.go:2095`）或 `StateDone || StateUndoFailed`（`app.go:2174`）
+⇒ failed 行的 `dest_path` 既不会虚增释放量，也不会凭空多出一个可回撤目标。
+
+红法：新用例经 `renameFile` 缝造 EXDEV、再经 `removeSrc` 缝造删源失败（先例
+`move_crossvolume_identity_test.go:28-36`、`undo_move_partial_m113_test.go`），断
+`res.Failed[0].Err` 含「数据已在 <dst>」且该 dst 与文本里那份一致；变异自证 = 把 `:584`
+改回"不传 dst"，必须红。
+
+#### 24.3.2 M40：同卷 move 不再计入 `Reclaimed`
+
+判据来源唯一：`MoveFile` 自己知道走了哪条腿——`rename` 快路径 `:34-35` 返回 nil 就是同卷
+（跨卷会带 EXDEV/`ERROR_NOT_SAME_DEVICE` 落进 `isCrossDevice` 那条腿），copy→校验→删源那条腿
+才是跨卷。⇒ **不改公开签名**：新增 `moveFileDetailed(src, targetDir) (string, bool, error)`
+（第二位 = crossVol），`MoveFile` 收成丢掉该位的薄包装。八个调用点里只有 `executor.go:583`
+需要那一位，`undo.go:197` 与六处测试一字不动（约束 7）。
+
+**不新增计数字段**：同卷 move 的贡献哪一栏都不进。三条理由：① 用户裁定"新增计数的界面呈现属 M8，
+不做"；② M130 刚登记过一个"只写不读"的字段，明知故犯加第二栏同样的死字段；③ 结果条从"释放 X"
+变成"释放 0"就是真话（同卷改名一分未减），落点仍逐项写在 `ItemResult.DestPath`。
+
+红法与负控制（关键是别把跨卷那半一起清零）：
+- 新用例 V4：`Execute(Kind:"move", TargetDir: 同一卷的子目录)` ⇒ 断 `res.Reclaimed == 0`，
+  **改前红在 `Reclaimed == size`**（这就是登记两年那笔假账的形状）。
+- 既有 V3 `TestCrossVolumeMoveStillReclaims`（`executor_account_test.go:74-93`，
+  经 `forceCrossVolumeRename` 换 `renameFile` 缝）必须继续绿 ⇒ 它充当本修复的负控制，
+  证明这是"分辨"而不是"把 move 整栏改坏"。
+- ★ 两条都不需要真第二个卷：同卷走原生快路径，跨卷由同一个缝造 EXDEV ⇒ **三条腿都能真跑**，
+  本项不属"代码已改、验证未兑现"那一类。
+
+连带话术（必须一起改，否则下一轮又多两条过期句子）：`executor.go:410-411` 的
+"登记为 M40，此处不动"、`executor_account_test.go:67-71` 的"本项不动它，也不把已知的假账钉成契约"
+——本轮动了，两处改为真读数。
+
+#### 24.3.3 M114 的两处残半
+
+**(a) S1 四处仍把"读不动"说成"inode 已变化"。** 逐字读数：`move.go:106`、`:110`、
+`symlink.go:80`、`:84` 四句 `fmt.Errorf` 的文案硬编码"…在校验后被替换（inode 已变化），已拦截（S1）"，
+走的是 `identityStill` 二值视图 ⇒ M114 修的是 `guardIdentity`，这四格原样留着同一个假话形状。
+改法：四处换 `identityCheck` 三路分发，**处置一字不变**（含既有的 `_ = os.Remove(tmp)`），
+只换说法，且四句共用一个 helper（`identityGuardSentence(what, v, why)`）以免四处各自漂移：
+- `vReplaced` ⇒ 「<what>在校验后被替换（inode 已变化），已拦截（S1）」**逐字与今天相同**
+  （`symlink_test.go:625` 钉着"保留源"，另有"inode 已变化"的既有钉子，改字就是收窄）；
+- `vGone` ⇒ 「<what>在校验后已不存在，已拦截（S1）」；
+- `vUnknown` ⇒ 「无法确认<what>仍是校验时那个对象（<why>），已拦截（S1）」，
+  与 `guardIdentity` 用的 `:361` 那同一句式。
+
+红法：经 `fsidFromPathFn` 缝注入 `errSimulatedUnreadable`（该接缝专为这件事存在，
+`identity_unknown_m114_test.go:31-35` 已示范为何不用 `syscall.EACCES`），
+改前文案含"被替换" ⇒ 红；改后含"无法确认"且保留底层原因 ⇒ 绿。
+负控制 = 另一次真顶替（换 inode）必须仍说"被替换"且一字不变。
+
+**(b) `identityStatus` 只剩测试在用。** 读数：`verify.go:166`（`identityStill` 的包装，丢弃 `gone`）
++ 测试引用 `verify_m52_m54_test.go:129/:146/:154`；`gone` 那一位在**生产里零读者**。
+★ 本轮**不删**它：删要挪动三条既有断言的落点 = 收窄（约束 2 禁止），第 2 轮 §23.12 已把这件事
+记成"一条新的话术债"。本轮只把 `verify.go:185-187` 那句过期话术改成真读数——
+"executor 那六处改直读 identityCheck"不准：六处经 `guardIdentity`（`:463/:541/:558/:580/:599/:670`），
+`identityCheck` 在生产里的直调点只有 `:343` 一处；并补一句 `identityStatus.gone` 无生产读者。
+
+### 24.4 本轮新增 13 条：坐标、形状、修法、红法
+
+| ID | 列值 | 坐标（本轮逐字读数） | 缺陷形状 | 修法 | 取红方式 |
+|---|---|---|---|---|---|
+| M135 | OPS-17 | `verify.go:144-146` | 判据本体的第二格没人钉：`identityCheck` 四路分发里 `!cur.Resolved` 那条既有文案又有语义，零断言 | 新用例经 `fsidFromPathFn` 注入 `(fsid.ID{Resolved:false}, nil)`，断"不含被替换 + 含无法确认 + 仍拦下" | 变异 R3-MU1（改前存活，§24.2）必须红 |
+| M136 | HAS-4 | `hasher.go:259-265` × `hasher_test.go:194-197` | 断言判的不是那一格：吞掉 `CopyBuffer` 的 err 会掉进 `n != size` 的短读支，**照样报错**，只是换一个错 ⇒ "两半一起改才红"（M129 已经撞到过） | 现断言之外补**错误身份**判据 `errors.Is(err, fs.ErrClosed)`（短读支包的是 `io.ErrUnexpectedEOF`，两者可分） | 只删 err 分支（R3-MU2 的一半）必须红；两半同改仍红（既有钉子） |
+| M137 | DDP-3 | `pipeline.go:809-811` × `group_order_probe_test.go:28-33` | 键被执行到但**不 decisive**：夹具 A=3/B=2/C=2，删第二级后第三级（m-a1 < y-c1 < z-b1）给出**完全相同**的序 | 新用例自带冲突夹具：组 P（2×300KiB，头 `a-p1.bin`）与组 Q（3×150KiB，头 `b-q1.bin`）可释放量都是 300KiB ⇒ 有第二级 Q 在前，删掉则最小路径把 P 提前 | 变异 R3-MU3 必须红；既有 `want` 一字不改（它继续钉第一、三级） |
+| M138 | OPS-18 | `move.go:59-64` × `move_crossvolume_identity_test.go:92` | 契约没钉子：`MoveFile` 部分成功必须回落点（M113、M89 都建在这一位上），用例却写成 `_, err :=` | 同一用例改 `dst, err :=`，断 `dst != ""`、`dst` 出现在 `err.Error()` 里、且该路径上的内容等于源 | 变异 R3-MU4 必须红 |
+| M139 | FC-4 | `fscase.go:171` × `verdict_from_test.go` 三条 | 撞名支（`return false, false`）零覆盖：现有三条是"看不见 / 同一对象 / 读不动" | 新增第四条：lower、upper 各为**独立存在的两个文件**（不同 inode），断 `v=false, ok=false` | 变异 R3-MU5 必须红；不依赖卷的语义 ⇒ 本机真跑 |
+| M140 | FC-5 | `fscase.go:172-173` × `verdict_from_test.go:19-36` | 不是判据缺陷，是**覆盖局限**：既有那条拿"同一名字的另一种大小写"当 upper，APFS 上命中同一对象 ⇒ 只能 `t.Skip`，读数归 CI 的 linux 腿 | 再补一条：upper 用**从未创建过的名字**（ENOENT 与大小写语义无关，三条腿都能真跑）；既有条目与其 `t.Skip` **原样不动**（AS-K2） | 把 `:173` 改成 `return false, false` ⇒ 红在本机新那条（而不是只有 linux） |
+| M141 | FE-14 | `PreviewPanel.vue:117` × `:30` × `app.go:1050` | 展示不真：chip `v-if="overRenderCap"` 不受 `isMd` 约束，而 image 预览允许到 ~256KB base64 ⇒ 预览一张 100KB 的图会显示「默认源码」 | 改为 `v-if="isMd && overRenderCap"`；在 `test-frontend-logic.sh` 加接线锚（.vue 打不进 `node --test`，先例 M116/M118） | 负控制：`FRONTEND_DIR` 指向"把 chip 改回未门控"的那份副本，必须报写法被回退（该覆盖位 `:18-21` 就是为此存在） |
+| M142 | GATE-9 | `smoke-symlink-assert.sh:153`、`:172` | 一条纪律三份实现，**最弱那份在守契约**：`case "$out" in *SKIP*)` 允许 SKIP 出现在任意位置（含 assert 自己打印的说明行），而 `run-gates.sh:155` 与 `ci.yml` 都按行首 `^SKIP` 锚定 | 两处改为 `printf '%s\n' "$out" \| grep -q '^SKIP'`（三份同一把尺子）；`:224`/`:225` 那条"必须不含 SKIP"**保持整串匹配**（absence 本就该看全文） | 负控制：`SMOKE_TARGET` 指向一份 rc=2 且只在行中打 SKIP 的桩 ⇒ 改前 A1 判 ok（假绿），改后判 bad |
+| M143 | TST-5 | `app_preview_p3_test.go:58` × `app.go:1044-1047` | 表与被测对象脱钩：用例硬写 `exts := []string{".png", ".bmp"}`，生产表有 6 项 ⇒ 往 `imageMime` 加一项而没注册解码器，本条照绿。而这正是 `:1039-1040` 那句 P3 承诺要防的事 | 改由**生产表驱动**：遍历 `imageMime` 的键，每项配一段可解码夹具字节，断 `image.DecodeConfig` 返回的格式名 = 表值去掉 `image/` 前缀；并断**两侧键集合相等** | 两种变异都必须红：表里删 `.gif`（集合不再相等）、删 `app.go:25-26` 的解码器注册 |
+| M144 | TST-6 | `app.go:899`、`:906`、`:913` × 注释 `:892`「稳定：组 ID 兜底」 | 兜底键零覆盖：三个分支都有平手时的 `GroupID <` 兜底，没有一条用例把"平手"造出来 ⇒ 删兜底不会红（`sort.Slice` 非稳定，序落到遍历序） | 新用例造两组同尺寸 / 同成员数 / 同可释放量，且**故意把 GroupID 与路径序倒过来发放** ⇒ 有兜底按 ID 升序，删兜底即红 | 三条分支各自把兜底改成 `return false`，必须各红一次（同一判据三格，逐格取红） |
+| M145 | PRG-3 | `progress_test.go:27` | 恒不成立的析取：`!= 0 && != -1` 里的 `0` 不可达——`progress.go:141` 只在 `elapsed > 0` 时写 ETA，`elapsed == 0` 时初值 `-1` 原样交回 | 收紧为 `!= -1`（**是补强不是放宽**，约束 2 管的是反方向），并把不可达推导写进注释 | 变异：`elapsed > 0` 之后加 `else { ev.ETASeconds = 0 }` ⇒ 改前绿（0 被放过），改后必须红 |
+| M146 | DBF-1 | `dbfile_test.go:15-23`、`:29-38` | 表从硬编码清单遍历且**无条数下界**：两张表删空 ⇒ 循环 0 次 ⇒ 全绿（同仓先例已补过：`app_undo_platform_probe_test.go` 的 `checked != 4`、`sqlconn_test.go` 的 `scanned < 50`） | 两张表各加下界（corrupt ≥6 / transient ≥8），文案明说"下界归零时本条等于没跑" | 变异：清空任一表 ⇒ 必须红在下界，而不是无声通过 |
+| M147 | WT-1 | `worktemp.go:133-136` × `isExtStart:159` | 注释与行为不符：`:127-128` 承诺"名尾 / .扩展名 / _序号.扩展名"三种收尾，`isExtStart` 实为"`rest[0]=='.'`" ⇒ `photo.fdd-restored.anything.jpg` 也被判成我们的暂存（生成侧只插一个扩展名） | ✓ **行为不修**：判宽=多保护一个用户文件，判窄=把自己的暂存当真实数据参与去重，风险不对称。本批只把 `:127-128` 的话术改成真读数 | —（不改行为 ⇒ 不取红；随 §6.20 话术面对账一并核） |
+
+### 24.5 M134 欠的那条静态防回归断言（本轮补）
+
+§23.11 登记 M134 时自己写下"没做 (a)：未加静态 grep 断言防回归（新增断言要把 `MIN_CHECKS`
+从 14 抬起、连带重取条数读数）"。本轮补上，代价照计：
+
+- 落点：`smoke-symlink-assert.sh` 新增一组 **E 静态防回归**——扫 `scripts/smoke-symlink.sh`、
+  `scripts/smoke-symlink-assert.sh`、`scripts/check-version-sync.sh`、`.github/workflows/ci.yml`
+  四个文件，命中"`$VAR` 紧跟一个非 ASCII 字节"即判 bad（M134 的根因形状：bash 3.2.57 在
+  `LC_CTYPE=C.UTF-8` 下把全角括号首字节算进变量名，`set -u` 当场打死被测脚本）。
+- `MIN_CHECKS` 14 → 15，并按规矩**重取**条数读数（不许沿用 14 那句"实测"）。
+- 负控制：给扫描位一个可覆盖入口（`SCAN_FILES`，先例是 `test-frontend-logic.sh:18-21` 的
+  `FRONTEND_DIR`，注释原话就是"负控制要拿故意改坏的那份跑本套断言"）⇒ 用一份含
+  `"$FOO）"` 的副本喂进去必须红，用真仓必须绿。
+
+### 24.6 本批**不做**的清单（逐条给理由，不留"以后再说"）
+
+| 项 | 不做的是什么 | 为什么 |
+|---|---|---|
+| M130（PRG-2） | 删 `progress.go` 里只写不读的 `lastEmit` | 死代码清理不属判据面；同包本轮已因 M145 开窗，约束 7 二次不动 |
+| M131（HAS-2） | 删 `growth_sampling_test.go:134` 那条恒不成立的后半 | 删一半 = **收窄**既有断言（约束 2）；要补的是小文件腿的另一条用例，本批不扩面 |
+| M132（HAS-3） | 改 `shortread_test.go:111-114` 那句"上限"话术 | 断言对夹具成立，动的只是注释；同包本轮已开 M136 一窗 ⇒ 约束 7 |
+| M89 的形状面 | 给 `model.FailedItem` 加 `DestPath` | 那是 M30 的 TS 对齐改动；"文本 + 账本"已把信息交完（§24.3.1） |
+| M40 的计数字段 | 新增"同卷搬移字节"栏 | 用户裁定"新增计数的界面呈现属 M8，不做"，且不复制 M130 那种只写不读的字段 |
+| `identityStatus` | 删掉这个只剩测试在用的兼容层 | 删它要挪三条既有断言 = 收窄；本轮只把它的注释改成真读数（§24.3.3-b） |
+| M91（FSID-1） | `(dev,ino)` 回收 inode 的三选一修法 | 属裁定面（A/B/C 各有代价），且现象本机不可复现（APFS 不还号）⇒ 仍待裁定，不占本批 |
+| M147 的行为 | 收紧 `isExtStart` | 判宽是保护面，判窄才是风险；不对称 ⇒ 登记不修（§24.4 末行） |
+
+### 24.7 提交节奏与本批门禁计划
+
+三提交（本项目规矩）：① 本节设计段；② 实施（M89/M40/M114 残半/M134-E 组 + M135~M146 十二条
+与 M147 的话术，**每项先取红**）；③ 划账 §6.20 + 文档对齐 + 本批话术面十条。
+每批做完跑全套 15 行门禁，任何一项红就停下修，不带红交付。
+
+本批**不需要**真机读数即可兑现的：M40（EXDEV 由缝造）、M89、M114(a)、M135~M147 全部
+（M140 只兑现"新那条本机跑"，既有的 `UpperAbsent` 仍归 CI 的 linux 腿，AS-K2 不放宽）。
+本批**兑现不了、必须写明**的：`smoke-symlink-assert.sh` 的 E 组在 CI 的 linux/macOS 腿上会跑，
+但 runner 的 bash 版本与本机 3.2.57 不同，M134 那类缺陷**只在开发机上复现** ⇒ 该组的
+真读数以本机为准，CI 只作旁证（这句话必须出现在划账里，免得读成"CI 绿 = 防回归已生效"）。
