@@ -19,6 +19,9 @@ type Matcher struct {
 	incExt   extSet
 	excExt   extSet
 	excPaths []string // 2026-09-18 审查 I1：已归一为 "/" 分隔的排除模式
+	// invalid 是**语法无效**的排除模式（原文，未归一），由 Compile 逐段探出（R2-4）。
+	// 它们**仍在 excPaths 里**：本字段只负责"说出来了"，不负责改判（方向仍是少排除=多扫）。
+	invalid []string
 }
 
 // extSetMapMin 建 map 的列表长度阈值（含）。
@@ -120,11 +123,19 @@ func Compile(f *model.Filters) *Matcher {
 	if f == nil {
 		return nil
 	}
-	var excPaths []string
+	var excPaths, invalid []string
 	if len(f.ExcludePaths) > 0 {
 		excPaths = make([]string, len(f.ExcludePaths))
 		for i, pat := range f.ExcludePaths {
-			excPaths[i] = pathnorm.Slash(pat, "\\")
+			norm := pathnorm.Slash(pat, "\\")
+			excPaths[i] = norm
+			// R2-4：语法无效的模式**照旧留在 excPaths 里**（它命中不了任何东西，
+			// 行为与改前逐字一致），这里只是把它登记出来让上层能留痕。
+			// ★ 判据取归一后的形态：匹配用的就是它，报"归一后的死活"才是真话；
+			// 但回显给用户的仍是原文，他才认得出自己敲的是哪一条。
+			if badExcludePattern(norm) {
+				invalid = append(invalid, pat)
+			}
 		}
 	}
 	return &Matcher{
@@ -132,7 +143,42 @@ func Compile(f *model.Filters) *Matcher {
 		incExt:   newExtSet(normalizeExtList(f.IncludeExts)),
 		excExt:   newExtSet(normalizeExtList(f.ExcludeExts)),
 		excPaths: excPaths,
+		invalid:  invalid,
 	}
+}
+
+// badExcludePattern 该模式是否语法无效（Go 的 path.Match 会报 ErrBadPattern）。
+//
+// ★ 必须**逐段**问，不能拿整条模式去问一次：整模式自检是输入相关的——
+// `a[b/c]d` 用 9 个不同串试，一次都不报错，而逐段试 `a[b` 稳定报错。
+// 本包的匹配本就是切段后逐段交给 path.Match（matchSegs），探针与运行时不同形就会漏。
+// （22 条语料的实测对照见设计段 §30.6：只有逐段能抓到 1 条、只有整模式能抓到 0 条。）
+//
+// `**` 段跳过：matchSegs 把它当递归通配单独处理，从不交给 path.Match。
+// 探针串必须非空：Go 在空串上提前退出 chunkScan，不报语法错。
+//
+// ★ 抓不到"语法合法但永不命中"（`a/[z-a]` 反向区间、`[!]a]`）：那是 glob 可满足性问题，
+// 要判它就得在本包里再写一份 glob 语义，正是 P-1 静态钉防的那类分叉。这一条边界写进 docs/09。
+func badExcludePattern(normPat string) bool {
+	for _, seg := range strings.Split(normPat, "/") {
+		if seg == "" || seg == "**" {
+			continue
+		}
+		if _, err := matchFold(seg, "probe", false); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// InvalidPatterns 返回本次编译里语法无效的排除模式（用户原文，按输入顺序）。
+// 全部有效时返回 nil。nil *Matcher 恒返回 nil，与 Compile/Apply/ExcludeDir
+// 的三处 nil 短路同契约——所以上层可以直接 matcher.InvalidPatterns() 不判空。
+func (m *Matcher) InvalidPatterns() []string {
+	if m == nil {
+		return nil
+	}
+	return m.invalid
 }
 
 // Apply 判断文件是否通过过滤器。
@@ -264,14 +310,14 @@ func matchPath(pat, rel, name string, insensitive bool) bool {
 		return false
 	}
 	if !strings.Contains(pat, "/") {
-		if matchFold(pat, name, insensitive) {
+		if matchFoldOK(pat, name, insensitive) {
 			return true
 		}
 		for _, seg := range strings.Split(rel, "/") {
 			if seg == "" {
 				continue
 			}
-			if matchFold(pat, seg, insensitive) {
+			if matchFoldOK(pat, seg, insensitive) {
 				return true
 			}
 		}
@@ -288,7 +334,7 @@ func matchPath(pat, rel, name string, insensitive bool) bool {
 		}
 		return false
 	}
-	if matchFold(pat, rel, insensitive) {
+	if matchFoldOK(pat, rel, insensitive) {
 		return true
 	}
 	return false
@@ -304,11 +350,21 @@ func foldCase(s string, insensitive bool) string {
 	return s
 }
 
+// matchFoldOK 是四条匹配腿的**唯一吞错点**：语法无效的模式在这里退成"不命中"。
+// 方向是少排除 = 多扫（不会多删），而这类模式在 Compile 里已经被单独上报进失败清单
+// （R2-4），所以这里吞掉的是一份**已经留过痕**的错误，不是无声失效。
+func matchFoldOK(pat, s string, insensitive bool) bool {
+	ok, _ := matchFold(pat, s, insensitive)
+	return ok
+}
+
 // matchFold 是本包唯一允许出现 path.Match 的位置（P-1 型静态钉：filter_m105_test.go 的
 // TestPathMatchOnlyInsideMatchFold）。insensitive=false 时与改前逐字同一条路径。
-func matchFold(pat, s string, insensitive bool) bool {
-	ok, _ := path.Match(foldCase(pat, insensitive), foldCase(s, insensitive))
-	return ok
+//
+// R2-4：err 不再在这里吞掉，而是原样交给调用方——Compile 的语法校验要用它，
+// 且必须用**同一个函数**，否则就要在本包里再写一份 glob 解析（那正是本钉防的分叉）。
+func matchFold(pat, s string, insensitive bool) (bool, error) {
+	return path.Match(foldCase(pat, insensitive), foldCase(s, insensitive))
 }
 
 // matchSegs 段级 glob 匹配：pat/rel 已按 "/" 切段。** 匹配 0..n 个段
@@ -328,7 +384,7 @@ func matchSegs(pat, rel []string, insensitive bool) bool {
 	if len(rel) == 0 {
 		return false
 	}
-	if !matchFold(pat[0], rel[0], insensitive) {
+	if !matchFoldOK(pat[0], rel[0], insensitive) {
 		return false
 	}
 	return matchSegs(pat[1:], rel[1:], insensitive)

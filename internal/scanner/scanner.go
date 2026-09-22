@@ -248,6 +248,18 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	prefixes := rootPrefixes(cleaned)
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
 	matcher := filter.Compile(f)
+	// R2-4（设计段 §30.6）：语法无效的排除模式**整条不生效**（path.Match 的
+	// ErrBadPattern 原先在本包外面被吞掉）。方向仍是少排除=多扫，不改判，
+	// 但必须留痕——失败清单是扫描侧唯一已经到得了用户的明细通道（六个跳过类计数
+	// 在前端只有类型声明、零消费者）。
+	// ★ 排在 worker 启动之前：这里直接 append 不与下面的 mu 临界区竞争。
+	for _, pat := range matcher.InvalidPatterns() {
+		res.Failed = append(res.Failed, model.FailedItem{
+			Path:  pat,
+			Stage: "exclude",
+			Err:   "排除模式语法无效（path.Match: bad pattern），这一条整条未生效，已按未排除处理",
+		})
+	}
 
 	// M6-P4：盘根伪文件的锚点。**原样字符串**比对即可，不必折叠：遍历期的 dir
 	// 只有两种来源——用户给的根（就是这份字符串本身）或 filepath.Join(父, 名字)，

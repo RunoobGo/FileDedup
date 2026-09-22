@@ -6025,3 +6025,54 @@ AS-R3 留的观察点，**不新增接缝**）：
 - 不改 `pathnorm.Slash` 的 `\`→`/` 归一：报的是**归一之后**的死活。副作用要写清——
   用户写 `mydir\[` 会被归一成 `mydir/` + 段 `[` 并报"无效"，而这条模式在归一后的世界里
   本来就永不命中，所以这不是误伤。
+
+**实施读数（HEAD `26794c3` 之上新增，逐项实跑）**：
+
+- 改动面：`internal/filter/filter.go`（`matchFold` 改回传 error、新增 `matchFoldOK` 吞错点、
+  `Matcher.invalid` 字段 + `InvalidPatterns()` nil-safe 访问器、`badExcludePattern` 逐段探针）、
+  `internal/scanner/scanner.go`（`filter.Compile` 之后 12 行上报）、
+  测试 `internal/filter/badpattern_test.go`（5 条）+ `internal/scanner/scanner_badpattern_test.go`（3 条）、
+  `docs/09` §5.2 补一段。**前端零改动**（与设计段判断一致），`matchPath`/`matchSegs` 的
+  四条腿只是把 `matchFold` 换成 `matchFoldOK`，**匹配语义一字未动**。
+- RED 面貌与设计段预测一致：`vet: internal/filter/badpattern_test.go:54:13: m.InvalidPatterns
+  undefined (type *Matcher has no field or method InvalidPatterns)` —— 编译失败而非断言红。
+- ★ **设计段自己的两张表有一行半是错的，按实测改正**：`Compile` 先做 `pathnorm.Slash(pat,"\\")`
+  再校验，所以 `\` 归一成 `/` ⇒ 两个空段 ⇒ **不报**；`a\[` 归一成 `a/[` ⇒ **报**。
+  我先前那张表拿**归一前**的 `path.Match` 读数填了"不报/不报"，两行都反了。
+  站得住的是设计段"不改 Slash 归一"那一格（它本来就预言 `mydir\[` 会被报）——
+  错的是测试表，改正后 `TestCompileFlagsBadPatterns` 连这两条一起过。
+  顺带一条流程自认：`internal/scanner` 那三条是**先写实现后写测试**（TDD 顺序偏离），
+  没拿到改前红；下面的变异 M2 给出的是同一格的等价证据。
+- 变异（三条，全部 `cp` 备份 → `cp` 还原 → `cmp` 自证：三次 `M1/M2/M3-RESTORE cmp ok`，未用 `git checkout`）：
+  - **M1** 逐段探针换成整模式探针 ⇒ 只红在预测的那一格：
+    `InvalidPatterns("a[b/c]d") = []，want 命中=true（★ 整模式自检会漏这一条，只有逐段能抓到）`。
+    ⇒ "必须逐段"这条判据是承重的，不是审美。
+  - **M2** 删掉 `scanner.go` 的上报那一段 ⇒ `失败清单里的排除条目 = 0 条`，而 `internal/filter`
+    全部仍绿 ⇒ "包内测得到"与"用户看得见"确实是两条独立性质（设计段预言的那一格成立）。
+  - **M3** `Compile` 里短路不登记 ⇒ filter 三条红（`TestCompileFlagsBadPatterns` /
+    `TestCompileReportsRawPattern` / `TestBadPatternStillFailsOpen`）+ scanner ① 红。
+    其中 `TestBadPatternStillFailsOpen` 会红是因为它另钉了一条结构事实
+    （`m.excPaths` 仍原样保留坏模式），这条设计段没预言、实施时补的：坏模式留着与剔掉
+    **今日行为相同**，但"留着"是"只报告不改判"的实现证据，没有它这格就退化成一句注释。
+- 回归：`gofmt -l` 空 → `go build ./...` → `go vet` ×（darwin/windows/linux）→
+  `go test -race -count=2 ./...` **23 包全 ok** → `bash scripts/run-gates.sh`
+  `rows=15 PASS=14 SKIP=1 FAIL=0`（唯一 SKIP 是需要 root 的 `smoke-symlink`，与本批无关、改前同形）。
+  ★ 这趟门禁已含 `race-x4-root`、`frontend-build`、`frontend-logic`、`smoke-cli`，
+  即 B 批收尾要求的那三项一并取到了读数。
+- `docs/09` §5.2 新段落里举的三个例子（`build/[`、`node_modules/**[a-`、`mydir\[`）与两个
+  反例（`a/[z-a]`、`node_modules/**`）都用一次性探针测试实测过再写：三条全报、两条全不报；
+  临时文件 `internal/filter/zz_docprobe_test.go` 跑完即删，未进树。
+
+**本项之后仍不成立的声明（未兑现面）**：
+- 不报"语法合法但永不命中"（`a/[z-a]`、`[!]a]`）：判它需要一份 glob 可满足性判定，
+  那是在本包里再写一份 glob 语义，正是 P-1 静态钉防的分叉。已作为边界写进手册 §5.2。
+- 不即时：只在**扫描收尾**的失败清单里出现。输入时不校验、扫描中途不提示、
+  也不额外弹 toast（走 FailedItem 这条既有通道 = 前端零改动的代价）。
+- `FilesFailed = len(failed)` 会按条 +1，"失败项 N"含这些条目；没为它单拆一个数。
+  口径本就如此（目录读失败项一直在里面），但别把它读成"N 个文件读不了"。
+- 抽屉的阶段列显示英文 `exclude`（`FailedDrawer.vue:58` 一直原样渲染 `f.Stage`，
+  `stageLabel` 只服务 ScanView 的进度行，且既有 `ads`/`ops` 同样没有中文标签）。
+- Windows 腿未跑：用例无平台假设（纯字符串判据 + 真目录遍历），但读数只在 darwin 取证。
+- 本批新发现、**未修**：P-1 静态钉只读 `filter.go` 一个文件，"新开一个文件写第二份
+  `path.Match`"这个洞它一直挡不住。本批把校验放在 `filter.go` 内所以仍在作用面里，
+  扩钉（扫全包非测试 .go）不属本项 → 交 E2 收口时登记。
