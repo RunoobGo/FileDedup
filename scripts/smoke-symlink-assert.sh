@@ -55,10 +55,11 @@ fails=0
 # case 全部 miss、某段被提前 return 跳过）fails 同样是 0，脚本却会打印"全部断言通过"
 # 并 exit 0。本脚本的职责正是"自证冒烟判据本身有效"，它自己不能靠"什么都没验"骗过。
 # ⇒ checks 由 ok/bad 各自累加，收尾要求它不低于 MIN_CHECKS。
-# MIN_CHECKS=14 = 本机实跑 `grep -c "✓\|✗"` 的读数（A1/A2/B/C/D 五段各若干条）；
+# MIN_CHECKS=15 = 本机实跑 `grep -c "✓\|✗"` 的读数（A1/A2/B/C/D/E 六段各若干条；
+# E 是 2026-09-22 第 3 轮 §24.5 补的 M134 静态防回归，14 是它进来之前的真读数）；
 # 只设**下限**不设等号：以后加断言不必回来改这里，而"少跑到"一定会红。
 checks=0
-MIN_CHECKS=14
+MIN_CHECKS=15
 ok() { checks=$((checks + 1)); printf '  ✓ %s\n' "$1"; }
 bad() {
 	checks=$((checks + 1))
@@ -149,10 +150,17 @@ if [ "$rc" = "2" ]; then
 else
 	bad "非 root 时退出码 = ${rc}，应为 2：跳过若用 0，CI 里与全绿同形，环境退化时这条防线会静默消失"
 fi
-case "$out" in
-*SKIP*) ok "输出含 SKIP 标记（供门禁精确放行）" ;;
-*) bad "输出无 SKIP 标记，门禁无法区分「合法跳过」与「真失败」" ;;
-esac
+# M142（第 3 轮 §24.4，GATE 家族）：判据与 ci.yml:160 的 `grep -q '^SKIP'` **对齐到同一锚**。
+# 改前这里是 `case "$out" in *SKIP*)` ——任意位置含 "SKIP" 五个字就算过：
+# 被测脚本只要在任何一句话里提到"SKIP"（注释、提示、甚至"这不是 SKIP"），
+# 跳过自证就成立了，而真正被 CI 认领的是"有一行以 SKIP 开头"。
+# 守契约的那道闸比契约本身还松，是"一条纪律多份实现、最弱者守契约"的 I5 形状。
+skip_anchored() { printf '%s\n' "$1" | grep -q '^SKIP'; }
+if skip_anchored "$out"; then
+	ok "输出含行首 SKIP 标记（与 ci.yml 的认领口径同锚）"
+else
+	bad "输出没有以 SKIP 开头的行，门禁无法区分「合法跳过」与「真失败」"
+fi
 if printf '%s' "$out" | grep -qE '跳过'; then
 	ok "输出说明原因"
 else
@@ -168,10 +176,11 @@ if [ "$rc" = "2" ]; then
 else
 	bad "挂载全失败时退出码 = ${rc}，应为 2（当前是 0：静默通过）"
 fi
-case "$out" in
-*SKIP*) ok "输出含 SKIP 标记" ;;
-*) bad "输出无 SKIP 标记" ;;
-esac
+if skip_anchored "$out"; then
+	ok "输出含行首 SKIP 标记（同 A1 的锚，M142）"
+else
+	bad "输出没有以 SKIP 开头的行"
+fi
 
 # ---- B：losetup 成功后 mount 失败，必须释放**那个** loop ----
 say_title 'B loop 未泄漏（losetup 建立、mount 失败）'
@@ -244,6 +253,44 @@ else
 	bad "D 组路径未释放 ${LOOP_DEV}（日志：$(tr '\n' ' ' <"$STUBS/losetup.log")）"
 fi
 
+# ---- E：静态防回归——`$VAR` 紧跟全角字符（M134 的成因，第 3 轮 §24.5）----
+# M134 修的是"bash 3.2 在 LC_CTYPE=C.UTF-8 下把全角字符首字节算进变量名"，
+# 症状是 set -u 报 unbound variable、门禁红而归因指向环境。修法当时是**逐处**
+# 把 `$VAR` 改成 `${VAR}`——那是一次性修复，没有任何东西阻止下一处再写出来。
+# 本组就是那道"阻止"：把规矩变成机器判据（M134 欠的静态断言，§24.5）。
+#
+# 只扫代码行：整行注释（含 YAML 的 # 注释）里的举例不构成运行时风险，
+# 而本仓的注释正好就有 `$LOOP）` 这一形（M134 自己的说明段）。
+say_title 'E 门禁脚本里没有 $VAR 紧邻全角字符的写法（M134 静态防回归）'
+NA_BYTE="$(printf '\200-\377')"
+if [ -n "${M134_SCAN_FILES:-}" ]; then
+	scan_list="$M134_SCAN_FILES"
+else
+	scan_list="$(printf '%s\n' "$REPO_ROOT"/scripts/*.sh "$REPO_ROOT/.github/workflows/ci.yml")"
+fi
+scanned=0
+m134_bad=''
+for f in $scan_list; do
+	if [ ! -f "$f" ]; then
+		m134_bad="$m134_bad ${f}(读不到)"
+		continue
+	fi
+	scanned=$((scanned + 1))
+	hit=$(LC_ALL=C grep -v '^[[:space:]]*#' "$f" |
+		LC_ALL=C grep -nE "\\\$[A-Za-z_][A-Za-z0-9_]*[${NA_BYTE}]" | head -3)
+	if [ -n "$hit" ]; then
+		m134_bad="$m134_bad ${f##*/}:$(printf '%s' "$hit" | tr '\n' ' ')"
+	fi
+done
+# 下界：清单为空 / glob 没展开时，"没有命中"是假的通过（M119 同一个坑）。
+if [ "$scanned" -lt 8 ]; then
+	bad "只扫到 ${scanned} 个文件（7 个 scripts/*.sh + ci.yml = 8）⇒ 扫描面本身没成立，不读作通过"
+elif [ -z "$m134_bad" ]; then
+	ok "${scanned} 个门禁脚本的代码行里没有 \$VAR 紧邻全角字符"
+else
+	bad "M134 复发：\$VAR 直接贴着全角字符，bash 3.2 会把全角首字节读进变量名 ⇒${m134_bad}"
+fi
+
 printf '\n'
 printf 'smoke-symlink-assert: 走到断言 %s 条（下限 %s 条），其中失败 %s 条\n' \
 	"$checks" "$MIN_CHECKS" "$fails"
@@ -257,5 +304,5 @@ if [ "$checks" -lt "$MIN_CHECKS" ]; then
 		"⇒ 有分支整段没被执行，不读作通过" >&2
 	exit 1
 fi
-echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D 真失败）"
+echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D 真失败 / E 静态防回归）"
 exit 0

@@ -89,12 +89,28 @@ func TestMoveFileCrossVolumeDoesNotDeleteReplacedSource(t *testing.T) {
 	const thirdParty = "someone else's freshly written file"
 	st := hijackAfterCopy(t, src, thirdParty)
 
-	_, err := MoveFile(src, dstDir)
+	dst, err := MoveFile(src, dstDir)
 	if err == nil {
 		t.Fatal("复制期间源被第三方顶替，MoveFile 却报告成功：删掉的是第三方文件，账本还会记 done（AS-H4）")
 	}
 	if !strings.Contains(err.Error(), "源") || !strings.Contains(err.Error(), "替换") {
 		t.Fatalf("错误应说明「源在复制期间被替换」，实际: %v", err)
+	}
+	// M138（第 3 轮 §24.4 OPS-18）：部分成功**必须把落点交回调用方**。M113（undoMove）
+	// 与 M89（执行器记账）都建在这一位上，而改前这里写的是 `_, err := MoveFile(...)`
+	// ⇒ 把 move.go:63 的返回值改回空串，全仓没有一个用例变红（§24.2 的 R3-MU4）。
+	// 钉三件事：落点非空、错误文本自带同一个落点（不丢信息时的第二道保险）、
+	// 那份副本装的确实是原内容（用户据此判断该删哪一份）。
+	if dst == "" {
+		t.Fatalf("部分成功必须交回已复制的落点，实得空串 ⇒ 执行器与账本无从登记这份多出来的副本（M138）")
+	}
+	if !strings.Contains(err.Error(), dst) {
+		t.Errorf("错误文本必须自带落点: err=%v dst=%s", err, dst)
+	}
+	if copied, cerr := os.ReadFile(dst); cerr != nil {
+		t.Errorf("落点上的副本读不出: %v", cerr)
+	} else if string(copied) != string(payload) {
+		t.Errorf("落点上的副本与被顶替前的原内容不符: %q", copied)
 	}
 	if st.calls != 0 {
 		t.Fatalf("守卫触发后不得删任何路径，实际删源调用 %d 次", st.calls)

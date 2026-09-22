@@ -18,31 +18,43 @@ import (
 //     任何失败保留源文件不删（安全优先）
 //   - 目标重名：O_EXCL 原子抢占 + name_1.ext 递增（见 claimDst）
 //
-// 返回目标完整路径。
+// 返回目标完整路径。需要知道"数据是否真的离开源卷"的调用方用 moveFileDetailed
+// （M40：执行器的 Reclaimed 只认跨卷那一格）。
 func MoveFile(src, targetDir string) (string, error) {
+	dst, _, err := moveFileDetailed(src, targetDir)
+	return dst, err
+}
+
+// moveFileDetailed 的第二个返回值 crossVol：**仅当 err == nil 时有意义**，
+// 表示这次搬移走的是"复制 → 校验 → 删源"那条跨卷腿，数据真的离开了源卷。
+// 同卷快路径（rename 成功）一次 syscall 就完成，磁盘总量一分未减。
+//
+// 为什么这条判据只能从这里出（M40，§24.3.2）：EXDEV 只有 rename 那一刻知道，
+// 上层要分辨就得自己再问一遍卷，两处实现必然漂移（I5）。
+func moveFileDetailed(src, targetDir string) (string, bool, error) {
 	if targetDir == "" {
-		return "", fmt.Errorf("未指定目标目录")
+		return "", false, fmt.Errorf("未指定目标目录")
 	}
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		return "", err
+		return "", false, err
 	}
 	dst, err := claimDst(targetDir, filepath.Base(src))
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	if err := renameFile(src, dst.path); err == nil {
-		return dst.path, nil // 同卷快路径
+		return dst.path, false, nil // 同卷快路径：一次改名，没腾出任何空间
 	} else if !isCrossDevice(err) {
 		dst.release()
-		return "", fmt.Errorf("移动失败: %w", err)
+		return "", false, fmt.Errorf("移动失败: %w", err)
 	}
 
 	// 跨卷：复制 → 校验 → 还原元数据 → 删源
 	st, err := os.Stat(src)
 	if err != nil {
 		dst.release()
-		return "", err
+		return "", false, err
 	}
 	// AS-H4（2026-09-20 全仓审计）：复制可持续数秒到数分钟，是全部已加固点里
 	// **窗口最大**的一个，而删源用的是按路径的 os.Remove——窗口内第三方以 rename
@@ -51,26 +63,29 @@ func MoveFile(src, targetDir string) (string, error) {
 	srcID, err := pathIdentity(src)
 	if err != nil {
 		dst.release()
-		return "", err
+		return "", false, err
 	}
 	if err := copyVerifyFile(src, dst.path, st); err != nil {
 		dst.release() // 清理半成品（仅当占位仍属于我们）
-		return "", err
+		return "", false, err
 	}
 	if !identityStill(src, srcID) {
 		// 不删源，也不把这次算成功：两份并存交给用户核对，
 		// 代价远小于替用户删掉一个他没打算删的第三方文件。
-		return dst.path, fmt.Errorf("已复制到 %s，但源文件在复制期间被替换（inode 已变化）："+
+		// ★ 返回值里的 dst.path 不是冗余：M113（undoMove）与 M89（执行器记账）
+		// 全靠这一位把副本交给账本，M138 已把"部分成功必须回落点"钉成契约。
+		return dst.path, true, fmt.Errorf("已复制到 %s，但源文件在复制期间被替换（inode 已变化）："+
 			"为避免误删第三方文件**未删除源**，两份并存，请核对后自行处理其一: %s", dst.path, src)
 	}
 	if err := removeSrc(src); err != nil {
-		// M88（04 §6.11 OPS-14c，设计段 §20.0-5）：与 undo.go:177 改前同型——说了"两份并存"
-		// 却不给落点。这里更要紧的是 executor.go:568 在部分成功时只取 err 记 ocFailed、
-		// **把 dst 丢掉**（另登记 M89），于是错误文本是这份副本在整条链路上唯一的留痕处。
-		return dst.path, fmt.Errorf("已复制但删除源失败（两份并存，新副本在 %s，源文件仍在 %s，"+
+		// M88（04 §6.11 OPS-14c，设计段 §20.0-5）：与 undo.go:182 改前同型——说了"两份并存"
+		// 却不给落点。这里更要紧的是执行器在部分成功时只取 err 记 ocFailed、
+		// **把 dst 丢掉**（M89，第 3 轮 §24.3.1 已修），于是错误文本曾是这份
+		// 副本在整条链路上唯一的留痕处。
+		return dst.path, true, fmt.Errorf("已复制但删除源失败（两份并存，新副本在 %s，源文件仍在 %s，"+
 			"请核对后自行删去其一）: %w", dst.path, src, err)
 	}
-	return dst.path, nil
+	return dst.path, true, nil
 }
 
 // HardlinkMerge 硬链接合并（M3-T05）：冗余路径替换为指向 keep 的硬链接。
@@ -103,13 +118,13 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	if err := os.Link(keep, tmp); err != nil {
 		return fmt.Errorf("硬链接失败（可能跨卷或权限）: %w", err)
 	}
-	if !identityStill(tmp, keepID) {
+	if s := identityGuardSentence("保留源", tmp, keepID); s != "" {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("保留源在校验后被替换（inode 已变化），已拦截（S1）")
+		return errors.New(s)
 	}
-	if !identityStill(dup, dupID) {
+	if s := identityGuardSentence("目标文件", dup, dupID); s != "" {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
+		return errors.New(s)
 	}
 	backup := dup + FddOldSuffix
 	// backup 位上若有不属于本次操作的对象，rename 会把它静默覆盖掉（M6）。
@@ -212,11 +227,13 @@ func verifyHardlinked(keep, dup string) error {
 //
 // M112（04 §6.11 OPS-16，设计段 §23.1）：改前这段承诺"还原失败不作为整体失败
 // （数据已在目标处），单独返回错误供上层记录"——代码没这么做，也做不了：
-// 本函数直接把 restoreMeta 的错误原样返回，MoveFile:56 见错即 dst.release()
-// 删掉刚复制完的那份并整项判失败。不丢数据（源文件未动），但这次移动没做成。
-// 按注释那样回"成功但降级"需要 MoveFile 有三态出口，那是另一条挂账 M40 的形状
-// 改动；本轮只把话改回真话，不改行为。同包 undo.go:447 applyMtime 才是注释
-// 原先描述的那种口径（失败不升级为整体失败、返回 void）。
+// 本函数直接把 restoreMeta 的错误原样返回，moveFileDetailed 见错即 dst.release()
+// 删掉刚复制完的那份并整项判失败（:68-71 那三行）。不丢数据（源文件未动），
+// 但这次移动没做成。按注释那样回"成功但降级"需要三态出口，2026-09-22 随
+// M40 落地的 moveFileDetailed 已经有了它（第二个返回值 crossVol），但**没有**
+// 顺手改成"元数据失败只警告"——那是行为改动，本批不做，登记在此。
+// 同包 undo.go:452 applyMtime 才是原先那段注释描述的口径（失败不升级为整体
+// 失败、返回 void）。
 func copyVerify(src, dst string, st os.FileInfo) error {
 	sf, err := os.Open(src)
 	if err != nil {

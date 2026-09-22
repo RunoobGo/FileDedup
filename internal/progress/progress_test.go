@@ -24,8 +24,18 @@ func TestTrackerCounts(t *testing.T) {
 	if ev.FilesTotal != 100 || ev.BytesTotal != 1000 {
 		t.Fatalf("总量错误: %+v", ev)
 	}
-	if ev.ETASeconds != 0 && ev.ETASeconds != -1 {
-		t.Fatalf("未启动计时时 ETA 应为 0 或 -1: %d", ev.ETASeconds)
+	// M145（第 3 轮 §24.4 PRG-3）：改前这句是 `ev.ETASeconds != 0 && ev.ETASeconds != -1`，
+	// 其中 `!= 0` 恒不成立——推导全在 progress.go 里：ETASeconds 只在 `if elapsed > 0`
+	// 块内被写（:152），而本用例没调 Start ⇒ snapshotLocked 的 :129-131 把零值 start
+	// 置为 now ⇒ :140 `elapsed = now.Sub(start).Seconds()` 恰为 0，那条写入根本不执行，
+	// 字段原样带着 :138 的初值 -1 交回。于是「0」成了一个恒被放过的值：
+	// 按 §24.4 的红法给 elapsed==0 那条路补一句 `ev.ETASeconds = 0`，改前整包照绿
+	// （实得读数见本轮记录），判据对那一格是瞎的。
+	// 收紧为只认 -1（未知）——**这是补强不是放宽**（约束 2 管的是反方向），
+	// 相邻几条断言一字不动。
+	if ev.ETASeconds != -1 {
+		t.Fatalf("未启动计时时 ETA 只能是初值 -1（未知）：实得 %d。"+
+			"elapsed==0 那条路没有任何写入点，交出别的值即说明 ETA 被无中生有地算了出来", ev.ETASeconds)
 	}
 }
 

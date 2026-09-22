@@ -77,13 +77,13 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	// 的是"链接建对了"，检不出"keep 本身被换"。与 HardlinkMerge 的
 	// identityStill(tmp, keepID) 同构的守卫必须由 keepID 承担（2026-09-20 审查：
 	// 修正前 keepID 参数收而不用，S1 提示形同虚设）。
-	if !identityStill(keep, keepID) {
+	if s := identityGuardSentence("保留源", keep, keepID); s != "" {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("保留源在校验后被替换（inode 已变化），已拦截（S1）")
+		return errors.New(s)
 	}
-	if !identityStill(dup, dupID) {
+	if s := identityGuardSentence("目标文件", dup, dupID); s != "" {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("目标文件在校验后被替换（inode 已变化），已拦截（S1）")
+		return errors.New(s)
 	}
 
 	// ---- 步骤 3：备份原 dup（绝不先删）----

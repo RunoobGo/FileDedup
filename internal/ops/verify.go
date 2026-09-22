@@ -150,6 +150,33 @@ func identityCheck(path string, id fsid.ID) (identityVerdict, string) {
 	return vReplaced, ""
 }
 
+// identityGuardSentence 把"破坏性动作前的身份复核没过"这句话定成分格的说法。
+// 空串 = 复核通过（vSame），调用方继续；非空即拦截理由（调用方自行清理 tmp 后返回错误）。
+//
+// 为什么要有这个 helper（M114 残半 a，第 3 轮 §24.3.3）：HardlinkMerge 与 SymlinkMerge
+// 各留了两道 `if !identityStill(...) { 说"被替换" }`，用的正是 M54/M114 在 executor
+// 那六处已经换掉的两布尔视图 ⇒ "读不动身份 / 原先能解析现在解析不出"被说成
+// "在校验后被替换（inode 已变化）"，宣称看到过一个并不存在的新对象。
+// 处置方向一个字没改（三格全部拦下、全部 fail-closed），改的只有说法。
+//
+// ★ vReplaced 的文本与改前**逐字节相同**：既有文案、既有测试、用户可见措辞都不受影响。
+// subject 是这份东西在用户话术里的名字（"保留源" / "目标文件"）。
+func identityGuardSentence(subject, path string, id fsid.ID) string {
+	v, why := identityCheck(path, id)
+	switch v {
+	case vSame:
+		return ""
+	case vReplaced:
+		return subject + "在校验后被替换（inode 已变化），已拦截（S1）"
+	case vGone:
+		return subject + "已消失，无法合并（S1 拦截）"
+	default:
+		// 与 executor.go 的 guardIdentity 同形：写成 default 而非 case vUnknown，
+		// 将来新增归因时的默认落点是"说不准"，不是"说死了"。
+		return "无法确认" + subject + "仍是校验时那个对象（" + why + "），已拦截（S1）"
+	}
+}
+
 // identityStill 复核 path 当前指向的物理文件仍是 id 记录的那一个。
 // 不跟随符号链接：路径被换成链接/目录/另一文件时，身份必不同。
 //
@@ -182,9 +209,19 @@ func identityStill(path string, id fsid.ID) bool {
 // os.Lstat 的 *PathError，Windows 腿（fsid_windows.go:128）返回 syscall.Errno，
 // 两侧该判据都成立（Errno 自带 Is）⇒ 一个纯函数跨平台，不需要真机。
 //
-// ★ M114 之后本视图只剩两格：executor 那六处改直读 identityCheck（第四格"读不动"
-// 在这里表达不出来——(false,false) 仍是两条来路共用的一格）。其余十处继续用
-// identityStill（各自的"消失"处置语义并不相同，见 merge_guard.go:90 的刻意 fail-closed）。
+// ★ M114 之后本视图只剩两格，而且这两格在生产里**只有一个读者**：identityStill
+// （下面 :166 那处）拿 still 而把 gone 丢掉 ⇒ 生产链路上没有任何地方消费 `gone`，
+// 它 presently 只被 verify_m52_m54_test.go 直接调用着（M54 的判据是从这个视图上钉的）。
+// 这一位是"注释承诺 > 实现"的形状，登记而不顺手删（删它要连带搬 M54 的断言，属独立改动面）。
+//
+// 原先这段写的是"executor 那六处改直读 identityCheck，其余十处继续用 identityStill"
+// ——两处都对不上现在的码（M114-b 本轮校正）：
+//   - executor 那六处不是直读，而是共用 executor.go:371 的 guardIdentity（它读 identityCheck）；
+//   - 2026-09-22（M114 残半 a）之后，HardlinkMerge 与 SymlinkMerge 的四道守卫也不再
+//     用本视图，它们改走 identityGuardSentence；剩下的 identityStill 用户是
+//     move.go:72（跨卷删源前）、undo.go:173（回撤回填前）、symlink.go:117（步骤 5 终局复核）、
+//     claimedDst.stillOurs 与 merge_guard.go:44/:90/:133 —— 各自的"消失"处置语义并不相同，
+//     其中 merge_guard.go:90 是**刻意**的 fail-closed，与 identityStill 的 fail-open 相反。
 func identityStatus(path string, id fsid.ID) (still bool, gone bool) {
 	v, _ := identityCheck(path, id)
 	return v == vSame, v == vGone

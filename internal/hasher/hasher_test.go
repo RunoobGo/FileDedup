@@ -3,6 +3,8 @@ package hasher
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -197,6 +199,19 @@ func TestHashFullReadErrorPropagates(t *testing.T) {
 	}
 	if out != ([32]byte{}) {
 		t.Errorf("出错时不得交回部分指纹，实得 %x（err=%v）", out, err)
+	}
+	// M136（第 3 轮 §24.4 HAS-4）：上面两条只断言「回来的是个错误」，判的并不是
+	// hasher.go:260-262 那一格——把 `if err != nil { return [32]byte{}, err }` 整块删掉
+	// （吞掉 io.CopyBuffer 的读错误）之后，n(=0) != size 立即成立，函数掉进下面的短读支
+	// **照样报错**，只是换成一枚包装 io.ErrUnexpectedEOF 的错误 ⇒ 变异全绿（§24.2 R3-MU2）。
+	// 也就是说「句柄已关」与「文件真的短读」两类故障在这两条断言下不可分：被吞掉的读错误
+	// 会以「文件短读」的面目出现，真因（谁把读打断了）就此丢失。
+	// 因此补上错误**身份**判据：已关闭句柄的读在三条腿上都是 fs.ErrClosed，
+	// 短读支包装的是 io.ErrUnexpectedEOF，两者可分 ⇒ 只认前者，且必须原样交回。
+	if !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("错误身份不符：HashFull 必须原样交回读错误的真因（fs.ErrClosed），实得 %v "+
+			"（若它其实是 io.ErrUnexpectedEOF，说明 CopyBuffer 的错误被吞了、"+
+			"这一格由短读支代答，判据没钉在 hasher.go:260-262 上）", err)
 	}
 }
 

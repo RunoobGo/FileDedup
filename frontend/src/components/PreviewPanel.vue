@@ -40,12 +40,24 @@ const isMd = computed(() => store.preview?.kind === 'text' && isMarkdownExt(ext.
 // 因此超过阈值时**默认退回源码**（源码只是一个 <pre>，代价恒定），
 // 但保留手动渲染入口 —— 把选择权交给用户，而不是替他把界面冻住半秒。
 //
-// ★ M117（04 §6.11 FE-12）：按当前的后端上限，这道护栏**打不到**——预览内容只有
-// PreviewFile 一个来源，文本腿固定截在前 4 KiB（app.go 的 textLimit = 4 << 10），
-// 而 isMd 又要求 kind === 'text' ⇒ content.length > 64 KiB 恒假。上面那三档是
+// ★ M117（04 §6.11 FE-12）：这道护栏对 Markdown 这条腿**打不到**——预览内容只有
+// PreviewFile 一个来源，文本腿固定截在前 4 KiB（app.go:1084 的 textLimit = 4 << 10），
+// 而 isMd 又要求 kind === 'text' ⇒ 文本的 content.length > 64 KiB 恒假。上面那三档是
 // **渲染器本体**的代价读数（真造 400 KB 文档即得），不是这条分支的可达读数。
-// 保留它的理由是"后端上限以后变大时不必重新想起来"，不是"它现在在挡什么"。
+// 保留它的理由是「后端上限以后变大时不必重新想起来」，不是「它现在在挡什么」。
 // 也不调低阈值：那会让正常 md 文件默认退回源码，属改行为，不属本轮。
+//
+// 「2026-09-22 第 3 轮更正」——上面那句「恒假」是 M117 留下的**过度声明**，真读数只有
+// 一半成立：恒假仅成立于 kind === 'text' 这条腿。overRenderCap 量的是
+// store.preview.content.length，而图片腿不经文本截断——app.go:1069 的 srcLimit = 20 << 20
+// 只管源体积，缩略图固定 512px / Quality 85（app.go:2443），编码后字节数没有任何上限钉住；
+// app.go:1049 的旧注释声称图片 ≤256KB base64，函数体里却没有实现这句话的常量（登记为 M148）。
+// 本轮走 PreviewFile 的真实 thumbnail() 复测：512×512 与 2048×2048 的均匀 RGB 噪声图，
+// 缩略图 ≈198.5–198.8 KB，base64 后 264,680–265,132 B，**越过 256 KiB = 262,144 B**；
+// 而低细节图可以只有 12 KiB ⇒ 体积全凭内容，无上限可寻。于是模板 p-meta 里那枚只判
+// overRenderCap 的 chip（:128）会真的对一张图片显示「默认源码」，而图片既没有渲染态也
+// 没有源码态——这就是该 chip 必须受 isMd 约束的理由（M141，specs §24.4）。
+// 护栏本体（rendered 的默认值）仍只对 md 有意义。
 const MD_RENDER_MAX = 64 * 1024
 const overRenderCap = computed(() => (store.preview?.content.length ?? 0) > MD_RENDER_MAX)
 
@@ -114,7 +126,7 @@ function close() {
             <span class="chip">{{ typeLabel }}</span>
             <span class="chip">{{ humanBytes(store.preview.size) }}</span>
             <span class="chip">{{ formatMtime(store.preview.mtime) }}</span>
-            <span v-if="overRenderCap" class="chip chip-note">默认源码</span>
+            <span v-if="isMd && overRenderCap" class="chip chip-note">默认源码</span>
           </span>
         </div>
 

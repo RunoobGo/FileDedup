@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -79,6 +80,24 @@ type ItemResult struct {
 	State    string
 	Err      string
 	Warn     string
+}
+
+// DestHint 给"数据其实已经落到某个位置、只是这一步没报成功"的错误补上落点，
+// 并且**幂等**：底层错误文本本来就写着那个路径时不重复追加。
+//
+// M89（04 §6.11 OPS-14d，设计段 §24.3.1）：执行器在部分成功时原先只取 err 记
+// ocFailed、把 dst 丢掉 ⇒ 盘上多出来的那份副本在账本里没有任何条目。
+// ★ 本函数是这条判据的**唯一**实现：ops 侧（move 分支）与 app 侧（undoFailure）
+// 都调它。同一条"补落点"的规则在两处各写一遍是 I5 的漂移面（第 2 轮已为此校正过一次）。
+//
+// 只判 Contains 一条即可：dst 为空时任何字符串都"包含"空串，自然原样交回。
+// 写成 `dst == "" || !Contains(...)` 的前半截是恒不成立的析取支——正是本项目
+// 一路在登记的那种死门禁形状，不该由自己新写出来。
+func DestHint(msg, dst string) string {
+	if !strings.Contains(msg, dst) {
+		return msg + fmt.Sprintf("（数据已在 %s）", dst)
+	}
+	return msg
 }
 
 // Options 执行器配置。
@@ -297,6 +316,9 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		dst     string // trash/move 实际去向（未知时空）
 		linkSrc string // hardlink 指向的保留源
 		warn    string // 成功但有需要告知用户的情况（如临时文件残留）
+		// crossVol 仅 move 读：数据是否**真的跨卷**离开源卷（M40，§24.3.2）。
+		// 同卷 rename 是一次改名，磁盘总量一分未减，不得进 Reclaimed。
+		crossVol bool
 	}
 	outcomes := make([]outcome, len(toProcess))
 	// C6（2026-09-18 审查）：账本收口必须紧跟每次 syscall，而不是等全批走完
@@ -319,7 +341,14 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		case ocSkipped:
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "skipped"})
 		case ocFailed:
-			emitItem(ItemResult{OrigPath: toProcess[i].Path, State: "failed", Err: o.err})
+			// M89（§24.3.1）：失败也带落点。全仓只有 move 的一条腿会给出
+			// "已知落点 + 失败"（部分成功：副本已建、删源没成）；其余失败分支的
+			// o.dst 一直是空串，所以这一位在别处是惰性的。
+			// 落点进 `dest_path` 列不会虚增收益也不会凭空多出一个可回撤目标：
+			// reclaimed 只 SUM state=done（oplog.go:129-130），回撤候选只认
+			// done / undo-failed（app.go:2095、:2174）。
+			emitItem(ItemResult{OrigPath: toProcess[i].Path, DestPath: o.dst,
+				State: "failed", Err: o.err})
 		}
 		report(toProcess[i].Path)
 	}
@@ -407,8 +436,14 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				// 把数据搬到另一个卷的回收站，磁盘总量都没减），用户按这句话去核对
 				// 总量必然对不上。现在 trash 单列 TrashedBytes。
 				// Reclaimed 的**定义**没变（登记的修法原话是"别改定义"），
-				// 变的只是"谁有资格进这一栏"。同卷 move 同样是把改名报成释放，
-				// 但要先能分辨改名与跨卷（MoveFile 不报 EXDEV）⇒ 登记为 M40，此处不动。
+				// 变的只是"谁有资格进这一栏"。
+				//
+				// 2026-09-22（M40，§24.3.2）：同卷 move 也落进过 default，于是把一次
+				// 改名报成"释放 X"——与 09-19 硬链接、09-21 回收站同型的第三笔假账。
+				// 分辨依据只能由 MoveFile 交上来（它是唯一知道 EXDEV 走没走的地方），
+				// 故新增 outcome.crossVol，且**只为 move 读取**。同卷那一格哪一栏都不进：
+				// 新增栏位要前端呈现（用户裁定"新增计数的界面呈现属 M8，不做"），
+				// 而"释放 0"对同卷改名就是真话。
 				switch op.Kind {
 				case "hardlink":
 					res.LinkedBytes += e.Size
@@ -416,7 +451,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					res.SymlinkedBytes += e.Size
 				case "trash":
 					res.TrashedBytes += e.Size
-				default:
+				case "move":
+					if outcomes[i].crossVol {
+						res.Reclaimed += e.Size
+					}
+				default: // delete：数据真的从磁盘消失
 					res.Reclaimed += e.Size
 				}
 				// 成功但有残留等情况：逐条收集，供上层提示（不改变成败判定）
@@ -580,10 +619,21 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				continue
 			}
-			if dst, err := MoveFile(e.Path, op.TargetDir); err != nil {
-				settle(i, outcome{code: ocFailed, err: err.Error()})
-			} else {
-				settle(i, outcome{code: ocOK, dst: dst})
+			dst, crossVol, err := moveFileDetailed(e.Path, op.TargetDir)
+			switch {
+			case err != nil:
+				// M89（§24.3.1）：部分成功（MoveFile 已复制出副本、只是没删成源）
+				// 原先在这里把 dst 丢掉，只留下错误文本 ⇒ 那份多出来的副本既不进
+				// 账本也不可在历史页看到。改后 dst 随 outcome 一起交下去，
+				// 文本仍由 DestHint 兜一层（move.go 两条腿本来就自带落点，
+				// 所以这里是幂等的 no-op）。
+				settle(i, outcome{code: ocFailed, dst: dst, err: DestHint(err.Error(), dst)})
+			default:
+				// M40（§24.3.2）：只有**跨卷**那份数据真的离开了源卷才进 Reclaimed
+				// （见下面汇总处的 switch）。同卷 move 是一次改名，磁盘总量一分未减，
+				// 修正前却与 delete 共用 default 落进 Reclaimed——09-19 硬链接、
+				// 09-21 回收站两笔假账的第三个同型。
+				settle(i, outcome{code: ocOK, dst: dst, crossVol: crossVol})
 			}
 		}
 

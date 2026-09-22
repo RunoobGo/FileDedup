@@ -1046,7 +1046,9 @@ var imageMime = map[string]string{
 	".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
 }
 
-// PreviewFile 预览：图片（≤256KB base64）/ 文本（前 4KB）/ HEX（前 256B）。
+// PreviewFile 预览：图片（512px / q85 JPEG 缩略图的 base64，体积随内容而变，函数里没有
+// 字节上限常量）/ 文本（前 4KB）/ HEX（前 256B）。旧注释写的「图片 ≤256KB base64」在
+// 高频细节图上是假的，真读数与登记见 04 §6.11 M148。
 func (a *App) PreviewFile(id uint64) (PreviewData, error) {
 	a.mu.Lock()
 	e, ok := a.byID[id]
@@ -2208,12 +2210,16 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 //
 // Path 一格**保持 OrigPath**：它标识"哪一条账目失败"，换成落点会让失败清单
 // 对不上记录明细；落点走 Err（FailedDrawer.vue 原样渲染 Err）。
+//
+// ★ 第 3 轮 M89（§24.3.1）：这条"落点没出现在文本里就补上、出现了就不重复"的规则
+// 收归到 ops.DestHint——执行器的 move 分支要写同一句话，两处各写一遍是 I5 的漂移面。
+// 输出串逐字不变（这里就是那两条既有断言的落点），改的只是实现只有一份。
 func undoFailure(it history.OpItem, restored string, uerr error) model.FailedItem {
-	msg := uerr.Error()
-	if restored != "" && !strings.Contains(msg, restored) {
-		msg += fmt.Sprintf("（数据已在 %s）", restored)
+	return model.FailedItem{
+		Path:  it.OrigPath,
+		Stage: "undo",
+		Err:   ops.DestHint(uerr.Error(), restored),
 	}
-	return model.FailedItem{Path: it.OrigPath, Stage: "undo", Err: msg}
 }
 
 // undoOneFn 回撤执行入口的间接引用：测试据此断言"账本先落、文件后动"的先后顺序。

@@ -20,6 +20,13 @@ func TestIsCorruption(t *testing.T) {
 		"sqlite3: sqlite_notadb",
 		"RDONLY: repeated read error: is not a database",
 	}
+	// M146（第 3 轮 §24.4 DBF-1）：下界本身也是判据。这两张表都是硬编码清单，
+	// 表被删空时本条等于没跑 —— 循环 0 次、一条断言都不执行，整条测试照样绿。
+	// 先例同法：app_undo_platform_probe_test.go 的 `checked != 4`、
+	// sqlconn_test.go 与 app_pathnorm_gate_test.go 的 `scanned < 50`。
+	if len(corrupt) < 6 {
+		t.Fatalf("corrupt 表条目数 = %d，下界 6：判据清单被删空 ⇒ 本条等于没跑（M146）", len(corrupt))
+	}
 	for _, s := range corrupt {
 		if !IsCorruption(errors.New(s)) {
 			t.Errorf("应判为损坏: %q", s)
@@ -35,6 +42,11 @@ func TestIsCorruption(t *testing.T) {
 		"no such table: hash_cache",
 		"too many SQL commands",
 		"",
+	}
+	// M146：同上，transient 表的下界。误判方向一旦失守就是清库，
+	// 这条不允许靠「表空了 ⇒ 循环 0 次 ⇒ 通过」蒙过去。
+	if len(transient) < 8 {
+		t.Fatalf("transient 表条目数 = %d，下界 8：判据清单被删空 ⇒ 本条等于没跑（M146）", len(transient))
 	}
 	for _, s := range transient {
 		if IsCorruption(errors.New(s)) {

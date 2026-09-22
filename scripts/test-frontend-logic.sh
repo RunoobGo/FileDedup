@@ -130,6 +130,14 @@ wiring 'src/views/ResultView.vue' 'formatUnixSec(' '.toLocaleString(' \
 	'结果页历史时间引用 formatUnixSec（M116）'
 wiring 'src/views/ScanView.vue' 'percentOf(' 'Math.min(100, ' \
 	'扫描页进度条取自 percentOf（M118：不得自拼只夹上限的百分比）'
+# M141（第 3 轮 §24.4 FE-14）：「默认源码」chip 原先只判 overRenderCap，而 overRenderCap
+# 量的 store.preview.content.length 对**图片**也成立——图片腿不经文本截断（512px / q85
+# 缩略图 base64 后本机实测 264,680–265,132 B，见 M148），阈值 64 KiB 打得到它。于是预览一
+# 张大图会挂出「默认源码」，而图片既没有渲染态也没有源码态。chip 的语义只对 Markdown 成立，
+# 锚的就是「chip 问过 isMd 没有」；判据本体是 :30 的 isMd，这里钉的仍是模板接线（.vue 打不进
+# node --test，先例 M116/M118）。★ 锚写法、不锚中文文案。
+wiring 'src/components/PreviewPanel.vue' 'v-if="isMd && overRenderCap"' 'v-if="overRenderCap"' \
+	'「默认源码」chip 受 isMd 约束（M141：图片预览不得挂出该 chip）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
