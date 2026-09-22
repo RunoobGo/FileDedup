@@ -5445,3 +5445,104 @@ if f, err := os.Open(fx.dup1.Path); err == nil {
   该格有效读数只有 darwin 一条腿；linux 腿这一格**这次有 CI 了**（run 35740660581 的 linux job
   success），但 CI 不带 `-v` ⇒ 分不清它是"跑绿"还是"跳过"，只能记"该 job 全绿"，不能记成"这一格已验证"。
 - 「删后建 + inode 还号」那一档仍然没有断言（§28.10 六原样成立，本批一字未动）。
+
+---
+
+## 30. 第四轮全仓审查修订批（2026-09-23）：六项裁定落盘 + 逐条细化设计段
+
+> 取证基线：HEAD `35b2d3c`（run `35742927520` 三 job 全绿、门禁 `rows=15 PASS=14 SKIP=1`）。
+> 计划：`docs/superpowers/plans/2026-09-22-full-review-revision.md`（七路只读审查的汇总裁决）。
+> 本节按"每项实施前先写细化设计段"的节奏**逐条追加**：§30.<n> 落在对应任务动手之前。
+
+### 30.0 本批裁定（用户 2026-09-23 逐条选定，不是本代理推定）
+
+| # | 裁定 | 原话取向 |
+|---|---|---|
+| J-1 | CI 腿 `smoke-symlink` rc=2 **改判红** | 推翻 M8/M133 的"环境受限不怪代码"定性，划账加 dated 括注 |
+| J-2 | 发布腿 `draft: true` + 补 `-race` + `npm ci` 硬失败 + `concurrency` | **不加**跨工作流 CI-绿前置（required check 属账号级动作，且本机零验证手段） |
+| J-3 | M105 嵌套卷归属：**本批只登记** | 生产面改动，另行裁定 |
+| J-4 | M47/OPS-2 Linux 跨卷 trash 盲删源：**维持登记，本批不实施** | 它的红只能靠 CI Linux 腿造第二挂载兑现；不推送就永远停在"代码已改、验证未兑现" |
+| J-5 | M75(b)：**维持原裁定材料，本轮不碰** | 不新增证据 |
+| J-6 | 低危杂项：一行级且无行为争议的 **6 条随批修**（F 组），其余**逐条登记** | 见 §30.11 登记清单 |
+| 节奏 | **每项完成即本地提交**（设计段 → 实施 → 划账三提交），**全程不 push** | 用户显式覆盖计划 Global Constraints 里那句"禁提交" |
+
+### 30.1 R1-1（Task A1）：delete 腿在内容复核之后、删除之前补一道身份复核
+
+**坐标（HEAD `35b2d3c` 现读）**：`executor.go:419-440`（`guardContent`，`:423` 处 `v, _ := verifyFileFn(...)`
+把 VerifyFile 已经算好的身份**丢掉**）、`:644-663`（delete 腿：`:647` `guardIdentity` → `:651` `guardContent`
+→ `:654` `os.Remove(e.Path)`）、`verify.go:52-86`（`VerifyFile` 在 `:72` `id := fsid.FromFile(f)`
+已经拿到"哈希绑住的那个 fd"的身份，`:83` 随 `VerdictPass` 一起交出）。
+
+**缺口的形状**（这条腿的时序链，与其余四腿不对称）：
+
+```text
+校验循环(:266) → [用户看结果/勾选/点执行：无界时间] → guardIdentity(:647) ✅
+  → guardContent(:651) 全量 BLAKE3,大文件秒~分钟级,哈希绑 open 那一刻的 fd
+    → [窗口:第三方 rename 顶替这个路径] → os.Remove(:654) 按**路径**删
+```
+
+顶替者在这段窗口里就位 ⇒ `VerifyFile` 照样在自己的旧 fd 上算出组哈希、判 `VerdictPass`，
+随后 `os.Remove` 删掉的是**第三方那份**，账本记 `ocOK` 并把 `e.Size` 计进 `Reclaimed`（假账）。
+delete 是全管线**唯一不可逆腿**（无回收站、无 `undo`）。docs/09 §6.4 第 4 道承诺的是
+"真正执行删除/移动/合并前，再确认路径上现在的物理身份"，而 M91 补的那一段只承诺
+"身份复核**之后**再读一遍内容"——**没有承诺读完内容之后还验身份**，即手册这句话在 delete 腿
+的执行顺序与字面承诺相反（顺序是 身份→内容→动作，别的腿是 内容→身份→动作）。
+
+**其余四腿为什么不需要**（开码逐条确认，不是推定）：
+
+- `hardlink` / `symlink`：`HardlinkMerge`（`move.go:121-129`）与 `SymlinkMerge`（`symlink.go:79-88`）
+  在 `hardlinkRename(dup, backup)` **前一行**各自跑 `identityGuardSentence("目标文件", dup, dupID)`，
+  而 `dupID` 由 executor 下传 `procIDs[i]`（`executor.go:745`、`symlink` 同位）⇒ 守卫紧贴改名。
+- `move`：跨卷删源前有 `move.go:72` 的 `identityStill`；同卷是一次改名，数据不丢。
+- `trash`：OPS-7（`executor.go:630`）已在逐个派发前贴着补了一次 `guardIdentity`。
+
+⇒ delete 腿与 trash 腿是同一家族的**最后两处**，trash 那处已按"紧贴动作再复核一次"修过，本条同型。
+
+**修法判据**：`guardContent` 交出"内容复核通过那一刻的身份"，delete 腿在 `os.Remove` 之前
+按这个身份做一次 `identityCheck`，三格处置与 `guardIdentity` 逐条对齐（`:380-401`）：
+`vGone`→Skipped（目标已达成）、`vReplaced`→Failed、其余（含 `vUnknown` 与**将来任何**未登记结论）
+落 `default`→Failed 但不说"被替换"。文案点名"内容复核通过后"，与 `guardIdentity` 那句
+"文件在扫描后被替换"分开——两句都是拦下，但用户据此判断的是**哪一道**守卫生效。
+
+**与设计段（计划 Task A1）的三处偏差，就地记账**：
+
+1. 计划的片段写的是 `if vid.Resolved { if v, why := identityCheck(...); v != vSame {…} }`。
+   **实施不加这层 `vid.Resolved` 包装**：`identityCheck`（`verify.go:134-136`）开头就是
+   `if !id.Resolved { return vSame, "" }`，未解析的放行分支已经在那儿，再包一层是把同一条判据写两遍。
+2. 计划把三种结论**统一记成**"内容复核通过后、删除前文件被替换"。实施按 `guardIdentity` 分三格：
+   顶替发生在复核之后时路径上的对象也可能**已经没了**（`os.Remove` 会撞 ENOENT），
+   那一格记 Failed"被替换"就是 M54 明令禁止的假话（会在结果集里留一个盘上不存在的路径）。
+3. 计划要求 hardlink/symlink 两处改成双返回值并以 `_` 接住 ⇒ 这会让既有静态接线锚
+   `executor_m91_test.go:515` 的字面 `if guardContent(i, e) {` 一处不剩。锚点随之改成
+   数 `"guardContent(i, e"`（计数判据 3 不变、语义不变：钉的是"三腿各接一道"），
+   在 §30.1 这里登记，不算"改断言求绿"。
+
+**取红探针**（`executor_delete_recheck_test.go`，新建）：
+
+- 时点必须精确落在"内容复核绑完 fd 之后"。单用 `beforeActContentRecheck` 造不出来：那道缝跑在
+  `guardContent` **入口**（`executor.go:420`），此刻顶替 ⇒ `VerifyFile` 读到的是顶替者内容 ⇒
+  红落在 M91 那一格（"被修改"），不是本条那一格。
+- 用**两道既有缝配合**（都不新增生产面）：`beforeActContentRecheck` 只负责"装弹"（记一个 flag），
+  换装的 `verifyFileFn` 先跑真校验、**返回之前**按 flag 决定是否顶替并回填"顶替前的身份"作 `vid`。
+  这条形状与 `TestIdentityReplacedBeforeActionStillFails`（`verify_m52_m54_test.go:187-204`）
+  同族，差别只在顶替发生的**那一次调用**：P-6c 顶替在 `:266` 的校验循环（被 `guardIdentity` 接住），
+  本条顶替在 `:423` 的 `guardContent`（改前没有任何一道守卫接得住）。
+- 顶替夹具走本包唯一实现 `swapInAt`（先写旁边、原子改名；`assertDistinctIdentity` 自检"顶替者
+  必须另一个号"，会还号的卷上硬红在夹具）。
+- **前提自检放在 `Execute` 之前**（§29.2 立的规矩）：`needResolvedID(t, dup)` 在铺夹具后立即调用，
+  本卷不给稳定索引即 `Skipf` 并打印原因——不许放在断言之后，那里"造不出前提"与"守卫放行删了文件"
+  两种成因不可分。
+- 断言：`Failed` 恰一条 + `Stage=="verify"` + 含"内容复核通过后"与"被替换" + 含"盘上未做任何改动"；
+  顶替者原样在盘上且内容仍是那份 foreign；`OK`/`Reclaimed`/`Skipped` 归零；`OnItem` 序列里
+  **没有** `state=="done"`（账本没被写脏）。
+
+**变异**（编号接 §28 的 M25-x 之后，本条起 **M26-a**）：M26-a 把新守卫短路（`v != vSame` 改
+`false && v != vSame`）⇒ 本条用例必须红在"顶替者被删/OK 非零"，证明断言真接在判据上；
+M26-b 反向：把新守卫挪到 `guardContent` **之前**（等价于改前形状）⇒ 同样必须红。
+预测红集合：只有本条这一族用例（新文件里的），既有 M91 那批在两个变异下都应保持绿
+——若它们跟着红，说明我改动了 `guardContent` 的判据而不只是返回值形状。
+
+**边界（不许写成"竞态已消除"）**：未解析身份（FAT/exFAT）在这一格与 `identityStill` 同口径放行，
+**不是新增漏洞但也不是全覆盖**；闭合它的仍是 M91 那一道内容复核本身。顶替者是"另一份内容
+完全相同的文件"时现在会被拦下（比 docs/09 §6.4 第 3 道承认的那一格无害残余更严），
+严的方向是 fail-closed，写进手册时不承诺"只拦真危险"。
