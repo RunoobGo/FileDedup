@@ -201,5 +201,5 @@ func humanBytes(n uint64) string {
 		div *= u
 		exp++
 	}
-	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

@@ -7,7 +7,7 @@ export function humanBytes(n: number): string {
   const exp = Math.floor(Math.log(n) / Math.log(u))
   const div = Math.pow(u, exp)
   const unit = 'KMGTPE'[exp - 1] ?? 'K'
-  return `${(n / div).toFixed(1)} ${unit}B`
+  return `${(n / div).toFixed(1)} ${unit}iB`
 }
 
 export function humanSpeed(bps: number): string {
