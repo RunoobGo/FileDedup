@@ -55,8 +55,8 @@ const isMd = computed(() => store.preview?.kind === 'text' && isMarkdownExt(ext.
 // 本轮走 PreviewFile 的真实 thumbnail() 复测：512×512 与 2048×2048 的均匀 RGB 噪声图，
 // 缩略图 ≈198.5–198.8 KB，base64 后 264,680–265,132 B，**越过 256 KiB = 262,144 B**；
 // 而低细节图可以只有 12 KiB ⇒ 体积全凭内容，无上限可寻。于是模板 p-meta 里那枚只判
-// overRenderCap 的 chip（:128）会真的对一张图片显示「默认源码」，而图片既没有渲染态也
-// 没有源码态——这就是该 chip 必须受 isMd 约束的理由（M141，specs §24.4）。
+// overRenderCap 的 chip（认锚点、不认行号）会真的对一张图片显示「默认源码」，而图片
+// 既没有渲染态也没有源码态——这就是该 chip 必须受 isMd 约束的理由（M141，specs §24.4）。
 // 护栏本体（rendered 的默认值）仍只对 md 有意义。
 const MD_RENDER_MAX = 64 * 1024
 const overRenderCap = computed(() => (store.preview?.content.length ?? 0) > MD_RENDER_MAX)
