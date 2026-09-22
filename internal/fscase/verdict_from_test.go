@@ -95,7 +95,7 @@ func TestVerdictFromUnreadableUpperFallsBackToDefault(t *testing.T) {
 		// ① 穿过一个普通文件：darwin/linux 报 ENOTDIR，是文件系统真给的"读不动"。
 		{"under-regular-file", filepath.Join(lower, "x")},
 		// ② 串里带 NUL：Go 在 UTF-16 转换层就拒绝（Windows 连 syscall 都不进，
-		//    syscall_windows.go:42-45 直接 return EINVAL），三平台一律非 ErrNotExist。
+		//    syscall_windows.go:39-44 直接 return EINVAL），三平台一律非 ErrNotExist。
 		//    ★ Windows 腿走的是这一格：形状由 Go 拒绝而非文件系统给的 ENOTDIR，对
 		//    verdictFrom 是同一个 default: 支，对"平台差异"账目不是同一件事。
 		{"embedded-NUL", lower + "\x00x"},
@@ -114,10 +114,10 @@ func TestVerdictFromUnreadableUpperFallsBackToDefault(t *testing.T) {
 		}
 	}
 	if unreadable == "" {
-		t.Fatalf("夹具前提不成立：两种\"读不动\"形状在本平台都造不出来 ⇒ 测不到 M126 那一格\n%s",
+		t.Fatalf("夹具前提不成立：两种「读不动」形状在本平台都造不出来 ⇒ 测不到 M126 那一格\n%s",
 			strings.Join(readings, "\n"))
 	}
-	t.Logf("本平台钉\"读不动\"那一格用的形状：%s（%v）", shape, ferr)
+	t.Logf("本平台钉「读不动」那一格用的形状：%s（%v）", shape, ferr)
 
 	v, ok := verdictFrom(lower, unreadable)
 	if !ok {
