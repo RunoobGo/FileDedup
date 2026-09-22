@@ -5728,7 +5728,7 @@ AS-H1 的口径就是"身份与内容出自同一句柄"。
   现在那一行有注释指着这件事，且包装函数交回 `verID` 本体；本批不新增防御性代码去"检测自己写的接缝"，
   红绿读数本身已经把它钉住（M27-a 与这次踩坑同形）。
 - **回归**：`gofmt -l internal/ops/` 空、`go build ./...` 过、`go vet ./internal/ops/` 过；
-  包级全量随 A/B 批合跑（见 §30.5）。
+  ops 包级全量随 B 批收尾统一合跑并记读数。
 - **未兑现面（不许写成通过）**：`undo.go` 的这条新守卫在 **Windows** 上未跑过。跨平台依据只有
   AS-H1 那条既有结论（`fsid.FromFile` 句柄查询在两平台都解析）与本机的 `identityCheck` 单测；
   FAT/exFAT「无稳定索引 ⇒ `verID` 未解析 ⇒ 放行」那一格**本机没有实物见证**（本机 APFS 恒解析），
@@ -5832,7 +5832,8 @@ DeadlineExceeded 各一条。
 - **回归**：`gofmt -l internal/ cmd/` 空、`go build ./...` 过、
   `go vet ./...` × 3（darwin / GOOS=linux / GOOS=windows）全过、
   `go test -race -count=2 ./internal/fscase ./internal/scanner ./internal/dedup` →
-  `ok 1.317s / 2.196s / 7.590s`。全量与根包 `-count=4` 随 B 批合跑（见 §30.5）。
+  `ok 1.317s / 2.196s / 7.590s`；全仓 `go test -race -count=2 ./...` 亦跑过一遍，
+  无 FAIL 输出（含根包 `-count=2`，根包 `-count=4` 的 flake 纪律随 B 批收尾再跑一次）。
 - **未兑现面（不许写成通过）**：
   - **没有真死挂载实物**。"NFS 硬挂载 / 拔走的 SMB 上 syscall 永不返回"是这条腿的立项前提，
     本机与 CI 都造不出来；测试证的是"探测观察 ctx、错误能让扫描收口"这个**形状**，
@@ -5844,3 +5845,53 @@ DeadlineExceeded 各一条。
     本条不冒称已覆盖。
   - `VerdictCtx` 在 **Windows** 上未跑过（用例无平台假设：只依赖 ctx 与 goroutine，
     以及"能进钩子"这一条平台无关的夹具）。
+
+### 30.5 R2-3（Task B3）：ExecuteOperation 的卷语义探测搬到 `opsRunning` 置位之前
+
+**坐标（HEAD `4c5cab9` 现读）**：`app.go:1816`（`ExecuteOperation` 入口）→ `:1822` 取锁 →
+`:1866` `a.opsRunning = true` → `:1867-1868` 造 `opCtx`/`a.opsCancel` → `:1869` 释锁 →
+`:1883-1884` `ops.ApplyProcessPolicy(groups, op.ProcessDirs, keepIDs)` →
+`ops/keep.go:362-364`（`ApplyProcessPolicyWith(..., nil)`）→ `:379` `normalizeDirs(dirs, resolve)` →
+`:256-259`（`resolve == nil` 时 `resolve = fscase.Sensitive`）→ 就地往用户指定目录写探测文件。
+
+**这一族已经修过两处，执行侧是第三处漏网**：AS-R3（`PreviewProcessPolicy`，app.go:1372-1376
+锁外 `ops.WarmSensitivity`）与 APP-1（`ApplyKeepPolicy`，app.go:1448 同型）。
+两处的形状都是"锁外预热一次、锁内只剩纯查表 + 纯比较"，钉子都在 `app_process_lock_test.go`
+与 `app_keep_policy_lock_test.go`。
+
+**为什么这里的后果不是"卡住一把锁"而是"卡住整个操作面"**：探测点落在 `a.mu.Unlock()` **之后**，
+所以 `a.mu` 没被占（预览、读结果集照常）——但 `opsRunning` 已在 `:1866` 置真，而它是
+`StartScan`（:1827 那一支的对侧）与后续 `ExecuteOperation`（:1823）的**拒绝闸门**。
+探测永不返回 ⇒ `resetOps` 所在的那段永不执行 ⇒
+- `opsRunning` 永久为真：此后每一次清理（`app.go:1823`）与每一次新扫描（`app.go:611`）
+  都被"清理操作执行中"拒掉；
+- `CancelOperation`（`app.go:743-752`）只是调 `a.opsCancel()` 取消 `opCtx`，
+  而这一步既没把 ctx 传给探测、也没人在读它 ⇒ 解不了；
+- 前端那次 `ExecuteOperation` 绑定的 Promise 永不 settle。
+现状只靠"前端 M77 会先调 Preview"缓解（Preview 预热过 ⇒ 命中缓存 ⇒ 执行侧不再写盘），
+**结构上无保证**：跳过预览直接执行、或预热与执行之间换了目录，就落到这条路上。
+
+**修法（一句话）**：与那两处逐字同型——入口在**取锁之前**
+`var resolve ops.SensResolver; if len(op.ProcessDirs) > 0 { resolve = ops.WarmSensitivity(op.ProcessDirs) }`，
+下面那一处换成 `ops.ApplyProcessPolicyWith(groups, op.ProcessDirs, keepIDs, resolve)`。
+`WarmSensitivity` 与 `normalizeDirs` 用同一个 `dirKey` 归一（keep.go:216），预热表必命中，
+锁内那趟不再有写盘。
+
+**为什么这一格值得单独修、而不是等 §30.4 那条 ctx 缝顺带解决**：`fscase` 可中断（R2-2）
+与"这一步不许占着互斥位"是**两条不同的性质**。搬动是结构性的：即便探测永远不返回，
+应用也不会被钉成"清理操作执行中"。给 `WarmSensitivity` 加 ctx 属另一条改动
+（要过 `ops`/`keep.go` 与既有两处调用点），本批不做，见下面"未兑现面"。
+
+**预测红的面貌（跑前写明）**：两条用例都挂在既有探针上（`fscase.SetProbeHook`，
+AS-R3 留的观察点，**不新增接缝**）：
+- `TestExecuteOperationProbesBeforeOpsRunning`：改前红在"探测发生时 `a.opsRunning` 已为真"，
+  而不是红在夹具前提（`probed==0` 那条单独兜）；
+- `TestExecuteOperationBlockedProbeDoesNotWedgeApp`：改前红在"探测被卡住的窗口里
+  `opsRunning` 仍为真"（⇒ 一切操作被拒）。
+★ 两条都必须打印"没有卡死"的正向读数（AS-K2 那一族：不红不等于对）。
+
+**不做的边界**：
+- `opCtx` 与 `resetOps` 一字不动：本项只挪探测点，不碰派发/复位链；
+- `beginJournal`（`opsRunning` 之后、锁外的 SQLite 写）同族风险**不在本项**：
+  那是账本侧的 I/O，判据与修法都不一样（另批）；
+- 执行 goroutine 内部的 I/O 本来就在锁外、且受 `opCtx` 管，不是这一格。
