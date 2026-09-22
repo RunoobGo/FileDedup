@@ -6,17 +6,19 @@ package fscase
 // 改前 `case uerr != nil: return true, true` 把两者混为一谈，且结果被
 // Sensitive:55-70 按目录**永久缓存**：一次 EIO/ESTALE 就把整趟扫描的折叠语义钉死。
 //
-// 三条用例都不依赖被测卷的大小写语义：upper 只是被当作"另一个路径串"来 lstat，
-// 所以它们在 darwin/linux 本机与 CI 三条腿上都是真跑，不靠"换个平台碰运气"。
+// 三条用例都不依赖被测卷的大小写语义；★ 但"不依赖语义"不等于"每条腿都造得出夹具"：
+// CI 首跑的 Windows 腿把下面那个"读不动"形状报成 ENOENT（登记 M151，§25），红在前提
+// 自检而不是产品判据 ⇒ 本条改按候选形状取"本平台确实读不动"的那一格，三条腿一律不 Skip。
 //
-// ★ 上面那段"三条"是真读数，本文件其后（第 3 轮 §24.4）又补了两条 M139/M140，
-// 那两条同样不依赖被测卷的语义、且在 darwin 本机**必须真跑**（一条 Skip 都不新增）；
-// 原三条与它们的一条 t.Skip、一条 t.Skipf 一字未动。
+// ★ 上面那段"三条"是真读数，本文件其后（第 3 轮 §24.4）又补了两条 M139/M140，那两条
+// 同样不依赖被测卷的语义、且在 darwin 本机**必须真跑**；既有的那句 t.Skip 与 t.Skipf 一字未动。
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -80,16 +82,42 @@ func TestVerdictFromUnreadableUpperFallsBackToDefault(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(lower) })
 
-	// 把 upper 做成"位于一个普通文件之下"的路径 ⇒ Lstat 报 ENOTDIR（"读不动"），
-	// 而不是 ENOENT（"不存在"）。夹具前提自检：判据落不到 ENOTDIR 就别往下测（I5）。
-	unreadable := filepath.Join(lower, "x")
-	_, ferr := os.Lstat(unreadable)
-	if ferr == nil {
-		t.Fatalf("夹具前提不成立：Lstat(%q) 竟然成功", unreadable)
+	// upper 必须是"读不动"而不是"不存在"。★ 形状按候选依次试（M151，§25）：同一形状在
+	// 不同平台报的不是同一格 —— Windows 把 `dir/file/x` 报成 ERROR_PATH_NOT_FOUND，
+	// 在 errors.Is(err, os.ErrNotExist) 眼里那就是"不存在"，本条就白测了。取第一个
+	// "Lstat 失败且失败不是 ErrNotExist"的形状；一个都没有就硬红并逐条打印实测错误，
+	// ★ 不许退成 t.Skip —— 那等于把该平台的读数来源从一条降为零条（AS-K2）。
+	var unreadable string
+	var ferr error
+	var shape string
+	var readings []string
+	for _, cand := range []struct{ name, path string }{
+		// ① 穿过一个普通文件：darwin/linux 报 ENOTDIR，是文件系统真给的"读不动"。
+		{"under-regular-file", filepath.Join(lower, "x")},
+		// ② 串里带 NUL：Go 在 UTF-16 转换层就拒绝（Windows 连 syscall 都不进，
+		//    syscall_windows.go:42-45 直接 return EINVAL），三平台一律非 ErrNotExist。
+		//    ★ Windows 腿走的是这一格：形状由 Go 拒绝而非文件系统给的 ENOTDIR，对
+		//    verdictFrom 是同一个 default: 支，对"平台差异"账目不是同一件事。
+		{"embedded-NUL", lower + "\x00x"},
+	} {
+		_, err := os.Lstat(cand.path)
+		switch {
+		case err == nil:
+			readings = append(readings, fmt.Sprintf("%s：Lstat 竟然成功 ⇒ 不合格", cand.name))
+		case errors.Is(err, os.ErrNotExist):
+			readings = append(readings, fmt.Sprintf("%s：%v ⇒ 落 ENOENT 那一格，不合格", cand.name, err))
+		default:
+			readings = append(readings, fmt.Sprintf("%s：%v ⇒ 合格", cand.name, err))
+			if unreadable == "" {
+				unreadable, ferr, shape = cand.path, err, cand.name
+			}
+		}
 	}
-	if errors.Is(ferr, os.ErrNotExist) {
-		t.Fatalf("夹具前提不成立：本平台把这个串报成 ENOENT 而非\"读不动\"（%v）⇒ 测不到 M126 那一格", ferr)
+	if unreadable == "" {
+		t.Fatalf("夹具前提不成立：两种\"读不动\"形状在本平台都造不出来 ⇒ 测不到 M126 那一格\n%s",
+			strings.Join(readings, "\n"))
 	}
+	t.Logf("本平台钉\"读不动\"那一格用的形状：%s（%v）", shape, ferr)
 
 	v, ok := verdictFrom(lower, unreadable)
 	if !ok {
