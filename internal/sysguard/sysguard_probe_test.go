@@ -128,7 +128,8 @@ func TestTimeMachineEntryStillPrunesMixedCaseName(t *testing.T) {
 
 // TestAbsPathEntryReliesOnConstantBackslashSwap 补强（M64 变异 M-M64-b 暴露的覆盖缺口）。
 //
-// 现场：内置 eAbsPath 六条全是 POSIX 形（/proc /sys /dev /run /private /System），
+// 现场：内置 eAbsPath 全是 POSIX 形（/proc /sys /dev /run /System，加 darwin 的
+// /private/… 八条——M84 起那条整片 /private 已拆成后代子树，见 sysguard.go 表注释），
 // 而 Windows 风格的待判路径命中的是 dirName 条目（$Recycle.Bin 一类），压根走不到
 // absPath 那条循环。于是"Dir 先把反斜杠恒换成 /"这条语义在本包**没有任何用例需要
 // 它成立**——M64 收归时把 Slash 换成 filepath.ToSlash（unix 上即恒等映射）做变异，

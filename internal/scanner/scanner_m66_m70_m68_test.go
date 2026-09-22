@@ -7,8 +7,8 @@ package scanner
 //                子根抢先入集，同一棵树的两种拼写都留下。
 //   P-2 M70  —— WalkWithGate 无条件解引用 f *model.Filters，nil 时 panic 被逐目录
 //                recover 吞成一条 Failed ⇒ 现象是"整目录静默漏扫"，不是崩。
-//   P-3 M68  —— 链接根指向清单内目录时不警示：**只取证不实施**（t.Skipf），
-//                省事修法会被 P-3b 打红，理由与读数见设计稿 §17.7。
+//   P-3 M68  —— 链接根指向清单内目录时不警示：2026-09-22 随 M84 裁定转真跑
+//                （条目收窄后根侧解析不再误伤临时目录），理由与旧读数见设计稿 §17.7 / §27.5。
 
 import (
 	"context"
@@ -84,13 +84,13 @@ func TestWalkWithNilFiltersIsAllDefault(t *testing.T) {
 	}
 }
 
-// P-3（M68-a）：根是符号链接时，根级"已脱离系统保护"留痕看不出。
+// P-3（M68-a / M84）：根是符号链接时，根级"已脱离系统保护"留痕看不出。
 //
-// 本条 **skip 不实施**（设计稿 §17.7）：按"真实路径再过一遍 guard.Dir"修它，会让 darwin 上
-// /var 与 /tmp 之下的**每一个**普通根都得到一条假的"已脱离系统保护"——清单里
-// `eAbsPath /private`（sysguard.go:145，why 原文"var/tmp/folders 等运行时目录的真身"）
-// 是按前缀命中的，而 t.TempDir() 的真身就在 /private/var/folders 之下。
-// 反向钉子见 P-3b。整条 M68（两半）合并登记为 M84 等裁定。
+// 2026-09-22 转真跑（设计稿 §27.5 裁定"收窄 /private 条目"）。此前它只能 skip：
+// 按"真实路径再过一遍 guard.Dir"修，会让 darwin 上 /var 与 /tmp 之下**每一个**普通根
+// 都得到一条假的警示，因为清单里那条 /private 是按前缀命中整片的。条目收窄成
+// /private/etc、/private/var/db 等八条之后，解析真身这一步不再误伤临时目录。
+// 反向钉子见 P-3b（它现在钉的是"条目收窄没被改回去"）。
 func TestSymlinkedRootUnderProtectedDirIsReported(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "lost+found") // 清单里的三平台通吃条目（按目录名命中）
@@ -99,27 +99,40 @@ func TestSymlinkedRootUnderProtectedDirIsReported(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("本文件系统不支持符号链接: %v", err)
 	}
+	// ★ 夹具成立性自检：警示必须由"解析"这一步产生，而不是链接名自己就在清单内。
+	// 这一条不打红 M84 之前的实现（那时它根本不存在），它钉的是"本用例测的是哪一格"。
+	if guard.Dir(link, filepath.Base(link)).Skip {
+		t.Fatal("夹具不成立：链接名自身就命中清单，本用例测不到根侧解析那一步")
+	}
 
 	res := Walk(context.Background(), []string{link}, &model.Filters{}, 2)
 	if len(res.Files) != 1 {
 		t.Fatalf("收文件数 = %d, want 1（用户点名的根照扫）：%v", len(res.Files), filePaths(res.Files))
 	}
-	t.Skipf("M68/M84 待裁定：链接根指向清单内目录时不警示，实得 UnprotectedRoots=%v", res.UnprotectedRoots)
+	if !reflect.DeepEqual(res.UnprotectedRoots, []string{link}) {
+		t.Fatalf("UnprotectedRoots = %v, want [%q]（真身命中清单时警示的必须是**用户点的那一条**形）",
+			res.UnprotectedRoots, link)
+	}
+	// 警示不是剪枝：真身受保护也不该把这次扫描变成"0 文件 + 一条 ProtectedDirs"。
+	if res.ProtectedDirs != 0 {
+		t.Errorf("ProtectedDirs = %d, want 0（根级失效通道不记保护数）", res.ProtectedDirs)
+	}
 }
 
-// P-3b（M68 的**反向**钉子）：临时目录下的普通根不得报"已脱离系统保护"。
+// P-3b（M84 的**反向**钉子）：临时目录下的普通根不得报"已脱离系统保护"。
 //
-// 这条是本批唯一抓到"修复本身制造新假话"的用例：先按"根侧解析真实路径后判定"实现了
-// M68-a，它让 P-3 变绿的同时把这条打红（darwin 上 UnprotectedRoots 里冒出
-// /var/folders/.../photos 一条）。留成钉子，防止下一轮再用同一个省事修法去动它。
+// 这条抓到过"修复本身制造新假话"：先按"根侧解析真实路径后判定"实现了 M68-a，它让
+// P-3 变绿的同时把这条打红（darwin 上 UnprotectedRoots 里冒出 /var/folders/…/photos
+// 一条）。M84 之后根侧解析是**常态**，所以这条钉的对象随之换成清单本身：
+// 只要有人把 /private 那一组改回兜住整片的 /private，本用例立刻红。
 func TestPlainRootStillReportsNoUnprotected(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "photos")
 	mkDirFiles(t, dir, "a.txt")
 	res := Walk(context.Background(), []string{dir}, &model.Filters{}, 2)
 	if len(res.UnprotectedRoots) != 0 {
-		t.Fatalf("UnprotectedRoots = %v, want 空（既非清单内路径也不是链接；"+
-			"若这里非空，说明有人把根侧判据换成了'按真实路径问清单'——darwin 上 /private 会误伤一切临时目录）",
+		t.Fatalf("UnprotectedRoots = %v, want 空（临时根的真身在 darwin 上是 /private/var/folders/…；"+
+			"这里非空即说明 /private 那一组又被放宽成了整片锚定，M84 的收窄被改回去）",
 			res.UnprotectedRoots)
 	}
 	if len(res.Files) != 1 {

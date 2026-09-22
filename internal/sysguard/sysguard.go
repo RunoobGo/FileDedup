@@ -138,11 +138,27 @@ var table = []entry{
 
 	// ---- 绝对路径锚定条目：大小写精确、只认绝对根 ----
 	// 放宽成"任意段同名"会误伤真实数据（镜像根目录里的 /system、挂载盘里的 /proc）。
+	//
+	// ★ 登记一条 = 挡掉它**整棵子树**（Dir 走 pathnorm.Under 前缀判定），但只挡
+	// 遍历真正走到的那一层：本清单不逐段扫祖先（见 Dir 的注释），所以"祖先不再整片护"
+	// 时靠后代被单独问到时就命中——下面 /private 那一组就是这么切的。
 	{kind: eAbsPath, plat: pLinux, name: "/proc", why: "伪文件系统，读到的是内核生成物"},
 	{kind: eAbsPath, plat: pLinux, name: "/sys", why: "sysfs 伪文件系统"},
 	{kind: eAbsPath, plat: pLinux, name: "/dev", why: "设备节点目录"},
 	{kind: eAbsPath, plat: pLinux, name: "/run", why: "运行时伪文件系统"},
-	{kind: eAbsPath, plat: pDarwin, name: "/private", why: "var/tmp/folders 等运行时目录的真身"},
+	// M84（2026-09-22 裁定，设计稿 §27.5）：原先一条 /private 兜住整片，代价是
+	// darwin 上 t.TempDir() 的真身（/private/var/folders/…）以及一切用户级临时区
+	// 都被判成"系统保护"，把根侧真实路径判据变成不可用（上一批 M68-a 因此回退）。
+	// 现在逐个登记真身需要保护的子树，**刻意不含** /private/var/folders 与 /private/tmp：
+	// 那两处装的是用户自己的缓存与临时文件，是真实的可去重数据。
+	{kind: eAbsPath, plat: pDarwin, name: "/private/etc", why: "系统与账户配置"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/db", why: "系统数据库（授权、时区、通知等）"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/log", why: "系统日志"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/root", why: "root 用户主目录"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/spool", why: "邮件与打印队列"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/at", why: "at/cron 作业队列"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/empty", why: "chroot 空目录"},
+	{kind: eAbsPath, plat: pDarwin, name: "/private/var/run", why: "运行时套接字（对应 Linux 的 /run）"},
 	{kind: eAbsPath, plat: pDarwin, name: "/System", why: "系统卷；其下 /System/Volumes/Data 是用户数据卷的挂载点"},
 
 	// ---- 盘根伪文件：仅当父目录恰是扫描根（设计稿 §2.2：不做卷根判定）----

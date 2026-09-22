@@ -218,3 +218,65 @@ func TestGuardNoEmptyEntriesAndReasonNonEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestDarwinPrivateEntriesAreNarrowed 钉住 M84 的条目收窄（2026-09-22 裁定，设计稿 §27.5）。
+//
+// 改前这里只有一条 /private，按前缀命中整片 ⇒ darwin 上 t.TempDir() 的真身
+// （/private/var/folders/…）也算"系统保护目录"，根侧真实路径判据因此不可用
+// （上一批 M68-a 就是被这一格打回）。收窄成八条后代子树后三件事同时成立：
+//   - 该挡的仍挡（protected 表）；
+//   - 用户级临时区 /private/var/folders 与 /private/tmp 不再被吞（open 表）；
+//   - "祖先不整片护、靠后代被单独问到时就命中"可反证：/private/var 本身不受保护，
+//     它下面的 /private/var/log 受保护 ⇒ 遍历必须逐层问（Dir 的既有口径）。
+func TestDarwinPrivateEntriesAreNarrowed(t *testing.T) {
+	g := New(PlatformDarwin)
+	for _, p := range []string{
+		"/private/etc", "/private/etc/hosts",
+		"/private/var/db", "/private/var/db/notification_center",
+		"/private/var/log", "/private/var/root/Library",
+		"/private/var/spool/cron", "/private/var/at/tabs",
+		"/private/var/empty", "/private/var/run/mDNSResponder",
+	} {
+		if !dirSkip(g, p) {
+			t.Errorf("Dir(%q) 应判受保护（收窄时把这一片一起删了）", p)
+		}
+	}
+	for _, p := range []string{
+		"/private", "/private/var",
+		"/private/var/folders",
+		"/private/var/folders/8l/x0k7gh0000gn/T/TestFoo123/001/photos",
+		"/private/tmp", "/private/tmp/scratch/build",
+		"/Volumes/Macintosh HD/private/etc", // absPath 只锚绝对根：外接卷里的镜像不算
+		"/Users/me/private/etc",
+	} {
+		if dirSkip(g, p) {
+			t.Errorf("Dir(%q) 不该受保护：/private 又被放宽成整片锚定（M84 回退）", p)
+		}
+	}
+	// 表内自检：八条各自带 why，且整片锚定的 "/private" 不得再回来。
+	// ★ 数死 8 是有意的：少一条就是有一片真身没人护，而它在 unix 门禁上看不出来。
+	var n int
+	whys := make(map[string]bool)
+	for _, e := range table {
+		if e.kind != eAbsPath || e.plat&pDarwin == 0 {
+			continue
+		}
+		if e.name == "/private" {
+			t.Error("清单里又出现整片锚定的 /private（M84 已按后代子树拆开，依据见 §27.5）")
+		}
+		if !strings.HasPrefix(e.name, "/private/") {
+			continue
+		}
+		n++
+		if e.why == "" {
+			t.Errorf("%q 缺 why：报告里「为什么少了 N 个」指认不到具体子树", e.name)
+		}
+		whys[e.why] = true
+	}
+	if n != 8 {
+		t.Errorf("/private/… 锚定条目 = %d, want 8", n)
+	}
+	if len(whys) != n {
+		t.Errorf("理由去重后 %d 条，want %d 条（共用一句 why 时八片子树在报告里长同一个样）", len(whys), n)
+	}
+}

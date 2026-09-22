@@ -235,9 +235,24 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	}
 	// (1) 用户点名的根本身就是清单内路径：照他的意思扫，但这份"已脱离系统保护"
 	// 必须留痕，界面据此警示（M8）。剪枝不参与，故不计入 ProtectedDirs。
+	//
+	// M84（设计稿 §27.5）：根是符号链接时，"用户给的那条形"不在清单内、真身在
+	// （链接名 photo-lib → 真身 …/lost+found），只问一次就漏警示。⇒ 额外问一次真身。
+	// ★ 解析结果**只**用来问清单：不进 rawKeys / visitKey / rootsUnder / 任何 emitted
+	// Path，遍历键与展示路径一律维持用户给的那条形；命中时登记的也是用户点的那条形。
+	// 之所以敢解（上一批 M68-a 因同一改动回退）：清单里那条兜住整片的 /private 已按
+	// 后代子树收窄（sysguard.go 的 M84 注释），临时目录的真身不再被判成"系统保护"。
 	startUnprot := make(map[string]struct{})
 	for _, r := range cleaned {
 		if guard.Dir(r, filepath.Base(r)).Skip {
+			startUnprot[r] = struct{}{}
+			continue
+		}
+		real, err := filepath.EvalSymlinks(r)
+		if err != nil {
+			continue // 解不开（无权限/竞态消失）不是失败：拿得到的判据已经问过了
+		}
+		if real != r && guard.Dir(real, filepath.Base(real)).Skip {
 			startUnprot[r] = struct{}{}
 		}
 	}
