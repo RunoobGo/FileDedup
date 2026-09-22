@@ -4720,3 +4720,229 @@ M48 两条 + 一条防回归 ⇒ **只多不少**；任何一条计数下降都�
 - M48 的窗口在真文件系统上不可复现 ⇒ 钩子是唯一取证手段；它钉"被动落子"，**不**钉"删占位再抢"（M152）。
 - M84 的 macOS 副作用（以 `/` 或 `/private` 为根会进 `/private/tmp`、`/private/var/folders`）
   没有做过一次全量真扫的耗时读数 ⇒ 手册已按新判据措辞，代价未实测。
+
+## 28. 裁定的第二批细化设计段（2026-09-22；M79 / M62+M85 / M105 / M91）
+
+§27.0 落了九条裁定的**取向**，§27 只给了第一批的设计。本节是第二批四条的设计段，
+按 §27.1 的"先轻后重"排：**M79**（文案归位，无判据变更）→ **M62+M85**（`fscase` 立三态）→
+**M105**（`filter` 消费三态）→ **M91**（执行期内容复核）。
+
+★ **顺序不是审美问题，M105 硬依赖 M62+M85**：M105 的取向是"按卷敏感度过渡"，而 darwin 的
+平台默认是 `defaultSensitive = false`（`default_insensitive.go:7`）——若 `fscase` 仍是二态
+`Sensitive(dir) bool`，"探测不了"与"这卷确证不敏感"在 filter 眼里同一形状 ⇒ 未验证过的卷上
+排除模式会**无声放宽**，正是 §26.4 说的"把用户想扫的挡掉"。三态（`proven` 位）先落地，
+M105 才有"未知 ⇒ 保持现状（敏感）"这一档可接。这两条**不许拆成两批交付**。
+
+### 28.0 现状真读数（写设计前逐条开码重取，含两处对 §26 的坐标更正）
+
+- **M79 的出口与消费面**：后端 `app.go:1692 undoableReasonFor(kind, goos)` 两条生产出口
+  `app.go:2164`、`:2308`（都是 `return "", fmt.Errorf("%s", undoableReason(meta.Kind))`）；
+  判据本体 `app.go:1664 undoableFor`（`undoableReason` 在 `:1682`、`undoableReasonFor` 在 `:1692`）。
+  前端消费链真读数（本轮首查）：
+  `frontend/src/stores/scan.ts:444 undoRecord` / `:458 undoItem`（两条 `await api.undo*` 在
+  `:449`/`:463`，catch 里的 `notifyError('回撤失败', e)` 在 `:453`/`:467`）→
+  `stores/toast.ts:74 notifyError`（`e` 转成正文）→ `ToastHost.vue:28 {{ t.msg }}`，
+  **后端错误串原样进 toast**（只加"回撤失败："前缀）。`RecordsView.vue:69 noUndoTitle` 是
+  徽标 title 的**第二份文案**。前端 `tests/*.test.ts` **导入不了 `.vue`**（`scripts/test-frontend-logic.sh:122`
+  已明写），但 `scan-*.test.ts` 经 `harness.mjs` 吃 Pinia store ⇒ **store 层可测、视图层只能走接线锚点**。
+  ★ 更正 §26.2 一处：它说前端"另有 noUndoTitle 一份"，没说是**唯一可改的一份**——
+  后端这两句 error 是 toast 的正文，收窄时不能只改 title。
+- **M62+M85 的落点**：`fscase.go:59 Default()`、`:63 Sensitive(dir)`（`mu`+`cache map[string]bool`，
+  `filepath.Clean` 键，无淘汰）、`:132 probe` 三条退路（`:143` 创建失败→`Default()`、`:155` 重试用尽→`Default()`）、
+  `:172 verdictFrom` 第四条（`:184` 读不动→`Default(), true`）。★ 更正 §26.3 一处坐标：
+  它点 `fscase.go:134 return Default()`，现读该行在 **`:143`**（M151 改注释把代码推下去 9 行）；
+  `probe:116` 这类被引用的小节号也一并以现码为准。`fscase.Default()` 全仓**零 Go 调用者**（除包内），
+  改签名只波及包内 + 测试。
+- **M105 的穿透面**：`filter.go:118 Compile` 预编 `incExt/excExt`（`extSet`，恒 lower）与
+  `excPaths`（`pathnorm.Slash(pat, "\\")`）；判定点 `:140 Apply(name, rel, size)`、
+  `:186 ExcludeDir(rel, name)`、内部 `matchPath` 的三处 `path.Match`（`:245` 基名、`:252` 逐段、
+  `:269` 整条相对路径）+ `matchSegs:292`。**Matcher 在 match 时拿不到任何卷上下文**（只收
+  `name` + 相对路径）⇒ 裁定 C 要的"判据穿透到遍历期"是真的，没有现成通道。
+  生产侧调用点只有两处：`scanner.go:456 matcher.Apply(...)`、`scanner.go:396 matcher.ExcludeDir(...)`，
+  而**同一次遍历里根敏感度已经算好**（`scanner.go:597-599 sens[i] = probeCaseSensitive(r)`，
+  经 `dedupeRoots`）⇒ 穿透只是"把已有的 `sens[i]` 递到调用点"，不必新造探测。
+  ★ 更正 §26.4 的一处坐标：第二条 `EqualFold` 在 `sysguard.go:270`（`File()` 里比对盘根伪文件名），
+  不是 `:254`（M84 拆条目把它推下去了）；`sysguard.go:109` 那条不变。
+- **M91 的复核面**：`executor.go:257 v, vid := verifyFileFn(e, hashByID[fid], pool)` 是**校验阶段**
+  的一次内容级重算，`vid` 存进 `procIDs`；破坏性动作前只问 `guardIdentity`（`:371`）=
+  `identityCheck(path, procIDs[i])`，即 **(dev,ino)**。⇒ 现码形状恰好是 M91 说的"身份复核通过但内容已不同"
+  那一格：`os.Remove(e.Path)`（`:600`）、`moveFileDetailed`（`:622`）、`HardlinkMerge`（`:682`）、
+  `SymlinkMerge`（`:753`）四处都在 `guardIdentity` 之后**直接动手**。
+  ★ 更正 §26.8 的代价口径：它按"`Merge` 签名 + 46 处调用点"算，但**复核不必进 `Merge`**——
+  放在 executor 的 `guardIdentity` 之后、动作之前，签名一字不动（`HardlinkMerge`/`SymlinkMerge`
+  的 46 处调用点因此**一处不改**）。代价回到它本来的那一半：每个 dup 在动作前多读一遍。
+
+### 28.1 M79 设计：后端吐码、前端一处文案方，两条出口同源
+
+- 后端：`undoableReasonFor(kind, goos) string` 改为 `undoReasonCodeFor(kind, goos) string`，
+  只吐两个稳定码（ASCII、不带标点、不做本地化）：
+  `undo-code-windows-trash`（`kind=="trash" && goos=="windows"`）、`undo-code-permanent-delete`
+  （其余不可撤的情形，含未知 kind 的兜底）。`undoableReason(kind)` 包装改名
+  `undoReasonCode(kind)`；`:2164`/`:2308` 改 `fmt.Errorf("%s", undoReasonCode(meta.Kind))`。
+  ★ **判据本体 `undoableFor` 一字不动**——裁定说的是"判据归后端、文案归前端"，不是换判据。
+- 前端：新建 `frontend/src/utils/undoReason.ts` 作**唯一文案方**，
+  `undoBlockedText(code: string, goos: string): string` 把两码映回现有的那两句中文
+  （逐字沿用 `RecordsView.vue:70-75` 与 `app.go:1694-1700` 现文案的**并集**，不新写第三套措辞），
+  未知码 ⇒ 返回一句不承诺任何归因的兜底（"这条记录不支持应用内回撤（未登记的原因码：<code>）"）。
+  `RecordsView.vue` 的 `noUndoTitle` 改为问 `store.platform.goos` + `m.kind` 映射出的码；
+  toast 侧在 `scan.ts:453`/`:467` 把后端串当 code 交给 `undoBlockedText`，
+  **认不出码时原样透传**（保住 `undoItem` 失败链上其它 error 的既有形状）。
+  `RecordsView.vue:68` 那句引用 `undoableReason()` 的注释随之作废，改点名 `undoReasonCodeFor`。
+- **取红（两条出口必须各自红一次）**：Go 侧新用例 `TestUndoReasonCodesAreStableAndPlatformScoped`
+  断言 ① 两码逐字、② 三平台 × 四类 kind 的码与 `undoableFor` **不自相矛盾**（判可撤 ⇒ 不出码），
+  ③ 改前树里 `undoReasonCodeFor` 不存在 = 编译不过，故红由**变异**提供（下面 M25-a/b）。
+  前端侧 `frontend/tests/undo-reason.test.ts` 钉：两码各得一句中文、未知码走兜底且**含**那个码串、
+  两句中文里"原因"与"下一步"两半都在（沿用 §20 那条 `op-failed-label` 的断言形状）。
+  ★ store 腿另钉一条（`scan-undo-error.test.ts`）：后端回 `undo-code-windows-trash` 时
+  toast 正文是中文而不是裸码——这是"改前后端 error 串、前端不认 ⇒ 用户看到英文码"这一格的真防线。
+- **旧断言怎么办（不越"不许改断言让门禁变绿"）**：`app_undo_test.go:533-578` 与
+  `app_undo_platform_probe_test.go` 那 11 处钉的是**中文正文**，正文搬家后它们在 Go 侧必然红。
+  处理 = 把每一格的**判据**逐格迁到它新的家（`undo-reason.test.ts` 接"原因+下一步都在"、
+  Go 接"码与判据不自相矛盾 + 同源性"），**一条判据都不许丢**（11 处的分布，均为本轮现读：
+  `app_undo_test.go` 5 处 = 两组 must-have 环 `:535`/`:551` + 单条 must-have `:568` + 两条
+  must-not-have `:541`/`:565`；`app_undo_platform_probe_test.go` 6 处 = 文案规则表 `:89-90`
+  及其两个消费环 `:108`/`:113`、平台互异 `:132-136`、非 Windows 不含 Windows 引导 `:139`、
+  导出入口同源 `:149`），
+  并在 04 表 M79 行的括注里
+  逐条写"原判据 → 新钉名"。★ 这不是"改断言迁就实现"：是裁定把文案换了归属，判据随归属搬家；
+  丢判据才算违规，所以要做**集合对账**（改前 11 处断言逐条点名去处，一条不落地）。
+- 手册：`docs/09:507` 那句"记录标注「不可回撤」，请用「打开系统回收站」手动还原"仍与成品一致，
+  不动；但 §6.22 六式样的对齐检查要现读一遍 toast 正文（改后 GUI 文案与改前**逐字相同**是
+  本条的验收线，否则就是把"文案搬家"做成了"文案改写"）。
+
+### 28.2 M62+M85 设计：`fscase` 三态出口，卷型已知走卷型、未知退默认并计一次数
+
+- 新 API（包内一份，**不动 `Sensitive(dir) bool` 的形状**：二态调用方共四处，改签名要一起动，
+  而这一轮不需要 —— `cmd/benchgen/main.go:316`、`ops/keep.go:177`/`:234`/`:243`（预热表与
+  `resolve` 注入，另 `:258 resolve = fscase.Sensitive` 是把函数值本身交出去）、
+  `scanner.go:142 var probeCaseSensitive = fscase.Sensitive`（H6 注入缝，测试换实现））：
+  `func Verdict(dir string) Result`，
+  `type Result struct { Sensitive, Proven bool }`；`Sensitive(dir)` 改为
+  `v := Verdict(dir); return v.Sensitive`（二态调用方语义不变），`Proven` 是给上层的"这格是实测确证吗"。
+  缓存值类型由 `bool` 换 `Result`（键不变）。
+- 判定顺序（M85 的取向就落在这一步）：① 写探针成功 ⇒ 实测确证（`Proven=true`）；
+  ② 探针不可用（创建失败/重试用尽/`verdictFrom` 读不动）⇒ **先看卷型**：
+  `fstype` 命中"天生不敏感"表（`msdos`/`fat`/`exfat`/`ntfs` 之外的 `cifs`/`smbfs` 一类**不进**这张表，
+  远端语义无从推断）⇒ `Sensitive=false, Proven=true`（按卷型确证）；
+  ③ 卷型也拿不到 ⇒ `Sensitive=Default(), Proven=false`（**现状行为**，M62 的"少扫不错删"方向不变）。
+- darwin 卷型现成可读：`internal/media/probe_darwin.go:72-80 statfsInfo` 已在取 `f_fstypename`
+  （小写，`:16` 注释与 `:39-47 networkFSTypes` 就是同一份名字的既有用法，可直接当命名口径）；
+  本条**不重复造轮子**——把 `f_fstypename` 的读取下沉成一份（新文件 `internal/fscase/volumetype_darwin.go`
+  走 `syscall.Statfs`，或复用 media 的导出面；实施时按"谁依赖谁更少"定，写在设计段的实现注记里）。
+  ★ linux 的 `f_type` magic、windows 的 `GetVolumeInformation` **本批不做**。现状证据（本轮现读，
+  并**更正本节初稿的一句话**：我先前写"全仓零 `Statfs` 调用者"，实测不成立）：
+  生产码里 `syscall.Statfs` **只有 darwin 一条** —— `media/probe_darwin.go:74`（另有一处在
+  `realbytes/realbytes_clone_darwin_test.go:37`，是测试夹具），linux/windows 腿确实零；
+  而 `internal/media/probe_other.go:13`（`//go:build !darwin`，恒 `Unknown`）正是"卷型读取先只做
+  darwin、其余腿维持原行为"的既有先例 ⇒ 跨平台读卷型的三条腿不是 M85 的必要条件；拿不到卷型的腿
+  走 ③，行为与今天一字不差。这条边界写进 §28.6"明确不做"，不留模糊。
+- **`Proven=false` 必须可见**：`model.Filters` 不动，新增一个"本轮有 N 个根的卷语义未经实测"
+  计数（根级：同一根只计一次）。★ 它不是一处改动而是**一条链**，照 M21
+  （`SkippedWorkTempFiles`）的同款五跳逐个点名，少一跳就是"CLI 有数、GUI 零值"那类假账：
+  ① `scanner.Result` 新增 `CaseProbeUnproven int`（与 `SkippedCloudFiles`（`:97`）同族；
+  赋值点就在根敏感度已经算好的那一圈 `:597-599 sens[i] = probeCaseSensitive(r)`）；
+  ② `dedup/pipeline.go` 一枚 `atomic.Uint64` + 记账（`:348-351` 那一组 `Store` 之后）+
+  **按轮归零**（`:302` 那一组，少写这行 = 上一轮的数串进本轮，M21 注释已警告过）+ 取值器
+  （照 `CloudSkipped()` `:101`）；③ `app.go` 的 `ScanSummary` 加字段（`SkippedCloudFiles`
+  在 `:154`，装配在 `:711` 那一组）；④ `cmd/fdd-cli/main.go` 的 `stats` 结构体加
+  `case_probe_unproven`（同 `:57` 的 `skipped_cloud_files`）并在 `:170` 那一组赋值；
+  ⑤ `frontend/src/wails.ts` 的 `ScanSummary` 镜像**只加类型位、不加渲染**
+  （`skippedCloudFiles: number` 在 `:57`；根包比对器 `wails_types_test.go:42` 的
+  `wailsMirrors` 表要求 TS 一侧字段齐，缺了就红）。
+  **界面不呈现**（裁定③"新增计数的界面呈现属 M8，不做"）⇒ ⑤ 只为过比对器，任何 View 都不读它。
+- 取红：新用例 `TestVerdictDistinguishesProvenFromDefaulted`——darwin 上 `t.TempDir()` 是 APFS
+  （确证敏感或不敏感，`Proven=true`），再造一条"探针必失败"的卷型（只读目录：`chmod 0500`
+  的父目录，`O_CREATE` 必 `EACCES`）⇒ 改前 `Sensitive()` 只回 bool，"确证"与"退默认"
+  在返回值上**不可区分**，断言 `Proven=false` 当场红；改后绿。★ 同时补一条负控制：
+  同一条只读夹具下若卷型可读（darwin 的 APFS 不是天生不敏感表里的名字），必须仍是
+  `Sensitive=Default(), Proven=false`——防"卷型分支顺手把退默认洗成确证"。
+- 变异：M25-c 把 ② 的"天生不敏感表"短路成"凡拿到卷型就算确证敏感"、M25-d 把 ③ 的
+  `Proven` 恒置 true，各杀各的那条。
+
+### 28.3 M105 设计：`filter` 的排除腿按"已确证不敏感"放宽，其余一字保持现状
+
+- 穿透形状（不动 `Compile`，只在**判定点**接一个值）：`Apply(name, rel string, size uint64, caseMode fscase.Result)`、
+  `ExcludeDir(rel, name string, caseMode fscase.Result)`。`caseMode.Proven == false`
+  或 `caseMode.Sensitive == true` ⇒ 走**今天的敏感路径**（零行为变化）；只有
+  `Proven && !Sensitive`（FAT/exFAT 这类确证不敏感卷）才放宽成大小写不敏感。
+  ★ 二态布尔不够：`{Sensitive:false}` 既可能是"确证不敏感"也可能是"退默认"，
+  把后者当前者放宽就是 M62 反对的那类"无声放宽"。这正是 §28.2 的三态必须先落地的原因。
+- 实现落点：`matchPath` 内把 `path.Match(pat, X)` 换成本包新增的一份
+  `matchFold(pat, X, insensitive bool)`（不敏感时对两侧 `strings.ToLower` 再 `path.Match`）；
+  三处 `path.Match`（`:245`/`:252`/`:269`）与 `matchSegs:292` 全部走这一份，
+  **不留第二份实现**（M64 的 I5 口径，且要被 P-1 型门禁钉住：本包内 `path.Match` 只允许出现在
+  `matchFold` 里）。`extSet` 腿**不动**（它今天就恒 lower，与本条无关）。
+- `filter` 不 import `fscase`？——必须 import（`fscase.Result` 是参数类型），`go vet` 三平台可过；
+  ★ 这是本批唯一新增的包依赖边，写进 §28.5 的依赖面变化，别让它悄悄发生。
+- 取红（两格，方向各自钉）：`TestExcludePatternIsInsensitiveOnlyOnProvenInsensitiveVolume` ——
+  ① `Proven=true, Sensitive=false` 卷上排除模式 `Temp` 必须命中 `TEMP/x.log`（改前红：不命中）；
+  ② `Proven=false` 卷上 `Temp` **不得**命中 `TEMP/x.log`（反向钉，防"顺手放宽"）。
+  两格都在**纯逻辑**里（无 build tag，Linux CI 也跑）= H6 惯例；真卷型不进断言（夹具只造 `Result` 值）。
+  ★ 另补一条负控制：确证**敏感**卷上大小写必须照旧区分（防 `matchFold` 把两腿反过来接）。
+- `sysguard` 那两条 `EqualFold`（`:109`/`:270`）**不动**：它判的是"清单里的系统目录名"，
+  与"用户写的排除模式"是两套判据，§26.4 说的"取向不擅自统一"到本批仍成立——本批只是给
+  filter 一条按卷过渡的路，不是把 sysguard 拉平。
+- 手册：`docs/09` 关于排除模式的措辞要现读一遍（grep "排除"），若它今天没说大小写，
+  本批**补一句口径**（"在不敏感卷上排除模式不分大小写；其余情形区分"）——
+  §26.4 的结论是"文档欠一条口径"，欠的那条在这里补上。
+
+### 28.4 M91 设计：删/搬/合并动作前对 dup 做一次内容级复核（A 案）
+
+- 落点（§28.0 已核实：不动 `Merge` 签名）：`guardIdentity` 之后、动作之前，新加一份
+  `guardContent(i, e)`，仅用于**会销毁 dup 原内容**的三条腿：`delete`（`:600`）、
+  `hardlink`（`:682`）、`symlink`（`:753`）。`move`/`trash` 不接：两者都把文件整体搬走、
+  内容不丢（`trash` 另有一档"落点在系统侧"，M56/M19 已处置），把它们纳进来就是扩大改动面。
+- 判据：`v, _ := verifyFileFn(e, hashByID[e.ID], pool)`（**复用同一条腿**，`executor.go:158` 的
+  既有测试缝，不新造接缝），三格处置：`VerdictFailed` → 拦下并写"内容在扫描后被修改，已拦截（M91）"；
+  `VerdictSkipped`/`VerdictUnverifiable` → 与 `guardIdentity` 同一分开口径（已消失记 Skipped、
+  无从判定记 Failed 且**不**说"被改过"）；`VerdictPass` → 放行。
+  ★ 未知结论（M52 那一格）落 default 拦下，与 `executor.go:659` / `:726` 两处 keep 源 switch
+  同口径（它们的 M52 加固 `default:` 分支在 `:674` / `:741`；那两行注释里写的"`:239` 那道循环"
+  指的是校验循环 switch（现读 `:258`），行号已随后续批次偏移 ⇒ 认锚点不认行号）。
+- 为什么这一格值得多读一遍盘：`(dev,ino)` 的定义域只到"同时存活的对象"（`fsid.go:8-9`
+  原文指定的兜底方向就是内容级证据），而 `CtimeNs` 不能纳入比较（M91 行已实测：合并主路径
+  自己 `rename(dup→backup)` 会推进 ctime，纳入即把每次正常合并判成顶替）。
+- **代价如实写**：每条腿每个 dup 多一次全量重算（校验阶段 `:257` 已经算过一次 ⇒ 总量约两倍读盘）。
+  不省这一遍的理由必须能说清：`:257` 与动作之间隔着"用户看结果、勾选项、点执行"的**无界时间**，
+  不是同一临界区。若将来要省，正确方向是"两次读合并成一次带钩子的复核"，不是放宽判据。
+  真机耗时读数：本批只在 darwin 取一条量级读数（benchgen 造 N 个 dup，比 `--fast` 门禁外的
+  一次 `fdd-cli delete` 前后耗时），拿不到的一律记"代价已计入、数值未测全"。
+- 取红（★ 这一格本机可复现，不必靠 inode 还号）：新缝 `beforeActContentRecheck func(path string)`
+  （**生产恒 nil**，同 `beforeClaimRename` 惯例），在 `guardContent` 之前调用；测试钩子里
+  **就地改写同一个 inode**（`os.OpenFile(p, O_WRONLY)` + `Truncate` + 写不同字节 ⇒ dev/ino 不变、
+  `identityStill` 恒真）⇒ 改前 `guardIdentity` 放行、内容被合并覆盖，断言"dup 的新字节还在"当场红；
+  改后 `guardContent` 拦下、红转绿。★ 这条探针钉的是"同 inode 就地改"，与 inode 还号是
+  **两种不同**欺骗形状：还号那一档本机仍不可复现（APFS 严格递增），沿用 §6.17 的口径记
+  "现象本机不可复现，内容级复核是它的兜底方向"，**不许**写"M91 已消除"。
+- 变异：M25-e 把 `guardContent` 退成"只问 size 相等"、M25-f 退成"ask 但恒 Pass"，各杀各的；
+  ★ 并加一条**防误伤**钉子：同卷同内容、mtime 被 `touch` 过的 dup 必须**放行**（
+  `VerdictPass` 那一格），否则这条防线会把正常合并全拦死——M91 行自己警告过的假阳方向。
+- 账本与文案：拦下的项进 `Failed`（Stage `verify`），文案点名"内容已变，请重新扫描"，
+  与 `:263-265` 那道 `VerdictFailed` 同一措辞族（`"校验失败：文件在扫描后被修改"`）；
+  不新增状态字符串（避免动 `history` 的态集合）。
+
+### 28.5 本批门禁、计数与依赖面
+
+- 15 行门禁全套 + 计数重取（第一批基线：**725** 条 Go、三平台 **673/678/685**、
+  node **45** + 接线锚点 **15**）。预期新增：M79 Go 1 + node 2 + store 腿 1、
+  M62+M85 Go 2（含负控制）、M105 Go 3（两格 + 反向钉）、M91 Go 2（取红 + 防误伤）
+  ⇒ **只多不少**，任何下降当场查。★ M79 会**搬家**若干条 Go 断言：搬家后的条数必须
+  ≥ 搬家前，且逐条对账（§28.1 的"原判据 → 新钉名"清单）。
+- 闭包三通道同批重取；`scanner.Result` 新增字段 ⇒ **M30 的 TS 类型比对**必须同步
+  （`frontend/src/wails.ts` 的镜像类型 + `scripts/` 比对器不报漂移才算绿）。
+- 新依赖边一条：`internal/filter` → `internal/fscase`（§28.3）。★ 检查不成环：
+  `fscase` 只 import `pathnorm`/`worktemp`，`filter` 现 import `model`/`pathnorm` ⇒ 安全。
+- 平台面：M91/M79 全平台中立（纯逻辑 + 参数注入）；M62+M85 的卷型读取只有 darwin 腿
+  （`syscall.Statfs` 在 darwin 上本机可跑），linux/windows 腿本批**不写** ⇒ 不新增未兑现的
+  平台分支，但要在 04 表 M62 行明写"另两平台的卷型腿未做，走 ③ 退默认"。
+
+### 28.6 本批明确不做
+
+- **`HardlinkMerge`/`SymlinkMerge` 的签名不动**（§28.0 已核实复核不必进 `Merge`），
+  46 处调用点一处不改。
+- **linux `f_type` magic / windows `GetVolumeInformation` 的卷型读取不做**（§28.2）：
+  拿不到卷型的腿行为与今天一字不差，不做"三条腿各写一份、两条没读数"。
+- **`sysguard` 的两条 `EqualFold` 不拉平**（§26.4 的"取向不擅自统一"仍成立）。
+- **`move`/`trash` 不接内容复核**（数据不丢的那两条腿，接进来是扩大改动面）。
+- **`Proven=false` 的计数不进前端界面**（裁定③）。
+- **M75(b)**（UPSERT 覆盖 ctime）不在 §27.0 的九条里，**仍未裁**，本批不碰。
