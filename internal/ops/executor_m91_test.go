@@ -512,7 +512,10 @@ func TestM91DestructiveLegWiringCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "if guardContent(i, e) {"
+	// 锚点的字形在 R1-1（§30.1）改过：delete 那条腿从 `if guardContent(i, e) {` 改成
+	// 先接住 (handled, vid) 再判，所以整句字面不再三处相同。计数判据换成调用点前缀
+	// ——它同样钉得住"三腿各接一道"，且不管各腿怎么消费第二个返回值。
+	const want = "guardContent(i, e"
 	if n := strings.Count(string(src), want); n != 3 {
 		t.Fatalf("guardContent 接线处 = %d，期望 3（delete/hardlink/symlink）。\n"+
 			"多于 3：新腿需要复核 ⇒ 请同时补用例并把本判据改掉；\n"+

@@ -416,14 +416,21 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	// 处置分格与 guardIdentity 逐条对齐（M54/M52/M114 的同一族口径）：已消失记 Skipped
 	// （目标已达成，不是失败）、无从判定记 Failed 但**不说**"被改过"、未知结论落 default
 	// 拦下（方向与 executor.go 那道校验循环的 default 一致）。
-	guardContent := func(i int, e *model.FileEntry) bool {
+	//
+	// 第二个返回值（R1-1）：VerdictPass 时交出"内容复核通过那一刻的身份"，非通过时是零值。
+	// 为什么必须交出去：这一次哈希绑的是 open 那一刻的 fd，而大文件的 BLAKE3 要跑秒到分钟级；
+	// 重算期间路径可以被 rename 换成另一个对象，哈希照样通过。修前这里 `v, _ :=` 把身份丢掉，
+	// 于是 delete 这条**唯一不可逆**的腿变成：复核的是 A，动手删的是按路径找到的 B。
+	// 只有 delete 消费它——hardlink/symlink 的破坏性改名在 Merge 内部各自还有一道紧贴的守卫
+	// （move.go:125 / symlink.go:84 的 identityGuardSentence），move/trash 根本不接这道复核。
+	guardContent := func(i int, e *model.FileEntry) (bool, fsid.ID) {
 		if beforeActContentRecheck != nil {
 			beforeActContentRecheck(e.Path)
 		}
-		v, _ := verifyFileFn(e, hashByID[e.ID], pool)
+		v, vid := verifyFileFn(e, hashByID[e.ID], pool)
 		switch v {
 		case VerdictPass:
-			return false
+			return false, vid
 		case VerdictSkipped:
 			settle(i, outcome{code: ocSkipped})
 		case VerdictFailed:
@@ -436,7 +443,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			settle(i, outcome{code: ocFailed, stage: "verify",
 				err: fmt.Sprintf("动作前复核返回未知结论（值 %d），已拦截：盘上未做任何改动", int(v))})
 		}
-		return true
+		return true, fsid.ID{} // 未通过的一侧不交身份：handled 已为 true，调用方不会再看
 	}
 
 	// C7：worker 内 panic 守卫落地。fn（trash/VerifyFile/HardlinkMerge）panic 会
@@ -648,7 +655,28 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 				return
 			}
 			// M91：删除会把这份内容永久销毁，身份对了不等于内容还是扫到的那份。
-			if guardContent(i, e) {
+			handled, vid := guardContent(i, e)
+			if handled {
+				return
+			}
+			// R1-1：内容复核通过到 os.Remove 之间隔着一次**全量重算**（大文件秒到分钟级），
+			// 而上面的 guardIdentity 读的是更早的校验循环那次身份。哈希绑 fd、删除按路径，
+			// 这一段窗口里被 rename 顶替时两侧判据都点头——本道复核把"我删的就是我刚哈希那份"
+			// 钉成一句可执行的话。处置分格与 guardIdentity 逐条一致（M54/M114 的同一把尺子）；
+			// 未解析身份（FAT/exFAT）由 identityCheck 的放行分支接住，与那道复核同口径。
+			if v, why := identityCheck(e.Path, vid); v != vSame {
+				switch v {
+				case vGone:
+					settle(i, outcome{code: ocSkipped})
+				case vReplaced:
+					settle(i, outcome{code: ocFailed, stage: "verify",
+						err: "内容复核通过后、删除前文件被替换（inode 已变化），已拦截：盘上未做任何改动"})
+				default:
+					// 与 guardIdentity 同样是 default 而非 case vUnknown：新增归因时忘了登记，
+					// 后果是"被当成无从判定拦下"（安全），而不是"宣称看到过一个不存在的新对象"。
+					settle(i, outcome{code: ocFailed, stage: "verify",
+						err: fmt.Sprintf("内容复核通过后无法确认文件仍是那个对象（%s），已拦截：盘上未做任何改动", why)})
+				}
 				return
 			}
 			if err := os.Remove(e.Path); err != nil {
@@ -709,7 +737,9 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// M91：dup 侧同样要内容级复核——HardlinkMerge 会用源覆盖 dup 位置上的
 			// 那份数据，就地改写过的 dup（同一个 inode）光靠身份复核挡不住。
-			if guardContent(i, e) {
+			// vid 不消费（R1-1 只补 delete 这一格）：真正销毁数据的改名在 HardlinkMerge 内部，
+			// 它自己在 rename 前一行跑 identityGuardSentence（move.go:125），已经紧贴动作。
+			if handled, _ := guardContent(i, e); handled {
 				return
 			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
@@ -785,7 +815,9 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// M91：与 hardlink 同一条腿——SymlinkMerge 会删掉 dup 位置上的原数据再放链接，
 			// 那份数据如果已被就地改写，就没有任何东西能把它找回来。
-			if guardContent(i, e) {
+			// vid 不消费的理由与上面 hardlink 那处相同：SymlinkMerge 在改名前一行自己有
+			// identityGuardSentence（symlink.go:84）。
+			if handled, _ := guardContent(i, e); handled {
 				return
 			}
 			// S1 扩展：keep 源也须内容级校验（源被篡改时链接会指向被改过的

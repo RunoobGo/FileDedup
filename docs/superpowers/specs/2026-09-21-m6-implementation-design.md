@@ -5546,3 +5546,32 @@ M26-b 反向：把新守卫挪到 `guardContent` **之前**（等价于改前形
 **不是新增漏洞但也不是全覆盖**；闭合它的仍是 M91 那一道内容复核本身。顶替者是"另一份内容
 完全相同的文件"时现在会被拦下（比 docs/09 §6.4 第 3 道承认的那一格无害残余更严），
 严的方向是 fail-closed，写进手册时不承诺"只拦真危险"。
+
+**§30.1 真读数（实施后回填，2026-09-23）**
+
+- **修前红**（`go test -race -count=1 -run TestDeleteLegRecheck ./internal/ops`，生产码未改时）：
+  ```text
+  --- FAIL: TestDeleteLegRechecksIdentityAfterContentRecheck (0.00s)
+      executor_delete_recheck_test.go:105: Failed = []，want 恰好 1 条
+  ```
+  ⇒ 与上面预测的"红的面貌"逐字一致（不是红在夹具前提、不是红在别格）。
+- 本文件第二条用例 `TestDeleteLegRecheckCountsVanishedDupAsSkipped` **改前即绿**：它不是修前红探针，
+  而是"三格处置"的分格钉（改前那条走的是 `os.Remove` 撞 ENOENT → Skipped，形状本来就对）。
+  ★ 它的红由 **M26-c** 提供（见下），不冒充"修前必红"。
+- **变异三条**（备份 `cp` + 还原 `cp` + `cmp` 自证逐字节相同，不用 `git checkout --`）：
+
+| 变异 | 形状 | 实测红集合 | 预测 |
+|---|---|---|---|
+| M26-a 新守卫短路（`false && v != vSame`） | = 改前形态 | test1 一条（`Failed = []`） | 一致 |
+| M26-b 新守卫挪到 `guardContent` **之前** | 复核不紧贴动作 | **打不通**：`[build failed]`，块内引用的 `vid` 尚未声明 | 预测被推翻 |
+| M26-c 三格折成一句「被替换」（= 设计片段的字面形状） | gone 被说成顶替 | test2 一条（`skipped=[] failed=[…被替换…]`） | 一致 |
+
+  ★ M26-b 打不通这一条反过来是本方案相对备选形状的真实优势：备选（OPS-7 同型，二次
+  `guardIdentity` 复用 `procIDs[i]`）覆盖面上等价（开码逐条比过：唯一差别是"顶替者内容恰好相同"
+  那一格备选更严、本方案更准），但它**能被挪到内容复核之前**且两句文案完全同形，读不出是哪道
+  守卫拦下的；`vid` 形状在编译期就把位置钉死了。备选已考虑并否决。
+- **回归**：`go test -race -count=2 ./internal/ops` → `ok 2.391s`；`GOOS=windows go vet`、
+  `GOOS=linux go vet` 均过；`gofmt -l internal/ops/` 空。
+- **静态接线锚字形变更**（偏差 3 的落地）：`TestM91DestructiveLegWiringCount` 的字面由
+  `if guardContent(i, e) {` 改为 `guardContent(i, e`，**计数判据仍是 3、语义不变**（钉"三腿各接一道"），
+  改因写在测试自己的注释里。三平台运行时行为未验（本机 darwin 只到 `vet` 的编译面）。
