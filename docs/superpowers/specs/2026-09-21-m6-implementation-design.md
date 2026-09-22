@@ -5733,3 +5733,65 @@ AS-H1 的口径就是"身份与内容出自同一句柄"。
   AS-H1 那条既有结论（`fsid.FromFile` 句柄查询在两平台都解析）与本机的 `identityCheck` 单测；
   FAT/exFAT「无稳定索引 ⇒ `verID` 未解析 ⇒ 放行」那一格**本机没有实物见证**（本机 APFS 恒解析），
   它由 `verify.go` 的 `identityCheck` 既有钉子间接覆盖，本批不冒称已测。
+
+### 30.4 R2-2（Task B2）：卷语义探测接上 ctx——扫描启动腿不再能被一次卡住的探测永久挂住
+
+**坐标（HEAD `f1118cb` 现读）**：`fscase/fscase.go:121-137`（`Verdict`：查表 → `probe(key)` → 写表，
+全程无 ctx）、`:204-231`（`probe`：`OpenFile`/`Lstat`/`Remove` 三类 syscall，同样无 ctx）、
+`:160-174`（`SetProbeHook`/`fireProbeHook`，AS-R3 留的观察点）；
+`scanner/scanner.go:160`（`var probeCaseVerdict = fscase.Verdict`）、`:233`（`WalkWithGate` 在启动
+worker **之前**同步调 `dedupeRoots`）、`:638-645`（探测圈，逐根一次）；
+`dedup/pipeline.go:350-353`（`WalkWithGate` 返回后才第一次读 `ctx.Err()`）。
+
+**缺口的形状**：`Pipeline.Cancel` 只 cancel ctx；探测这条腿**没有一个人读 ctx**。死挂载
+（NFS 硬挂载 / 拔走的 SMB）上任一 syscall 挂住 ⇒ `WalkWithGate` 永不返回 ⇒ `pipeline.go:351`
+那个取消检查**永远执行不到**，扫描停在 `Scanning` 直到进程被杀。AS-R3（2026-09-20）修的是
+app 层**持锁**探测，同一族里"扫描启动腿探测不可取消"这条在 docs/04 里零登记（grep「死挂载」
+只命中 app.go 那两条）。
+
+**计划给的二选一，与本批实际裁定**（计划倾向 (a)，用户 2026-09-23 改裁 **(b) 的 ctx+超时形状**，
+理由是下面两条实证，不是风格偏好）：
+
+- **(a)「远端卷不写探针、按卷型给结论」会把挂死换成静默漏扫。** 卷型读不到的出路是
+  `defaulted()`，而 darwin 与 windows 的 `defaultSensitive = false`（`fscase/default_insensitive.go`）
+  ⇒ 远端根一律判**不敏感** ⇒ 折叠生效。折叠判错的后果包注释写了两遍：**同一棵树的两种拼写
+  合并 ⇒ 真不同的那棵整棵静默不被扫描，一条失败都不记**（:5-8、:8-9）。也就是说 (a) 拿
+  "多扫一棵"换成"少扫一棵"，方向上比原缺口更危险。
+- **(a) 在 CI 的两条腿上根本不成立。** `media.FSTypeName` 非 darwin 恒返回 `""`
+  （`probe_other.go:21`，注释明写"★ 本批不做（§28.6）"）⇒ linux/windows 上"先看卷型"这一步
+  恒无读数，(a) 落不到任何分支，门禁跑的两条腿测不到它，只有本机 darwin 有行为。
+- 附带一条：statfs 自己也是同一个挂载点上的内核态 syscall（`probe_darwin.go:88`
+  `syscall.Statfs(path, …)`），死挂载上它同样可以挂住 ⇒ "探测前先 statfs"并不是一个逃生口。
+  ★ 这一条本机**没有死挂载实物**可证，只作为"(a) 不彻底"的旁证记录，不冒称实测结论。
+
+**修法（一句话）**：给探测一条**能松手的路** —— `fscase` 新增 `VerdictCtx(ctx, dir) (Result, error)`，
+`probe` 仍在 goroutine 里跑原逻辑，调用方 select 在「结论」与「ctx 松手」之间；`Verdict(dir)` 收成
+`VerdictCtx(context.Background(), dir)` 的薄壳（Background 永不取消 ⇒ 错误分支不可达，公开签名与
+四处老调用方一字不动）。扫描器这条腿把 ctx 传进 `dedupeRoots`，探测出错即**中止本轮扫描**，
+绝不带着没问全的折叠继续走。
+
+**为什么取消时报错而不是"退默认继续扫"**：`dedupeRoots` 的第三次问卷结果直接决定根集合的
+折叠与判重（`scanner.go:646-705`），而 darwin/windows 的默认值是"不敏感"⇒ 退默认在这里
+**就是**上面 (a) 那个静默漏扫形状。取消本来就是"这趟不干了"，把它如实中止比替用户猜一棵树
+更诚实，也与 `pipeline.go:351-353` 既有收口同口径（取消不进 `Failed`，由 `ctx.Err()` 表达）。
+
+**缓存策略（M126 的落点）**：`ctx` 松手那一支**不写缓存**——"这格当时没问到"不是一条结论，
+把它钉进按目录缓存的表里，就是 M126 登记的"一次瞬时故障钉死整趟扫描"的复发形状。被放弃的
+探测迟到完成时也只写入带缓冲的 channel 后退出（不泄漏、也不越权替被取消的那次写表）；
+下一次问卷重新探测。
+
+**超时由谁定**：由调用方的 ctx 承载（`context.WithTimeout`），本包**不自造常量**。理由：只有
+调用方知道这一次探测值多久（扫描根在本地卷 0.1ms、在慢速卷可能永远不回），由被服务的层
+反过来给服务方定一个数，就是把"多慢算慢"变成了猜。测试里两格都要有见证：cancel 与
+DeadlineExceeded 各一条。
+
+**接缝**：不新增。`scanner.probeCaseVerdict` 已经是注入点（H6 惯例），本项只是把它的签名换成
+带 ctx 的版本；`fscase.SetProbeHook`（AS-R3 留的）在测试里扮演"卡在 syscall 里的探测"——钩子在
+`probe` 动手前同步回调，卡住它即等价于卡住那次写盘，不需要新缝。
+
+**预测红的面貌（跑前写明）**：
+- 现状树上没有 `VerdictCtx` 这个符号，`internal/fscase/probe_ctx_test.go` **编译即红**
+  （`undefined: fscase.VerdictCtx`）。挂死读数由**负控制**给出（见下），不由现状树给。
+- 绿了以后，负控制两刀：① 把 `VerdictCtx` 的 select 换成"只等结论"（= 改前形状）⇒ cancel 那两条
+  必须红在超时；② 删掉 `WalkWithGate` 里 `err != nil` 那道收口 ⇒ 扫描器那条必须红在
+  "根集合不完整却照样扫出了文件"（`Visited > 0`）。
