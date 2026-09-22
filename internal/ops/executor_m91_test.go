@@ -368,19 +368,35 @@ func TestM91UnreadableDupIsUnverifiableNotModified(t *testing.T) {
 		t.Skip("root 用户无权限拒绝语义")
 	}
 	fx := newFixture(t)
+	t.Cleanup(func() { _ = os.Chmod(fx.dup1.Path, 0o644) }) // 保障 TempDir 清理（中途 Fatalf 也不留 0 位）
+
+	// ★ 前置自检必须问在 Execute **之前**（2026-09-22 §29；CI run 35740660581 的 windows 腿
+	// 唯一一条红就出在这里）：放在之后，`os.Open` 失败有两种成因——权限真的拒绝 vs 复核放行后
+	// 文件已被删掉——探针分不开，于是"其实已经删掉了"被读成"本平台确实拒绝读"，红落到判据格
+	// （`Failed = []，want 恰好 1 条`）。这里先问一次语义、再原样还原。
+	// ★ 问的是**卷**而不是系统名：Windows 的 chmod 只翻 FILE_ATTRIBUTE_READONLY，exFAT/FAT 卷
+	// 上权限位整个不存在，按 runtime.GOOS 跳会放过"本卷造不出来"那一格。
+	if err := os.Chmod(fx.dup1.Path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(fx.dup1.Path); err == nil {
+		_ = f.Close()
+		if err := os.Chmod(fx.dup1.Path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Skipf("本平台/本卷的 chmod 不拒绝读：「读不动」这一前提造不出来，" +
+			"M91 的无从判定格在本卷未验证（§29.4，AS-K2：Skip 不是通过）")
+	}
+	if err := os.Chmod(fx.dup1.Path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	chmodZero := func(p string) ([]byte, error) { return nil, os.Chmod(p, 0) }
 	installAtContentRecheck(t, fx.dup1.Path, 1, chmodZero)
 
 	res := Execute(Options{Groups: []*model.DuplicateGroup{fx.group}},
 		model.OpRequest{Kind: "delete", FileIDs: []uint64{fx.dup1.ID}, ConfirmDanger: true})
 
-	// ★ 前置自检（§21.3 W3 同一把尺子）：chmod 0 造"读不动"只在认权限位的卷上成立。
-	// Windows 的 chmod 只翻只读位、不拒绝读，那一腿这一格造不出来 ⇒ 明写未验证，
-	// 不许拿 darwin 的绿冒充（AS-K2：Skip 不是通过）。
-	if f, err := os.Open(fx.dup1.Path); err == nil {
-		_ = f.Close()
-		t.Skipf("本平台 chmod 不拒绝读：「读不动」这一前提造不出来，M91 的无从判定格在本卷未验证")
-	}
 	if len(res.Failed) != 1 {
 		t.Fatalf("Failed = %+v，want 恰好 1 条", res.Failed)
 	}
