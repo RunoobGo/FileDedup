@@ -5647,3 +5647,52 @@ OK: 三跑一致、缓存命中生效，并与 manifest **逐组**对账通过�
 
 **同步面**：`docs/04-开发与测试计划.md` §3.4 第 1 项的「逐项对账」措辞已按实现对齐，
 并附本节的三档负控制读数与 `duplicate_files` 口径（只增括注，09-19 与 09-21 两串旧读数原样保留）。
+
+---
+
+### 30.3 R2-1（Task B1）：undo 同卷腿补「校验→放回原位」之间的身份留底复核
+
+**开码核实的时序（改前）**：
+```text
+undoTrash/undoMove → undoSourceCheck（Lstat → size → hashFile **按路径重开** 全量 BLAKE3）✅
+  → restoreInPlace → MkdirAll → claimExact/claimDst（在 OrigPath 抢一个 0 字节占位）
+  → renameFile(it.DestPath, target)          ← 同卷腿：到这里为止**没有任何** (dev,ino) 复核
+  → applyMtime(target) → 记"回撤成功"
+```
+跨卷腿（`isCrossDevice(err)` 回退分支，`undo.go:181-201`）反倒齐一条链：`pathIdentity` 留底
+→ `copyVerifyFile` → `identityStill` 复核 → 才 `removeSrc`。AS-H4 的那句话——"复核对象必须
+与动手对象是同一个"——只装在了回退分支上，同卷这条**常态分支**裸奔。M4 修的是**判据**
+（size → 内容哈希），没覆盖"哈希之后、改名之前"这段；M48/M56 管的是 OrigPath 侧的抢占与
+落点，不是 DestPath 侧的身份。
+
+**为什么内容哈希拦不住这一格**：`hashFile` 按路径 open 一份、哈希完就 close；随后
+`renameFile` 的是**那一刻路径上的东西**。中间被 rename 顶替时，我们回家的是顶替者，
+而账本记"回撤成功"、回收站/移动目录侧那份真件去向不明。等长同内容顶替（同一份数据的
+另一个副本被改名进来）连"内容不对"都不会暴露——只有身份看得见。
+
+**修法（一句话）**：把"校验时那份的身份"从 `undoSourceCheck` 里带出来，在 `restoreInPlace`
+`renameFile` **之前**用 `identityCheck` 复核一次，三格处置照 M54/M114 的尺子分说法：
+- `vSame` → 照常放回；
+- `vReplaced` → 拦，说"被替换（inode 已变化）"；
+- `vGone` → 拦，说"消失"（回撤场景**不记成已达成**：文件没回家，与 delete 腿的 Skipped 不同口径）；
+- `vUnknown`（`default:`）→ 拦，带上 `why`，**不得**说成被替换。
+拦截路径必须 `claim.release()`：抢下的 0 字节占位不留在用户原位（`renameFile` 失败分支已经是这么做的）。
+
+**身份怎么取**：`hashFile` 拆成 `hashFileIdentity`（open 一次，`fsid.FromFile(f)` 取身份 +
+经同一 fd 哈希）+ 原签名 `hashFile` 薄壳（其余四处调用点一字不动）。**刻意不**用
+`identityByHandle` 另开一次：两次 open 之间可以隔着一次顶替，那正是本项要修的形状；
+AS-H1 的口径就是"身份与内容出自同一句柄"。
+
+**接缝**：`var undoSourceCheckFn = undoSourceCheck`（生产不赋值，与 `verifyFileFn`/
+`fsidFromPathFn` 同族）。用例在哈希**通过之后**顶替 DestPath ⇒ 确定性地站在窗口里；
+不新增生产接缝之外的东西，也不引入 sleep。
+
+**预测红的面貌（跑前写明）**：改前树上 `TestUndoRechecksDestIdentityBeforeRename` 应红在
+"回撤成功"本身——返回 `target` 且 `err == nil`，原位上读到的字节是顶替者的
+`R21-INTRUDER`，`res == target` 而不是拦截错误；红不许落在夹具前提上。
+
+**不做的边界**：
+- `undoHardlink` / `undoSymlink` 本批不接：两者动手前已经各自握有一道
+  `identityByHandle` 复核（`undo.go:252-253` 等），不是同一格缺口，扩面属独立改动；
+- 跨卷腿那条 `pathIdentity`（`:181`）不改名为共用：它取底的时刻在 `renameFile` 失败**之后**，
+  与本项的"校验时刻留底"是两个不同的参照物，合并会把两件事混成一个。
