@@ -4,6 +4,7 @@ import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
 import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
 import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
+import { undoBlockedText } from '../utils/undoReason'
 // AS-H6（2026-09-20）：路径归属判据收回后端，这里不再 import 前端的 dirContains
 // 与大小写猜测——判据只有一份才不会再漂移。utils/pathpolicy.ts 只剩卷比较用的纯函数。
 
@@ -450,7 +451,7 @@ export const useScanStore = defineStore('scan', () => {
     } catch (e: any) {
       opsRunning.value = false
       opsProgress.value = null
-      toast().notifyError('回撤失败', e)
+      toast().notifyError('回撤失败', undoBlockedText(toast().errText(e)))
     }
   }
 
@@ -464,7 +465,7 @@ export const useScanStore = defineStore('scan', () => {
     } catch (e: any) {
       opsRunning.value = false
       opsProgress.value = null
-      toast().notifyError('回撤失败', e)
+      toast().notifyError('回撤失败', undoBlockedText(toast().errText(e)))
     }
   }
 

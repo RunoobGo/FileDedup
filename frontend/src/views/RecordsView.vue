@@ -5,6 +5,7 @@ import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import { humanBytes, formatCount, formatUnixSec } from '../utils/format'
+import { undoBlockedTitle, undoTitleCodeForKind } from '../utils/undoReason'
 import Icon from '../components/Icon.vue'
 import type { HistoryMeta, OpRecord, OpRecordItem } from '../wails'
 
@@ -59,20 +60,13 @@ function undoLeft(m: OpRecord): number {
   return m.undoable ? Math.max(0, m.done - m.undone) : 0
 }
 
-// noUndoTitle 「不可回撤」徽标的悬浮说明。
-// 2026-09-19：原来是一句笼统的「永久删除与 Windows 回收站不支持应用内回撤」，
-// 但这两类的**原因与出路完全不同**，笼统措辞让用户以为软件偷懒：
-//   - 永久删除：文件已不在磁盘，物理上无从恢复；
-//   - Windows 回收站：文件仍在回收站里，只是系统 API 不返回落点映射，
-//     应用算不出该搬回哪里 —— 手动还原完全可行。
-// 与后端 undoableReason()（app.go）保持同一口径。
+// noUndoTitle 「不可回撤」徽标的悬浮说明。这两句中文不在本文件——M79（裁定"判据归
+// 后端、文案归前端"）之后全仓只有一处写它（`utils/undoReason.ts`），这里只把记录映成
+// 原因码再问它。为什么这一侧不必问平台：徽标只在 `m.undoable === false` 时渲染（见模板），
+// 而 `undoable` 是后端按 `undoableFor(kind, GOOS)` 算好下传的 ⇒ 非 Windows 的 trash
+// 根本走不到"回收站那一码"，判据仍然只有一份。
 function noUndoTitle(m: OpRecord): string {
-  if (m.kind === 'trash') {
-    return 'Windows 回收站不支持应用内回撤：系统 API 不返回每个文件的落点映射，'
-      + '应用无法定位后搬回原处。文件仍在回收站里，请用「打开系统回收站」右键「还原」。'
-  }
-  return '永久删除不支持回撤：文件已从磁盘移除，没有可恢复的来源。'
-    + '若仍需保留，请改用「移入回收站」或「移动」。'
+  return undoBlockedTitle(undoTitleCodeForKind(m.kind))
 }
 
 function stateCls(s: string): string {

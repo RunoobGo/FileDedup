@@ -4780,14 +4780,28 @@ M105 才有"未知 ⇒ 保持现状（敏感）"这一档可接。这两条**不
   （其余不可撤的情形，含未知 kind 的兜底）。`undoableReason(kind)` 包装改名
   `undoReasonCode(kind)`；`:2164`/`:2308` 改 `fmt.Errorf("%s", undoReasonCode(meta.Kind))`。
   ★ **判据本体 `undoableFor` 一字不动**——裁定说的是"判据归后端、文案归前端"，不是换判据。
-- 前端：新建 `frontend/src/utils/undoReason.ts` 作**唯一文案方**，
-  `undoBlockedText(code: string, goos: string): string` 把两码映回现有的那两句中文
-  （逐字沿用 `RecordsView.vue:70-75` 与 `app.go:1694-1700` 现文案的**并集**，不新写第三套措辞），
-  未知码 ⇒ 返回一句不承诺任何归因的兜底（"这条记录不支持应用内回撤（未登记的原因码：<code>）"）。
-  `RecordsView.vue` 的 `noUndoTitle` 改为问 `store.platform.goos` + `m.kind` 映射出的码；
+- 前端：新建 `frontend/src/utils/undoReason.ts` 作**唯一文案方**。
+  ★ 本条初稿写的是"把两码映回现有那两句中文（逐字沿用两处现文案的**并集**）"，实施前自查
+  发现它与本节末尾自己写的验收线（"改后 GUI 文案与改前**逐字相同**"）**互相打架**：
+  `RecordsView.vue:71-75` 的徽标 title 与 `app.go:1694-1700` 的 toast 正文今天是**两段不等长的
+  同义文案**（title 是短体），取并集必然把短体改写成长体 ⇒ 那是"文案改写"，不是裁定说的"搬家"。
+  裁定原话是"判据归后端、**文案归前端**"，没有任何一处要求合并语域 ⇒ 定为一模块两语域：
+  `undoBlockedText(code: string): string`（toast 体，逐字等于今天的 `app.go` 那两句）
+  与 `undoBlockedTitle(code: string): string`（徽标 title 体，逐字等于今天的
+  `RecordsView.vue` 那两句；两体都不带 goos 参数，理由见本条末句的二次自查），
+  未知码两体各自返回一句不承诺归因的兜底（toast 体含那个码串，title 体不含）。
+  "唯一文案方"成立在**模块归属**上（全仓只有这一个文件写这两段中文），不成立在"合并成一段"上。
+  `RecordsView.vue` 的 `noUndoTitle` 改为问 `m.kind` 映出的码；
   toast 侧在 `scan.ts:453`/`:467` 把后端串当 code 交给 `undoBlockedText`，
   **认不出码时原样透传**（保住 `undoItem` 失败链上其它 error 的既有形状）。
   `RecordsView.vue:68` 那句引用 `undoableReason()` 的注释随之作废，改点名 `undoReasonCodeFor`。
+  ★ **实施前二次自查：本条初稿让前端"问 `store.platform.goos`"，而全仓前端压根没有平台状态**
+  （`grep -rn "goos|GOOS" frontend/src` 零命中 ⇒ 那个通道不存在，照写就得新造一条后端→前端的
+  平台下发，是扩大改动面）。为什么不需要它也安全：徽标只在 `m.undoable === false` 时才渲染
+  （`RecordsView.vue:280`），而 `undoable` 是后端按 `undoableFor(kind, runtime.GOOS)` 算好下传的
+  （`oplog.go:183` 落库、`:26` 出 `json:"undoable"`）⇒ 非 Windows 的 trash 记录根本走不到这一支，
+  "哪一类 kind 对应哪一句"因此不需要 goos 就能定；**goos 参数从两体都去掉**，
+  码由后端算（`undoReasonCode(kind)` 内部问过 `undoableFor`），前端只做码 → 文案。
 - **取红（两条出口必须各自红一次）**：Go 侧新用例 `TestUndoReasonCodesAreStableAndPlatformScoped`
   断言 ① 两码逐字、② 三平台 × 四类 kind 的码与 `undoableFor` **不自相矛盾**（判可撤 ⇒ 不出码），
   ③ 改前树里 `undoReasonCodeFor` 不存在 = 编译不过，故红由**变异**提供（下面 M25-a/b）。
@@ -4946,3 +4960,56 @@ M105 才有"未知 ⇒ 保持现状（敏感）"这一档可接。这两条**不
 - **`move`/`trash` 不接内容复核**（数据不丢的那两条腿，接进来是扩大改动面）。
 - **`Proven=false` 的计数不进前端界面**（裁定③）。
 - **M75(b)**（UPSERT 覆盖 ctime）不在 §27.0 的九条里，**仍未裁**，本批不碰。
+
+### 28.7 M79 实施真读数（2026-09-22，划账前的第一手证据）
+
+- **落地的用例名与设计名不同**：§28.1 预取的 `TestUndoReasonCodesAreStableAndPlatformScoped`
+  实施时改名 `TestUndoReasonCodeExplainsWhichBranch`——它钉的是"每一格出的是哪一支的码"，
+  而"三平台 × 全 kind 不自相矛盾"那半边本就在 `app_undo_platform_probe_test.go` 的三条里，
+  不重复立一名。**判据一条没少，只是名字与切分按实际写法收回**。
+- **★ 更正 §28.1 的"11 处"分布**：那个总数在**"断言里出现被搬走的那段中文"**这一定义下成立，
+  但它给的分布（`app_undo_test.go` 5 + probe 6）成员点错了。现读逐格：
+  - 含中文的站点实为 **`app_undo_test.go` 7**（`:535`/`:541`/`:551`/`:565`/`:568` 五条，
+    **加上 §28.1 漏掉的两条入口级** `:363`、`:505` 的 `Contains(err.Error(), "永久删除不支持回撤")`）
+    **+ probe 4**（`:89-90` 规则表、`:108`、`:113` 两个消费环、`:139` 非 Windows 不含 Windows 引导）= **11**；
+  - probe 的 `:132-136`（三平台两两互异）与 `:149`（导出入口同源）比的是**等值**、不含中文，
+    §28.1 把它们算进了"钉中文正文"，故其 5 与 6 两个分项各自都不成立，只有总数凑对；
+  - 若换成"搬家后必须重排的站点"这一口径则是 **14**（`app_undo_test.go` 8 = 上述 7 条 + `:573`
+    未知 kind 非空；probe 6 条全留，只是比的对象从中文换成码）。
+  - ★ 另有**两处看着像、其实不是**的：`TestUndoOperationItemSingleRestore` 与
+    `TestUndoOperationItemGuards` 里的 `Contains(err, "不可回撤")`／`"不存在"` 钉的是
+    `app.go:2326` 那句**按状态**的拒绝，与本次搬家无关 ⇒ 不计入，注释已就地写明"别算进对账"。
+  - 结论：错的是**计数与成员表**，不是方法。逐格归属写在两处注释里——
+    `app_undo_test.go:528-541` 的"原格 → 新归属"表（6 行）+ 两个入口级断言各自的 M79 括注，
+    probe 那 6 格由 `app_undo_platform_probe_test.go:20-22` 的文件头接管；一条判据未丢。
+- **取红（当场红，不靠"编译不过"）**：store 腿 `frontend/tests/scan-undo-error.test.ts` 在
+  `scan.ts` 未改的树上跑出 **2 红 1 绿**——红的两格是 `undoRecord`/`undoItem` 把后端码原样上屏
+  （`回撤失败：undo-code-windows-trash`），第三格是**负控制**（非码串原样透传），按设计本就预期绿。
+  ★ 这一形状与下面的 V-c 等价，V-c 现在可随时复现它，不必再依赖"当时看到的"。
+- **变异三条（2026-09-22 划账前重跑，逐字读数；每条 `cp` 回备份 + `diff -q` 核对）**：
+
+| 变异 | 做法 | 红在哪些格 | 仍然绿（且本该绿） |
+|---|---|---|---|
+| V-a | `app.go` 的原因分流丢掉平台腿：`kind == "trash" && !undoableFor(kind, goos)` → `kind == "trash"` | `TestUndoReasonCodeForBranchesByPlatformNotJustKind`、`TestUndoReasonCodeExplainsWhichBranch/非windows的trash走永久删除码` | 真值表、串台格子表（`checked=4`）、同源薄壳——它们钉的是别的连线 |
+| V-b | `undoReason.ts` 的 `undoBlockedText` 未知码不再透传、改吐固定句（丢掉"漏文案看得见"） | node 3 格：`未知码：toast 兜底含那个码串`、`非码的 error 原样透传`、store 腿负控制（`pass 7 / fail 3`） | 两体逐字钉、码字面量契约、kind→码 |
+| V-c | `scan.ts` 两条出口退回 `toast().errText(e)`（不经文案方） | store 腿两格正例（断言消息逐字：`toast 里漏出了后端原因码：回撤失败：undo-code-permanent-delete`）+ 新加的接线锚 | 负控制（透传形状一字未变） |
+
+  三条还原后复绿：`go test -run 'UndoReason|Undoable|Undo' .` ⇒ `ok filededup 0.623s`；
+  `bash scripts/test-frontend-logic.sh` ⇒ `node 用例 55 项 + 接线断言 17 项 = 合计 72 项全部通过`。
+- ★ **V-c 记一条取数命令自撞**（与 §6.21 同族）：`test-frontend-logic.sh` 先跑 node 腿、node 一红
+  就 `exit`，那条接线锚的"变异即红"**读不到脚本输出**。改用锚自身的谓词单独取证：
+  `grep -qF -- 'undoBlockedText(' frontend/src/stores/scan.ts` 变异后不命中 ⇒ 锚判失败。
+  这条不改锚的写法（锚仍按原样留在脚本里），只说明"为什么读数来自单独一条 grep"。
+- **门禁与计数（全套 15 行，日志 `/tmp/gates_m79_143831.log`）**：`rows=15 PASS=14 SKIP=1 FAIL=0`，
+  唯一 SKIP 仍是第 15 行 `smoke-symlink` `rc=2`（uid=501 挂不了独立文件系统，按 AS-K2 **不算通过**）。
+  与第一批基线逐格对账：`src_test=725`、`ok_pkgs=23`、`top_PASS=673`、`top_SKIP=5` **四格一字未动**
+  （M79 不新增顶层 Go 用例、不动 build tag）；变的是子用例
+  `sub_PASS 89 → 91`、`sub_SKIP 1 → 0`、`run 768 → 769`，闭合式 `678 + 91 + 0 = 769` 成立。
+  ★ `t.Skip` **语句**少 2 条、运行时 SKIP 只少 1 条：原 `:547`/`:559` 那一对按 `runtime.GOOS` 互斥跳过，
+  darwin 上只有前者真跳 ⇒ 两个数都对，别写成"少两条 SKIP"。
+  平台三值现读 **673 / 678 / 685**（linux/darwin/windows，`GOOS=… go list` 文件集 × 逐文件
+  `grep -c '^func Test'`；测试文件数 161 / 163 / 159）⇒ 与第一批同值，"M79 全平台中立"是量出来的。
+  前端腿：node `45 → 55`（+7 文案方、+3 store 腿）、接线锚 `15 → 17`、合计 `60 → 72`。
+- **未兑现（不得当作已通过）**：Windows 真机上徽标 title 与 toast 的实际呈现**没有读数**——本机
+  darwin，title 体只有静态接线锚 + node 纯逻辑腿两条腿 ⇒ 按"代码已改、验证未兑现"记。
+  `docs/09:507` 那句手册现读仍与成品一致，未改。

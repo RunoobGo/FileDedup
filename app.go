@@ -1657,7 +1657,7 @@ func (a *App) ClearScanHistory() error {
 // undoableFor 报告「这类操作在这个平台上能不能应用内回撤」——全包唯一实现。
 //
 // APP-6（2026-09-21 全量审查，I5 + H6）：这条判据原先有**两份内联写法**：
-// beginJournal 落库的 `OpMeta.Undoable` 一处、undoableReason 的文案分流一处。
+// beginJournal 落库的 `OpMeta.Undoable` 一处、原因分流（现名 `undoReasonCodeFor`）一处。
 // 两份必须同源，否则会出现"账本说可撤、界面说不可撤"（或反过来）。
 // 更要紧的是两处都直接读 `runtime.GOOS`，Windows 那条腿在本机永远断言不到；
 // 现在平台真值经参数注入，纯函数在三平台同一份代码上可测。
@@ -1665,39 +1665,42 @@ func undoableFor(kind, goos string) bool {
 	return kind != "delete" && !(kind == "trash" && goos == "windows")
 }
 
-// undoableReason 解释「这条记录为什么不可回撤」，并给出可执行的下一步。
+// 回撤失败原因码。字符串本身是**前后端契约**：前端 `utils/undoReason.ts` 按它查文案，
+// 改一个字节就等于把用户看到的说明换成空白兜底（M79）。
+const (
+	undoCodeWindowsTrash    = "undo-code-windows-trash"
+	undoCodePermanentDelete = "undo-code-permanent-delete"
+)
+
+// undoReasonCode 给出「这条记录为什么不可回撤」的**原因码**，全包唯一出口。
 //
-// 2026-09-19 改进：原文案是「该记录不可回撤（永久删除与 Windows 回收站不支持
-// 应用内回撤）」。用户读完仍然不知道**自己能做什么**——尤其 Windows 回收站
-// 这一条，其不可回撤并非「设计取舍」而是 API 层面的客观限制，必须讲清楚，
-// 否则容易被理解成「软件偷懒，故意不给撤」。
+// M79（2026-09-22 裁定"判据归后端、文案归前端"）：这里原本直接吐中文正文，
+// 而同一份解释在 `RecordsView.vue` 里另有一份短体 ⇒ 两处措辞已经各自漂移，
+// 后端每改一次文案就得重发一次二进制。现在后端只下发稳定码，中文由
+// `frontend/src/utils/undoReason.ts` 独家提供。
 //
-// 区分两类的本质差异：
+// 为什么必须是两码而不是一码（原中文文案留下的理由，随文案搬到前端）：
 //   - 永久删除：文件已不在磁盘上，**物理上无从恢复**（应用内绝无可能）。
 //   - Windows 回收站：文件**好好地躺在回收站里**，只是 SHFileOperation
 //     不返回「哪个文件落到了哪个 $Recycle.Bin 路径」的映射，应用无法
 //     自己算回去向。**手动还原完全可行**，出口是系统回收站。
 //
-// 二者都「不可应用内回撤」，但用户的可行动作截然不同，故分别成文。
-func undoableReason(kind string) string {
-	return undoableReasonFor(kind, runtime.GOOS)
+// 二者都「不可应用内回撤」，但用户的可行动作截然不同，故分别成码。
+func undoReasonCode(kind string) string {
+	return undoReasonCodeFor(kind, runtime.GOOS)
 }
 
-// undoableReasonFor 是 undoableReason 的平台参数注入版（APP-6 + H6）。
+// undoReasonCodeFor 是 undoReasonCode 的平台参数注入版（APP-6 + H6）。
 //
-// 为什么再拆一层：原文案分流直接读 runtime.GOOS，于是"Windows 上该说清落点映射
-// 缺失"这条分支在本机**只能 t.Skip**（既有用例 TestUndoableReasonExplainsAndGivesNextStep
-// 里的 windows 子用例就是这么写的）。平台真值进参数后，三平台的文案与判据
-// 是否自相矛盾，在任何一台机器上都能一次性断言。
-func undoableReasonFor(kind, goos string) string {
+// 为什么再拆一层：原因分流若直接读 runtime.GOOS，于是"Windows 才给回收站那一码"
+// 这条分支在本机**只能 t.Skip**。平台真值进参数后，三平台的码与判据是否自相矛盾，
+// 在任何一台机器上都能一次性断言。
+func undoReasonCodeFor(kind, goos string) string {
 	// 判据本身问 undoableFor（APP-6）；这里只决定"不可撤的原因是哪一种"。
 	if kind == "trash" && !undoableFor(kind, goos) {
-		return "Windows 回收站操作不支持应用内回撤：系统 API 不返回" +
-			"「每个文件落在回收站的哪个位置」的映射，应用无法定位文件而把它搬回原处。" +
-			"文件本身仍在回收站里，请点上方「打开系统回收站」，右键选择「还原」即可取回。"
+		return undoCodeWindowsTrash
 	}
-	return "永久删除不支持回撤：文件已从磁盘移除，没有任何可恢复的来源。" +
-		"若还需保留这些文件，请重新扫描后改用「移入回收站」或「移动」。"
+	return undoCodePermanentDelete
 }
 
 // histSnapshot 在锁内取账本句柄（M9，2026-09-21 全仓审计 §五 9）。
@@ -2161,7 +2164,7 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 	}
 	if !meta.Undoable {
 		release()
-		return "", fmt.Errorf("%s", undoableReason(meta.Kind))
+		return "", fmt.Errorf("%s", undoReasonCode(meta.Kind))
 	}
 
 	undoID := fmt.Sprintf("undo-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
@@ -2305,7 +2308,7 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 	}
 	if !meta.Undoable {
 		release()
-		return "", fmt.Errorf("%s", undoableReason(meta.Kind))
+		return "", fmt.Errorf("%s", undoReasonCode(meta.Kind))
 	}
 	var target *history.OpItem
 	for i := range items {

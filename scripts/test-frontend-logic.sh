@@ -138,6 +138,17 @@ wiring 'src/views/ScanView.vue' 'percentOf(' 'Math.min(100, ' \
 # node --test，先例 M116/M118）。★ 锚写法、不锚中文文案。
 wiring 'src/components/PreviewPanel.vue' 'v-if="isMd && overRenderCap"' 'v-if="overRenderCap"' \
 	'「默认源码」chip 受 isMd 约束（M141：图片预览不得挂出该 chip）'
+# M79（2026-09-22 裁定"判据归后端、文案归前端"，设计段 §28.1）：「这条记录为什么不可回撤」
+# 那两句中文原先有**两份**——后端 app.go 的 error 正文（进 toast）与本文件的徽标 title，
+# 两份措辞已经各自漂移。现在后端只下发原因码，中文全仓只写在 `src/utils/undoReason.ts`。
+# 锚的是"消费方有没有去问那一家"：视图问 title 体、store 的 catch 问 toast 体；
+# 被禁写法正是搬家前的形状（视图里内联整句 / store 把后端串直接当正文投出去）。
+# ★ 禁串取的是搬家前文案的一段稳定前缀，改文案时要同步改这里——但改文案本身
+#   已经是"只有 undoReason.ts 能动"的动作，漂移空间比改前小一个量级。
+wiring 'src/views/RecordsView.vue' 'undoBlockedTitle(' '不支持应用内回撤：系统 API' \
+	'记录页的不可回撤说明取自 utils/undoReason（M79：不得在视图里内联整句）'
+wiring 'src/stores/scan.ts' 'undoBlockedText(' "notifyError('回撤失败', e)" \
+	'回撤失败的 toast 正文经 utils/undoReason 翻译（M79：后端串不得原样上屏）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

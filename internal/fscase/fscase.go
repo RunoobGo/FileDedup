@@ -46,7 +46,7 @@ func Fold(p string, sensitive bool) string {
 }
 
 // fold 是 Fold 的平台注入版：sep 传平台分隔符真值，使 Windows 腿与 unix 腿
-// 在任一主机上都能被断言（H6 手法，同 app.go 的 undoableReasonFor）。
+// 在任一主机上都能被断言（H6 手法，同 app.go 的 undoReasonCodeFor）。
 func fold(p string, sensitive bool, sep string) string {
 	q := pathnorm.Slash(p, sep)
 	if sensitive {

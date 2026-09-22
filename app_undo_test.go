@@ -356,11 +356,14 @@ func TestUndoOperationTrashRestores(t *testing.T) {
 // 不可撤记录（delete / Windows trash 映射缺失）→ 入口同步报错。
 // 2026-09-19：文案改为「按 kind 分别解释原因 + 给出可执行下一步」，
 // 故断言不再匹配旧统一措辞，改为匹配 delete 专属说明。
+// M79（2026-09-22）：入口下发的是**原因码**，中文改由前端查表 ⇒ 这里改比码。
+// 「报的是哪一类原因」这条判据一字未丢，只是值域从中文正文换成码；
+// 那两句中文的判据在 `frontend/tests/undo-reason.test.ts`（逐字钉）。
 func TestUndoOperationNotUndoable(t *testing.T) {
 	a, _ := newHistApp(t)
 	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)
 	if _, err := a.UndoOperation(opID); err == nil ||
-		!strings.Contains(err.Error(), "永久删除不支持回撤") {
+		!strings.Contains(err.Error(), undoCodePermanentDelete) {
 		t.Fatalf("delete 记录应拒绝回撤: %v", err)
 	}
 	if _, err := a.UndoOperation(99999); err == nil ||
@@ -493,7 +496,12 @@ func TestUndoOperationItemMissingDestFails(t *testing.T) {
 	}
 }
 
-// 入口同步校验：记录不可撤 / 条目不属于该记录。
+// 单项出口的三道门禁（原注释「记录不可撤 / 条目不属于该记录」的展开）：
+// 不可撤 / 记录不存在 / 非 done·undo_failed 态各自同步拒绝。
+// M79（2026-09-22）：第一道改比**原因码**（同 `TestUndoOperationNotUndoable` 的注释）；
+// 第二道比的「不存在」、第三道（在途，只断言被拒、不比串）都不出自那两句被搬家的中文 ⇒ 一字未动，
+// 也别把它们算进搬家对账里。同族还有一处「不可回撤」在 `TestUndoOperationItemSingleRestore`，
+// 钉的是 `app.go:2326` 那句**按状态**的拒绝，同理不计入。
 func TestUndoOperationItemGuards(t *testing.T) {
 	a, _ := newHistApp(t)
 	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)
@@ -502,7 +510,7 @@ func TestUndoOperationItemGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := a.UndoOperationItem(opID, items[0].ID); err == nil ||
-		!strings.Contains(err.Error(), "永久删除不支持回撤") {
+		!strings.Contains(err.Error(), undoCodePermanentDelete) {
 		t.Fatalf("delete 记录应拒绝回撤: %v", err)
 	}
 	trashOp := seedDoneOp(t, a, "trash", true,
@@ -521,59 +529,66 @@ func TestUndoOperationItemGuards(t *testing.T) {
 	}
 }
 
-// TestUndoableReasonExplainsAndGivesNextStep 2026-09-19 改进的回归：
-// 「不可回撤」提示必须同时给出【原因】与【可执行的下一步】，而不是只丢一句
-// 「该记录不可回撤」让用户自己猜。
+// TestUndoReasonCodeExplainsWhichBranch 是 TestUndoableReasonExplainsAndGivesNextStep
+// 在 M79（裁定「判据归后端、文案归前端」）之后的对应物。逐格对账如下，一条判据没丢：
 //
-// 用户报障原文：「移入回收站的操作显示为不可回撤，应用设计中仅永久删除
-// 不可回撤」——其心智模型（只有硬删除才该不可撤）与实现的差异，正需要在
-// 文案里讲明白：Windows 回收站不可撤是**系统 API 拿不到落点映射**，
-// 文件仍在回收站里、手动可还原；而永久删除是**物理上无从恢复**。
-func TestUndoableReasonExplainsAndGivesNextStep(t *testing.T) {
-	t.Run("delete_说明物理不可恢复并给出替代方案", func(t *testing.T) {
-		msg := undoableReason("delete")
-		for _, want := range []string{"永久删除", "磁盘移除", "移入回收站"} {
-			if !strings.Contains(msg, want) {
-				t.Fatalf("delete 文案缺少 %q：%s", want, msg)
+//	原格	                              → 现在的归属
+//	:535 delete 文案含「永久删除/磁盘移除/移入回收站」 → node `undo-reason.test.ts` 的 toast 体逐字格
+//	                                     （逐字相等严格强于「含这三个词」）
+//	:541 不得回退成旧笼统措辞            → 同上（逐字相等 ⇒ 不可能等于旧句）+ Go 侧「必须是那两个码之一」
+//	:551 windows trash 含「映射/打开系统回收站/还原」 → node 侧同一族的 title/toast 逐字格
+//	:565 非 Windows 不得给 Windows 引导   → 本函数 goos=linux/darwin 的码互异格
+//	:568 非 Windows 的 trash 走兜底       → 本函数 trash@linux/darwin == 永久删除码
+//	:573 未知 kind 不得空                → 本函数「码非空且落在契约两码内」格
+//
+// ★ 搬家换来的一处净增益：改前 :547/:559 两格按 `runtime.GOOS` 分流、各自在非目标机器上
+//
+//	`t.Skip`（Windows 那一格在本机从没真跑过）。现在码由 `undoReasonCodeFor(kind, goos)`
+//	算，平台真值进参数 ⇒ 四格在任何一台机器上都真跑，本函数一条 Skip 都不留。
+//
+// 2026-09-19 那段用户报障（「移入回收站的操作显示为不可回撤」）要的东西没有作废：
+// 「讲明白原因与出路」仍然必须有，只是拆成两半——后端负责**分成两类**（两个码），
+// 前端负责**说人话**（`frontend/src/utils/undoReason.ts` 是全仓唯一写那两句中文的地方）。
+func TestUndoReasonCodeExplainsWhichBranch(t *testing.T) {
+	t.Run("delete_出永久删除码", func(t *testing.T) {
+		if got := undoReasonCode("delete"); got != undoCodePermanentDelete {
+			t.Fatalf("delete 应出永久删除码，实为 %q", got)
+		}
+	})
+
+	t.Run("windows_trash_出回收站码", func(t *testing.T) {
+		if got := undoReasonCodeFor("trash", "windows"); got != undoCodeWindowsTrash {
+			t.Fatalf("Windows 上的 trash 应出回收站码，实为 %q", got)
+		}
+	})
+
+	t.Run("非windows的trash走永久删除码", func(t *testing.T) {
+		for _, goos := range []string{"linux", "darwin"} {
+			if got := undoReasonCodeFor("trash", goos); got != undoCodePermanentDelete {
+				t.Fatalf("%s 上的 trash 拿到了 Windows 专属那一码：%q", goos, got)
 			}
 		}
-		// 不得再出现无从行动的笼统措辞
-		if strings.Contains(msg, "该记录不可回撤（") {
-			t.Fatalf("仍是旧笼统文案: %s", msg)
-		}
 	})
 
-	t.Run("windows_trash_说明落点映射缺失且文件可手动还原", func(t *testing.T) {
-		if runtime.GOOS != "windows" {
-			t.Skip("Windows 专属文案（按 runtime.GOOS 分流）")
-		}
-		msg := undoableReason("trash")
-		for _, want := range []string{"映射", "打开系统回收站", "还原"} {
-			if !strings.Contains(msg, want) {
-				t.Fatalf("windows trash 文案缺少 %q：%s", want, msg)
-			}
-		}
-	})
-
-	t.Run("非windows的trash走通用分支", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("本用例针对非 Windows")
-		}
-		// 非 Windows 上 trash 本就可撤，undoableReason 只在 delete 下被调用；
-		// 直接调用应落到通用兜底而非 Windows 专属文案。
-		msg := undoableReason("trash")
-		if strings.Contains(msg, "打开系统回收站") {
-			t.Fatalf("非 Windows 不应给出 Windows 专属引导: %s", msg)
-		}
-		if !strings.Contains(msg, "永久删除不支持回撤") {
-			t.Fatalf("缺少兜底原因说明: %s", msg)
-		}
-	})
-
-	t.Run("未知kind也有可读文案", func(t *testing.T) {
-		msg := undoableReason("some-future-kind")
+	t.Run("未知kind也有码且必须是契约内的码", func(t *testing.T) {
+		msg := undoReasonCode("some-future-kind")
 		if msg == "" {
-			t.Fatal("未知 kind 不得返回空文案")
+			t.Fatal("未知 kind 不得返回空码")
+		}
+		if msg != undoCodePermanentDelete {
+			t.Fatalf("未知 kind 应兜进永久删除码（与 undoableFor 的取值一致），实为 %q", msg)
+		}
+	})
+
+	// 码字面量本身是**前后端契约**：前端 undoReason.ts 按这两个字符串查文案，
+	// 改一个字节就是"后端发了个前端不认的码"，用户看到的说明退化成透传的裸码。
+	// 这一格钉的是常量，不是算法 ⇒ 算法全对但常量被手滑改写了也红。
+	t.Run("码字面量与前端契约逐字相同", func(t *testing.T) {
+		if undoCodeWindowsTrash != "undo-code-windows-trash" {
+			t.Fatalf("回收站码字面量漂移：%q", undoCodeWindowsTrash)
+		}
+		if undoCodePermanentDelete != "undo-code-permanent-delete" {
+			t.Fatalf("永久删除码字面量漂移：%q", undoCodePermanentDelete)
 		}
 	})
 }
