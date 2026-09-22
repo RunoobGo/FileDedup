@@ -4210,3 +4210,113 @@ err: err.Error()}) }`）。下游链路本来就是通的：`app.go:1940` 的 On
 本批**兑现不了、必须写明**的：`smoke-symlink-assert.sh` 的 E 组在 CI 的 linux/macOS 腿上会跑，
 但 runner 的 bash 版本与本机 3.2.57 不同，M134 那类缺陷**只在开发机上复现** ⇒ 该组的
 真读数以本机为准，CI 只作旁证（这句话必须出现在划账里，免得读成"CI 绿 = 防回归已生效"）。
+
+---
+
+## 25. 第 4 批（推送后 CI 首红复批）：Windows 腿唯一一条红 = M126 夹具的前提（登记 M151；2026-09-22）
+
+### 25.0 取材：一次真实 CI 读数，不是推断
+
+`4c73f23..dae51da` 推上 main 后，run **35674083361** 九条 job 里只有 `go test (windows)` 红，
+其余全 success（gofmt / vet×3 / test -race / frontend / smoke×2 / go test (macos)）。
+`gh run view 35674083361 --log-failed` 逐字：
+
+```text
+--- FAIL: TestVerdictFromUnreadableUpperFallsBackToDefault (0.00s)
+    verdict_from_test.go:91: 夹具前提不成立：本平台把这个串报成 ENOENT 而非"读不动"
+    （GetFileAttributesEx C:\Users\RUNNER~1\AppData\Local\Temp\
+      TestVerdictFromUnreadableUpperFallsBackToDefault1861496064\001\payload126c.txt\x:
+      The system cannot find the path specified.）⇒ 测不到 M126 那一格
+FAIL    filededup/internal/fscase  0.315s
+```
+
+同一次跑里其余 21 个包全 `ok`（含 `filededup` 根包 62.193s、`ops`、`dedup`、`scanner`、`history`）
+⇒ 这是**唯一**一条红，而且红在自己写的那句前提自检（`t.Fatalf`）里，**不是红在产品判据上**。
+★ 一句反话先堵掉：这不是"CI 又抽风"。抽风是同一形状时好时坏；这里是**本平台原理上造不出那个形状**。
+
+### 25.1 复核：为什么是夹具的锅，不是产品的锅（三条读数）
+
+1. **生产里 upper 恒为 dir 的直接子项**：`probeNames:111-114` 只产 `filepath.Join(dir, 上/小写名)`，
+   `verdictFrom` 的唯一调用点是 `probe:137`。"路径穿过一个普通文件"（`dir/file/x`）这一形状
+   **在生产里到不了** ⇒ Windows 把它报成 `ERROR_PATH_NOT_FOUND` 不构成产品缺陷，产品那一条
+   分支（`fscase.go:174-175`）该 Windows 用户本来就走不到这个输入。
+2. **判据格与 errno 种类无关**：`verdictFrom` 只看 `errors.Is(uerr, os.ErrNotExist)` 这一个类别判定，
+   任何**非 notExist** 的 Lstat 失败都落 `default:` ⇒ 换一种"读不动"的形状，钉的仍是 M126 那一格，
+   不需要动产品码。
+3. **本机三候选真读数**（临时探针，跑完即删；命令与原文见 §25.6）：
+
+| 候选形状 | darwin 实得 | `Is(ErrNotExist)` | 能否走到 `default:` |
+|---|---|---|---|
+| `filepath.Join(lower, "x")`（穿过普通文件） | `ENOTDIR: not a directory` | **false** | 能（现夹具用的就是这个） |
+| `lower + "\x00" + "x"`（串里带 NUL） | `EINVAL: invalid argument` | **false** | 能 |
+| 同名另一种大小写（既有 `UpperAbsent` 用） | 命中同一对象 | — | 不适用（走 `SameFile` 支） |
+
+**Windows 侧不靠猜，有 Go 1.27 源码两条硬证据**（本机 `$GOROOT` 直读）：
+- `syscall/syscall_windows.go:42-45` — `UTF16FromString` 遇到串内 NUL **直接 `return nil, EINVAL`**，
+  根本不进 Win32；`os/stat_windows.go:29-32` 把它包成 `PathError` 返回。
+- `syscall/syscall_windows.go:189-205` — Windows 上 `Errno.Is(ErrNotExist)` 的真值集合只有
+  `ERROR_FILE_NOT_FOUND / _ERROR_BAD_NETPATH / ERROR_PATH_NOT_FOUND / ENOENT`，**不含 EINVAL**。
+⇒ NUL 形状在三条腿（darwin/linux/windows）一律报"非 notExist"，而 `dir/file/x` 只在 Windows 退化。
+CI 复跑是最终裁判；若三条腿仍无一合格，本批的新自检会**硬红并打印每条候选的实测错误**，不会软成 Skip。
+
+### 25.2 修法判据：候选形状按序试，一条都不许 Skip
+
+改 `TestVerdictFromUnreadableUpperFallsBackToDefault` 体内的夹具构造，判据三条断言一字不动：
+
+1. 候选按序：① 穿过普通文件（真文件系统条件，darwin/linux 命中）→ ② 串内 NUL（Go 转换层拦下，
+   三平台一致）。取**第一个**"Lstat 失败且失败不是 ErrNotExist"的候选当 upper。
+2. 选中哪一格必须**外显**：`t.Logf` 打出形状名 + 实测错误，失败信息里也带上 ⇒ 读日志的人不必知道
+   平台就能判断这一格读没读到。
+3. 全不合格 ⇒ `t.Fatalf` 逐条打印候选的实测错误（★ 绝不退成 `t.Skip`；退 Skip 等于把这条腿
+   的读数来源从"CI 三条腿"偷偷降级成"零条"）。
+4. 注释里写死一句诚实话：Windows 上走的是第 ② 格，形状由 Go 的字符串转换层拒绝，**不是**
+   文件系统给的 `ENOTDIR`；两者对 `verdictFrom` 是同一格，但对本仓"平台差异"账目不是同一件事。
+
+### 25.3 两条被否决的修法（写下理由，免得下次再走一遍）
+
+| 否决项 | 为什么不走 |
+|---|---|
+| 给 Windows 加 `t.Skip` | AS-K2：skip 不当通过。三条腿里 Windows 那条从此**零读数**，而 M126 本体（"读不动不得给确证"）恰恰是最想让平台差异咬到的地方。M140 的先例是**换形状把 Skip 换成 PASS**，不是把 PASS 换成 Skip |
+| 往 `QUARANTINE` 清单加这条用例名 | 该脚本自己的话（`test-windows-quarantine.sh` 头段）："修好后从清单删除"、Windows job 变红时应补夹具而不是加隔离 ⇒ 加隔离 = 把该平台对该用例永久设为不设防 |
+| 新写一条 `...NulPath...` 用例、旧的照旧红 | 用例计数三条腿闭合方程（04 §3.2：`718-35-12-17-11`）要整表重算，且旧那条在 Windows 仍红 ⇒ 门禁不放行。约束 7：不扩面 |
+
+### 25.4 取红与变异计划
+
+- **改前红已有真读数**：§25.0 那段 CI 日志（本平台唯一一条红，红在 `verdict_from_test.go:91`）。
+  ★ 本批改的是测试码，生产码零改动 ⇒ "生产改动前先看它红过一次"这条不适用；但**新夹具必须自证还咬得住产品**：
+- **变异 M21-a（唯一一条）**：把 `fscase.go:174-175` 的 `default: return Default(), true` 改回
+  M126 改前形状 `return true, true` ⇒ 新用例必须在 darwin **当场红**，且必须红在
+  `v != Default()` 那一格（`Default()` 本机为 false，红文里点名"退平台默认"）。
+  ★ 若 `Default()` 恰好为 true（区分大小写默认真机）这条变异便不可杀，故本机另钉一条"红文指向的断言格"
+  的复核，不靠"整包红了"充数。
+- **反向不红也要如实记**：删掉 NUL 候选只留 ①（模拟改前）在 darwin 不会红（本机 ① 本来就合格）⇒
+  该候选的价值只在 Windows 腿，本机不得声称已验，只能声称"CI 复跑后绿"。
+
+### 25.5 本批不做的清单
+
+| 项 | 不做什么 | 为什么 |
+|---|---|---|
+| 产品 `verdictFrom` | 为 Windows 特判 `ERROR_PATH_NOT_FOUND` | 生产输入恒为直接子项，特判是给到不了的分支加码；且 `errors.Is` 的类别判定跨平台含义一致（"这个位置读不出对象"），改了反而引入新语义 |
+| `TestVerdictFromUpperAbsentIsConfirmedSensitive` | 消掉它体内那句 `t.Skip` | 那句 Skip 是**卷语义前提**（APFS 不区分大小写），与本平台形状无关，M126 括注已把它归 CI 的 linux 腿；本轮不重开 |
+| `TestVerdictFromNeverCreatedUpperIsConfirmedSensitive` | 同步换形状 | 它要的是 ENOENT 支，Windows 真读数里这一支**成立**（CI 该条未红）⇒ 前提在两条腿上都是对的，动它纯属扩面 |
+| M91 / M149 / 九条待裁定 | 顺手带上 | 各自等裁定或真机，与本批无关 |
+
+### 25.6 真读数留痕
+
+本机探针（跑完已删，仓库内不留该文件）：`internal/fscase/zz_wfx_probe_test.go`，
+`go test ./internal/fscase/ -run TestWFXProbeShapes -v` → `rc=0`，输出逐字（NUL 已替换为 `<NUL>`）：
+
+```text
+nul-bytes  isNotExist=false ENOTDIR=false EINVAL=true err=lstat .../payload126c.txt<NUL>x: invalid argument
+nul-inner  isNotExist=false ENOTDIR=false EINVAL=true err=lstat .../pay<NUL>load.txt: invalid argument
+under-file isNotExist=false ENOTDIR=true  EINVAL=false err=lstat .../payload126c.txt/x: not a directory
+```
+
+`$GOROOT=/opt/homebrew/Cellar/go/1.27.1/libexec`（`go version go1.27.1 darwin/arm64`）；
+§25.1 那两条 Windows 证据取自该目录下的 `src/syscall/syscall_windows.go` 与 `src/os/stat_windows.go`。
+
+### 25.7 提交节奏与门禁计划
+
+三提交：① 本节设计段；② 实施（换夹具 + 变异自证）；③ 划账 §6.21 + 登记表新增 **M151** +
+两处过期坐标（`verdict_from_test.go:33` 实为 `:37`）就地更正 + CI 三条腿真读数。
+第 ③ 步之后按同一授权口径推送（用户本轮原话"完成后推送到 github 仓库"覆盖"CI 红了就修完再推"这一闭环）。
