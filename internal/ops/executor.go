@@ -157,6 +157,15 @@ var adsCheck = ads.Check
 // 没有接缝就只能靠真实并发，那种用例在门禁上是掷硬币。
 var verifyFileFn = VerifyFile
 
+// beforeActContentRecheck 是"身份复核已过、正要重读这个 dup 的内容"的观察点，
+// **生产恒为 nil**（M91，2026-09-22 裁定 A 案，设计稿 §28.4）。
+//
+// 为什么要有它：M91 要挡的形状是"扫描后有人**就地**改写了 dup 的内容"——dev/ino 不变、
+// size 也可能不变，guardIdentity 恒放行，动作于是把那份新内容覆盖掉。改写本身本机可复现
+// （不需要 inode 还号），但"改写必须落在身份复核之后、内容复核之前"这一时序不能靠 sleep 赌。
+// 惯例同 beforeClaimRename / removeSrc：包级 var，测试直接换装。
+var beforeActContentRecheck func(path string)
+
 // Execute 执行清理操作（trash/delete/move/hardlink），返回聚合结果。
 // 安全语义（01 §9 / 02 决策 7）：
 //   - 保留项拒绝执行（S2）；delete 必须 ConfirmDanger（S4）
@@ -391,6 +400,45 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 		return true
 	}
 
+	// guardContent M91：**会销毁 dup 原内容**的三条腿（delete / hardlink / symlink）
+	// 在动手前对 dup 再做一次内容级复核。返回 true 表示这一项已记完账、调用方应当跳过。
+	//
+	// 为什么身份复核不够（这一格的立项理由）：(dev,ino) 的定义域只到"同时存活的对象"，
+	// fsid.go 自己给的兜底方向就是内容级证据；而"就地改写同一个 inode"（编辑器
+	// truncate+write、dd conv=notrunc、数据库追加）在身份上完全不可见。时间戳也帮不上：
+	// CtimeNs 不能纳入比较——合并主路径自己 rename(dup→backup) 就会推进 ctime
+	// （M91 行实测），纳入即把每一次正常合并都判成顶替。
+	//
+	// 为什么不复用校验循环那一次读数（:257）：那一读到动作之间隔着"用户看结果、勾选项、
+	// 点执行"的**无界时间**，不是同一临界区。★ 代价如实计入：每个 dup 多一次全量重算，
+	// 总读盘约两倍。将来要省，正确方向是"把两次读合并成一次带钩子的复核"，不是放宽判据。
+	//
+	// 处置分格与 guardIdentity 逐条对齐（M54/M52/M114 的同一族口径）：已消失记 Skipped
+	// （目标已达成，不是失败）、无从判定记 Failed 但**不说**"被改过"、未知结论落 default
+	// 拦下（方向与 executor.go 那道校验循环的 default 一致）。
+	guardContent := func(i int, e *model.FileEntry) bool {
+		if beforeActContentRecheck != nil {
+			beforeActContentRecheck(e.Path)
+		}
+		v, _ := verifyFileFn(e, hashByID[e.ID], pool)
+		switch v {
+		case VerdictPass:
+			return false
+		case VerdictSkipped:
+			settle(i, outcome{code: ocSkipped})
+		case VerdictFailed:
+			settle(i, outcome{code: ocFailed, stage: "verify",
+				err: "动作前复核失败：文件在扫描后被修改，已拦截：盘上未做任何改动，请重新扫描"})
+		case VerdictUnverifiable:
+			settle(i, outcome{code: ocFailed, stage: "verify",
+				err: "动作前复核无从判定（打不开、读不了或不是普通文件），已拦截：盘上未做任何改动"})
+		default:
+			settle(i, outcome{code: ocFailed, stage: "verify",
+				err: fmt.Sprintf("动作前复核返回未知结论（值 %d），已拦截：盘上未做任何改动", int(v))})
+		}
+		return true
+	}
+
 	// C7：worker 内 panic 守卫落地。fn（trash/VerifyFile/HardlinkMerge）panic 会
 	// 穿透 goTask 的 recover（仅包主 goroutine）直接崩进程；此处捕获后把该下标
 	// 标记为失败，并回调 OnPanic（由调用方发 ops:error）。进程不死、操作互斥标记
@@ -502,6 +550,8 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if guardIdentity(i, e.Path) { // H2 复核；M54 把"已消失"与"被替换"分开处置
 				continue
 			}
+			// trash 同样**不接** M91 内容复核（理由与下面 move 那一格同一条，§28.4）：
+			// 入回收站是一次改名/搬运，dup 的原内容还在回收站里，销毁不发生在这里。
 			usable = append(usable, i)
 		}
 		paths := make([]string, 0, len(usable))
@@ -597,6 +647,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				return
 			}
+			// M91：删除会把这份内容永久销毁，身份对了不等于内容还是扫到的那份。
+			if guardContent(i, e) {
+				return
+			}
 			if err := os.Remove(e.Path); err != nil {
 				if os.IsNotExist(err) {
 					settle(i, outcome{code: ocSkipped})
@@ -619,6 +673,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
 				continue
 			}
+			// ★ 这里**不接** M91 的内容复核，是设计裁定而不是漏（§28.4）：move 与 trash 都把
+			// 文件整体搬走、内容不丢，扫到的哈希对不上也不会销毁任何东西。把它们纳进来
+			// 就是拿两倍的读盘换零收益。（delete/hardlink/symlink 三条腿会销毁 dup 原内容，
+			// 那边才接。别"顺手补一致"。）
 			dst, crossVol, err := moveFileDetailed(e.Path, op.TargetDir)
 			switch {
 			case err != nil:
@@ -647,6 +705,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// H2：dup 在动作前仍须指向校验过的那份内容
 			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
+				return
+			}
+			// M91：dup 侧同样要内容级复核——HardlinkMerge 会用源覆盖 dup 位置上的
+			// 那份数据，就地改写过的 dup（同一个 inode）光靠身份复核挡不住。
+			if guardContent(i, e) {
 				return
 			}
 			// S1 扩展：keep 源也须校验——源在扫描后被篡改时硬链接会用新内容
@@ -718,6 +781,11 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			}
 			// H2：dup 在动作前仍须指向校验过的那份内容
 			if guardIdentity(i, e.Path) { // H2 复核；M54 分处置
+				return
+			}
+			// M91：与 hardlink 同一条腿——SymlinkMerge 会删掉 dup 位置上的原数据再放链接，
+			// 那份数据如果已被就地改写，就没有任何东西能把它找回来。
+			if guardContent(i, e) {
 				return
 			}
 			// S1 扩展：keep 源也须内容级校验（源被篡改时链接会指向被改过的
