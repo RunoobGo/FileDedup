@@ -5346,3 +5346,102 @@ M134/M142 静态查门禁脚本），"删行""搬走""写死常量"三种改法�
   `VerifyFile` 在 Windows 上按 AS-H1 走句柄查询，行为应当一致，但那是**推断**，不是读数。
 - `move` / `trash` 不接复核是**裁定**而非验证：两条负控制钉的是"这两条腿今天没接、接了当场红"，
   不是"这两条腿接了会出问题"。
+
+---
+
+## 29. 第 5 批（第二批裁定推送后 CI 首红复批）：Windows 腿唯一一条红 = M91「读不动」格的前提自检放错了位置（2026-09-22）
+
+### 29.0 取材：一次真实 CI 读数，不是推断
+
+`5e0ddb4..cf4089f`（十五个提交：九条裁定的两批全部）推上 main 后，run **35740660581**
+`gh run view --json jobs` 真读数 **3 个 job**：
+
+| job | 结论 |
+|---|---|
+| `gofmt / vet x3 / test -race / frontend / smoke`（linux） | **success** |
+| `go test (macos)` | **success** |
+| `go test (windows)` | **failure** |
+
+`--log-failed` 逐字，整条 run **只有一行** FAIL：
+
+```text
+--- FAIL: TestM91UnreadableDupIsUnverifiableNotModified (0.01s)
+    executor_m91_test.go:385: Failed = []，want 恰好 1 条
+FAIL    filededup/internal/ops  3.288s
+```
+
+⇒ 红在**测试夹具**，不在产品判据，也不在产品码。★ 整条 run 逐字只有这一行 `FAIL`，
+其余包一律 `ok`——但 CI 三条腿都不带 `-v`，`ok` 只表示"没有失败"，`ops` 里另外几条按平台自探的
+M91 用例是跑是跳**不可分**（§21.5 三-3 立的正是这条口径），所以这句只用来排除"还有别的红"，
+不用来兑现任何一格。
+
+★ 先纠正我自己写下的一句：§28.10 六写的是"该用例自带这条前置自检并 `Skipf`（§21.3 W3
+同一把尺子）"——**这句被本次 CI 推翻**：那条自检在 Windows 上根本没 Skip，它把红交给了断言。
+按"预测被推翻必须写下来"的口径，这一笔留在本节，不回去改 §28.10。
+
+### 29.1 复核：红在自检的**位置**（三条读数）
+
+那条自检长这样（`executor_m91_test.go:380-383`，位置在 `Execute` **之后**）：
+
+```go
+if f, err := os.Open(fx.dup1.Path); err == nil {
+    _ = f.Close()
+    t.Skipf("本平台 chmod 不拒绝读……")
+}
+```
+
+它的意图是"问清本平台到底拒不拒绝读"，但它问的其实是**另一件事**——`os.Open` 在
+`Execute` 之后失败有两种成因，这个探针分不开：**权限真的拒绝**，和**文件已经被删掉了**。
+
+1. **Windows 的 `chmod 0` 不拒绝读**（`$GOROOT/src/syscall/syscall_windows.go:759-773` 逐字）：
+   `Chmod` 只按 `mode&S_IWRITE` 翻 `FILE_ATTRIBUTE_READONLY` 这一个属性，
+   **没有任何一条路**能表达"拒读"。所以钩子跑完后 `verifyFileFn` 照样读得到内容、
+   哈希与组哈希相同 ⇒ `VerdictPass` ⇒ 复核放行 ⇒ delete 真的执行了。
+2. **本机等价复现**（临时探针 `tmp_ci29_probe_test.go`，跑完即删）：darwin 上把钩子换成
+   `os.Chmod(p, 0o444)`（一个"仍可读"的权限位，语义上正是 Windows 那个只读属性），
+   两条读数与 Windows 腿逐字同形：
+   ```text
+   PROBE-A 开不动=是 err=open …/dup1.bin: no such file or directory IsNotExist=true
+           ⇒ 原用例在此处**不** Skip
+   PROBE-B Failed=0 Skipped=0 OK=1 reclaimed=4096
+   Failed = []，want 恰好 1 条
+   ```
+   ★ 注意最后一行**就是 CI 那一行的原文** ⇒ 复现的是同一条失败路径，不是"看着像"。
+   同时 PROBE-B 说明放行之后**什么都没坏**：文件是被"正常删除"记进 `OK` 的，
+   `guardContent` 没有误判、没有多说一句"被修改"。
+3. **同族另外两处的写法**（现读，全仓 `os.Chmod(..., 0)` 六处）：`verify_m52_m54_test.go:66`
+   把"试开一下"放在**调用判据之前**（M52 那条在 Windows 腿因此**没有红**；是跑是跳不可分，
+   §21.5 三-3 已把这条边界写死）；`scanner_test.go:132`、`pipeline_test.go:199/245` 用
+   `runtime.GOOS == "windows"` 在**开头**跳过。★ 只有 M91 这一条把它放在了 `Execute` 之后。
+
+### 29.2 修法判据：把探针搬到 `Execute` 之前，断言一字不动
+
+- 位置：`newFixture` 之后、`installAtContentRecheck` 之前。做法是**先问一次平台语义再复原**：
+  `Chmod(dup, 0)` → `os.Open` → 打得开就 `Chmod(dup, 0o644)` 还原并 `t.Skipf`（文案沿用
+  §21.3 W3 那句"这一前提造不出来 ⇒ 本卷未验证"），打不开也还原，再把 `chmod 0` 交给钩子
+  在**复核时刻**执行（时序不变：仍必须落在身份复核之后，那是 §28.4 立这条缝的理由）。
+- **为什么不用 `runtime.GOOS == "windows"`**：这条探针的价值恰恰是它问的是**卷**而不是**系统名**。
+  exFAT/FAT 卷上 Unix 权限位整个不存在，darwin 插一根 exFAT U 盘同样造不出"读不动"
+  （§28.8 的卷型三态刚把这件事钉成判据）⇒ 按 OS 名跳会把"本平台跑得动、本卷跑不动"这一格放过去。
+- **断言集合一条不减**：`Failed` 恰一条、`无从判定`、`动作前复核`、不含`被修改`、
+  `stage=="verify"`、`OK`/`Reclaimed` 归零、还权限后内容仍是 4096 字节，全部原样在场。
+  ★ 最后那条"还权限再读盘"在移位后**多长出一层用处**：它现在是"文件还在盘上"的事后前提
+  （若哪天真放行删掉了，它红在"应当原样在盘上"，比这次"红在 `Failed = []`"更好读）。
+- **生产码零改动**（与本节 29.1-1 的读数是同一件事）：Windows 上这道复核读到内容、
+  判 `Pass`、放行删除，这个行为**是对的**——只读属性不代表内容被改过。所以本批不动 `guardContent`。
+
+### 29.3 不做的事
+
+- **不给 Windows 造一个真的"读不动"读数**。`beforeActContentRecheck` 的签名是
+  `func(path string)`（`executor.go:167`，生产恒 nil），它只能**做副作用**、不能交出错误，
+  要按 §22 批 `errSimulatedUnreadable`（M114）那种平台中立哨兵注入，必须把缝改成能返回错误
+  ⇒ 那是生产面改动，超开本批范围（约束 7）。Windows 那一格继续挂"未验证"。
+- 不往 `scripts/test-windows-quarantine.sh` 加条目：该清单 2026-09-19 起为空，脚本自己的话
+  就是"属于环境不支持这一类应当补自探 Skip，而不是加进清单掩盖"。
+
+### 29.4 兑现边界（本批之后仍然不成立的声明）
+
+- **M91 的 Windows「读不动」格仍未验证**，只是从"假红"改成"明写的 Skip"（AS-K2：Skip 不是通过）。
+  该格有效读数只有 darwin 一条腿；linux 腿这一格**这次有 CI 了**（run 35740660581 的 linux job
+  success），但 CI 不带 `-v` ⇒ 分不清它是"跑绿"还是"跳过"，只能记"该 job 全绿"，不能记成"这一格已验证"。
+- 「删后建 + inode 还号」那一档仍然没有断言（§28.10 六原样成立，本批一字未动）。
