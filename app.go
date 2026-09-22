@@ -1814,6 +1814,16 @@ func (a *App) beginJournal(hs *history.Store, histID int64, op model.OpRequest,
 // 校验 → 执行（回收站/永久删除/移动/硬链接）→ 事件反馈 → 结果集清理。
 // 互斥：执行期间拒绝再次操作与再次扫描（两组 goroutine 并发写结果集会互相覆盖）。
 func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
+	// ★ R2-3（2026-09-23 第四轮全仓审查，设计段 §30.5）：卷语义探测要**往用户目录写探测
+	// 文件**，是 I/O，必须落在 opsRunning 置位**之前**。这是这一族的第三处漏网——
+	// 预览（AS-R3，:1372）与保留策略（APP-1，:1448）都已是"锁外预热、锁内纯比较"，
+	// 而下面的 ApplyProcessPolicy 改前就地实测。它卡住（死挂载）不会锁住 a.mu，
+	// 却会把 opsRunning 永久钉成"清理操作执行中"：resetOps 在那条永不返回的 I/O 之后，
+	// 此后每次清理（:1823）与每次新扫描（:611）都被拒，CancelOperation 也解不了。
+	var resolve ops.SensResolver
+	if len(op.ProcessDirs) > 0 {
+		resolve = ops.WarmSensitivity(op.ProcessDirs)
+	}
 	// P1-1：快照读取与 opsRunning 置位在同一个临界区内完成。
 	// 修正前分了两段（读快照 → 释放锁 → 查状态 → 再取锁双检置位），
 	// 中间窗口里新扫描可以启动并清空结果集，本操作的 goroutine 随后
@@ -1881,7 +1891,9 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	//
 	// op 是值传递：op.FileIDs = kept 只改本地副本，前端勾选状态不受影响。
 	if len(op.ProcessDirs) > 0 {
-		pout := ops.ApplyProcessPolicy(groups, op.ProcessDirs, keepIDs)
+		// resolve 是入口那次锁外预热的查表版（R2-3）：预热与这里用的是同一批 dirs，
+		// 表必命中 ⇒ 这一段不再有任何写盘 I/O。
+		pout := ops.ApplyProcessPolicyWith(groups, op.ProcessDirs, keepIDs, resolve)
 		selectedCount := len(op.FileIDs) // 过滤前的勾选数，用于事件与拒绝文案
 		kept := make([]uint64, 0, selectedCount)
 		for _, id := range op.FileIDs {

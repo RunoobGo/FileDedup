@@ -13,9 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"filededup/internal/fscase"
+	"filededup/internal/model"
 )
 
 // TestPreviewProcessPolicyDoesNotProbeUnderLock 锁内不得有卷语义探测。
@@ -94,4 +97,123 @@ func TestWarmSensitivityIsCacheHitAfterWarm(t *testing.T) {
 	if got := probesOnce(); got != 0 {
 		t.Fatalf("第二次预览触发 %d 次探测，应为 0 次（该目录已探测过）", got)
 	}
+}
+
+// ---- R2-3（Task B3，设计段 §30.5）：执行侧是这一族的第三处漏网 ----
+//
+// 预览（AS-R3）与保留策略（APP-1）都已改成"锁外预热、锁内纯比较"，`ExecuteOperation`
+// 里那次 `ops.ApplyProcessPolicy` 没有：它跑在 `a.opsRunning = true` **之后**。
+// 后果不是卡住一把锁（那时 `a.mu` 已经放开），而是卡住整个操作面——
+// 探测永不返回 ⇒ `resetOps` 永不执行 ⇒ `opsRunning` 永久为真 ⇒
+// 此后每次清理（app.go:1823）与每次新扫描（app.go:611）都被拒，
+// 而 `CancelOperation` 只 cancel 一个没人读的 `opCtx`，解不了这一步。
+
+// TestExecuteOperationProbesBeforeOpsRunning 钉"探测发生在占互斥位之前"。
+// 判据取的是探测那一刻的 `a.opsRunning`，不是任何时序巧合。
+func TestExecuteOperationProbesBeforeOpsRunning(t *testing.T) {
+	a, rec, _, insideDir, _ := procFixture(t)
+	ids := idsInDir(t, a, insideDir)
+	if len(ids.ids) == 0 {
+		t.Fatalf("夹具前提不成立：%s 下没有非保留项", insideDir)
+	}
+
+	var probed, heldDuringProbe, runningDuringProbe bool
+	fscase.SetProbeHook(func(d string) {
+		if filepath.Clean(d) != filepath.Clean(insideDir) {
+			return
+		}
+		probed = true
+		// TryLock 而不是 Lock：探针若在锁内触发，Lock 会自锁死，红就变成挂死。
+		if !a.mu.TryLock() {
+			heldDuringProbe = true
+			return
+		}
+		runningDuringProbe = a.opsRunning
+		a.mu.Unlock()
+	})
+	t.Cleanup(func() { fscase.SetProbeHook(nil) })
+
+	if _, err := a.ExecuteOperation(model.OpRequest{
+		Kind: "trash", FileIDs: ids.ids, ProcessDirs: []string{insideDir},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitOpsDone(t, rec)
+	fscase.SetProbeHook(nil)
+
+	if !probed {
+		t.Fatalf("夹具前提不成立：%q 一次探测都没触发（结论命中缓存 ⇒ 本条什么都没观测到，不算通过）", insideDir)
+	}
+	if heldDuringProbe {
+		t.Fatal("在持有 a.mu 期间做了写盘探测（AS-R3 同族）：死挂载会卡住全部应用绑定")
+	}
+	if runningDuringProbe {
+		t.Fatal("卷语义探测发生在 opsRunning 置真之后（R2-3）：这一步卡住 = 此后一切清理与新扫描都被拒，" +
+			"且 CancelOperation 解不了。修法：入口取锁之前 ops.WarmSensitivity，下面改用 ApplyProcessPolicyWith。")
+	}
+	// 正向读数（AS-K2：不红不等于对）：搬动之后操作确实跑完，范围内的文件被回收。
+	for _, p := range ids.paths {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("范围内的文件应已被处理: %s err=%v", p, err)
+		}
+	}
+}
+
+// TestExecuteOperationBlockedProbeDoesNotWedgeApp 钉住那条后果本身：
+// 探测被卡住的**整个窗口**里，应用都不该处于"清理操作执行中"。
+func TestExecuteOperationBlockedProbeDoesNotWedgeApp(t *testing.T) {
+	a, rec, _, insideDir, _ := procFixture(t)
+	ids := idsInDir(t, a, insideDir)
+	if len(ids.ids) == 0 {
+		t.Fatalf("夹具前提不成立：%s 下没有非保留项", insideDir)
+	}
+
+	entered := make(chan struct{})
+	released := make(chan struct{})
+	var once, closeOnce sync.Once
+	release := func() { closeOnce.Do(func() { close(released) }) }
+	fscase.SetProbeHook(func(d string) {
+		if filepath.Clean(d) != filepath.Clean(insideDir) {
+			return
+		}
+		once.Do(func() { close(entered) })
+		<-released // 扮演死挂载上那次永不返回的写盘
+	})
+	t.Cleanup(func() {
+		fscase.SetProbeHook(nil)
+		release()
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a.ExecuteOperation(model.OpRequest{
+			Kind: "trash", FileIDs: ids.ids, ProcessDirs: []string{insideDir},
+		})
+		errCh <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("3s 内没有任何探测发生（夹具失效，不是通过）")
+	}
+	a.mu.Lock()
+	running := a.opsRunning
+	a.mu.Unlock()
+	if running {
+		t.Fatal("探测被卡住时 opsRunning 已为真（R2-3）：新扫描与新操作从这一刻起永久被拒，" +
+			"resetOps 在那条永不返回的 I/O 之后，永远轮不到执行")
+	}
+	t.Log("正向读数：探测被卡住的窗口里 opsRunning=false，应用未被钉成「清理操作执行中」")
+
+	release()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("松手之后 ExecuteOperation 没有返回：预热搬动把执行链接断了")
+	}
+	waitOpsDone(t, rec)
 }

@@ -5895,3 +5895,43 @@ AS-R3 留的观察点，**不新增接缝**）：
 - `beginJournal`（`opsRunning` 之后、锁外的 SQLite 写）同族风险**不在本项**：
   那是账本侧的 I/O，判据与修法都不一样（另批）；
 - 执行 goroutine 内部的 I/O 本来就在锁外、且受 `opCtx` 管，不是这一格。
+
+**实施读数（HEAD `467bc94` 之上新增，逐项实跑）**：
+
+- 改动面三处，比设计段更小：`app.go` 入口加预热（`var resolve ops.SensResolver` +
+  `ops.WarmSensitivity(op.ProcessDirs)`，位置在 `a.mu.Lock()` **之前**）、
+  `:1896` 那一处换 `ApplyProcessPolicyWith(..., resolve)`、
+  `app_process_lock_test.go` 追加 `---- R2-3 ----` 两条用例。既有断言一字未改，
+  **未新增任何接缝**（两条用例都挂在 AS-R3 留下的 `fscase.SetProbeHook` 上）。
+- 改前红面貌与设计段预测逐字对上（把入口预热删掉 + 那一处传 `nil` 即回到旧形状）：
+  `app_process_lock_test.go:151: 卷语义探测发生在 opsRunning 置真之后（R2-3）…` 与
+  `:204: 探测被卡住时 opsRunning 已为真（R2-3）…新扫描与新操作从这一刻起永久被拒…`，
+  两条同时 FAIL，`0.922s` 内出结果（不是挂死）。
+  负控制走 `cp` 备份 / `cp` 还原 + `cmp` 自证（`RESTORE-IDENTICAL: cmp ok`），未用 `git checkout`。
+- GREEN：两条 PASS，且各自打印了正向读数——用例 1 的正向面是"范围内的文件确实被回收"
+  （搬动之后操作照常完成），用例 2 在 `:207` 打 `正向读数：探测被卡住的窗口里
+  opsRunning=false，应用未被钉成「清理操作执行中」`。★ 两条都同时兜住了夹具前提
+  （`probed==false` 与"3s 内没有探测发生"各自单独红），不会出现"什么都没观测到却绿"。
+- 回归：`gofmt -l` 空 → `go build ./...` → `go vet` ×（darwin/windows/linux）全过 →
+  根包 `go test -race -count=4 .` `ok filededup 56.617s` →
+  全仓 `go test -race -count=2 ./...` **23 个包全 ok**（含 `internal/fscase`、`internal/scanner`）。
+- 一处测试侧自踩（不改实现，但要记）：用例 2 起初在函数体和 `t.Cleanup` 里各 `close(release)`
+  一次，第一次跑到清理阶段就 `panic: close of closed channel`（`app_process_lock_test.go:183`）。
+  改成 `released chan struct{}` + `sync.Once` 保护的 `release()` 闭包后不复现。
+  ★ 顺带一条诚实说明：那次 panic 的 stdout 里混进了
+  `[history] 账本写入失败：… sql: database is closed`（其中一条路径写作 `/m7/...`，
+  不属于本夹具）——那是 panic 打断测试二进制后，别的测试遗留的执行 goroutine 在已关闭的库上写账本，
+  修复 panic 之后本次全仓 `-race -count=2` 复跑**未再出现**该字样。不当作本项成果，也不当作已查明。
+
+**本项之后仍不成立的声明（未兑现面）**：
+- 入口那次 `ops.WarmSensitivity` **自己不可中断**（无 ctx 参数）。它若卡在死挂载上，
+  这次 `ExecuteOperation` 调用照样永不返回、前端 Promise 照样不 settle，
+  `CancelOperation` 也照样解不了（预热发生在 `opCtx` 创建之前，没有东西可 cancel）。
+  改动的收益边界是**结构性**的：卡住的位置从"已经对外宣称'清理操作执行中'之后"
+  挪到"还没对外宣称之前"——`opsRunning` 不再被钉真，清理与新扫描不被永久拒。
+  要连这条一起收口，需要给 `WarmSensitivity`/`normalizeDirs` 串上 ctx
+  （要过 `ops/keep.go` 与既有两处调用点），另批登记。
+- 真机死挂载（拔走网络盘 / NFS 挂死后 stat 挂死）**没有实物可测**：上面所有"卡住"读数
+  都是钩子模拟出来的等待，不是文件系统真挂死。**Windows 腿未跑**（用例无平台假设，
+  但结论只在 darwin 本机取证）。
+- `beginJournal` 的 SQLite I/O 仍在 `opsRunning` 之后，同族风险本项不覆盖。
