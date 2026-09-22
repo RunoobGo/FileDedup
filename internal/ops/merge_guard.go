@@ -108,12 +108,19 @@ func slotProvesSymlink(keep, path string) bool {
 //   - dup 位空着（我们的改名把它腾空的）→ 原样 rename 回去，现场与操作前一致；
 //   - dup 位又被占了，或归还改名失败 → 保持不动，只把位置报给用户。
 //     这里绝不做"先删再放"：那等于我们主动删掉一个陌生文件。
+//
+// M48（2026-09-22 裁定，设计稿 §27.6）：「空着」原来是 Lstat 问一次、再改名上位——
+// 两步之间第三方能把文件落进去，而下一次改名会把它连内容顶掉。现在改成先以
+// O_EXCL 占住那个名字（claimExact）再改名：**O_EXCL 本身就是一次问 + 一次占**，
+// 所以这里不再有独立的 Lstat（保留 Lstat 再叠一层 claim 是双查，不是抢占）。
 func abandonForeignBackup(backup, dup, tmp string) error {
 	_ = os.Remove(tmp) // 我们自己的临时链接，正常清理
-	if _, err := os.Lstat(dup); errors.Is(err, os.ErrNotExist) {
+	if claim, ok, _ := claimExact(dup); ok {
+		fireBeforeClaimRename(dup)
 		if rerr := hardlinkRename(backup, dup); rerr == nil {
 			return fmt.Errorf("目标位置在校验后被第三方文件顶替，已放弃合并并把它放回原位 %s（本次未处置任何文件）", dup)
 		}
+		claim.release() // 改名没成，名字还给系统；backup 仍在原位，走下面那句报位置
 	}
 	return fmt.Errorf("目标位置在校验后被第三方文件顶替，已放弃合并；该文件现位于 %s"+
 		"（不属于本次操作，扫描会自动忽略此名，请自行核对后再处置）", backup)

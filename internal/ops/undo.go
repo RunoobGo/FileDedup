@@ -301,6 +301,16 @@ func undoHardlink(it UndoItem) (string, error) {
 		os.Remove(tmp)
 		return "", fmt.Errorf("保留源内容与扫描记录不一致（已被修改），已拦截（S1）")
 	}
+	// M48 第三处（2026-09-22 裁定「只写明窗口」，设计稿 §27.6，登记 M152）：
+	// 上面的身份复核（①）与这次改名之间存在**本批不消除**的窗口——第三方若专门
+	// 针对本次操作把已核验的那个硬链接删掉、在同一名字上放自己的文件，改名会
+	// 原子地把它顶掉（数据不丢：真相在 tmp/LinkSrc，丢的是那个陌生文件）。
+	// claimExact 在这里**不适配**：要占的名字正被我们刚核验的对象占着，O_EXCL 必撞
+	// 已存在的合法现状；而"先删再占"既重新制造了空位、又删掉了刚核验过的链接本身。
+	// 要收掉它需要新原语（腾位改名），§27.8 明记本批不做。
+	// 与 restoreInPlace 的抢占不是一档：那里"名字被占"是个**有用**的答复（占着的
+	// 不是我们的东西 ⇒ 改落 .fdd-restored 名）；这里占着名字的正是本次对象，
+	// 抢占问不出"现状正常"与"已被顶替"的区别。
 	if err := hardlinkRename(tmp, it.OrigPath); err != nil {
 		os.Remove(tmp)
 		return "", fmt.Errorf("恢复独立文件失败: %w", err)
@@ -411,14 +421,27 @@ func undoSymlink(it UndoItem) (string, error) {
 		return "", err
 	}
 
-	// ③ 删链接 → 还原备份。
+	// ③ 删链接 → 占住名字 → 还原备份。
 	// 顺序不能反：先删链接才能把备份改名到该路径（改名会覆盖，但显式删除
 	// 让语义更清楚，也避免某些平台上"改名覆盖已存在文件"的失败）。
 	// 万一"删链接成功但改名失败"，数据仍在 backup 处，报错里给出位置。
 	if err := os.Remove(it.OrigPath); err != nil {
 		return "", fmt.Errorf("删除软链接失败: %w", err)
 	}
+	// M48（2026-09-22 裁定，设计稿 §27.6）：名字空出来的那一刻先以 O_EXCL 占住再改名。
+	// 与上面 restoreInPlace 的 M19 同形——hardlinkRename 对已存在的普通文件是**静默
+	// 替换**，"删链接"与"改名"之间同步盘/下载器把版本落回来，就会被我们连内容一起顶掉。
+	claim, ok, _ := claimExact(it.OrigPath)
+	if !ok {
+		// 抢不到 = 原位又有了东西（第三方落子，或别人在那儿建了目录）。这一支**不改名**：
+		// 数据仍在 backup，报清位置，让用户自己决定，我们不动别人的东西。
+		// 错误被丢弃的理由同 claimExact 注释（问过、答案就是"别动"）。
+		return "", fmt.Errorf("软链接已删除，但原位随即又被占用，未覆盖任何文件；"+
+			"备份保留在 %s（数据未丢失，请核对占用者后再处置）", backup)
+	}
+	fireBeforeClaimRename(it.OrigPath)
 	if err := hardlinkRename(backup, it.OrigPath); err != nil {
+		claim.release()
 		return "", fmt.Errorf("链接已删除，但还原备份失败，原文件保留在 %s（数据未丢失）: %w",
 			backup, err)
 	}

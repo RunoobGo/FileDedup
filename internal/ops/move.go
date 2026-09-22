@@ -357,8 +357,14 @@ func (c claimedDst) release() {
 // claimExact 原子抢占一个**确切名字**：O_CREATE|O_EXCL 建 0 字节占位，抢到即拥有。
 //
 // 与 claimDst 的唯一差别：**名字被占时不递增**，把 ok 置 false 交调用方换路。
-// 用于"这个名字就是结果本身、换名即换语义"的场合——目前只有回收站回撤的原位恢复
-// （undo.go：抢到 → 恢复回原路径；抢不到 → 另落 name.fdd-restored.ext）。
+// 用于"这个名字就是结果本身、换名即换语义"的场合。调用方三处（M48，设计稿 §27.6
+// 把范围从 1 处扩到 3 处；M19/M20 立它时只有 undoTrash 一处）：
+//   - restoreInPlace（undo.go：回收站回撤与移动回撤共用）——抢到 → 恢复回原路径；
+//     抢不到 → 另落 name.fdd-restored.ext；
+//   - undoSymlink —— 删掉我们建的软链接后先占住原位，抢不到就**不改名**，
+//     备份留在原地报位置；
+//   - abandonForeignBackup（merge_guard.go）—— dup 位空着才把第三方文件放回，
+//     抢不到就走"保持不动、只报位置"那支。
 //
 // M19（2026-09-21，设计稿 §8）：那一支原先用 `os.Lstat(OrigPath)` 判空后**不认领**
 // 直接改名，而 os.Rename 对已存在的普通文件是**静默替换**（Windows 腿是
@@ -437,3 +443,21 @@ var copyVerifyFile = copyVerify
 // removeSrc 默认 os.Remove：测试据此断言「守卫生效时一次都不该删」。
 // 抽成 var 本身不改变行为，但把"是否真的动手"变成可观测的事实。
 var removeSrc = os.Remove
+
+// beforeClaimRename 是"名字已经空出来、即将改名上位"的观察点，**生产恒为 nil**。
+//
+// 为什么要有它（M48，2026-09-22 裁定，设计稿 §27.6）：这两处的缺陷形态是
+// "检查/腾空 与 改名 之间第三方被动落子"，而那个落子时机在真实文件系统上不可复现。
+// 没有能插在两步之间的钩子，就等于"这条防线永远不会被测试需要"——与 claimExact
+// 当初的 M19 取证同形。惯例同 removeSrc / copyVerifyFile：包级 var，测试直接换装。
+//
+// ★ 只有**加了抢占**的两处挂这个钩子。undoHardlink 的改名（undo.go 同文件，登记
+// M152）窗口同样存在，但本批按 §27.8 不引入腾位改名新原语——那儿没有可钉的防线，
+// 挂钩子只会钉出一个必须失败的测试。
+var beforeClaimRename func(path string)
+
+func fireBeforeClaimRename(path string) {
+	if beforeClaimRename != nil {
+		beforeClaimRename(path)
+	}
+}
