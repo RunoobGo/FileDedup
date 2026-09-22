@@ -83,22 +83,27 @@ func UndoOne(it UndoItem) (string, error) {
 }
 
 // undoSourceCheck 回撤前确认 DestPath（回收站落点/移动目标）仍是记录中那份文件。
-func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
+//
+// 第二个返回值是**校验通过那一刻**该文件的身份（与内容哈希出自同一句柄），供
+// restoreInPlace 在 `renameFile` 之前复核"我要搬回家的还是刚哈希的那一份"（R2-1）。
+// 旧账本没有内容证据时不做哈希，也就不留底：返回未解析 ID ⇒ identityCheck 走
+// vSame 放行分支，处置与改前逐格相同（本项只补"有内容证据"那一侧的窗口）。
+func undoSourceCheck(it UndoItem, where string) (os.FileInfo, fsid.ID, error) {
 	st, err := os.Lstat(it.DestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if alreadyRestored(it) {
-				return nil, errRestoredAlready
+				return nil, fsid.ID{}, errRestoredAlready
 			}
-			return nil, fmt.Errorf("%s中的文件已不存在（可能已被清空或手动还原）: %s", where, it.DestPath)
+			return nil, fsid.ID{}, fmt.Errorf("%s中的文件已不存在（可能已被清空或手动还原）: %s", where, it.DestPath)
 		}
-		return nil, err
+		return nil, fsid.ID{}, err
 	}
 	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s中的路径不是普通文件: %s", where, it.DestPath)
+		return nil, fsid.ID{}, fmt.Errorf("%s中的路径不是普通文件: %s", where, it.DestPath)
 	}
 	if uint64(st.Size()) != it.Size {
-		return nil, fmt.Errorf("%s文件大小与记录不符（%d ≠ %d），可能已被替换，已拦截", where, st.Size(), it.Size)
+		return nil, fsid.ID{}, fmt.Errorf("%s文件大小与记录不符（%d ≠ %d），可能已被替换，已拦截", where, st.Size(), it.Size)
 	}
 	// M4：尺寸相等不等于"还是那一份文件"。同长度改写（回收站里那份被写工具
 	// 原地更新、移动目标被同名文件顶替）只比 size 会一路放行，把错内容放回家，
@@ -108,27 +113,34 @@ func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
 	// it.Hash 为零值时**跳过而不是拦死**：升级前写入的旧账本没有内容证据，
 	// "无从比对"不等于"校验失败"，一律拦会让历史记录全都撤不回。
 	if it.Hash != ([32]byte{}) {
-		h, err := hashFile(it.DestPath)
+		h, id, err := hashFileIdentity(it.DestPath)
 		if err != nil {
-			return nil, err
+			return nil, fsid.ID{}, err
 		}
 		if h != it.Hash {
-			return nil, fmt.Errorf("%s中的文件内容与扫描记录不符（已被修改或替换），已拦截（S1）: %s", where, it.DestPath)
+			return nil, fsid.ID{}, fmt.Errorf("%s中的文件内容与扫描记录不符（已被修改或替换），已拦截（S1）: %s", where, it.DestPath)
 		}
+		return st, id, nil
 	}
-	return st, nil
+	return st, fsid.ID{}, nil
 }
+
+// undoSourceCheckFn 是回撤校验入口的包级接缝（R2-1，设计段 §30.3）：**生产恒等于
+// undoSourceCheck 本身**，仅供用例站在"校验已过、改名未发"这一刻动手顶替 DestPath。
+// 先立接缝再取红，为的是让修前红落在"回撤成功"这句话上，而不是落在编译失败上
+// （M91 那批第一次试错正是这个形状，见 executor_m91_test.go 头部）。
+var undoSourceCheckFn = undoSourceCheck
 
 // undoTrash 回收站 → 原位。判据本体见 restoreInPlace（与 undoMove 共用同一段代码）。
 func undoTrash(it UndoItem) (string, error) {
-	st, err := undoSourceCheck(it, "回收站")
+	st, verID, err := undoSourceCheckFn(it, "回收站")
 	if errors.Is(err, errRestoredAlready) {
 		return it.OrigPath, nil
 	}
 	if err != nil {
 		return "", err
 	}
-	return restoreInPlace(it, st, "回收站")
+	return restoreInPlace(it, st, verID, "回收站")
 }
 
 // restoreInPlace 把 it.DestPath 放回 it.OrigPath，原位被占时落到
@@ -143,7 +155,7 @@ func undoTrash(it UndoItem) (string, error) {
 // （home.bin → home_1.bin），既不是 .fdd-restored 家族（worktemp 认不得 ⇒ 下一次
 // 扫描把回撤产物当用户数据再吃一轮），也不满足"确切名字能占就回原名"。
 // 同形 = 同一段代码，不是同一套文字。
-func restoreInPlace(it UndoItem, st os.FileInfo, where string) (string, error) {
+func restoreInPlace(it UndoItem, st os.FileInfo, verID fsid.ID, where string) (string, error) {
 	side := where + "侧"
 	if err := os.MkdirAll(filepath.Dir(it.OrigPath), 0o755); err != nil {
 		return "", err
@@ -170,6 +182,29 @@ func restoreInPlace(it UndoItem, st os.FileInfo, where string) (string, error) {
 			return "", err
 		}
 		claim, target = c, c.path
+	}
+	// R2-1（第四轮全仓审查，设计段 §30.3）：**紧贴动作**的最后一道复核。
+	// 上面的 renameFile 是常态分支（同卷），跨卷回退分支自 AS-H4 起就握着
+	// "留底 → 复制校验 → 删前复核"一条链，而这一支中间零复核：
+	// undoSourceCheck 的哈希按路径 open、算完就 close，从这里到 renameFile 之间被
+	// rename 顶替时，两侧判据都点头——搬回家的是顶替者，账本记"回撤成功"。
+	// 等长同内容的顶替连哈希都过不去不了（见 undo_identity_test.go 那一格），
+	// 只有身份看得见。verID 未解析（FAT/exFAT、旧账本无内容证据）时 identityCheck
+	// 返回 vSame 放行，处置与改前逐格相同。
+	if v, why := identityCheck(it.DestPath, verID); v != vSame {
+		claim.release() // 抢下的 0 字节占位必须还回去：拦截不许在用户原位留半个文件
+		switch v {
+		case vGone:
+			// ★ 回撤场景的"消失"**不记成已达成**，与 delete 腿的 Skipped 是两个口径：
+			// 那里的目标是"这份 dup 不在盘上"，这里的目标是"文件回家"，没回家就是失败。
+			return "", fmt.Errorf("%s中的文件在校验后消失，原位未做任何改动: %s", side, it.DestPath)
+		case vReplaced:
+			return "", fmt.Errorf("%s中的文件在校验后被替换（inode 已变化），已拦截（S1），原位未做任何改动: %s", side, it.DestPath)
+		default:
+			// 与 guardIdentity / guardContent 同样是 default 而非 case vUnknown：新增归因时
+			// 忘了登记，后果是"被当成无从判定拦下"（安全），而不是"宣称看到过一个不存在的新对象"。
+			return "", fmt.Errorf("无法确认%s中的文件仍是校验时那个对象（%s），已拦截（S1），原位未做任何改动: %s", side, why, it.DestPath)
+		}
 	}
 	if err := renameFile(it.DestPath, target); err != nil {
 		if !isCrossDevice(err) {
@@ -212,14 +247,14 @@ func restoreInPlace(it UndoItem, st os.FileInfo, where string) (string, error) {
 // 一条都不省——那条链是 AS-H4 的成果，改前 undoMove 靠 MoveFile 内部实现拿到，
 // 换判据后必须自己带上，否则"原位空闲但跨卷"这一格从"能回"退成"回不去"。
 func undoMove(it UndoItem) (string, error) {
-	st, err := undoSourceCheck(it, "移动目标")
+	st, verID, err := undoSourceCheckFn(it, "移动目标")
 	if errors.Is(err, errRestoredAlready) {
 		return it.OrigPath, nil
 	}
 	if err != nil {
 		return "", err
 	}
-	return restoreInPlace(it, st, "移动目标")
+	return restoreInPlace(it, st, verID, "移动目标")
 }
 
 // undoHardlink 拆除指向 LinkSrc 的硬链接，恢复独立文件。
@@ -470,19 +505,35 @@ func identityByHandle(p string) (fsid.ID, error) {
 	return fsid.FromFile(f), nil
 }
 
-func hashFile(p string) ([32]byte, error) {
+// hashFileIdentity 一次 open 同时交出**内容哈希**与**该句柄的身份**（R2-1，设计段 §30.3）。
+//
+// 为什么不复用 identityByHandle：那是**另开一次** open，两次 open 之间可以隔着一次顶替，
+// 而顶替正是本函数要防的形状——用"哈希之后再去拿一次身份"来实现守卫，守卫的参照物
+// 已经是被动过的那个对象。AS-H1 的口径就是"身份与内容出自同一句柄"（见 verify.go 的
+// VerifyFile 头部），这里照那一侧的样子做。
+//
+// 卷不提供稳定索引（FAT/exFAT）时 id.Resolved 为 false，调用方按"无从比对"放行，
+// 与 identityCheck 的 vSame 同口径。
+func hashFileIdentity(p string) ([32]byte, fsid.ID, error) {
 	f, err := os.Open(p)
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, fsid.ID{}, err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return [32]byte{}, err
+		return [32]byte{}, fsid.ID{}, err
 	}
+	id := fsid.FromFile(f)
 	buf := undoPool.GetStreamBuf()
 	defer undoPool.PutStreamBuf(buf)
-	return hasher.HashFull(f, st.Size(), buf)
+	h, err := hasher.HashFull(f, st.Size(), buf)
+	return h, id, err
+}
+
+func hashFile(p string) ([32]byte, error) {
+	h, _, err := hashFileIdentity(p)
+	return h, err
 }
 
 // applyMtime 还原扫描时记录的修改时间（纳秒精度）。失败不作为整体失败：

@@ -5696,3 +5696,40 @@ AS-H1 的口径就是"身份与内容出自同一句柄"。
   `identityByHandle` 复核（`undo.go:252-253` 等），不是同一格缺口，扩面属独立改动；
 - 跨卷腿那条 `pathIdentity`（`:181`）不改名为共用：它取底的时刻在 `renameFile` 失败**之后**，
   与本项的"校验时刻留底"是两个不同的参照物，合并会把两件事混成一个。
+
+**实施读数（本机 darwin/arm64，2026-09-23）**
+
+- **修前红（真红，不是编译失败）**：接缝 `undoSourceCheckFn` 先落地、守卫未落地时跑
+  `go test ./internal/ops -run TestUndo -count=1`，四条红在预测的那句话上：
+  ```text
+  --- FAIL: TestUndoTrashBlocksIntruderAfterContentCheck
+      undo_identity_test.go:116: 顶替者被放回原位并记成回撤成功（target="…/orig/a.bin"）：同卷腿没有身份留底（R2-1）
+  --- FAIL: TestUndoMoveBlocksIntruderAfterContentCheck
+      undo_identity_test.go:155: move 腿同样把顶替者搬回了家（target="…/orig/a.fdd-restored.bin"）
+  --- FAIL: TestUndoBlocksSameContentIntruder
+      undo_identity_test.go:189: 同内容顶替者被放回原位并记成成功（target="…/orig/a.bin"）：判据退化成了内容比对
+  --- FAIL: TestUndoVanishedDestIsNotReportedAsReplaced
+      undo_identity_test.go:217: 报错未说明是「消失」…: 恢复失败: rename …/.Trash/a.bin …/orig/a.bin: no such file or directory
+  ```
+  第五条 `TestUndoTouchedDestStillRestores` **改前即绿**（防误伤钉子，它的红由 M27-c 一侧的形状提供）。
+- **守卫落地后**：`go test ./internal/ops -count=1` → `ok 0.657s`（全包，含既有 21 条 undo 用例一字未改）。
+- **变异三条**（`cp` 备份 + `cp` 还原 + `cmp` 自证，未用 `git checkout --`）：
+
+| 变异 | 形状 | 实测红集合 | 预测 |
+|---|---|---|---|
+| M27-a 守卫短路（`false && v != vSame`） | = 改前形态 | trash / move / sameContent / vanished **四条全红** | 一致 |
+| M27-b `vGone` 折进「被替换（inode 已变化）」那句 | 三格说成一句 | 仅 `TestUndoVanishedDestIsNotReportedAsReplaced` 一条红 | 一致 |
+| M27-c 参照物改成就地取（`identityByHandle` 在守卫前另开一次 open） | 守卫的参照物被动过 | trash / move / sameContent **三条红**，vanished 仍绿 | 一致（gone 那一格就地取身份会失败、回落到 `verID`，所以照拦） |
+
+  ★ M27-c 是"为什么必须同句柄"的实证：把它当成"反正都 open 一次"的等价写法，三个顶替格当场全空转。
+- **实施期踩到并已钉住的一格（不遮掩）**：接缝包装函数最初写成 `st, _, err := orig(...)`
+  再 `return st, fsid.ID{}, err` —— **吞掉了身份**，守卫于是拿着未解析参照物恒走 `vSame` 放行，
+  四条红一条都没转绿。这正是 §6.13 与 M114 登记过的"接缝吞参照物 ⇒ 守卫静默空转"形状的复发。
+  现在那一行有注释指着这件事，且包装函数交回 `verID` 本体；本批不新增防御性代码去"检测自己写的接缝"，
+  红绿读数本身已经把它钉住（M27-a 与这次踩坑同形）。
+- **回归**：`gofmt -l internal/ops/` 空、`go build ./...` 过、`go vet ./internal/ops/` 过；
+  包级全量随 A/B 批合跑（见 §30.5）。
+- **未兑现面（不许写成通过）**：`undo.go` 的这条新守卫在 **Windows** 上未跑过。跨平台依据只有
+  AS-H1 那条既有结论（`fsid.FromFile` 句柄查询在两平台都解析）与本机的 `identityCheck` 单测；
+  FAT/exFAT「无稳定索引 ⇒ `verID` 未解析 ⇒ 放行」那一格**本机没有实物见证**（本机 APFS 恒解析），
+  它由 `verify.go` 的 `identityCheck` 既有钉子间接覆盖，本批不冒称已测。
