@@ -6076,3 +6076,81 @@ AS-R3 留的观察点，**不新增接缝**）：
 - 本批新发现、**未修**：P-1 静态钉只读 `filter.go` 一个文件，"新开一个文件写第二份
   `path.Match`"这个洞它一直挡不住。本批把校验放在 `filter.go` 内所以仍在作用面里，
   扩钉（扫全包非测试 .go）不属本项 → 交 E2 收口时登记。
+
+### 30.7 R3-1（Task C1）：三处"唯一判据 / 唯一文案方"的漏网入口
+
+**① GroupCard 对勾选项承诺"删除"（现读 `frontend/src/components/GroupCard.vue`）**
+
+同一张卡片里，两条腿对同一件事说两种话（这一条比任何抽象纪律都硬）：
+
+| 行 | 现文 | 说的是同一件事吗 |
+| --- | --- | --- |
+| `:37` 组级全选 title | `全选/取消该组待清理项（不含保留项）` | 用"待清理" |
+| `:43` 组级全选 aria-label | `全选该组待清理项（N 个冗余项）` | 用"待清理" |
+| `:61` 单项 title | `勾选为待删除项` | 用"删除" |
+| `:68` 单项 **aria-label** | `标记为删除 ${f.name}` | 用"删除" |
+| `:75` 冗余徽标 title | `冗余项（勾选后将被删除）` | 承诺"将被删除" |
+
+后果不是措辞不齐而是**假承诺**：勾上之后要走五颗按钮里的一颗（移入回收站 / 移动到… /
+硬链接合并 / 软链接合并 / 永久删除，`ResultView.vue:357-371`），其中
+- 只有 `delete` 是"数据从磁盘消失"；`trash` 是改名进回收站（M22 裁定它不得说"释放/删除"）、
+  `hardlink`/`symlink` 保留项仍可访问、`move` 只是离开原位置；
+- 还要被**处理策略**收窄（`op.ProcessDirs` ∩ 勾选项，实际处理范围可以小于勾选范围）。
+
+`:68` 那一处最重：aria-label 是屏幕阅读器用户**唯一**能拿到的来源，读到的是"标记为删除 文件名"。
+
+**修法**：三句收进 `utils/opdisplay.ts` 一个出口 `selectionWording()`（与 `reclaimLine`/
+`opFailedLabel` 同族：判据一份、措辞一份，组件只许引用）。给函数而不是给常量是沿用
+`ConfirmDialog` 那条锚的形状（`reclaimLine(` 出现在组件里才算接线，import 行不算）。
+GroupCard 三处改为引用：`w.checkTitle` / `` `${w.ariaVerb} ${f.name}` `` / `w.redundantTitle`。
+新措辞按计划的"待清理"族：`勾选为待清理项` / `标记为待清理` / `冗余项（勾选后按所选操作处理）`。
+
+**② ScanView 历史横幅的恢复按钮绕过 `histBusy`（现读 `ScanView.vue:143`）**
+
+FE-3 已把"历史行三个动作"的禁用态收进 `store.histBusy`（`scan.ts:151`
+= `busy.value || histLoading.value`），并在 `RecordsView.vue:241/244/246` 落了锚。
+ScanView 的"上次扫描 → 恢复"是同形漏网：它只问 `store.opsRunning`，
+于是 `openHistory` 在途（`histLoading` 已真、界面还停在扫描页）时这颗按钮**仍可点**，
+第二次 `openHistory` 的回包与第一次交错 ⇒ 双回包各自 `bumpResultGen`，
+先到的那份被后到的覆盖成"看着对、其实是另一条记录"的结果集。这正是 M16/M25 那一族。
+全仓 grep 过：`opsRunning` 作为禁用判据只剩这一处（`ResultView.vue:421` 是进度条 `v-if`，不是闸门）。
+
+**修法**：`:143` 的 `:disabled="store.opsRunning"` → `:disabled="store.histBusy"`。
+
+**③ RecordsView 空态做了平台无关的假承诺（现读 `RecordsView.vue:259`）**
+
+现文：`清理操作会自动留痕，并支持对回收站/移动/硬链接合并进行回撤。` 两处不真：
+- 后端 `app.go:1677-1679 undoableFor(kind, goos) = kind != "delete" && !(kind == "trash" && goos == "windows")`
+  ⇒ **Windows 上的回收站记录不可应用内回撤**（SHFileOperation 不返回落点映射，见 `:1695-1700`），
+  这句在 Windows 腿上是假话；
+- 它漏了 `symlink`（`undoSymlink` 存在且可撤）。
+而同一页 `:274` 的 `不可回撤` 徽标已经按后端下传的 `m.undoable` 逐条如实渲染，
+`utils/undoReason.ts` 又是"为什么不可回撤"的唯一文案方（M79 裁定：判据归后端、文案归前端）
+⇒ 这句空态总述绕过了整套机制，是全场唯一一处"替所有记录打包票"的话。
+
+**修法**：改成不打包票、并把判据指回徽标：`清理操作会自动留痕；多数操作支持回撤，能不能撤以每条记录的徽标为准。`
+
+**钉子（`scripts/test-frontend-logic.sh` 接线锚 +3，现读数 17 项）**
+按该脚本自己写的规矩"★ 只锚标识符引用、不锚中文文案——锚文案会误报"：
+1. `GroupCard.vue` 必须出现 `selectionWording(`，禁止出现旧内联 `标记为删除`；
+2. `ScanView.vue` 恢复按钮：必须出现 `store.histBusy`，禁止出现 `:disabled="store.opsRunning"`；
+3. `RecordsView.vue` 空态判据回到徽标：必须出现 `m.undoable`，禁止出现旧整句 `并支持对回收站`。
+"禁止"侧锚的是**被取代的旧写法**（与既有 `group.files.length - 1`、`humanBytes` 两锚同形），
+不是锚新文案 ⇒ 日后改措辞不会误报。另在 `frontend/tests/opdisplay.test.ts` 给
+`selectionWording()` 补例（它才是文案的归属地，node 侧断言"三句里不得出现'删除'"）。
+
+**预测红面貌（跑前写明）**：
+- 三条锚先加先跑 ⇒ 三条红（`✗ …（未引用 …）`×3、`✗ …（出现被禁写法：…）`×3 各按实际计数），
+  计数行随之从 17 涨到 20；`node --test` 那 55 例此时仍全绿（组件措辞不在 node 覆盖里）。
+- `opdisplay.test.ts` 新增例在实现前红在 `selectionWording is not a function`（或 import 报错），
+  与 B4 的编译红同性质，如实记为"接口不存在"而非"断言不符"。
+- 变异（绿后回砍）：(a) GroupCard 改回内联 `'标记为删除 ' + f.name` ⇒ 锚 1 红；
+  (b) ScanView 的 disabled 退回 `store.opsRunning` ⇒ 锚 2 红；
+  (c) 把 `selectionWording()` 的三句改回带"删除"⇒ 只有 node 例红、三条锚全绿
+  ⇒ 证明"锚接线"与"测文案"是两层，缺一不可（本仓 M79/M81 反复栽的地方）。
+
+**不做的边界**：
+- 不动 `store.histBusy`/`busyTip` 的判据本身（那三条 already 收口，本项只补漏网的引用点）。
+- 不给空态句子再造一个"唯一文案方"函数：全仓只有这一处（grep 过 `支持对回收站`），
+  为单点建出口是本批反对的过度抽象。
+- 不改五颗按钮的名字与确认框文案（M15/M22 已收口，`reclaimLine` 逐类显式）。
