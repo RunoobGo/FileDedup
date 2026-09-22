@@ -5935,3 +5935,93 @@ AS-R3 留的观察点，**不新增接缝**）：
   都是钩子模拟出来的等待，不是文件系统真挂死。**Windows 腿未跑**（用例无平台假设，
   但结论只在 darwin 本机取证）。
 - `beginJournal` 的 SQLite I/O 仍在 `opsRunning` 之后，同族风险本项不覆盖。
+
+### 30.6 R2-4（Task B4）：排除模式的坏 glob 不再静默失效
+
+**坐标（HEAD `2259927` 现读）**：用户输入 → `internal/filter/filter.go:119 Compile`
+→ `:123-130` 只做 `pathnorm.Slash(pat, "\\")` 归一、**无任何语法校验** → `Matcher.excPaths`
+→ 匹配期 `:262 matchPath` 四条腿 → `:309 matchFold` 的 `ok, _ := path.Match(...)` 把
+`ErrBadPattern` 丢进 `_`。生产侧唯一调用方：`internal/scanner/scanner.go:250`。
+出水面：`Result.Failed`（scanner.go:553-557 临界区汇总）→ `a.failed`（app.go:667）
+→ `GetFailedItems`（app.go:1040）→ `FailedDrawer.vue:57-61`（阶段/路径/错误原因三列）。
+
+**第一手读数（`path.Match` 到底什么时候报 ErrBadPattern，本机跑出来的，不是推断）**：
+
+| 模式 | 逐段探针 `Match(seg,"probe")` | 整模式拿 9 个串去试 | 结论 |
+| --- | --- | --- | --- |
+| `[` | 报（`syntax error in pattern`） | 报 | 吞掉的正是这一类 |
+| `a[b/c]d` | **报**（坏段 `a[b`） | **一次都不报**（含 `Match("a[b/c]d","ab/cd") = false,nil`） | 整模式自检会漏 |
+| `x/**/[`、`**/[`、`a/[/b`、`*[`、`[]a]`、`\`、`[**`、`a/[b/c` | 报 | 报 | 一致 |
+| `a/[z-a]`（反向区间）、`[!]a]`、`a\[`（转义左括号） | 不报 | 不报 | **Go 视为合法语法**，本项抓不到 |
+| `build/**`、`node_modules`、`*.tmp`、`a/b/*` | 不报 | 不报 | 正常模式，不误伤 |
+
+22 条语料的对照计数：**只有逐段能抓到 1 条，只有整模式能抓到 0 条**。⇒ 判据一：
+**必须逐段探**。这不是偏好，是因为本包的匹配本来就是切段后逐段交给 `path.Match`
+（`matchSegs` :331），探针与运行时不同形就会漏。判据二：探针串**必须非空**
+（Go 在空串上提前 break 出 chunkScan，不报语法错）。
+
+★ 顺带按实测**校正计划原文**：`docs/superpowers/plans/...md:245` 举的 RED 例子是
+`Compile([]string{"[", "a/[z-a]"})`，第二条 `a/[z-a]` 在 Go 里是**合法语法**
+（反向区间只是永不命中，不报 `ErrBadPattern`）⇒ 本项抓不到它。不改成"两条都抓到"的说法，
+按实际能力写：本项只报"语法错"，不承诺报"语法对但永不命中"（见下面未兑现面）。
+
+**方向不变（fail-open 一字未改）**：坏模式命中不了任何东西 ⇒ 后果是"少排除 = 多扫"，
+与 M62/M105 记的"多扫不错删"同向。本项**不动 `excPaths`**：坏模式仍留在列表里走
+同一条永不命中的腿，只是不再无声。
+
+**为什么送进既有失败清单，而不是新加一个扫描侧计数**：这一条与
+`ProtectedDirs`/`SkippedCloudFiles`/`CaseProbeUnproven` 那一族**语义相反**。那一族立了
+"独立成数、不混 Failed"的规矩（scanner.go:83-90 原文：混进来会把真正的"你的文件读不了"
+淹没在系统噪声里），因为它们数的是**引擎有意跳过、用户没做错**。本条数的是
+**用户下的指令没被执行**，正是失败清单的题中之义，且它最多只有用户自己打错的那几条，
+不构成噪声。
+
+开码核实（全量对账 `frontend/src`）给出的第二条理由更硬：`ScanSummary` 现有的六个计数
+（`protectedDirs`/`protectedFiles`/`skippedCloudFiles`/`caseProbeUnproven`/`unprotectedRoots`/
+`filesFailed`）在前端**只有 `wails.ts:41-68` 的类型声明、零消费者**（裁定②③明写"界面不呈现"），
+`scan:done` 处理器（`scan.ts:843-849`）只读 `s.reclaimable` 一个字段 ⇒ 再加一个 `ScanSummary`
+字段 = 再加一个 DOA 字段，还要过 M30 的 TS/Go 双向 parity 钉，对"不再无声"零贡献。
+`opsResult.Warnings`（`ResultView.showWarnings`）结构上不可复用：`opsResult` 只由 `ops:done`
+写、每次新扫描清空。⇒ **失败清单是本仓库唯一一条已经到得了用户的扫描侧明细通道**，
+走它前端零改动。
+
+代价如实列出：`FilesFailed = len(failed)` 会按条 +1、界面上的"失败项 N"含它、
+并随 `hs.SaveScan(cfg, groups, failed)` 进历史（可追溯，这正是目的）。
+抽屉的 阶段 列会显示英文 `exclude` —— 与既有 `ads`/`ops` 同处理（`stageLabel`
+只服务 ScanView 的进度行，`FailedDrawer.vue:58` 一直原样渲染 `f.Stage`）。
+
+**修法（三处，都不碰匹配语义）**：
+1. `matchFold` 的签名由 `bool` 改为 `(bool, error)`，`path.Match(` 仍然**只出现在它体内**。
+   这是选这条修法的首要理由：P-1 型静态钉 `filter_m105_test.go:138` 的判据是
+   "matchFold 之外出现 `path.Match(` 即为分叉"，定锚用 `strings.Index(s, "func matchFold(")`，
+   而 `func matchFoldOK(` 不含那个左括号 ⇒ **既有钉一字不改仍然成立**。
+   新增 `matchFoldOK`（bool）作为四条腿的显式吞错点，"唯一吞错点"从 matchFold 挪到
+   matchFoldOK，注释同步。
+2. `Compile` 对每条模式（**归一后**的形态，因为匹配用的就是它）逐段跑 `matchFold`，
+   命中 `ErrBadPattern` 的记录**用户原始输入**进 `Matcher.invalid`，经 nil-safe 访问器
+   `InvalidPatterns()` 出包（与 `Compile`/`Apply`/`ExcludeDir` 三处 nil 短路同契约，
+   故不裸露字段——这一条偏离计划原文的 `Invalid []string` 措辞，理由是契约不是审美）。
+3. `scanner.go:250` 之后把 `InvalidPatterns()` 逐条 append 进 `res.Failed`
+   （`Stage: "exclude"`）。位置在 worker 启动**之前** ⇒ 无并发写；顺序天然排在遍历期
+   失败项之前 ⇒ 三跑互比稳定。
+
+**预测红面貌（跑前写明）**：
+- `internal/filter/badpattern_test.go`：`Compile(...).InvalidPatterns()` 改前不存在 ⇒
+  **编译失败**（不是断言红，如实记）。
+- 逐段/整模式差异例（`a[b/c]d` 必须被抓到）：实现若退回"整模式自检" ⇒ 这条红。
+- 负控制：全正常模式的夹具必须**一条都不报**（否则"抓到"没有意义）。
+- scanner 侧：含坏模式的扫描，`res.Failed` 有且仅有 1 条 `Stage=="exclude"`、
+  `Path` 等于用户原文；同一夹具下那条路径**依然被扫到**（fail-open 钉）；
+  无坏模式的扫描 `Failed` 零新增。
+- 变异（绿了以后回砍，逐条预测谁会红）：(a) `Compile` 里短路 `invalid = nil`
+  ⇒ filter 三条全红；(b) 把 `matchFold` 的 err 又吞成 bool（回到改前签名）⇒ 编译红；
+  (c) 删掉 scanner 那句 append ⇒ filter 侧全绿、只有 scanner 条红
+  ⇒ 证明"包内测得到"与"用户看得见"是两条独立性质（这一族反复栽过的地方）。
+
+**不做的边界**：
+- 不做前端：抽屉零改动即呈现；不加 `ScanSummary` 字段（理由见上）。
+- 不判"语法合法但永不命中"（`[z-a]`、`[!]a]` 这类）：要判它等于自己再实现一份 glob
+  可满足性判定，正是 P-1 钉防的那类分叉。
+- 不改 `pathnorm.Slash` 的 `\`→`/` 归一：报的是**归一之后**的死活。副作用要写清——
+  用户写 `mydir\[` 会被归一成 `mydir/` + 段 `[` 并报"无效"，而这条模式在归一后的世界里
+  本来就永不命中，所以这不是误伤。
