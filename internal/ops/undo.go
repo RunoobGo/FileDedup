@@ -119,7 +119,7 @@ func undoSourceCheck(it UndoItem, where string) (os.FileInfo, error) {
 	return st, nil
 }
 
-// undoTrash 回收站 → 原位：原位被占时落到 name.fdd-restored.ext（宁另名不覆盖）。
+// undoTrash 回收站 → 原位。判据本体见 restoreInPlace（与 undoMove 共用同一段代码）。
 func undoTrash(it UndoItem) (string, error) {
 	st, err := undoSourceCheck(it, "回收站")
 	if errors.Is(err, errRestoredAlready) {
@@ -128,6 +128,23 @@ func undoTrash(it UndoItem) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return restoreInPlace(it, st, "回收站")
+}
+
+// restoreInPlace 把 it.DestPath 放回 it.OrigPath，原位被占时落到
+// name.fdd-restored.ext（宁另名不覆盖）。where 只进错误文案（传"回收站"/"移动目标"，
+// 成品是"回收站侧"/"移动目标侧"； undoSourceCheck 那两条用的是不带"侧"的短形）。
+//
+// ★ 落点契约（M56，设计稿 §27.4）：**回撤成功 ≠ 回到 OrigPath**。本函数返回的是
+// 实际落点，调用方必须把返回值当唯一凭据（app 层的"数据已在 …"补写认的就是它）；
+// 失败路径同样回传已落盘的副本位置（M113 立的规矩，跨设备腿见下）。
+//
+// 两条回撤路径共用这一段是刻意的：M56 裁定前 undoMove 走 MoveFile 的**递增改名**
+// （home.bin → home_1.bin），既不是 .fdd-restored 家族（worktemp 认不得 ⇒ 下一次
+// 扫描把回撤产物当用户数据再吃一轮），也不满足"确切名字能占就回原名"。
+// 同形 = 同一段代码，不是同一套文字。
+func restoreInPlace(it UndoItem, st os.FileInfo, where string) (string, error) {
+	side := where + "侧"
 	if err := os.MkdirAll(filepath.Dir(it.OrigPath), 0o755); err != nil {
 		return "", err
 	}
@@ -159,7 +176,7 @@ func undoTrash(it UndoItem) (string, error) {
 			claim.release()
 			return "", fmt.Errorf("恢复失败: %w", err)
 		}
-		// AS-H4 同型（2026-09-20 全仓审计）：回收站侧文件在复制窗口内同样可能被
+		// AS-H4 同型（2026-09-20 全仓审计）：回撤侧文件在复制窗口内同样可能被
 		// 第三方以 rename 顶替，而这里原先按路径盲删。复制前取身份、删前复核。
 		srcID, err := pathIdentity(it.DestPath)
 		if err != nil {
@@ -171,40 +188,38 @@ func undoTrash(it UndoItem) (string, error) {
 			return "", err
 		}
 		if !identityStill(it.DestPath, srcID) {
-			return target, fmt.Errorf("已恢复到 %s，但回收站侧文件在复制期间被替换（inode 已变化）："+
-				"为避免误删第三方文件**未清理回收站侧**，两份并存，请核对后自行处理其一: %s", target, it.DestPath)
+			return target, fmt.Errorf("已恢复到 %s，但%s文件在复制期间被替换（inode 已变化）："+
+				"为避免误删第三方文件**未清理%s**，两份并存，请核对后自行处理其一: %s", target, side, side, it.DestPath)
 		}
 		if err := removeSrc(it.DestPath); err != nil {
-			// M86（04 §6.11 OPS-14b，设计段 §19.0-2）：数据已经在家、只是回收站侧
+			// M86（04 §6.11 OPS-14b，设计段 §19.0-2）：数据已经在家、只是回撤侧
 			// 没清掉，盘上是两份。这句原先只说"两份并存"却不给落点，用户既不知道
-			// 哪份是真的、也不知道该去哪删多余的一份 —— 与同函数 :174 那条同型
-			// 分支的写法不对称。补上 target 与残留位置。
-			return target, fmt.Errorf("已复制但清理回收站侧失败（两份并存，已恢复的文件在 %s，"+
-				"回收站侧残留 %s，请核对后自行删去其一）: %w", target, it.DestPath, err)
+			// 哪份是真的、也不知道该去哪删多余的一份 —— 与上面那条同型分支的写法
+			// 不对称。补上 target 与残留位置。
+			return target, fmt.Errorf("已复制但清理%s失败（两份并存，已恢复的文件在 %s，"+
+				"%s残留 %s，请核对后自行删去其一）: %w", side, target, side, it.DestPath, err)
 		}
 	}
 	applyMtime(target, it.MtimeNs)
 	return target, nil
 }
 
-// undoMove 移动目标 → 原目录：复用 MoveFile（重名递增天然不覆盖）。
+// undoMove 移动目标 → 原位：与 undoTrash 同形（M56，2026-09-22 裁定，设计稿 §27.4）。
+//
+// 改前这里是 MoveFile(it.DestPath, filepath.Dir(it.OrigPath))，重名走递增改名；
+// 现在两条腿（回收站 / 移动目标）共用 restoreInPlace 一份判据：确切名字能占就回原名，
+// 占不了才落 name.fdd-restored.ext，跨设备回退链（身份复核 → 复制校验 → 删前复核）
+// 一条都不省——那条链是 AS-H4 的成果，改前 undoMove 靠 MoveFile 内部实现拿到，
+// 换判据后必须自己带上，否则"原位空闲但跨卷"这一格从"能回"退成"回不去"。
 func undoMove(it UndoItem) (string, error) {
-	if _, err := undoSourceCheck(it, "移动目标"); errors.Is(err, errRestoredAlready) {
+	st, err := undoSourceCheck(it, "移动目标")
+	if errors.Is(err, errRestoredAlready) {
 		return it.OrigPath, nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return "", err
 	}
-	dst, err := MoveFile(it.DestPath, filepath.Dir(it.OrigPath))
-	if err != nil {
-		// M113（04 §6.11 OPS-14e，设计段 §23.2）：这里原先是 `return "", err`。
-		// MoveFile 有两条"返回 dst 且 err≠nil"的部分成功路径（move.go:60-65 源被顶替、
-		// :66-72 删源失败），此时盘上已经是两份，而 app 层 undoFailure 的
-		// "（数据已在 …）"补写（M86 立的做法）认的就是这个返回值 —— 丢掉落点等于
-		// 让那份孤儿副本在界面上不存在。完全失败时 MoveFile 回空串，行为不变。
-		return dst, err
-	}
-	applyMtime(dst, it.MtimeNs)
-	return dst, nil
+	return restoreInPlace(it, st, "移动目标")
 }
 
 // undoHardlink 拆除指向 LinkSrc 的硬链接，恢复独立文件。
