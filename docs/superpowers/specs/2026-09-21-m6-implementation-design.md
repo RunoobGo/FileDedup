@@ -5575,3 +5575,75 @@ M26-b 反向：把新守卫挪到 `guardContent` **之前**（等价于改前形
 - **静态接线锚字形变更**（偏差 3 的落地）：`TestM91DestructiveLegWiringCount` 的字面由
   `if guardContent(i, e) {` 改为 `guardContent(i, e`，**计数判据仍是 3、语义不变**（钉"三腿各接一道"），
   改因写在测试自己的注释里。三平台运行时行为未验（本机 darwin 只到 `vet` 的编译面）。
+
+---
+
+### 30.2 R1-2 + R4-1（Task A2）：`smoke-cli.sh` 从「计数对账」升级为「逐组对账 + failed 硬断言 + shapes 消费」
+
+**裁定依据**：J-6（一行级随批修）与 plan Task A2 的建议列；本项无需另裁。
+
+**判据本体（修的是什么形状）**：门禁语料是本地合成的干净树，脚本此前对 `manifest.json`
+只取两个量——组数、语料文件总数。这两项**都粗于数据面**：某组成员被一致性剔除（预筛收敛
+过头、短读、缓存误判）而该组仍 ≥2 成员时，组数不变、`files_total` 不变（它走
+`Pipeline.ScannedFiles()` 语料口径，与分组无关，见 `cmd/fdd-cli/main.go` 里 B3-6 那段注释）、
+三跑照样逐字一致 ⇒ 全绿。`failed` 更早年是**只进互比键**、从未断言为 0，于是"三跑一起失败"
+也绿。benchgen 早就在 manifest 写 `shapes`，注释承诺"造不出来的形态必须与造出来了可区分"，
+但 `smoke-cli.sh` 全文不读这个键 ⇒ 承诺悬空。
+
+**新增四道断言**（`scripts/smoke-cli.sh` 对账段）：
+1. `base["failed"] != 0` → 红；
+2. `reclaimable` 等于 manifest 逐组推得的 Σ(size×(n−1))；
+3. `duplicate_files` 等于 manifest 逐组推得的 Σn；
+4. **逐组** `(可释放字节, 组内路径集合)` 整表等于 manifest 重建的期望表（红时打印
+   「仅 manifest 有此组」/「仅报告有此组」各前 3 条，直接指出是哪一组少了一个成员）；
+5.（R4-1）`shapes.symlink=false` → 红；`shapes.case_pair=false` → linux 红、其余平台打印
+   WARN 且不进通过判定。
+
+**偏差 1（必须记）：`duplicate_files` 的口径与 plan 的代码片段不一致。** plan Step 1 写
+`exp_dup = Σ(n-1)`（冗余项数），现场实报 518、按该式推得 313，差值恰为组数 205。开码取证：
+`cmd/fdd-cli/main.go` 的统计是 `for _, f := range g.Files { gj.Files = append(...); r.Stats.DuplicateFiles++ }`
+——逐个成员自增，**含每组那个保留项**，所以定义是「位于重复组内的文件数」= Σn；而
+`reclaimable` 走 `g.Reclaimable`（已扣保留项）= Σ(size×(n−1))。两式各按各的口径钉死，
+并在脚本里留了一条"将来谁把这个字段改成冗余项数，这里必须红一次并要求同步"。
+
+**偏差 2：负控制改的是**报告**，不是 plan Step 2 写的「删 benchgen 语料某文件重生成」。**
+理由：删语料文件会同时让 `files_total` 少 1 ⇒ 旧断言跟着红，就读不出本项要钉的那一格
+（"旧全绿 / 新红"）。改成对三份报告同向抹掉一个成员（并同步 `reclaimable_bytes` /
+`duplicate_files`），恰好保留"文件仍被扫到、只是没进组"这一真实形状，且三跑同改 ⇒
+互比照样逐字一致，正面压住了"互比发现不了三跑一起漏"那句注释承诺的格子。
+变异用 `cp` 备份 + `cp` 还原 + `cmp` 自证（`RESTORE-CMP-OK`，sha1 还原前后同为
+`87675e8b7ffdb2d60ba03381707e5aabf2bb91f9`），未用 `git checkout --`。
+
+**真读数（本机 darwin/arm64，2026-09-23，语料 C×0.02：2359 文件 / 205 组 / 复扫命中 532）**
+
+绿跑（rc=0）：
+```text
+OK: 三跑一致、缓存命中生效，并与 manifest **逐组**对账通过（205 组 / 可释放 90522243 B = 期望值 /
+    组内文件 518 个 = 期望值 / 语料 2360 文件 / 失败 0 / 复扫命中 532 / shapes={'symlink': True, 'case_pair': False}）
+    WARN: shapes.case_pair=false（平台 darwin）：本卷不区分大小写，该形态本轮未覆盖（不进通过判定）
+```
+
+负控制（抹掉成员 `bench/small/f000083.bin`，258,535 B；三跑同改）——**旧断言四项在三种形态下
+全部照旧绿**（`groups=205` 等值 manifest、`files_total=2360` 等值语料+1、三跑 digest 逐字一致、
+`failed=0`），新断言按维度分别红：
+
+| 变异档 | 改什么 | 实测 |
+|---|---|---|
+| `all` | 组表 + 两个聚合量一起改 | `FAIL: reclaimable=90263708，manifest 逐组期望 90522243` |
+| `dup` | 只改 `duplicate_files` | `FAIL: dup_files=517，manifest 逐组期望 518（口径：…含保留项）` |
+| `table` | 只改组表（聚合量不动） | `FAIL: 逐组对账不一致（期望 205 组 / 实报 205 组）` + `仅 manifest 有此组: reclaimable=517070 files=[d000083_0.bin, d000083_1.bin, f000083.bin]` |
+
+★ `table` 那一档是本项的存在理由：组数 205、语料 2360、三跑一致、失败 0 ——旧门禁在这一形态下
+**四项全绿**，而它精确就是 plan「证据」段写的那一格。
+
+**回归（A 批合跑，本机 2026-09-23）**：`gofmt -l .` 空 → `go build ./...` 过 → `go vet` darwin/windows/linux
+三平台过 → `go test -race -count=2 ./...` 全 ok（含 `filededup/internal/ops 5.224s`）→ `go test -race -count=4 .`
+`ok filededup 56.456s` → `npm run build` 643ms 过 → `bash scripts/run-gates.sh`
+`rows=15 PASS=14 SKIP=1 FAIL=0`（第 15 行 `smoke-symlink` 本机无 root，按 AS-K2 **不算通过**）。
+
+**未兑现面（不许写成通过）**：`shapes.case_pair=false` 在 **linux 判红** 那一支本机没有实物见证
+（本机是 darwin，走 WARN 支）；Windows 腿的 `manifest.groups[].files` 反斜杠归一只到
+`norm()` 的代码面，本机未跑。两支都要等 CI 真跑，届时把读数记回本节。
+
+**同步面**：`docs/04-开发与测试计划.md` §3.4 第 1 项的「逐项对账」措辞已按实现对齐，
+并附本节的三档负控制读数与 `duplicate_files` 口径（只增括注，09-19 与 09-21 两串旧读数原样保留）。
