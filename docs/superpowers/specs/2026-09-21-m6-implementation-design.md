@@ -4343,3 +4343,14 @@ under-file isNotExist=false ENOTDIR=true  EINVAL=false err=lstat .../payload126c
   （原 `:37`，本批 `fmt`/`strings` 两个 import 推下去两行 ⇒ §6.21 五那两处过期坐标改认锚点）。
 - **本批未扩面清单照 §25.5 执行**：产品码 `git diff` 只余 `verdict_from_test.go` 一个文件；
   Windows 腿的兑现仍挂在 CI 复跑上（§25.4 末行写的"近似"就是这件事，不得读成已验）。
+
+### 25.9 CI 复跑兑现（追记，2026-09-22）
+
+- **§25.0 那句"九条 job 里只有 `go test (windows)` 红"读错了层级**：`gh run view --json jobs` 的真读数是
+  **3 个 job**（`check` / `go test (windows)` / `go test (macos)`），"九条"是把 `check` job 的 step 名当成了 job。
+  ★ 结论不受影响（红的确实只有 Windows 腿那一条用例），但这一笔记在 §6.21 一，不抹平。
+- **复跑 run `35675632521`（推 `48df096` 之后）三条 job 全 success**，`gh run watch --exit-status` 返回 0；
+  windows 腿逐字 `ok  filededup/internal/fscase  0.075s` ⇒ **§25.4 末行那句"该候选的价值只在 Windows 腿，
+  本机不得声称已验"到此兑现**（兑现依据见 §6.21 七：该用例体内无 `t.Skip`，包级 `ok` 在这一条上等价于 PASS）。
+- **顺带拿到一条旧账的硬读数**：CI 的 linux runner 上 step 16 真跑（`OK: 跨卷软链接的 7 条核心判据全部成立`）
+  ⇒ 本机第 15 行 `smoke-symlink rc=2 SKIP` 那一格"全仓有没有一条真跑的腿"= 有。M133 的**失败支**仍没被走过。
