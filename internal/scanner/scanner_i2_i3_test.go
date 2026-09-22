@@ -95,21 +95,21 @@ func TestWalkPanicIsolatedAsFailed(t *testing.T) {
 // M36（2026-09-21）之后这里是折叠**唯一**的消费方（遍历键一律不折，见 visitKey），
 // 故这条也是"折叠没有一并被删掉"的反向对照。
 func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
-	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
 	base := t.TempDir() // 绝对路径，分隔符与卷名前缀交给平台
 	variants := []string{filepath.Join(base, "a"), filepath.Join(base, "A")}
 
 	var probed atomic.Int32
 	sens := func(v bool) {
 		probed.Store(0)
-		probeCaseSensitive = func(string) bool {
+		probeCaseVerdict = func(string) fscase.Result {
 			probed.Add(1)
-			return v
+			return fscase.Result{Sensitive: v, Proven: true}
 		}
 	}
 
 	sens(false)
-	kept, _ := dedupeRoots(variants)
+	kept, _, _ := dedupeRoots(variants)
 	if len(kept) != 1 {
 		t.Fatalf("探测说不敏感时保留根数 = %d, want 1（两根应被并成一棵）：%v", len(kept), kept)
 	}
@@ -118,7 +118,7 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	}
 
 	sens(true)
-	kept, _ = dedupeRoots(variants)
+	kept, _, _ = dedupeRoots(variants)
 	if len(kept) != 2 {
 		t.Fatalf("探测说敏感时保留根数 = %d, want 2（两棵子树各自入列，修正前被折叠成一棵）：%v",
 			len(kept), kept)
@@ -134,7 +134,7 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 // 此时跳过并由上面的字符串层用例覆盖。修正前只有编译目标钦定的一条路：
 // macOS 上敏感卷会静默漏扫一棵子树。
 func TestWalkCaseSensitivityIsProbed(t *testing.T) {
-	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
 	root := t.TempDir()
 	lower := filepath.Join(root, "a")
 	upper := filepath.Join(root, "A")
@@ -149,9 +149,9 @@ func TestWalkCaseSensitivityIsProbed(t *testing.T) {
 	var probed atomic.Int32
 	sens := func(v bool) {
 		probed.Store(0)
-		probeCaseSensitive = func(string) bool {
+		probeCaseVerdict = func(string) fscase.Result {
 			probed.Add(1)
-			return v
+			return fscase.Result{Sensitive: v, Proven: true}
 		}
 	}
 
@@ -190,13 +190,13 @@ func filePaths(entries []*model.FileEntry) []string {
 // 只会以唯一拼写出现，设计稿 §6.1）。折叠因此对单根整个关掉（见 TestFolderSingleRootNeverFolds），
 // 于是探测也确实没有存在意义了。
 func TestWalkSingleRootSkipsProbe(t *testing.T) {
-	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
 	root := t.TempDir()
 	mkDirFiles(t, root, "x.txt")
 	var probed atomic.Int32
-	probeCaseSensitive = func(string) bool {
+	probeCaseVerdict = func(string) fscase.Result {
 		probed.Add(1)
-		return true
+		return fscase.Result{Sensitive: true, Proven: true}
 	}
 	if res := Walk(context.Background(), []string{root}, &model.Filters{}, 2); len(res.Files) != 1 {
 		t.Fatalf("文件数 = %d, want 1", len(res.Files))

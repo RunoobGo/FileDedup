@@ -9,7 +9,7 @@ package scanner
 // 后遇到的那棵整棵不进语料，且 `files_failed=0`（静默）。
 //
 // 本机（darwin）的临时目录一律在不敏感卷上，两棵大小写不同的目录**无法并存**，
-// 所以下面两条走**注入**：`probeCaseSensitive` 扮演"这些根在不敏感卷上"（E8）——
+// 所以下面两条走**注入**：`probeCaseVerdict` 扮演"这些根在不敏感卷上"（E8）——
 // 复现的正是缺陷的要害（根卷判定 ≠ 子树现实），只是把"子树在另一卷上"换成了
 // Linux 本来就大小写敏感的临时目录。V3 与卷语义无关，两端都能跑；
 // V2 在 Linux CI 上跑真两棵（macOS 上 skip）。
@@ -26,7 +26,7 @@ import (
 // V2（设计稿 §10.3）：两个根扫"父根 + 另一无关目录"，父根子树里两棵大小写不同的
 // 目录都要收齐。修前 2（一棵被折掉，零失败记录），修后 3。
 func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
-	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
 	base := t.TempDir()
 	if !fscase.Sensitive(base) {
 		t.Skipf("临时目录所在卷不区分大小写（%s）：alpha/ 与 ALPHA/ 无法并存", base)
@@ -39,7 +39,7 @@ func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
 
 	// 扮演"两个根都在不敏感卷上"。真值 3 与卷语义无关——它测的是
 	// "遍历不该拿根卷的判定去折叠子树的拼写"。
-	probeCaseSensitive = func(string) bool { return false }
+	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} }
 
 	res := Walk(context.Background(), []string{parent, other}, &model.Filters{}, 2)
 	if len(res.Files) != 3 {
@@ -56,14 +56,14 @@ func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
 // （fail-closed），只记 ProtectedDirs，不把用户从没点过的目录放行成"已脱离保护"。
 // 修前折叠键让两者匹配 ⇒ 逃逸放行 + UnprotectedRoots 报出一个他没点过的根。
 func TestCaseMismatchedRootUnderProtectedDirIsNotRescued(t *testing.T) {
-	t.Cleanup(func() { probeCaseSensitive = fscase.Sensitive })
+	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
 	root := t.TempDir()
 	mkDirFiles(t, filepath.Join(root, "lost+found", "inner"), "x.bin")
 	mkDirFiles(t, filepath.Join(root, "keep"), "a.bin")
 	// 用户手输的大小写变体：在不敏感卷上 OS 认它（指向同一个目录），
 	// 而遍历里的拼写来自 ReadDir ⇒ 两者就此不同。
 	mismatch := filepath.Join(root, "LOST+FOUND", "inner")
-	probeCaseSensitive = func(string) bool { return false } // 扮演"该卷不敏感"
+	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} } // 扮演"该卷不敏感"
 
 	res := Walk(context.Background(), []string{root, mismatch}, &model.Filters{}, 2)
 	if hasPathWith(res, "/lost+found/") {

@@ -58,6 +58,11 @@ export interface ScanSummary {
   // 本轮按 worktemp.IsTempName 跳过的工作临时名文件数（M21）。
   // ★ 判据是名字形态，分不出"我们的残留"与"用户恰好这样命名的文件"。
   skippedWorkTempFiles: number
+  // 本轮问卷过、但卷大小写语义取自平台默认的扫描根数（M62+M85）。
+  // ★ 0 有两种成因（所有根都拿到读数 / 单根一趟按 C1 压根没问卷），不许读成"实测过"。
+  // ★ 本条只是**类型位**：Go 侧有这个 JSON 字段，M30 比对器要求 TS 一侧同步补齐；
+  //   任何 View 都不读它（裁定③「新增计数的界面呈现属 M8，不做」）。
+  caseProbeUnproven: number
   // 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名了保护清单内路径）。
   unprotectedRoots?: string[]
 }

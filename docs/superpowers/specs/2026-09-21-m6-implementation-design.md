@@ -5013,3 +5013,133 @@ M105 才有"未知 ⇒ 保持现状（敏感）"这一档可接。这两条**不
 - **未兑现（不得当作已通过）**：Windows 真机上徽标 title 与 toast 的实际呈现**没有读数**——本机
   darwin，title 体只有静态接线锚 + node 纯逻辑腿两条腿 ⇒ 按"代码已改、验证未兑现"记。
   `docs/09:507` 那句手册现读仍与成品一致，未改。
+
+### 28.8 M62+M85 实施真读数（2026-09-22，划账前的第一手证据）
+
+**一、落地的形状与 §28.2 的四处偏差**
+
+- 三态出口按 §28.2 落地：`fscase.go:80`（`Result{Sensitive, Proven}`）、`:121 Verdict`（按目录缓存
+  **三态整体**，不是 bool）、`:146 Sensitive` 退成 `Verdict` 的薄投影、`:204 probe` 三条退出口
+  全部先问卷型（`:111 fromVolumeType`）。二态老调用方四处（benchgen、keep.go 三处 + `:258` 交出
+  函数值）一字未改，由 `TestSensitiveIsBoolViewOfVerdict` 钉"两边同源、不留第二份判定"。
+- **偏差 1（取红夹具换形）**：§28.2 预取的"探针必失败"是 `chmod 0500` 的只读父目录，落地改用
+  **不存在的目录**（`verdict_result_test.go:35-54 missingProbeDir`）。理由是 M151 的现成教训：
+  同一形状在不同平台报的不是同一格（Windows 对目录只读位未必拒绝创建 ⇒ 那一腿白测），而
+  不存在目录的 `O_CREATE` 恒 ENOENT（父目录都不在，与卷的写权限无关），三平台落在 `probe` 里
+  同一条 return。仍带前提自检（Lstat 必须不存在、O_CREATE 不得报 EEXIST），落点由现场说话。
+- **偏差 2（卷型读取选了复用 media 的导出面）**：§28.2 留的两条路里没写 `volumetype_darwin.go`
+  那一条，落地是 `media/probe_darwin.go:79 FSTypeName`（读已在手的 `statfsInfo(path).fsType`）
+  + `probe_other.go:21` 恒 ""。⇒ **新增依赖边 `fscase → media`，这一条 §28.5 没预告**（那里只
+  登记了 `filter → fscase`）。现读闭环：`go list` 给出 media 的内部依赖集为**空**，fscase 现在
+  import `media`/`pathnorm`/`worktemp` ⇒ 不成环；`grep -rn "internal/fscase" internal/media/` = 无匹配。
+- **偏差 3（用例名与切分）**：设计段预取的 `TestVerdictDistinguishesProvenFromDefaulted` 未用。
+  实际按来路分格：① 确证 / ② 卷型确证不敏感（4 名字）/ ③ 退默认（兼负控制）/ 远端与可敏感卷
+  不得确证（9 名字）/ 薄投影同源 / 空串不隐身 = 6 条。合成一条的坏处正是 M126 返工的原因：
+  拿本机卷语义当普适判据。
+- **偏差 4（条数，且是低估）**：§28.5 预期"M62+M85 新增 Go 2（含负控制）"，实读 **+15 条顶层 +
+  13 个子用例**。低估的原因：设计段把五跳当成"加一个字段"，实际每一跳要的是**受众不同**的判据
+  （跳① 计得对不对 / 跳② 会不会串轮 / 跳③ 装不装配 / 跳④ 值连线在不在 / 跳⑤ 线上名字），
+  而跳④ 一度**没有任何判据可红**（见"四"）。
+
+**二、取红的诚实记法：改前是编译级，行为级由变异提供**
+
+§28.2 写"改前 `Sensitive()` 只回 bool，断言 `Proven=false` 当场红"。字面读数不是这样：改前树里
+`Result`/`Verdict`/`CaseProbeUnproven` 都不存在，五跳的"改前红"依次是
+`undefined: probeCaseVerdict`、`assignment mismatch: 2 variables, 3 values`、
+`res.CaseProbeUnproven undefined`（scanner/dedup/根包三处）、
+`TS 侧缺 1 个 Go 下发字段（前端按类型取不到）：ScanSummary.caseProbeUnproven` —— 全是编译不过，
+不是断言红。⇒ 本条的行为级证据**全部由下面的变异表提供**（与 §28.1 对 M25-a/b 的处理同一手法），
+"编译不过"不当作判据已兑现。
+
+**三、★ 加 `Proven` 断言时撞出一条既有夹具 bug（断言一字未改）**
+
+`fscase_test.go` 的 `TestProbeGivesUpWithoutTouchingStrangers`（M62+M85 之前就在，钉"重试用尽
+不许动别人的文件"）补上 `Proven` 断言后当场红：`{Sensitive:false Proven:true}`。查下来是**夹具**
+的既有 bug：那条循环 8 次占的是**同一个名字**（`staleProbeAt` 的序号实参没随 `i` 变），"重试用尽"
+这一格压根没走到；改前读绿纯属巧合——退默认给的 bool 恰好等于 `Default()`，二态看不出走没走到。
+修法只动夹具：占位名按 `start+i+1` 递变、`if len(stales) != probeAttempts` 自查、
+`probeNo` 增量前提自检、`useVolumeType(t, "")` 把卷型钉成"读不到"（否则断言在替 CI 那台机器的
+卷型背书）。★ 这不属于"改测试断言让门禁变绿"——**断言原样保留**，被修的是它自己声明的前提。
+
+**四、变异重跑（2026-09-22 划账前，逐字读数；每条 `cp` 回备份 + `diff` 核对）**
+
+| 变异 | 做法 | 红在哪些格（逐字） | 备注 |
+|---|---|---|---|
+| M25-c | `fscase.go:112` 表查改成"凡拿到卷型就算确证不敏感" | `verdict_result_test.go:128: 卷型 "smbfs" 不足以确证大小写语义，却报了 Proven=true：{Sensitive:false Proven:true}` × 9（smbfs/cifs/nfs/afpfs/webdav/apfs/ext4/xfs/btrfs），包级 FAIL | 正是 §28.2 说的"红在负控制那条"，不是红在 ② 本身 |
+| M25-d | `fscase.go:108 defaulted()` 的 `Proven` 恒 true（把退默认洗成实测） | `fscase_test.go:153: 重试用尽 + 卷型读不到 ⇒ 这一格没有任何证据，却报了确证`、`verdict_result_test.go:87: …这是把退默认洗成实测（M62 反对的无声改判）`、`:128` 那 9 格、`TestEmptyDirKeepsDefaultAndIsNotProven` | 4 条用例 / 12 格 |
+| M25-g | `scanner.go:626 unproven++` → `unproven += 0`（问了但不计） | `scanner_m62_test.go:83: 两根退默认 ⇒ CaseProbeUnproven 应为 2，实得 0` + `TestWalkReportsUnprovenVerdictCount` + `pipeline_caseprobe_test.go:63` + `app_caseprobe_test.go:67: ScanSummary.CaseProbeUnproven = 0，want 2` | 一条链的传导：跳① 坏 ⇒ 跳②③ 跟着红。`TestSingleRootDoesNotAskAndCountsZero` 仍绿（本该绿：它钉"不该问时不问"，不钉"该计时要计"） |
+| M25-h | `pipeline.go:314` 删按轮归零行 | `pipeline_caseprobe_test.go:76: 本轮在赋值之前就返回 ⇒ 计数必须是归零后的 0，实得 2（上一轮的 2 串进本轮）` | ★ 第一次存活，见"五" |
+| M25-i | `pipeline.go:363` 删读数 Store 行 | `pipeline_caseprobe_test.go:63: 两根都退默认 ⇒ 应为 2，实得 0（少一行 Store 就是这一格红）` + 根包 app 那条 | |
+| M25-j | `app.go:712 caseUnproven := a.pipe.CaseProbeUnproven()` → `uint64(0)` | `app_caseprobe_test.go:67`（唯一受众；跳①②的用例读不到这一格，变异点在跳③之后） | |
+| M25-k | `main.go:176` 删跳④赋值行 | **补钉之前：`ok filededup/cmd/fdd-cli 0.416s`，无判据可红**；补 `TestCLIStatsCaseProbeUnprovenIsWired` 之后：`main_test.go:86: 第四跳的赋值必须恰好一行、原样在场（…），实得 0 次 ⇒ 这行被删、被搬走或被写成常量（CLI 有键但恒 0）` | ★ 缺口与补法见"六" |
+| M25-l | `wails.ts:65` 删 TS 镜像字段 | `wails_types_test.go:416: TS 侧缺 1 个 Go 下发字段（前端按类型取不到）：ScanSummary.caseProbeUnproven` | 跳⑤ 由 M30 比对器接手，不另立判据（I5） |
+
+八条全部还原核对：`RESTORE-ALL-IDENTICAL`（fscase/scanner/dedup/app/CLI/TS 六文件逐文件 `diff -q`）
++ `RESTORE-SCANNER-IDENTICAL` + `RESTORE-CLI-IDENTICAL` + `RESTORE-TS-IDENTICAL`；全部还原后五包复绿
+（`fscase`/`scanner`/`dedup`/`cmd/fdd-cli`/根包 全 `ok`）。
+
+**五、★ M25-h 第一次存活：归零那一行的受众被订单挡在外面**
+
+跳② 用例的第一版订单是 `missing(2) → live(0) → canceled`。删掉 `Store(0)` 后包级 **rc=0**（变异
+活着）。原因不在代码，在订单：`live` 那一轮自己就把 0 写进去了，于是"少一行归零"没有任何可观察
+差别。归零行真正的受众是**本轮根本走不到那一组 Store** 的路径 ⇒ 订单改成
+`live(0) → missing(2) → canceled`（ctx 预先取消，`Run` 在 `Scanner.Walk` 之后、Store 之前就
+return），此时没有归零就会把上一轮的 2 留在原地。重排后 M25-h 按上表逐字命中。这条教训写进了
+`pipeline_caseprobe_test.go:66-76` 的注释（订单本身是判据的一部分）。
+
+**六、★ 跳④ 的判据缺口：值连线在 `main()` 里，反射与 marshal 都摸不到**
+
+`TestReportStatsExposesCaseProbeUnproven` 钉的是 JSON 键名 + 值能落进去，`main.go:176` 那一行赋值
+删掉既不编译失败、也不改键名，只让这一键恒为 0 ⇒ M25-k 原样跑**是绿的**。这一跳若止步于此，就是
+§28.2 警告的"CLI 有数、GUI 零值"那一类假账的反向版本（键在、值永远是 0，没人红）。补法：
+`TestCLIStatsCaseProbeUnprovenIsWired` 用**源码级**锚（含等号两侧，手法先例是 M30 读 TS 源文件、
+M134/M142 静态查门禁脚本），"删行""搬走""写死常量"三种改法都红（M25-k / M25-k2 双读数在册）。
+★ 边界照实写：源码级钉挡得住"行没了"，挡不住"换成另一条同样返回 0 的路径"。同族那六枚计数器
+（`FilesTotal`/`CacheHits`/`ProtectedDirs`/`ProtectedFiles`/`SkippedCloudFiles`/`SkippedWorkTempFiles`）
+连这一层都没有——是既有缺口，本批只补自己新加的这一跳，不替它们补（约束 7）。
+
+**七、★ 两处取数命令自撞（与 §6.21 同族，读数本身差点是假的）**
+
+- M25-g 第一次用 `-run 'CaseProbe|DedupeRoots|SingleRoot|ScanSummary'` 跑 ⇒ 漏掉
+  `TestWalkReportsUnprovenVerdictCount`（名字里没这四个词），第一次的"红在哪些格"少报一格。
+  换成 `-run 'Unproven|…'` 重跑才是上表那份完整读数。**过滤器写法会替你把用例藏起来**。
+- 第一次 `useVolumeType(t, "")` 的锚与 M25-i 的 Store 行锚点差两个空格（gofmt 后列对齐变了）
+  ⇒ 变异脚本按"锚点必须恰好一次"自检（`MUT-PREMISE-FAIL anchor count=0`），当场拒绝改动，
+  没有产生"改了个没改到的地方却读到绿"的假读数。★ 唯一一次真踩到的是 M25-l：锚点写成
+  tab 而文件里是两个空格 ⇒ 首跑跳过未改码，改正锚点后按上表命中。
+
+**八、门禁与计数（全套 15 行）**
+
+- 首跑 **`rows=15 PASS=13 SKIP=1 FAIL=1`**，红在第 1 行 `gofmt`（列出 `scanner_m62_test.go` 一条
+  函数声明的对齐）。★ 这一跑未落盘（读数在本次会话的工具输出里），格式修好后另两份落盘：
+  `/tmp/gates_m62m85.log`（14 条新用例时点，`src_test=739`）与
+  `/tmp/gates_m62m85_2.log`（补跳④钉之后，**划账以这一份为准**）⇒ 两次同值
+  `rows=15 PASS=14 SKIP=1 FAIL=0`。唯一 SKIP 仍是第 15 行 `smoke-symlink` `rc=2`
+  （uid=501 挂不了独立文件系统，按 AS-K2 **不算通过**）。
+- 行 6 与基线（§28.7 末）逐格对账：`top_PASS 673 → 688`、`top_SKIP 5 → 5`、
+  `sub_PASS 91 → 104`、`sub_SKIP 0 → 0`、`run 769 → 797`、`src_test 725 → 740`、`ok_pkgs 23 → 23`。
+  闭合式全中：`688 + 5 = 693`、`693 + 104 + 0 = 797`。行 7/8 竞态：`ok_pkgs=23`/`1`，
+  **`data_race=0`** 两格未动。
+- 计数三通道同批重取且互相闭合：全仓 grep 通道 **740** = 行 6 `src_test=740`；
+  本机 `go test -list '^Test'` **693** = `GOOS=darwin go list` 文件集通道 **693**。
+  平台三值现读 **688 / 693 / 700**（linux/darwin/windows，文件数 165 / 167 / 163）⇒
+  每平台 **+15**、文件 **+4**；四象限（Windows 专属 35 / Linux 专属 12 / darwin 专属 17 /
+  unix 专属 11）**一条没动**：`740−35−17=688`、`740−35−12=693`、`740−12−17−11=700` 三式全中
+  ⇒ "本批 15 条全平台中立"是量出来的，不是推的。
+- 新增 15 条的归属：既有测试文件 +4（CLI 3 + media 1）、新文件 +11（fscase 6 / scanner 3 /
+  dedup 1 / app 1）；子用例 +13 = ② 表 4 名字 + 远端与可敏感卷负控制 9 名字（两条循环各一枚）。
+- 前端腿一字未动：`node 用例 55 项 + 接线断言 17 项 = 合计 72 项全部通过` ⇒ 与本条无关，符合
+  裁定③（只加类型位、任何 View 都不读它）。
+- `go vet` 三平台（linux/darwin/windows）全过、`gofmt -l` 空、`go test ./...` 23 包全 `ok`。
+
+**九、未兑现（不得当作已通过）**
+
+- **linux/windows 的卷型腿本批不做**（§28.6）⇒ 那两平台上 `FSTypeName` 恒 ""，② 那一格只有
+  注入证据。`TestFSTypeNameByPlatform` 钉的是反向那一格："非 darwin 必须返回空串"——防的是
+  有人没有真机读数就顺手补上一条实现。04 表 M62 行须明写"另两平台走 ③ 退默认"。
+- **真 FAT/exFAT/NTFS 卷与远端卷上的 ② 判定无真机读数**：本机无 root、不挂镜像（同
+  `smoke-symlink` 那一族）⇒ "代码已改、验证未兑现"。
+- **CI 三条腿**：本批未推送 ⇒ 零 CI 读数；推送与否由用户另行授权。
+- **这一格在界面上看不见**（裁定③）：`ScanSummary.CaseProbeUnproven` 的受众只有 CLI JSON 与
+  类型镜像；history.db **未统计**该值（`app.go:166-175` 注释已写明），别把它当"历史里查得到"。
+- **跳④ 的钉是源码级**，不是行为级（见"六"的边界）。

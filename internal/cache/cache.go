@@ -419,7 +419,7 @@ func (c *Cache) LastHit(path string) (int64, bool) {
 	return ts, true
 }
 
-// evictFn 是淘汰步骤的注入点（测试接缝，惯例同 ops.verifyFileFn / scanner.probeCaseSensitive）。
+// evictFn 是淘汰步骤的注入点（测试接缝，惯例同 ops.verifyFileFn / scanner.probeCaseVerdict）。
 // 生产恒等于 evictLocked。为什么要接缝：Store 在 Commit 之后会把 cntValid 置回 false，
 // evictLocked 于是先重算 COUNT、只有真超限才发 DELETE —— 想稳定造出"已写回、淘汰失败"
 // 这一档，就得往库里塞 50 万条（MaxEntries），或留一个把计数伪造成超限的口子；

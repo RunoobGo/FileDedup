@@ -58,6 +58,11 @@ type Pipeline struct {
 	// （应用自己的 .fdd-* 残留，04 §6.8.8 M21）。走与 protected*/cloudSkipped
 	// 完全相同的下发路径：绑定的 scan:done 载荷与 CLI 报告都从这里取数。
 	workTempSkipped atomic.Uint64
+	// caseProbeUnproven 是 M62+M85 的"本轮有多少个根的卷语义是从平台默认来的"计数，
+	// 与 protected*/cloudSkipped/workTempSkipped 同一套按轮归零的下发路径（设计稿 §28.2 ②）。
+	// 计数从 scanner.Result 转存而不是让绑定层去 import scanner：流水线后面的阶段会改写
+	// 结果集，事后拿不到"当初问卷问到了什么"。
+	caseProbeUnproven atomic.Uint64
 	// unprotectedRoots 是"因用户显式指定而脱离系统保护"的根，界面须警示。
 	// 它是字符串集合而非计数，故不塞进 atomic；只在扫描收尾写一次，读在 Run 之后。
 	unprotectedRoots []string
@@ -104,6 +109,11 @@ func (p *Pipeline) CloudSkipped() uint64 { return p.cloudSkipped.Load() }
 // 口径是"到达的文件项里名字命中"，与扩展名/大小/隐藏设置无关；不含目录
 // （临时命名的目录不会被跳过，见 scanner.go 的 M1 注释）。
 func (p *Pipeline) WorkTempSkipped() uint64 { return p.workTempSkipped.Load() }
+
+// CaseProbeUnproven 返回本轮**问卷过、但卷大小写语义来自平台默认**的扫描根数（M62+M85）。
+// 0 有两种成因，别当成"这一卷实测过"：要么所有根都拿到了读数，要么单根一趟压根没问卷
+// （C1，见 scanner.dedupeRoots）。口径与限制都写在 scanner.Result 同名字段上。
+func (p *Pipeline) CaseProbeUnproven() uint64 { return p.caseProbeUnproven.Load() }
 
 // UnprotectedRoots 返回"因用户显式指定而脱离系统保护"的扫描根（Run 结束后读取）。
 // 非空即意味着这一轮有一部分扫描是在保护清单之外跑的，界面必须警示：
@@ -299,8 +309,9 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	p.cacheHits.Store(0) // AS-K1：按轮归零，见 CacheHits 注释
 	p.protectedDirs.Store(0)
 	p.protectedFiles.Store(0)
-	p.cloudSkipped.Store(0)    // M6-P1：同口径按轮归零，否则上一轮的占位数会串进本轮报告
-	p.workTempSkipped.Store(0) // M21：同口径按轮归零
+	p.cloudSkipped.Store(0)      // M6-P1：同口径按轮归零，否则上一轮的占位数会串进本轮报告
+	p.workTempSkipped.Store(0)   // M21：同口径按轮归零
+	p.caseProbeUnproven.Store(0) // M62+M85：同口径按轮归零，少这行 = 上一轮的未确证串进本轮
 	// 闸门复位：上一轮若在 Paused 下被取消（父 ctx 直接取消、未走 CancelScan），
 	// gate 仍处于关闭态；不复位则本轮 worker 的 gate.Wait 会永久阻塞。
 	p.gate.Resume()
@@ -349,6 +360,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 	p.protectedFiles.Store(uint64(scan.ProtectedFiles))
 	p.cloudSkipped.Store(uint64(scan.SkippedCloudFiles))
 	p.workTempSkipped.Store(uint64(scan.SkippedWorkTempFiles)) // M21
+	p.caseProbeUnproven.Store(uint64(scan.CaseProbeUnproven))  // M62+M85
 	p.mu.Lock()
 	p.unprotectedRoots = scan.UnprotectedRoots
 	p.mu.Unlock()

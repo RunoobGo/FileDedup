@@ -115,14 +115,42 @@ func TestProbeNotDegradedByStaleCollision(t *testing.T) {
 
 // TestProbeGivesUpWithoutTouchingStrangers 钉住重试的上界与"不替陌生人删文件"：
 // 连续 probeAttempts 个名字全被占时退回默认值，而且一个占位文件都不许消失。
+//
+// ★ M62+M85 之后"重试用尽"是**三条**退默认出口之一（另两条：创建失败、upper 读不动），
+// 所以这一格的收尾会先问卷型。测试把卷型钉成"读不到"（helper 见 verdict_result_test.go）：
+// 不这么做的话，断言就在替 CI 那台机器的卷型背书 —— 真挂一张 FAT 镜像跑测试套件的机器上，
+// `Sensitive` 会合理地等于 false 而 `Proven` 合理地等于 true。
 func TestProbeGivesUpWithoutTouchingStrangers(t *testing.T) {
+	restore := useVolumeType(t, "")
+	defer restore()
 	dir := t.TempDir()
+	// ★ 夹具前提修复（本轮 M62+M85 发现，改前只占住**一个**名字）：循环里传的是
+	// `probeNo.Load()+1`，而 Load 在循环内不变 ⇒ 八个迭代建的是同一个文件。probe
+	// 第一轮撞名、第二轮就换号成功了，从没走到「重试用尽」那一格。改前这条一直绿：
+	// 换号成功读到的 bool 恰好等于 Default()（不敏感卷 false、敏感卷 true），断言在
+	// 返回值上看不出差别 —— 与上面那条 M13 用例注释说的「只断言结论等于默认值是空的」
+	// 是同一件事，这次由 Proven 那一格把它暴露出来。
+	// 这里不改断言、只让前提成立：占住 probe 下一步真正会用到的那八个号（本包无并发
+	// 测试，probeNo 在两次调用之间不会被别人推进，故窗口就是 [start+1, start+8]）。
+	start := probeNo.Load()
 	var stales []string
 	for i := 0; i < probeAttempts; i++ {
-		stales = append(stales, staleProbeAt(t, dir, probeNo.Load()+1))
+		stales = append(stales, staleProbeAt(t, dir, start+uint64(i)+1))
 	}
-	if got := probe(dir); got != Default() {
-		t.Fatalf("重试用尽后应退回平台默认，实得 %v", got)
+	if len(stales) != probeAttempts {
+		t.Fatalf("夹具前提不成立：占位名有重复（%d 个 want %d）⇒ 测不到「重试用尽」", len(stales), probeAttempts)
+	}
+	got := probe(dir)
+	// 前提自检：必须真的用掉了八个号，否则本条测的不是「重试用尽」。
+	if used := probeNo.Load() - start; used != probeAttempts {
+		t.Fatalf("夹具前提不成立：本次只推进了 %d 个探测号（want %d）⇒ 没走到「重试用尽」那一格",
+			used, probeAttempts)
+	}
+	if got.Sensitive != Default() {
+		t.Fatalf("重试用尽后应退回平台默认，实得 %+v", got)
+	}
+	if got.Proven {
+		t.Fatalf("重试用尽 + 卷型读不到 ⇒ 这一格没有任何证据，却报了确证：%+v", got)
 	}
 	for _, p := range stales {
 		if _, err := os.Lstat(p); err != nil {

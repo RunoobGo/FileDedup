@@ -163,6 +163,17 @@ type ScanSummary struct {
 	// ★ 同上面两条的口径缺口：history.db 没存这个数，从记录页恢复时只能显示
 	// "未统计"，不得用零值冒充"这一轮没有工作临时文件"。
 	SkippedWorkTempFiles uint64 `json:"skippedWorkTempFiles"`
+	// CaseProbeUnproven 本轮**问卷过、但卷大小写语义取自平台默认**的扫描根数（M62+M85）。
+	//
+	// 为什么要有这个数：`fscase` 三态之前只回 bool，"实测"与"猜的（平台默认）"同形，
+	// 上层既无从警示、也无从收窄判据（M105 的放宽前置条件就是"确证不敏感"）。
+	//
+	// ★ 0 有两种成因（口径全在 scanner.Result.CaseProbeUnproven 与 dedupeRoots 注释里）：
+	// 所有根都拿到读数，或单根一趟按 C1 压根没问卷 —— 别把它读成"这一卷实测过"。
+	//
+	// ★ 同上面三条的口径缺口：history.db 没存这个数，从记录页恢复时只能显示"未统计"，
+	// 不得用零值冒充"这一轮的卷语义都实测过"。界面不呈现（裁定③），故该缺口暂不可见。
+	CaseProbeUnproven uint64 `json:"caseProbeUnproven"`
 	// UnprotectedRoots 非空即表示"这一轮有扫描根脱离了系统保护"（用户显式点名
 	// 了清单内的路径或其内部）。警示文案属 M8（本轮只有 JSON 与 CLI 报告）。
 	//
@@ -689,7 +700,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		}
 		a.resultsReady = true
 		a.curHistID = histID
-		// M6-P4 / M21：四个"按轮计数"口径在与 superseded() 判定同一临界区内取。
+		// M6-P4 / M21 / M62+M85：五个"按轮计数"口径在与 superseded() 判定同一临界区内取。
 		// 为什么不能留到锁外的 emit 里现取：Run 一开始就把按轮计数器归零，
 		// 而 a.scanInFlight 在扫描体第一行就复位（新扫描因此可通过在途检查，
 		// 只靠 resultGen 判取代）。锁内取数等于把结论钉死成"未被取代 ⇒
@@ -698,6 +709,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		pFiles := a.pipe.ProtectedFiles()
 		cloudSkipped := a.pipe.CloudSkipped()
 		wtSkipped := a.pipe.WorkTempSkipped()
+		caseUnproven := a.pipe.CaseProbeUnproven()
 		unprot := a.pipe.UnprotectedRoots()
 		a.mu.Unlock()
 		a.emit(a.ctx, "scan:done", ScanSummary{
@@ -710,6 +722,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			ProtectedFiles:       pFiles,
 			SkippedCloudFiles:    cloudSkipped,
 			SkippedWorkTempFiles: wtSkipped,
+			CaseProbeUnproven:    caseUnproven,
 			UnprotectedRoots:     unprot,
 		})
 	})

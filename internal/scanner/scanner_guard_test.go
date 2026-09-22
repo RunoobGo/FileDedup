@@ -8,7 +8,7 @@ package scanner
 // 平台无关的做法：$Recycle.Bin 与 lost+found 在清单里是**三平台通吃**的条目
 // （外接卷跨平台挂载才是主要受害场景），所以 T6/T8/T9 不需要任何平台豁免，
 // 在 Linux 门禁上就是真夹具真断言。只有盘根伪文件与 Windows 保留名必须
-// 换装 Windows 清单——走 guard 注入点（与 probeCaseSensitive 同一手法）。
+// 换装 Windows 清单——走 guard 注入点（与 probeCaseVerdict 同一手法）。
 
 import (
 	"context"

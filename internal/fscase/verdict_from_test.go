@@ -40,12 +40,19 @@ func TestVerdictFromUpperAbsentIsConfirmedSensitive(t *testing.T) {
 			"不算通过（AS-K2）；该支由 CI 的 linux 腿（区分大小写的 ext4）真跑")
 	}
 
-	v, ok := verdictFrom(lower, upper)
+	v, proven, ok := verdictFrom(lower, upper)
 	if !ok {
 		t.Fatalf("upper 不存在是可归因的（ok=false 会被当成撞名而白换号）：v=%v ok=%v", v, ok)
 	}
 	if !v {
 		t.Fatalf("upper 位置上空着 ⇒ 必须是确证的\"区分大小写\"，实得 v=%v", v)
+	}
+	// M62+M85 补强：这一支是「换一种写法确实看不见」= 文件系统给的读数，必须标确证。
+	// 它掉成 proven=false 不只是账目问题：probe 会因此丢掉①这一格实测，改走②卷型表
+	// （fromVolumeType），而 ntfs/exfat 恰好在表里 ⇒ 一个「实测区分大小写」的卷被卷型
+	// 猜成「不区分」，方向相反。
+	if !proven {
+		t.Fatalf("ENOENT 是实测读数，必须确证：实得 proven=false（v=%v）", v)
 	}
 }
 
@@ -64,12 +71,21 @@ func TestVerdictFromSameObjectIsInsensitive(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(upper) })
 
-	v, ok := verdictFrom(lower, upper)
+	v, proven, ok := verdictFrom(lower, upper)
 	if !ok {
 		t.Fatalf("SameFile 是可归因的：v=%v ok=%v", v, ok)
 	}
 	if v {
 		t.Fatalf("两个名字命中同一对象 ⇒ 必须判\"不区分大小写\"，实得 v=%v", v)
+	}
+	// M62+M85 补强：命中同一对象同样是文件系统给的读数（这一格正是「这卷实测不区分」的
+	// 实测形态），必须确证。它掉成 proven=false 的后果分两层：在 Default() 与真卷型
+	// 相反的主机上（linux 上 Default=true，而这一格读到的是不敏感）结论会被翻成
+	// 「区分大小写」⇒ 同一棵树的两种拼写各走一遍，重复组数与可释放空间虚高、据此下发
+	// 的清理会多删文件；即便在 darwin 上值碰巧一致，这格也从「有读数」降为「没读数」，
+	// M105 少一条可放宽的依据、计数链多一笔虚增。
+	if !proven {
+		t.Fatalf("SameFile 是实测读数，必须确证：实得 proven=false（v=%v）", v)
 	}
 }
 
@@ -119,13 +135,20 @@ func TestVerdictFromUnreadableUpperFallsBackToDefault(t *testing.T) {
 	}
 	t.Logf("本平台钉「读不动」那一格用的形状：%s（%v）", shape, ferr)
 
-	v, ok := verdictFrom(lower, unreadable)
+	v, proven, ok := verdictFrom(lower, unreadable)
 	if !ok {
 		t.Fatalf("退默认值也是结论（ok=false 会白耗换号重试）：v=%v ok=%v", v, ok)
 	}
 	if v != Default() {
 		t.Fatalf("upper 读不动 ⇒ 必须退平台默认 %v，实得确证值 %v（%v）："+
 			"这是把\"无从判定\"报成\"卷区分大小写\"，且会被 Sensitive() 永久缓存", Default(), v, ferr)
+	}
+	// M62+M85 补强：这一格是「读不动」而不是「看不见」，proven 必须是 false。
+	// 它是 M62 那一档存在的理由：只有这一位为假，probe 才会去问卷型（M85 的落点），
+	// 并在卷型也读不到时如实记为未确证。若这一格写成 true，「一次 EIO 钉死整趟扫描」
+	// 的老问题只是换了个值继续存在，而计数链永远报 0。
+	if proven {
+		t.Fatalf("upper 读不动给不出证据，proven 必须是 false（%v），实得 true", ferr)
 	}
 }
 
@@ -181,13 +204,20 @@ func TestVerdictFromOtherFileAtUpperIsNameCollision(t *testing.T) {
 		t.Fatalf("夹具前提不成立：lower=%q 与 upper=%q 命中同一对象 ⇒ 落不到撞名那一格，本条测不到 M139", lower, upper)
 	}
 
-	v, ok := verdictFrom(lower, upper)
+	v, proven, ok := verdictFrom(lower, upper)
 	if ok {
 		t.Fatalf("upper 位置上是另一个文件 ⇒ 无从归因，必须 ok=false（让 probe 换号），实得 ok=true、v=%v："+
 			"这一格报成确证会被 Sensitive() 按目录永久缓存（M139）", v)
 	}
 	if v {
 		t.Fatalf("撞名给不出「区分大小写」的读数，v 必须是 false（结论由换号后的下一轮给出），实得 v=true")
+	}
+	// M62+M85 补强：撞名同样没有任何证据 ⇒ proven 必须为假。这一格 ok 已为假，
+	// probe 走的是换号而不是问卷型，所以它是三态里「两个 bool 都假」的那一种形状；
+	// 若把 proven 误置 true，probing 会在不可归因的读数上直接返回（本轮不钉这个分支，
+	// 只保证 verdictFrom 自己不撒谎）。
+	if proven {
+		t.Fatalf("撞名读数不可归因 ⇒ proven 必须为 false，实得 true（v=%v）", v)
 	}
 }
 
@@ -219,11 +249,18 @@ func TestVerdictFromNeverCreatedUpperIsConfirmedSensitive(t *testing.T) {
 		t.Fatalf("夹具前提不成立：本卷把 %q 报成 %v 而非 ENOENT ⇒ 落的是「读不动」那一格，不是 M126 那格", upper, uerr)
 	}
 
-	v, ok := verdictFrom(lower, upper)
+	v, proven, ok := verdictFrom(lower, upper)
 	if !ok {
 		t.Fatalf("upper 从未存在是可归因的（ok=false 会被当成撞名而白换号）：v=%v ok=%v", v, ok)
 	}
 	if !v {
 		t.Fatalf("换一种写法确实看不见 ⇒ 必须是确证的「区分大小写」，实得 v=%v（M140：这一格在本机也要读到）", v)
+	}
+	// M62+M85 补强。★ 与上面第一条同一格（ENOENT ⇒ 确证），但第一条在不敏感卷上会
+	// t.Skip（本文件体内那句），这条不会 ⇒ 三平台都能读到 proven=true 这一格。
+	// 这不只是重复钉一遍：把 ENOENT 那一支写成 proven=false 的变异，在 Windows 腿上
+	// 只有这一条测得到（第一条在那里 Skip）。
+	if !proven {
+		t.Fatalf("ENOENT 是实测读数，必须确证：实得 proven=false（v=%v）", v)
 	}
 }

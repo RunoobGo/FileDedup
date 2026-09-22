@@ -1,6 +1,9 @@
 package media
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // G6：并发度只降级、不升级。
 func TestAutoWorkers(t *testing.T) {
@@ -106,6 +109,32 @@ func TestClassString(t *testing.T) {
 	for c, want := range cases {
 		if got := c.String(); got != want {
 			t.Fatalf("Class(%d).String() = %q, want %q", c, got, want)
+		}
+	}
+}
+
+// M85（设计稿 §28.2）钉 FSTypeName 的两条腿：darwin 真取到名字（不钉具体值，
+// 那等于拿本机卷型当普适判据），另两平台恒空串。
+//
+// ★ 后半句是承重的而不是凑数的：fscase 的"探针不可用 ⇒ 先问卷型"依赖这个约定 ——
+// 空串读作"没有读数"，退默认，与 M62 之前一字不差。哪天有人补上 linux 的 f_type 魔数
+// 或 windows 的 GetVolumeInformation 却不改这张表（§28.6 的"明确不做"），
+// 红的是**这条**而不是 fscase 里那条注入式用例。
+func TestFSTypeNameByPlatform(t *testing.T) {
+	dir := t.TempDir()
+	name := FSTypeName(dir)
+	t.Logf("goos=%s FSTypeName(%q)=%q", runtime.GOOS, dir, name)
+	switch runtime.GOOS {
+	case "darwin":
+		if name == "" {
+			t.Fatalf("darwin 的卷型读不出来 ⇒ fromVolumeType 永远拿不到证据，" +
+				"M85 那一档形同未做（不是'安全退回'，是白做）")
+		}
+	default:
+		if name != "" {
+			t.Fatalf("%s 的 FSTypeName 返回了 %q，但 §28.6 明写本批只做 darwin 一条腿 ⇒ "+
+				"fscase 的天生不敏感表里没有为这个名字准备的条目，补一条腿就得同步补表并给真夹具",
+				runtime.GOOS, name)
 		}
 	}
 }

@@ -115,6 +115,17 @@ type Result struct {
 	// 正常文件同样在这个数里，二者不可分辨。界面文案（M8）不得写成"清理了 N 个
 	// 残留"，只能中性表述。
 	SkippedWorkTempFiles int
+	// CaseProbeUnproven 是本轮**问卷过、但卷大小写语义来自平台默认**的根数
+	// （M62+M85，设计稿 §28.2 ①；口径与三格边界见 dedupeRoots 第三个返回值）。
+	//
+	// 为什么必须存在：`fscase.Sensitive` 只回 bool，"实测出来的"和"猜出来的"在
+	// 返回值上同形 ⇒ 上层既不能提醒用户"这次的判重建立在猜测上"，也不能自己收窄
+	// 判据（M105 要的前置条件就是"确证不敏感"才放宽）。这个数是那条前置条件的载体。
+	//
+	// ★ 读它的人要知道它**不数**什么：单根一趟不发起探测（C1，见 dedupeRoots 注释），
+	// 所以本数为 0 只表示"本轮判重没用到卷语义"，不表示"该卷已实测"。
+	// 与 SkippedCloudFiles 同族：独立计数、不记 Failed（退默认不是失败，是一次有据的兜底）。
+	CaseProbeUnproven int
 	// UnprotectedRoots 是"因为用户显式指定了它，所以保护对它失效"的根路径。
 	// 界面必须据此警示（M8）：这些根扫出来的东西可能全是系统元数据，
 	// 也可能是用户唯一真正想扫的——两种情况下他都该知道自己脱离了保护范围。
@@ -128,7 +139,7 @@ type Waiter interface {
 }
 
 // guard 系统保护清单。抽成包级变量供测试换装别的平台清单（与
-// probeCaseSensitive 同一手法）：盘根伪文件与 Windows 保留名只在 Windows 清单里，
+// probeCaseVerdict 同一手法）：盘根伪文件与 Windows 保留名只在 Windows 清单里，
 // 不能注入就永远只能在 Windows 上才有断言机会，而那是"等于没测"。
 var guard = sysguard.New(sysguard.Current)
 
@@ -137,9 +148,14 @@ var guard = sysguard.New(sysguard.Current)
 // 不能注入就等于把"顺序对不对""计数准不准"这两件真正可测的事留白。
 var cloudCheck = cloudfile.Of
 
-// probeCaseSensitive 按卷探测入口；抽成变量供测试扮演敏感/不敏感卷
+// probeCaseVerdict 按卷探测入口；抽成变量供测试扮演敏感/不敏感卷
 // （真实大小写敏感卷需要专门格式化的卷，本机与 CI 都无法现造）。
-var probeCaseSensitive = fscase.Sensitive
+//
+// ★ M62+M85：返回三态 Result 而不是 bool。这里曾经是一条 bool 缝（probeCaseSensitive
+// = fscase.Sensitive），换成一条缝出两份读数是**必要**的而不是顺手美化：
+// 判重要用 Sensitive，而"这格是不是猜的"（Proven）要计入 CaseProbeUnproven，
+// 两条缝各问一次会让测试能注入互相矛盾的读数（一边说不敏感、一边说没实测）。
+var probeCaseVerdict = fscase.Verdict
 
 // visitKey 遍历期的比较键（M36，设计稿 §10.1）：**只归一分隔符，不做大小写折叠**。
 //
@@ -209,7 +225,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		f = &model.Filters{}
 	}
 	res := &Result{}
-	cleaned, all := dedupeRoots(roots)
+	cleaned, all, unproven := dedupeRoots(roots)
+	res.CaseProbeUnproven = unproven
 	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
 	prefixes := rootPrefixes(cleaned)
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
@@ -564,20 +581,25 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 }
 
 // dedupeRoots 规范化并剔除被其他根包含的子根（a 与 a/b 同扫时丢弃 a/b），
-// 返回保留的根，以及**去重前的全部规范化根**。
+// 返回保留的根，以及**去重前的全部规范化根**，外加本次问卷里"卷语义未经实测"的根数。
 //
 // 第二个返回值单独给出是 M6-P4 的逃逸判据要用：保护清单会把宽根的一条子树剪掉，
 // 此时"子根已被宽根覆盖"并不成立（宽根走不进受保护目录里面），被丢弃的子根
 // 仍须作为"用户显式指定过"的依据放行。
 //
+// 第三个返回值是 M62+M85 的计数口径（设计稿 §28.2 ①）：数的是**本函数实际问卷过**
+// 且结论来自平台默认的根，含随后被宽根覆盖而丢弃的子根（它的折叠键参与过排序与判重，
+// 猜错的读数已经生效）。单根提前 return 时它是 0 —— 那 0 说的是"本轮判重没用到卷语义"，
+// 不是"该卷已实测"，别拿它当后者用（C1 的取舍见下）。
+//
 // I2 + M36（2026-09-21）：判重前按各根所在卷的语义折叠——这里是折叠**唯一**的消费方
 // （遍历期一律不折，见 visitKey）：同一棵树的两种拼写只可能出现在**用户给的根**上。
-// 探测（probeCaseSensitive）因此只为这个合并服务。
+// 探测（probeCaseVerdict）因此只为这个合并服务。
 //
 // C1（2026-09-21）：单根不探测。理由**不是**"无从判重所以折叠无关紧要"（单根时这个
 // 函数确实没有可判之物，但真正让探测失去意义的是遍历键本来就不折叠，设计稿 §10.1），
 // 而是不给最常用的一条路（只选一个目录）平白往用户目录里写探测文件。
-func dedupeRoots(roots []string) ([]string, []string) {
+func dedupeRoots(roots []string) ([]string, []string, int) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -590,13 +612,19 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		out = append(out, filepath.Clean(abs))
 	}
 	if len(out) <= 1 {
-		return out, out
+		return out, out, 0
 	}
-	// M66（04 §6.11 SCN-4）：sens 必须在排序**之前**算——排序键要用它。探测与顺序无关，
+	// M66（04 §6.11 SCN-4）：卷读数必须在排序**之前**算——排序键要用它。探测与顺序无关，
 	// 所以上移本身不改任何结论；单根提前 return 也保住了 C1（最常走的那条路不写探测文件）。
-	sens := make([]bool, len(out))
+	// ★ M62+M85：这一圈从 []bool 换成 []fscase.Result，是为了让"猜的"那一半顺着同一条腿
+	// 传下去，不再另起一条探测调用（两条缝各问一次 = 测试可注入互相矛盾的读数）。
+	verdicts := make([]fscase.Result, len(out))
+	unproven := 0
 	for i, r := range out {
-		sens[i] = probeCaseSensitive(r)
+		verdicts[i] = probeCaseVerdict(r)
+		if !verdicts[i].Proven {
+			unproven++
+		}
 	}
 	// M66：入集顺序按**折叠后的串**排。修前这里排原样串，而判重按折叠串 ⇒
 	// 'B'(0x42) < 'b'(0x62) 让子根 "/data/B/A" 抢在宽根 "/data/b" 之前入 kept，
@@ -608,7 +636,7 @@ func dedupeRoots(roots []string) ([]string, []string) {
 	// 根数量为个位数，多余的这次折叠不构成热路径。
 	fkeys := make([]string, len(out))
 	for i, r := range out {
-		fkeys[i] = fscase.Fold(r, sens[i])
+		fkeys[i] = fscase.Fold(r, verdicts[i].Sensitive)
 	}
 	order := make([]int, len(out))
 	for i := range order {
@@ -622,14 +650,14 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		return out[ia] < out[ib] // 同折叠键（同物两拼写）时按原样串定序，保住确定性
 	})
 	sortedPaths := make([]string, len(out))
-	sortedSens := make([]bool, len(out))
+	sortedVerdicts := make([]fscase.Result, len(out))
 	for pos, i := range order {
 		sortedPaths[pos] = out[i]
-		sortedSens[pos] = sens[i]
+		sortedVerdicts[pos] = verdicts[i]
 	}
-	out, sens = sortedPaths, sortedSens
+	out, verdicts = sortedPaths, sortedVerdicts
 	var kept []string
-	var keepSens []bool
+	var keepVerdicts []fscase.Result
 	for i, r := range out {
 		dup := false
 		// M26：比较键的归一在 fscase.Fold 的替换腿里完成，前缀判定走 pathnorm.Under，
@@ -642,10 +670,10 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		// 两条平台上都是空操作（M64 取证 §16.0-1）。别"补回来"。
 		// ★ M63 顺带修掉的一格：改前 unix 上 Fold 折 "\"、visitKey 不折，两套键对
 		// 含字面反斜杠的根名给出不同形状（本处只用 Fold，故当时未暴露）。
-		fr := fscase.Fold(r, sens[i])
+		fr := fscase.Fold(r, verdicts[i].Sensitive)
 		for j, k := range kept {
 			// k 是 r 的前缀目录（各按自身卷的语义折叠后比较）
-			fk := fscase.Fold(k, keepSens[j])
+			fk := fscase.Fold(k, keepVerdicts[j].Sensitive)
 			if pathnorm.Under(fr, fk) {
 				dup = true
 				break
@@ -653,10 +681,10 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		}
 		if !dup {
 			kept = append(kept, r)
-			keepSens = append(keepSens, sens[i])
+			keepVerdicts = append(keepVerdicts, verdicts[i])
 		}
 	}
-	return kept, out
+	return kept, out, unproven
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

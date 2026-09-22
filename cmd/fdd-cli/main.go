@@ -61,6 +61,10 @@ type report struct {
 		// 口径同 protected_files：命中不是失败，但必须看得见。判据是名字形态，
 		// 无法区分"我们的残留"与"用户恰好这样命名的文件"。
 		SkippedWorkTempFiles int `json:"skipped_work_temp_files"`
+		// CaseProbeUnproven（M62+M85）：本轮问卷过、但卷大小写语义取自平台默认的根数。
+		// 0 有两种成因（都确证 / 单根一趟按 C1 压根没问卷），别读成"这一卷实测过"；
+		// 完整口径见 scanner.Result.CaseProbeUnproven。
+		CaseProbeUnproven int `json:"case_probe_unproven"`
 		// M6-P2（2026-09-21）实占口径合计。reclaimable_bytes 保留逻辑口径不动
 		// （它是历史数字与既往报表的参照），实占另起一键，两数之差就是稀疏/
 		// 压缩文件此前被虚报的量。
@@ -169,6 +173,7 @@ func main() {
 	r.Stats.ProtectedFiles = int(p.ProtectedFiles())
 	r.Stats.SkippedCloudFiles = int(p.CloudSkipped())
 	r.Stats.SkippedWorkTempFiles = int(p.WorkTempSkipped())
+	r.Stats.CaseProbeUnproven = int(p.CaseProbeUnproven()) // M62+M85
 
 	var w io.Writer = os.Stdout
 	if *out != "" {

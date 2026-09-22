@@ -67,6 +67,17 @@ func (in probeInput) classify(isInternal func(device string) bool, rot func(moun
 	return rot(in.mount)
 }
 
+// FSTypeName 返回路径所在卷的文件系统类型名（statfs 的 f_fstypename，已小写，
+// 如 "apfs" / "msdos" / "smbfs"）；读不到时返回空串，调用方据此维持原行为。
+//
+// M85（2026-09-22 裁定「按卷型分岔」，设计稿 §28.2）要的就是这一个字段：探针写不进
+// 目录时（只读卷、无写权限），卷型本身可以是证据。★ 本包不解释这个名字意味着什么
+// ——"哪些卷天生不区分大小写"是 fscase 的判据，放这边会让介质探测替语义探测做决定。
+//
+// 复用 statfsInfo 而不是再调一次 syscall.Statfs：全仓那一次调用是这里（:74），
+// 多开一份就得连 NUL 截断的 cstr 一起再写一遍（I5）。
+func FSTypeName(path string) string { return statfsInfo(path).fsType }
+
 // statfsInfo 一次 statfs 取齐类型名 / 挂载点 / 设备名。
 // 失败时返回零值（fsType 为空），classify 会据此返回 Unknown。
 func statfsInfo(path string) probeInput {
