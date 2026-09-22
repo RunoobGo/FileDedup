@@ -621,9 +621,12 @@ func dedupeRoots(roots []string) ([]string, []string) {
 		// 两者都在 "/" 空间里，
 		// 与平台分隔符无关。修前这里写的是 fk+string(filepath.Separator)，
 		// 而 fr/fk 在 Windows 不敏感卷上是 "c:/a/b" 这种形态 ⇒ 该分支恒不成立。
-		// Fold 的替换腿已恒把 "\" 换成 "/"（见 fscase.Fold），故这里**不需要**再过
+		// Fold 的替换腿按**宿主**分隔符归一（M63，2026-09-22 裁定；改前无条件恒换 "\"），
+		// 与上面的 visitKey 同口径，故这里**不需要**再过
 		// 一次平台分隔符归一——收归前那句 keyOf(..., string(filepath.Separator)) 在
 		// 两条平台上都是空操作（M64 取证 §16.0-1）。别"补回来"。
+		// ★ M63 顺带修掉的一格：改前 unix 上 Fold 折 "\"、visitKey 不折，两套键对
+		// 含字面反斜杠的根名给出不同形状（本处只用 Fold，故当时未暴露）。
 		fr := fscase.Fold(r, sens[i])
 		for j, k := range kept {
 			// k 是 r 的前缀目录（各按自身卷的语义折叠后比较）

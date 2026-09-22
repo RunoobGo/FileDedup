@@ -139,24 +139,67 @@ func TestProbeGivesUpWithoutTouchingStrangers(t *testing.T) {
 // 的前缀判据直接吃 Fold 的输出——那条腿断了，Windows 上"同一棵树的两种拼写"
 // 就不再合并，同一目录走两遍，重复组数与可释放空间虚高。
 //
-// 这里锁的是**现状语义**，含 M63（FC-2）那条已知偏差：unix 上 "a\b" 是合法文件名，
-// Fold 仍按分隔符处理。将来若按 M63 改判据，本用例必须变红并在那里重新登记语义。
+// 2026-09-22 M63 裁定后本用例**收窄为「大小写腿平台无关」**（设计稿 §27.3）：
+// 分隔符腿改成按宿主平台注入，于是它不再能在任一主机上被同一组字面量钉住，
+// 改由 fold 的显式 sep 参数承担（Windows 腿传 "\\"、unix 腿传 "/"），
+// 宿主绑定那一格另见 TestFoldSeparatorLegFollowsHostPlatform。
+// 收窄不等于删断言：下面四格一条都没减，只是把「不吃宿主」这件事从 Fold
+// 挪到了 fold 的参数上。原第 157-161 行那条 FC-2 偏差钉（unix 上 Fold 仍折 "\"）
+// 随改判据作废，它钉住的正是本次裁定要修掉的错误语义。
 func TestFoldSwapLegIsPlatformIndependent(t *testing.T) {
 	// 不敏感卷：反斜杠形与斜杠形必须折成同一个键（大小写也一起折）。
-	if a, b := Fold(`C:\A\b`, false), Fold(`c:/a/B`, false); a != b {
+	if a, b := fold(`C:\A\b`, false, `\`), fold(`c:/a/B`, false, `\`); a != b {
 		t.Errorf("不敏感卷上两种拼写未折成同键：%q vs %q", a, b)
 	}
 	// 敏感卷：只换分隔符、不动大小写——替换腿与折叠腿是两件事，必须各自可钉。
-	if got, want := Fold(`C:\A\b`, true), `C:/A/b`; got != want {
-		t.Errorf("Fold(%q, true) = %q，want %q", `C:\A\b`, got, want)
+	if got, want := fold(`C:\A\b`, true, `\`), `C:/A/b`; got != want {
+		t.Errorf("fold(%q, true, %q) = %q，want %q", `C:\A\b`, `\`, got, want)
 	}
 	// 误伤面：敏感卷上大小写不同的两棵目录不得被折成同一棵（M36 的判据前提）。
-	if Fold(`C:\A\b`, true) == Fold(`C:\A\B`, true) {
+	if fold(`C:\A\b`, true, `\`) == fold(`C:\A\B`, true, `\`) {
 		t.Error("敏感卷上 A\\b 与 A\\B 被折成同键：一棵树会整棵静默不被扫描")
 	}
-	// ★ FC-2 偏差钉：本函数不吃宿主分隔符真值，在 unix 上照样把 "\" 当分隔符。
-	// 这是"跨平台清单必须任一 GOOS 都认 Windows 写法"的代价，登记在 M63。
-	if got, want := Fold(`a\b`, true), "a/b"; got != want {
-		t.Errorf("Fold(%q, true) = %q，want %q——替换腿不再平台无关（M63 若改判据请同时更新本用例）", `a\b`, got, want)
+	// ★ 大小写腿必须与 sep 取值无关：同一条输入换分隔符口径，大小写结论不变。
+	// 这一格才是本用例在 M63 之后真正要钉的"平台无关"。
+	if got, want := fold(`C:\A\b`, false, `/`), `c:\a\b`; got != want {
+		t.Errorf("fold(%q, false, %q) = %q，want %q：大小写腿被分隔符口径带跑了", `C:\A\b`, `/`, got, want)
+	}
+}
+
+// TestFoldSeparatorLegFollowsHostPlatform 正向钉住 M63 改后的判据：
+// Windows 折 "\"、非 Windows 不折，且 Fold 与按宿主分隔符注入的 fold 同源。
+//
+// 改前的 FC-2 偏差（unix 上 "a\b" 是合法文件名却被当结构）在这里第一次有钉子：
+// 上一用例的第四格只证明"大小写腿不受 sep 影响"，证明不了"Fold 到底取哪个 sep"。
+func TestFoldSeparatorLegFollowsHostPlatform(t *testing.T) {
+	// Windows 腿：反斜杠是结构。
+	if got, want := fold(`a\b`, true, `\`), "a/b"; got != want {
+		t.Errorf("fold(Windows) = %q，want %q", got, want)
+	}
+	// unix 腿：反斜杠是普通文件名字符，原样保留。
+	if got, want := fold(`a\b`, true, `/`), `a\b`; got != want {
+		t.Errorf("fold(unix) = %q，want %q：合法文件名里的反斜杠被当成结构（M63 回归）", got, want)
+	}
+	// 这一格是 M63 的全部代价：改前两者同键 ⇒ unix 上 "a\b" 那棵目录整棵静默不被扫描。
+	if fold(`a\b`, false, `/`) == fold(`a/b`, false, `/`) {
+		t.Error(`a\b 与 a/b 折成同键：本机上它们不是同一个目录`)
+	}
+	// 同源钉：Fold 就是「按宿主分隔符注入」那一版，不许各写一份判据。
+	for _, c := range []struct {
+		p string
+		s bool
+	}{
+		{`a\b`, true}, {`a\b`, false}, {`C:\A\b`, true}, {`C:\A\b`, false},
+		{`/data/B/A`, false}, {`plain/path`, true},
+	} {
+		if got, want := Fold(c.p, c.s), fold(c.p, c.s, string(filepath.Separator)); got != want {
+			t.Fatalf("Fold(%q, %v) = %q 与注入宿主分隔符的 %q 分叉", c.p, c.s, got, want)
+		}
+	}
+	// 宿主真值：非 Windows 上 Fold 必须保住字面反斜杠。
+	if filepath.Separator != '\\' {
+		if got, want := Fold(`a\b`, true), `a\b`; got != want {
+			t.Errorf("本机分隔符为 %q，Fold = %q，want %q", string(filepath.Separator), got, want)
+		}
 	}
 }

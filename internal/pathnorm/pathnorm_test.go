@@ -57,6 +57,9 @@ func TestSlashMatchesPlatformSepSemantics(t *testing.T) {
 // TestSlashBackslashLegMatchesOldThreeCopies 钉住：给字面 "\\" 时本函数与
 // fscase.Fold / filter.toSlashPat / sysguard.normalize 的替换腿逐字相同。
 // 这三份旧实现今天的行为一致性就是"零语义迁移"的全部内容。
+// ★ 2026-09-22 M63 后本句对 **fscase.Fold 已不成立**（它改注入宿主分隔符，见 §27.3）：
+// 上面那份 gold 仍等价于 sysguard/filter 那两处刻意保留的字面 "\"，对 Fold 只在
+// Windows 上等价。本用例不吃 Fold，所以断言不动；改的是这句"今天"的范围。
 func TestSlashBackslashLegMatchesOldThreeCopies(t *testing.T) {
 	for _, p := range slashCorpus {
 		got, want := Slash(p, `\`), goldSwapBackslash(p)

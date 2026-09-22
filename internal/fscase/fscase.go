@@ -28,18 +28,27 @@ import (
 )
 
 // Fold 归一化路径用于「同一目录/前缀」比较：按所在卷语义折叠大小写，
-// 并统一为 "/" 分隔（Windows 原生 "\" 与用户手写的 "/" 混用会漏匹配）。
+// 并把**本平台**的分隔符统一为 "/"。
 //
-// 分隔符那一半走 pathnorm（M64 收归：本仓曾有四份反斜杠转斜杠的实现）。这里给字面
-// "\" 而不是平台真值，是因为本函数的输入里两种分隔符都可能已有（用户手输 "/"、
-// 遍历给 "\"），键空间必须只有一个形状。
-// ★ 由此产生的已知偏差登记在 M63（FC-2）：unix 上 "a\b" 是合法文件名，这里仍按
+// 分隔符那一半走 pathnorm（M64 收归：本仓曾有四份反斜杠转斜杠的实现），
+// 注入的是平台真值 string(filepath.Separator)，与 visitKey 同一口径。
 //
-//	分隔符处理。本轮不改判据，只保证"要改只需改一处"。
+// ★ M63（FC-2）已于 2026-09-22 裁定改判据并实施（设计稿 §27.3）：改前这里给字面
+// "\"，理由是"输入里两种分隔符都可能已有，键空间必须只有一个形状"，代价是 unix 上
+// "a\b" 这个合法文件名被当成结构，两个不同目录折成同键 ⇒ 一棵整棵静默不被扫描。
+// 现在按平台取：Windows 仍折 "\"（用户手输 "/" 与遍历给的 "\" 混用那一格照旧覆盖），
+// unix 上 "\" 还原为普通文件名字符。pathnorm 包注释本来就写明这条口径
+// （"非 Windows 上 \\ 是合法文件名字符，不能当成结构"），此前只有 Fold 没跟上。
 //
-// 大小写折叠是本包自己的判据（按卷实测），不属于路径归一，保持就地。
+// 大小写折叠腿一字未动（按卷实测，本包自己的判据），仍与宿主平台无关。
 func Fold(p string, sensitive bool) string {
-	q := pathnorm.Slash(p, "\\")
+	return fold(p, sensitive, string(filepath.Separator))
+}
+
+// fold 是 Fold 的平台注入版：sep 传平台分隔符真值，使 Windows 腿与 unix 腿
+// 在任一主机上都能被断言（H6 手法，同 app.go 的 undoableReasonFor）。
+func fold(p string, sensitive bool, sep string) string {
+	q := pathnorm.Slash(p, sep)
 	if sensitive {
 		return q
 	}
