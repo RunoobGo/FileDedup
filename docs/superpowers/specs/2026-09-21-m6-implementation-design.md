@@ -4320,3 +4320,26 @@ under-file isNotExist=false ENOTDIR=true  EINVAL=false err=lstat .../payload126c
 三提交：① 本节设计段；② 实施（换夹具 + 变异自证）；③ 划账 §6.21 + 登记表新增 **M151** +
 两处过期坐标（`verdict_from_test.go:33` 实为 `:37`）就地更正 + CI 三条腿真读数。
 第 ③ 步之后按同一授权口径推送（用户本轮原话"完成后推送到 github 仓库"覆盖"CI 红了就修完再推"这一闭环）。
+
+### 25.8 实施期真读数与一处勘误（追记，2026-09-22）
+
+- **§25.1 那条 Windows 证据的行号写偏了 3 行**：真锚是 `syscall/syscall_windows.go:39-44`
+  （文档注释在 `:40`、`return nil, EINVAL` 在 `:44`），本节 §25.1 里写的 `:42-45` 是按实现体猜的。
+  ★ 同批把用例注释里的这一处也一起改对（`verdict_from_test.go:98`）。`os/stat_windows.go:29-32`
+  与 `syscall/syscall_windows.go:201-205` 两处当时就是真读数，未改。
+- **变异 M21-a 真读数**：`fscase.go:175` 退回 `return true, true` ⇒
+  `TestVerdictFromUnreadableUpperFallsBackToDefault` FAIL，红文逐字
+  "upper 读不动 ⇒ 必须退平台默认 false，实得确证值 true（… not a directory）"，
+  落点 `verdict_from_test.go:127`（= 预测的那一格，不是"整包红了"充数）；还原后 `git diff` 干净。
+- **负控制 N-1（只留 NUL 候选）**：PASS，`t.Logf` 形状位报 `embedded-NUL`
+  （`lstat …payload126c.txt<NUL>x: invalid argument`）⇒ Windows 腿那条路有本机近似读数。
+- **负控制 N-2（两格都换成从未创建的名字）**：FAIL 且逐条打印两格实测错误
+  （"… no such file or directory ⇒ 落 ENOENT 那一格，不合格"）⇒ 前提造不出时硬红，无 Skip 逃逸口。
+- **门禁两次**：`/tmp/gates_r4_impl.log`、`/tmp/gates_r4_impl_2.log` 同为
+  `rows=15 PASS=14 SKIP=1 FAIL=0`；第二次是补跑（第一次之后把新加的两处 Go 字符串字面量
+  从 `\"…\"` 换成「」，与全仓 478:66 的主流写法对齐）。
+- **计数通道复算**：全仓 `^func Test` = **718**（未动）、`internal/fscase` = **12 条 / 2 文件**
+  （`fscase_test.go` 7 + `verdict_from_test.go` 5）；本文件 SKIP 仍一条，`t.Skip(` 现读 `:39`
+  （原 `:37`，本批 `fmt`/`strings` 两个 import 推下去两行 ⇒ §6.21 五那两处过期坐标改认锚点）。
+- **本批未扩面清单照 §25.5 执行**：产品码 `git diff` 只余 `verdict_from_test.go` 一个文件；
+  Windows 腿的兑现仍挂在 CI 复跑上（§25.4 末行写的"近似"就是这件事，不得读成已验）。
