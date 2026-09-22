@@ -191,8 +191,21 @@ func TestRelativeToEquivalence(t *testing.T) {
 	)
 	for _, full := range cases {
 		want := naiveRelativeTo(roots, full)
-		if got := relativeTo(prefixes, full); got != want {
+		got, gi := relativeTo(prefixes, full)
+		if got != want {
 			t.Fatalf("relativeTo(%q) = %q, want %q", full, got, want)
+		}
+		// M105 新增的第二个返回值：这里**不**重新推一遍"第一个命中的前缀"（那与实现同义
+		// 反复、测不出东西），只做交叉验证 —— rel 与 idx 必须**成对可信**，因为调用点拿
+		// idx 去取该根的卷语义，错位比不给 idx 更糟（把 A 卷的读数按到 B 卷的根上）。
+		if gi < 0 {
+			if got != filepath.Base(full) {
+				t.Fatalf("relativeTo(%q) 报 idx=-1 却给不出兜底的 Base：rel=%q", full, got)
+			}
+			continue
+		}
+		if !strings.HasPrefix(full, prefixes[gi]) || got != full[len(prefixes[gi]):] {
+			t.Fatalf("relativeTo(%q) 的 rel/idx 不成对：idx=%d prefix=%q rel=%q", full, gi, prefixes[gi], got)
 		}
 	}
 }
@@ -205,10 +218,10 @@ func TestRelativeToNoAllocs(t *testing.T) {
 	roots := nativePaths("/a", "/b", "/c", "/d", "/e")
 	prefixes := rootPrefixes(roots)
 	full := filepath.FromSlash("/e/deep/nested/dir/file.bin")
-	if got := filepath.ToSlash(relativeTo(prefixes, full)); got != "deep/nested/dir/file.bin" {
+	if got, _ := relativeTo(prefixes, full); filepath.ToSlash(got) != "deep/nested/dir/file.bin" {
 		t.Fatalf("rel = %q", got)
 	}
-	if n := testing.AllocsPerRun(200, func() { _ = relativeTo(prefixes, full) }); n != 0 {
+	if n := testing.AllocsPerRun(200, func() { _, _ = relativeTo(prefixes, full) }); n != 0 {
 		t.Fatalf("relativeTo 每次分配 %.1f 次，期望 0（G2 未生效）", n)
 	}
 	naive := testing.AllocsPerRun(200, func() {
@@ -224,7 +237,7 @@ func BenchmarkRelativeTo(b *testing.B) {
 	b.Run("Precomputed", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = relativeTo(prefixes, full)
+			_, _ = relativeTo(prefixes, full)
 		}
 	})
 	b.Run("NaiveConcat", func(b *testing.B) {

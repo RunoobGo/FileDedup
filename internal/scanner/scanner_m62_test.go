@@ -9,7 +9,8 @@ package scanner
 //
 // ★ 口径钉死在三格，缺一格就是假账：
 //   - 只数**问卷过的**根（dedupeRoots 里那个 sens 圈），同一根只计一次；
-//   - 单根一趟 C1 不探测 ⇒ 这里必须是 0，而这个 0 的含义是"本轮判重没用到卷语义"，
+//   - 无消费方时不探测 ⇒ 那里必须是 0（判重需要 ≥2 根；排除模式那条消费方是 M105 接上的，
+//     见下面的口径收窄说明），而这个 0 的含义是"本轮没有需要卷语义的根"，
 //     **不是**"该卷已实测"（下面第 4 格把这条边界钉住，免得将来有人拿它当后者用）；
 //   - 被宽根覆盖而丢弃的子根照样计：它的折叠键参与过排序与判重，猜错的读数已经生效。
 //
@@ -75,7 +76,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 		"beta":  defaultedResult(),
 		"gamma": defaultedResult(),
 	})
-	kept, _, unproven := dedupeRoots(roots)
+	kept, _, unproven, _ := dedupeRoots(roots, false)
 	if len(kept) != 3 {
 		t.Fatalf("三棵互不包含的根应全保留，实得 %d：%v", len(kept), kept)
 	}
@@ -90,7 +91,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 	stubVerdict(t, map[string]fscase.Result{
 		"alpha": provenSensitive(), "beta": provenSensitive(), "gamma": provenInsensitive(),
 	})
-	if _, _, unproven := dedupeRoots(roots); unproven != 0 {
+	if _, _, unproven, _ := dedupeRoots(roots, false); unproven != 0 {
 		t.Fatalf("全部确证 ⇒ 应为 0，实得 %d", unproven)
 	}
 
@@ -105,7 +106,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 		filepath.Base(base): defaultedResult(),
 		"sub":               defaultedResult(),
 	})
-	kept, _, unproven = dedupeRoots(nested)
+	kept, _, unproven, _ = dedupeRoots(nested, false)
 	if len(kept) != 1 {
 		t.Fatalf("子根应被宽根覆盖而丢弃，实得 kept=%v", kept)
 	}
@@ -129,19 +130,25 @@ func TestWalkReportsUnprovenVerdictCount(t *testing.T) {
 	}
 }
 
-// TestSingleRootDoesNotAskAndCountsZero 钉住 C1 那条边界在计数上的含义。
-// 单根一趟探测一次都不发起（这是 C1 的原意：不给最常用的那条路往用户目录写探测文件），
-// 于是本数只能是 0 —— 而 0 说的是"本轮判重没用到卷语义"，不是"这卷已实测"。
-// 将来若有人让单根也问卷（M105 就是一条真实的诱因），这一格的 calls==0 会先红，
-// 那正是逼他回来改这条口径的时刻，而不是让计数悄悄换个含义。
-func TestSingleRootDoesNotAskAndCountsZero(t *testing.T) {
+// TestSingleRootWithoutExcludesDoesNotAskAndCountsZero 钉住 C1 那条边界在计数上的含义。
+// 单根且**没有排除模式**时一趟探测都不发起（这是 C1 的原意：不给最常用的那条路往用户
+// 目录写探测文件），于是本数只能是 0 —— 而 0 说的是"本轮没有消费方需要卷语义"，
+// **不是**"这卷已实测"。
+//
+// ★ 2026-09-22 的适用范围收窄（M105，设计稿 §28.3 补记二）：本用例原来叫
+// TestSingleRootDoesNotAskAndCountsZero、钉的是"单根一律不探测"。M105 正是本文件注释
+// 预先点名的那个诱因（"将来若有人让单根也问卷……这一格会先红，逼他回来改口径"），
+// 红过之后按预定程序把口径改成"**无排除模式**才不探测"：有排除模式时不探测就没有卷
+// 语义读数，单根用户的排除永远不放宽，fail-open 那一格在最常见形态上原样留着。
+// 反向那一格（有排除模式 ⇒ 恰好探测一次）在 scanner_m105_test.go，两格合起来才是新口径。
+func TestSingleRootWithoutExcludesDoesNotAskAndCountsZero(t *testing.T) {
 	roots := siblingRoots(t)
 	calls := stubVerdict(t, map[string]fscase.Result{"alpha": defaultedResult()})
-	_, _, unproven := dedupeRoots(roots[:1])
+	_, _, unproven, _ := dedupeRoots(roots[:1], false)
 	if n := calls.Load(); n != 0 {
-		t.Fatalf("单根不得发起卷探测（C1）：实得 %d 次", n)
+		t.Fatalf("单根且无排除模式不得发起卷探测（C1）：实得 %d 次", n)
 	}
 	if unproven != 0 {
-		t.Fatalf("单根未问卷 ⇒ 计数应为 0（含义见本用例注释），实得 %d", unproven)
+		t.Fatalf("未问卷 ⇒ 计数应为 0（含义见本用例注释），实得 %d", unproven)
 	}
 }

@@ -109,7 +109,7 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	}
 
 	sens(false)
-	kept, _, _ := dedupeRoots(variants)
+	kept, _, _, _ := dedupeRoots(variants, false)
 	if len(kept) != 1 {
 		t.Fatalf("探测说不敏感时保留根数 = %d, want 1（两根应被并成一棵）：%v", len(kept), kept)
 	}
@@ -118,7 +118,7 @@ func TestDedupeRootsFoldsByProbedVolume(t *testing.T) {
 	}
 
 	sens(true)
-	kept, _, _ = dedupeRoots(variants)
+	kept, _, _, _ = dedupeRoots(variants, false)
 	if len(kept) != 2 {
 		t.Fatalf("探测说敏感时保留根数 = %d, want 2（两棵子树各自入列，修正前被折叠成一棵）：%v",
 			len(kept), kept)

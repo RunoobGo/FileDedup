@@ -35,7 +35,7 @@ func TestExtSetNormalizesMissingDot(t *testing.T) {
 	}
 	for _, c := range cases {
 		f := &model.Filters{ExcludeExts: c.list, IncludeHidden: true}
-		if got := Compile(f).Apply(c.input, c.input, 10); got != c.want {
+		if got := Compile(f).Apply(c.input, c.input, 10, unproven); got != c.want {
 			t.Errorf("%s：Apply(%q) = %v, want %v（排除列表 %q）", c.name, c.input, got, c.want, c.list)
 		}
 	}
@@ -44,10 +44,10 @@ func TestExtSetNormalizesMissingDot(t *testing.T) {
 func TestExtSetNormalizesIncludeList(t *testing.T) {
 	f := &model.Filters{IncludeExts: []string{"jpg"}, IncludeHidden: true}
 	m := Compile(f)
-	if !m.Apply("a.jpg", "a.jpg", 10) {
+	if !m.Apply("a.jpg", "a.jpg", 10, unproven) {
 		t.Error("包含列表归一后必须仍能放行 .jpg")
 	}
-	if m.Apply("a.png", "a.png", 10) {
+	if m.Apply("a.png", "a.png", 10, unproven) {
 		t.Error("包含列表外的一条必须仍被排除（归一不得放宽判定）")
 	}
 }
@@ -59,7 +59,7 @@ func TestExtSetBlankEntriesAreInactive(t *testing.T) {
 	if !m.incExt.inactive() {
 		t.Error("空白项应视为未配置（inactive），否则包含列表会把全部文件挡掉")
 	}
-	if !m.Apply("a.jpg", "a.jpg", 10) {
+	if !m.Apply("a.jpg", "a.jpg", 10, unproven) {
 		t.Error("未配置包含列表时必须放行任意扩展名")
 	}
 }
@@ -68,10 +68,10 @@ func TestExtSetBlankEntriesAreInactive(t *testing.T) {
 func TestExtSetDoesNotMatchInnerDots(t *testing.T) {
 	f := &model.Filters{ExcludeExts: []string{"gz"}, IncludeHidden: true}
 	m := Compile(f)
-	if m.Apply("archive.tar.gz", "archive.tar.gz", 10) {
+	if m.Apply("archive.tar.gz", "archive.tar.gz", 10, unproven) {
 		t.Error(".tar.gz 的末段是 .gz，应当被排除")
 	}
-	if !m.Apply("archive.tar.bz2", "archive.tar.bz2", 10) {
+	if !m.Apply("archive.tar.bz2", "archive.tar.bz2", 10, unproven) {
 		t.Error("模式 gz 不得匹配 .bz2（归一不得放宽成子串匹配）")
 	}
 }

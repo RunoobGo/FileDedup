@@ -37,7 +37,7 @@ func TestRootPrefixesDoNotDoubleSeparator(t *testing.T) {
 			t.Errorf("rootPrefixes(%q) = %q, want %q", c.root, got, c.want)
 		}
 	}
-	if got := relativeTo(rootPrefixes([]string{sep}), sep+"a/b/c.txt"); got != "a/b/c.txt" {
+	if got, _ := relativeTo(rootPrefixes([]string{sep}), sep+"a/b/c.txt"); got != "a/b/c.txt" {
 		t.Fatalf("盘根下的 relativeTo = %q, want %q："+
 			"落到 filepath.Base 兜底 ⇒ 任何含 %q 的 ExcludePaths 静默失效（§15.0-A SCN-3）",
 			got, "a/b/c.txt", "/")

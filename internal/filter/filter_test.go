@@ -38,7 +38,7 @@ func TestApply(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := Compile(c.f).Apply(c.file, c.rel, c.size); got != c.want {
+			if got := Compile(c.f).Apply(c.file, c.rel, c.size, unproven); got != c.want {
 				t.Fatalf("Apply(%q) = %v, want %v", c.file, got, c.want)
 			}
 		})
@@ -119,15 +119,15 @@ func TestExtMatchNoAllocs(t *testing.T) {
 	}
 	long = append(long, ".jpg")
 	m := Compile(&model.Filters{ExcludeExts: long})
-	if m.Apply("p.jpg", "p.jpg", 10) {
+	if m.Apply("p.jpg", "p.jpg", 10, unproven) {
 		t.Fatal("应被 ExcludeExts 命中而跳过")
 	}
-	if n := testing.AllocsPerRun(200, func() { _ = m.Apply("p.jpg", "p.jpg", 10) }); n != 0 {
+	if n := testing.AllocsPerRun(200, func() { _ = m.Apply("p.jpg", "p.jpg", 10, unproven) }); n != 0 {
 		t.Fatalf("长列表 Apply 每次分配 %.1f 次，期望 0", n)
 	}
 	// 短列表分支同样零分配
 	sm := Compile(&model.Filters{ExcludeExts: []string{".tmp", ".log", ".jpg"}})
-	if n := testing.AllocsPerRun(200, func() { _ = sm.Apply("p.jpg", "p.jpg", 10) }); n != 0 {
+	if n := testing.AllocsPerRun(200, func() { _ = sm.Apply("p.jpg", "p.jpg", 10, unproven) }); n != 0 {
 		t.Fatalf("短列表 Apply 每次分配 %.1f 次，期望 0", n)
 	}
 }
@@ -199,26 +199,26 @@ func TestPrunable(t *testing.T) {
 
 func TestExcludeDirSemantics(t *testing.T) {
 	m := Compile(&model.Filters{ExcludePaths: []string{"node_modules", "build/**", "*/keep"}})
-	if !m.ExcludeDir("x/node_modules", "node_modules") {
+	if !m.ExcludeDir("x/node_modules", "node_modules", unproven) {
 		t.Error("段模式应剪枝")
 	}
 	// 既有 matchPath 语义：前缀式按「相对扫描根」的路径匹配，不含祖先段
-	if !m.ExcludeDir("build", "build") {
+	if !m.ExcludeDir("build", "build", unproven) {
 		t.Error("前缀式 build/** 应剪枝根下的 build 目录")
 	}
-	if m.ExcludeDir("src/build", "build") {
+	if m.ExcludeDir("src/build", "build", unproven) {
 		t.Error("build/** 按既有语义不匹配 src/build（不得额外扩大范围）")
 	}
 	// "*/keep" 匹配目录 */keep 自身，但剪枝不安全 → 必须拒绝剪枝（退回文件级）
-	if m.ExcludeDir("a/keep", "keep") {
+	if m.ExcludeDir("a/keep", "keep", unproven) {
 		t.Error("通配在中间的模式不得用于目录剪枝")
 	}
-	if m.ExcludeDir("docs", "docs") {
+	if m.ExcludeDir("docs", "docs", unproven) {
 		t.Error("未命中的目录不应剪枝")
 	}
 	// nil matcher 恒不剪枝
 	var nilM *Matcher
-	if nilM.ExcludeDir("a", "a") {
+	if nilM.ExcludeDir("a", "a", unproven) {
 		t.Error("nil matcher 应不剪枝")
 	}
 }
@@ -269,9 +269,15 @@ func TestMatchPathStarVsDoubleStar(t *testing.T) {
 		{"单层 * 不跨段", "a/*", "a/x", true},
 		{"单层 * 不跨段-深层", "a/*", "a/x/y", false},
 	}
-	for _, c := range cases {
-		if got := matchPath(c.pat, c.rel, "f.o"); got != c.want {
-			t.Errorf("matchPath(%q, %q) = %v, want %v (%s)", c.pat, c.rel, got, c.want, c.name)
+	for _, insensitive := range []bool{false, true} {
+		// M105 补强：同一张表在放宽腿下必须给出**完全相同**的结果 —— 上面这些条目本来就
+		// 全是小写，ToLower 是恒等映射，所以两趟一旦分叉，坏的一定是"放宽顺手改掉了
+		// C2 的单层/段边界/递归语义"（那是第二份实现的典型症状），而不是本表。
+		// ★ 这不是把判据改松：false 那一趟就是改前那条腿。
+		for _, c := range cases {
+			if got := matchPath(c.pat, c.rel, "f.o", insensitive); got != c.want {
+				t.Errorf("matchPath(%q, %q, insensitive=%v) = %v, want %v (%s)", c.pat, c.rel, insensitive, got, c.want, c.name)
+			}
 		}
 	}
 }
@@ -279,13 +285,13 @@ func TestMatchPathStarVsDoubleStar(t *testing.T) {
 // TestExcludeDirC2 剪枝行为端到端：单 * 不剪枝（退回文件级），** 剪枝。
 func TestExcludeDirC2(t *testing.T) {
 	m := Compile(&model.Filters{ExcludePaths: []string{"a/b/*", "c/d/**", "a/**/b"}})
-	if m.ExcludeDir("a/b/c", "c") {
+	if m.ExcludeDir("a/b/c", "c", unproven) {
 		t.Error("尾随单 * 的命中目录不得剪枝（否则误删 a/b/c/d）")
 	}
-	if !m.ExcludeDir("c/d/x", "x") {
+	if !m.ExcludeDir("c/d/x", "x", unproven) {
 		t.Error("尾部 ** 的命中目录应剪枝（后代必然命中）")
 	}
-	if m.ExcludeDir("a/x/b", "b") {
+	if m.ExcludeDir("a/x/b", "b", unproven) {
 		t.Error("中间 ** 的命中目录不得剪枝（后代不保证命中）")
 	}
 }
@@ -329,11 +335,11 @@ func TestNativeSeparatorsMatch(t *testing.T) {
 			dr  string
 		}{{"native", c.rel, c.dirRel}, {"slash", slashRel, slashDir}} {
 			m := Compile(&model.Filters{ExcludePaths: []string{c.pat}})
-			if got := m.Apply(name, sep.rel, 1<<20); got == c.want {
+			if got := m.Apply(name, sep.rel, 1<<20, unproven); got == c.want {
 				t.Errorf("%s[%s]: Apply(pat=%q, rel=%q) 排除=%v, want %v",
 					c.name, sep.tag, c.pat, sep.rel, !got, c.want)
 			}
-			if got := m.ExcludeDir(sep.dr, c.dir); got != c.prune {
+			if got := m.ExcludeDir(sep.dr, c.dir, unproven); got != c.prune {
 				t.Errorf("%s[%s]: ExcludeDir(%q, %q) = %v, want %v",
 					c.name, sep.tag, sep.dr, c.dir, got, c.prune)
 			}

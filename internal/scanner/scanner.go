@@ -122,8 +122,10 @@ type Result struct {
 	// 返回值上同形 ⇒ 上层既不能提醒用户"这次的判重建立在猜测上"，也不能自己收窄
 	// 判据（M105 要的前置条件就是"确证不敏感"才放宽）。这个数是那条前置条件的载体。
 	//
-	// ★ 读它的人要知道它**不数**什么：单根一趟不发起探测（C1，见 dedupeRoots 注释），
-	// 所以本数为 0 只表示"本轮判重没用到卷语义"，不表示"该卷已实测"。
+	// ★ 读它的人要知道它**不数**什么：探测只为**有消费方**的根发起 —— 判重需要（≥2 根）
+	// 或用户写了排除模式（M105 的按卷放宽）才探测；单根且无排除模式时一趟都不探测
+	// （C1 及其 M105 收窄，见 dedupeRoots 注释）。所以本数为 0 只表示"本轮没有需要卷语义
+	// 而探不到的根"，不表示"该卷已实测"。
 	// 与 SkippedCloudFiles 同族：独立计数、不记 Failed（退默认不是失败，是一次有据的兜底）。
 	CaseProbeUnproven int
 	// UnprotectedRoots 是"因为用户显式指定了它，所以保护对它失效"的根路径。
@@ -225,7 +227,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		f = &model.Filters{}
 	}
 	res := &Result{}
-	cleaned, all, unproven := dedupeRoots(roots)
+	// M105（设计稿 §28.3 补记二）：单根是否探测取决于**有没有排除模式**。判重（≥2 根）
+	// 那条消费方一直在；排除模式这条是这批新接上的，没有它时探测结果无人可读，
+	// C1 的"别往用户目录写探测文件"原口径继续成立。
+	cleaned, all, unproven, rootVerdicts := dedupeRoots(roots, len(f.ExcludePaths) > 0)
 	res.CaseProbeUnproven = unproven
 	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
 	prefixes := rootPrefixes(cleaned)
@@ -410,7 +415,10 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						// 排除 node_modules/.git 时仍会把整棵树走完再逐个过滤，
 						// 大目录场景下"排除"只省结果不省时间（实测遍历量不变）。
 						// 目录不参与扩展名/大小判定，故走 matchPath-only 的裁剪入口。
-						if matcher.ExcludeDir(relativeTo(prefixes, full), de.Name()) {
+						// M105：卷语义按**该目录所属根**给（与下面的文件级同一条读数），
+						// 否则不敏感卷上整棵剪枝腿跟不上文件腿，症状只解一半。
+						drel, dridx := relativeTo(prefixes, full)
+						if matcher.ExcludeDir(drel, de.Name(), verdictFor(rootVerdicts, dridx)) {
 							continue
 						}
 						key := visitKey(full)
@@ -469,8 +477,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					if vok {
 						tracking[idx].Observe(vid, rep, rok)
 					}
-					rel := relativeTo(prefixes, full)
-					if !matcher.Apply(de.Name(), rel, size) {
+					rel, ridx := relativeTo(prefixes, full)
+					if !matcher.Apply(de.Name(), rel, size, verdictFor(rootVerdicts, ridx)) {
 						continue
 					}
 					e := &model.FileEntry{
@@ -599,7 +607,15 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 // C1（2026-09-21）：单根不探测。理由**不是**"无从判重所以折叠无关紧要"（单根时这个
 // 函数确实没有可判之物，但真正让探测失去意义的是遍历键本来就不折叠，设计稿 §10.1），
 // 而是不给最常用的一条路（只选一个目录）平白往用户目录里写探测文件。
-func dedupeRoots(roots []string) ([]string, []string, int) {
+//
+// ★ C1 的 M105 收窄（设计稿 §28.3 补记二）：`probeSingleRoot` 由调用点按"有没有排除
+// 模式"给。有排除模式时不探测就没有卷语义读数 ⇒ 单根用户的排除永远不放宽，fail-open
+// 那一格（04 §6.11 FLT-3）在最常见形态上原样留着；无排除模式时探测结果没有任何消费方，
+// C1 的原口径继续成立。
+//
+// 第四个返回值 keepVerdicts 与 kept **同序**（不是与 all 同序）：调用点拿 relativeTo 的
+// 根下标去取，错位比不放宽更糟（把 A 卷的语义按到 B 卷的根上）。
+func dedupeRoots(roots []string, probeSingleRoot bool) ([]string, []string, int, []fscase.Result) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -611,11 +627,12 @@ func dedupeRoots(roots []string) ([]string, []string, int) {
 		}
 		out = append(out, filepath.Clean(abs))
 	}
-	if len(out) <= 1 {
-		return out, out, 0
+	if len(out) == 0 || (len(out) == 1 && !probeSingleRoot) {
+		return out, out, 0, nil
 	}
 	// M66（04 §6.11 SCN-4）：卷读数必须在排序**之前**算——排序键要用它。探测与顺序无关，
-	// 所以上移本身不改任何结论；单根提前 return 也保住了 C1（最常走的那条路不写探测文件）。
+	// 所以上移本身不改任何结论；单根只在 `probeSingleRoot` 为真时才走到这里（C1 的
+	// 最常走那条路不写探测文件，收窄理由见函数注释）。
 	// ★ M62+M85：这一圈从 []bool 换成 []fscase.Result，是为了让"猜的"那一半顺着同一条腿
 	// 传下去，不再另起一条探测调用（两条缝各问一次 = 测试可注入互相矛盾的读数）。
 	verdicts := make([]fscase.Result, len(out))
@@ -684,7 +701,7 @@ func dedupeRoots(roots []string) ([]string, []string, int) {
 			keepVerdicts = append(keepVerdicts, verdicts[i])
 		}
 	}
-	return kept, out, unproven
+	return kept, out, unproven, keepVerdicts
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。
@@ -709,14 +726,29 @@ func rootPrefixes(roots []string) []string {
 	return out
 }
 
-// relativeTo 计算 full 相对最近扫描根的路径（过滤 glob 用）。
+// relativeTo 计算 full 相对最近扫描根的路径（过滤 glob 用），并回该根的**下标**。
 // rootPrefixes 为 rootPrefixes() 的产物；len(rp) 恰为「根长（+ 必要时的一位分隔符）」，
 // 故用 full[len(rp):] 切片即可，无需再算偏移。
-func relativeTo(rootPrefixes []string, full string) string {
-	for _, rp := range rootPrefixes {
+//
+// 下标是 M105 要的：排除模式能否按"不分大小写"比对，取决于**该条目所属那根**所在卷的
+// 语义（设计稿 §28.3 补记二），混合根时一个全局读数两种错法都有。那条前缀循环本来就在
+// 找根，多返回一个下标零成本。兜底路径（没有任何根前缀命中）给 -1，由 verdictFor 折成
+// "未确证"。
+func relativeTo(rootPrefixes []string, full string) (string, int) {
+	for i, rp := range rootPrefixes {
 		if strings.HasPrefix(full, rp) {
-			return full[len(rp):]
+			return full[len(rp):], i
 		}
 	}
-	return filepath.Base(full)
+	return filepath.Base(full), -1
+}
+
+// verdictFor 取某根的卷语义读数。idx 为负（relativeTo 兜底）或越界时返回零值 Result，
+// 即 `Proven=false` ⇒ filter 不放宽。★ 方向与 M62 同一条：拿不准就不扩大排除范围，
+// 这里不许退成"顺手取最后一个/第一个根"，那是把别的卷的语义按到本条目上。
+func verdictFor(verdicts []fscase.Result, idx int) fscase.Result {
+	if idx < 0 || idx >= len(verdicts) {
+		return fscase.Result{}
+	}
+	return verdicts[idx]
 }

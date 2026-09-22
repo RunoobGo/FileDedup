@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"filededup/internal/fscase"
 	"filededup/internal/model"
 	"filededup/internal/pathnorm"
 )
@@ -135,9 +136,14 @@ func Compile(f *model.Filters) *Matcher {
 }
 
 // Apply 判断文件是否通过过滤器。
-// name 为文件名；rel 为相对扫描根的路径（用于路径 glob）。
+// name 为文件名；rel 为相对扫描根的路径（用于路径 glob）；size 为字节数。
 // 返回 false 表示跳过。
-func (m *Matcher) Apply(name, rel string, size uint64) bool {
+//
+// M105（2026-09-22 裁定「按卷敏感度过渡」）：caseMode 是**这条路径所属扫描根**的卷语义。
+// 只有 `Proven && !Sensitive`（FAT/exFAT/NTFS 这类确证不敏感卷）才把排除模式放宽成
+// 不分大小写；未确证与确证敏感都走改前那条腿，一字不差。放宽的方向是"多排除 = 少扫"，
+// 与 M62 的"少扫不错删"同向；反向（拿未确证当不敏感）才是事故。
+func (m *Matcher) Apply(name, rel string, size uint64, caseMode fscase.Result) bool {
 	if m == nil {
 		return true
 	}
@@ -163,15 +169,23 @@ func (m *Matcher) Apply(name, rel string, size uint64) bool {
 	}
 	// 路径排除 glob
 	if len(m.excPaths) > 0 {
+		insensitive := excludesRelaxed(caseMode)
 		// Windows 遍历给的是 "\" 分隔，统一后再比对（模式侧同一函数 ⇒ 两侧对称）
 		rel = pathnorm.Slash(rel, "\\")
 		for _, pat := range m.excPaths {
-			if matchPath(pat, rel, name) {
+			if matchPath(pat, rel, name, insensitive) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// excludesRelaxed 排除模式能否按"不分大小写"比对：**两个条件缺一不可**。
+// ★ 写成 `!caseMode.Sensitive` 单条件就是把"退默认"当"实测"（M62 反对的无声改判），
+// 判据格在 filter_m105_test.go 的「未确证卷上照旧区分大小写」那一格。
+func excludesRelaxed(caseMode fscase.Result) bool {
+	return caseMode.Proven && !caseMode.Sensitive
 }
 
 // ExcludeDir 判定目录是否可被安全剪枝（返回 true 表示不再深入遍历）。
@@ -183,16 +197,20 @@ func (m *Matcher) Apply(name, rel string, size uint64) bool {
 // 模式形态生效，见 prunable：含通配且含斜杠的模式（如 "*/build"）经 filepath.Match
 // 只匹配目录自身、不匹配其后代，按它剪枝会连带丢掉本该保留的文件（实测确认）。
 // 这类模式退回原有的文件级判定，遍历量不变但结果始终正确。
-func (m *Matcher) ExcludeDir(rel, name string) bool {
+//
+// caseMode 的口径与 Apply 同一条（M105）：两腿必须同判据，否则会出现"文件排了、
+// 整棵目录没排"的分裂读数。
+func (m *Matcher) ExcludeDir(rel, name string, caseMode fscase.Result) bool {
 	if m == nil {
 		return false
 	}
+	insensitive := excludesRelaxed(caseMode)
 	rel = pathnorm.Slash(rel, "\\")
 	for _, pat := range m.excPaths {
 		if !prunable(pat) {
 			continue
 		}
-		if matchPath(pat, rel, name) {
+		if matchPath(pat, rel, name, insensitive) {
 			return true
 		}
 	}
@@ -237,50 +255,71 @@ func prunable(pat string) bool {
 // I1：一律用 path.Match 而非 filepath.Match——后者在 Windows 上以 "\" 为分隔符，
 // "*" 会跨越 "/" 段，"单层"语义在三平台上各不相同。pat 与 rel 已在调用点归一为
 // "/" 分隔，故匹配结果与宿主平台无关。
-func matchPath(pat, rel, name string) bool {
+//
+// M105：insensitive=true（确证不敏感卷）时**四条腿一致**放宽。★ 漏掉字面前缀那条是本条
+// 最容易重演的 fail-open：`Cache/Sessions` 这种无通配前缀恰恰是用户最常写的排除形态，
+// 而它今天走 pathnorm.Under 而不是 path.Match。
+func matchPath(pat, rel, name string, insensitive bool) bool {
 	if pat == "" {
 		return false
 	}
 	if !strings.Contains(pat, "/") {
-		if ok, _ := path.Match(pat, name); ok {
+		if matchFold(pat, name, insensitive) {
 			return true
 		}
 		for _, seg := range strings.Split(rel, "/") {
 			if seg == "" {
 				continue
 			}
-			if ok, _ := path.Match(pat, seg); ok {
+			if matchFold(pat, seg, insensitive) {
 				return true
 			}
 		}
 		return false
 	}
 	if strings.Contains(pat, "**") {
-		return matchSegs(strings.Split(pat, "/"), strings.Split(rel, "/"))
+		return matchSegs(strings.Split(pat, "/"), strings.Split(rel, "/"), insensitive)
 	}
 	// 字面前缀式（无通配）：dir 或 dir/ 递归命中后代
 	if !strings.ContainsAny(pat, "*?[") {
 		prefix := strings.TrimSuffix(pat, "/")
-		if prefix != "" && pathnorm.Under(rel, prefix) {
+		if prefix != "" && pathnorm.Under(foldCase(rel, insensitive), foldCase(prefix, insensitive)) {
 			return true
 		}
 		return false
 	}
-	if ok, _ := path.Match(pat, rel); ok {
+	if matchFold(pat, rel, insensitive) {
 		return true
 	}
 	return false
 }
 
+// foldCase 是放宽的**唯一**大小写处理点（matchFold 与字面前缀腿共用，不留第二份）。
+// 用 strings.ToLower 而非 unicode/norm：不敏感卷的语义本就是"两种拼写同物"，极端
+// Unicode 字符上折不齐的后果是"少排除 = 多扫一遍"，不会多删。
+func foldCase(s string, insensitive bool) string {
+	if insensitive {
+		return strings.ToLower(s)
+	}
+	return s
+}
+
+// matchFold 是本包唯一允许出现 path.Match 的位置（P-1 型静态钉：filter_m105_test.go 的
+// TestPathMatchOnlyInsideMatchFold）。insensitive=false 时与改前逐字同一条路径。
+func matchFold(pat, s string, insensitive bool) bool {
+	ok, _ := path.Match(foldCase(pat, insensitive), foldCase(s, insensitive))
+	return ok
+}
+
 // matchSegs 段级 glob 匹配：pat/rel 已按 "/" 切段。** 匹配 0..n 个段
-// （递归），其余段交由 path.Match（* 不跨段）。回溯实现，段数有限无性能顾虑。
-func matchSegs(pat, rel []string) bool {
+// （递归），其余段交由 matchFold（* 不跨段）。回溯实现，段数有限无性能顾虑。
+func matchSegs(pat, rel []string, insensitive bool) bool {
 	if len(pat) == 0 {
 		return len(rel) == 0
 	}
 	if pat[0] == "**" {
 		for i := 0; i <= len(rel); i++ {
-			if matchSegs(pat[1:], rel[i:]) {
+			if matchSegs(pat[1:], rel[i:], insensitive) {
 				return true
 			}
 		}
@@ -289,8 +328,8 @@ func matchSegs(pat, rel []string) bool {
 	if len(rel) == 0 {
 		return false
 	}
-	if ok, _ := path.Match(pat[0], rel[0]); !ok {
+	if !matchFold(pat[0], rel[0], insensitive) {
 		return false
 	}
-	return matchSegs(pat[1:], rel[1:])
+	return matchSegs(pat[1:], rel[1:], insensitive)
 }
