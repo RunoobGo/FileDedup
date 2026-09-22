@@ -265,3 +265,22 @@ func TestUndoTouchedDestStillRestores(t *testing.T) {
 		t.Fatalf("回撤侧没清掉，盘上两份: %v", lerr)
 	}
 }
+
+// ---- 覆盖面：接线形状（守卫只在同卷那条改名之前，不许多接） ----
+
+// TestUndoSameVolumeGuardWiringCount 与 M91 的 TestM91DestructiveLegWiringCount 同族：
+// 逐条用例各测自己那一格，**没有任何一处**能读出「是不是漏了新腿 / 是不是多接了一道」。
+// 期望 1：restoreInPlace 里紧贴 renameFile 的那一道。跨卷回退分支用的是 AS-H4 那条
+// identityStill（参照物取在复制之前，是另一个时刻），不该被折进这一格。
+func TestUndoSameVolumeGuardWiringCount(t *testing.T) {
+	src, err := os.ReadFile("undo.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "identityCheck(it.DestPath, verID)"
+	if n := strings.Count(string(src), want); n != 1 {
+		t.Fatalf("同卷腿的身份复核接线处 = %d，期望 1（restoreInPlace 紧贴 renameFile）。\n"+
+			"多于 1：新腿需要复核 ⇒ 同时补用例并改掉本判据；\n"+
+			"0：这道复核掉了 ⇒ R2-1 的防线破口（设计段 §30.3）", n)
+	}
+}
