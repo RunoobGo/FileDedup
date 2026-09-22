@@ -4354,3 +4354,151 @@ under-file isNotExist=false ENOTDIR=true  EINVAL=false err=lstat .../payload126c
   本机不得声称已验"到此兑现**（兑现依据见 §6.21 七：该用例体内无 `t.Skip`，包级 `ok` 在这一条上等价于 PASS）。
 - **顺带拿到一条旧账的硬读数**：CI 的 linux runner 上 step 16 真跑（`OK: 跨卷软链接的 7 条核心判据全部成立`）
   ⇒ 本机第 15 行 `smoke-symlink rc=2 SKIP` 那一格"全仓有没有一条真跑的腿"= 有。M133 的**失败支**仍没被走过。
+
+## 26. 九条待裁定的裁定材料（取证批，2026-09-22；本批一条都不实施）
+
+### 26.0 方法：九条全部现开码重取，不沿用登记行原文
+
+登记行是 2026-09-21~22 分五批写下的，中间已经过 M64 收归、M19 占位、§6.17 夹具批、
+§6.20 三轮复审的改动 ⇒ 本轮逐条重开码取坐标与判据。**复核推翻四处登记表述**（逐条写在下面
+对应小节，标 ★）。这一节的存在理由：裁定的质量取决于现状是否属实，而"表里写了"不等于"码里是"。
+
+### 26.1 M82（FE-9）字节单位 —— ★ 现状比登记更糟，代价比登记更小
+
+- **登记原文**：`format.ts:5-10` 以 1024 计算却标 `KB/MB/GB`，手册用 KiB/MiB；"改单位会让现有
+  前端断言变红"。
+- **真读数**：全仓有**三份** 1024-based 的字节格式化器，分属**两派命名**：
+  1. `frontend/src/utils/format.ts:3` `humanBytes` ⇒ `KB/MB/GB`（`toFixed(1)`）
+  2. `cmd/fdd-cli/main.go:194` `humanBytes` ⇒ `KB/MB/GB`（`%.1f%cB`）
+  3. `internal/ops/recycle_policy.go:18` `humanSize` ⇒ **`KiB/MiB/GiB/TiB`**
+  手册 `docs/09*.md:113-141` 通篇 KiB/MiB/GiB ⇒ 派别 3 与手册一致，派别 1/2 与手册冲突。
+- ★ **登记说的那条代价不成立**：`frontend/tests/` 全目录内没有任何一条断言钉住 `humanBytes`
+  的输出单位串 —— 唯一涉及它的 `opdisplay.test.ts:71` 写的是 `raw.bytes === humanBytes(n)`（两边
+  同一个函数，自参照）；门禁 11 的 `test-frontend-logic.sh:86` 锚的是"ConfirmDialog 调了 humanBytes"
+  这件事，不锚输出。真正钉住单位串的断言在 Go 侧，且钉的是**对的那一派**：
+  `internal/ops/recycle_policy_test.go:357-359` 逐字 `"1.0 KiB"` / `"1.5 KiB"` / `"1.0 MiB"`。
+- **于是裁定题变成三选一**：
+  - **A（推荐）** 统一为二进制命名 `KiB/MiB/GiB`：改 `format.ts` + `fdd-cli/main.go` 两处**标签**，
+    数字一个不动（本来就算的 1024）。代价只有"用户看到 MiB 而不是 MB"。零断言需改。
+  - **B** 统一为十进制 `KB/MB/GB`（跟 Finder/资源管理器一致，用户最熟）：代价是**数字也变**
+    （1.0 MiB → 1.05 MB）、手册全篇要跟着改、`recycle_policy_test.go:357-359` 三条要改写
+    （属"改断言"，要走例外条款论证）。
+  - **C** 只改前端标签、不动 CLI：UI 与手册一致了，但 CLI 继续与两者矛盾。
+- **附带一问（同一处代码，不必另开 ID）**：Go 侧两份（`humanSize` 与 CLI `humanBytes`）要不要顺手
+  收归一份？跨 Go/TS 语言边界的三份收不了（M64 已确立"跨语言各留一份 + 静态比对器"）。
+
+### 26.2 M79（FE-6）"为什么不可回撤"的文案归谁 —— ★ 两份已逐字漂移，且前端注释引用了不存在的函数
+
+- **真读数**：后端 `app.go:1692 undoableReasonFor(kind, goos)`（`app.go:1682 undoableReason` 是本机
+  包装）有**两条生产出口**：`app.go:2164`、`:2308` —— 用户点「回撤」时被拒，返回的就是这句 error。
+  前端 `RecordsView.vue:69 noUndoTitle` 是**徽标 hover 的 title**，自己另写了一份。
+- ★ 两条文案**已经不一样了**（逐字对照）：后端"Windows 回收站操作不支持…请点上方「打开系统回收站」"，
+  前端"Windows 回收站不支持…请用「打开系统回收站」右键「还原」"。而 `RecordsView.vue:68` 的注释
+  写着"与后端 `undoableReason()`（app.go）保持同一口径" —— ★ 那个名字在 `undoableReasonFor`
+  拆层（APP-6）之后已不是导出入口的全称，注释引用的是一个**只剩包装语义的名字**。
+- **裁定题（三选一，都要动"判据归谁"）**：
+  - **A（登记修法）** 后端把 reason 文本随 `OpRecord` 下发：接口扩面 = `history/oplog.go:26` 附近加字段
+    + `frontend/wailsjs/go/models.ts` 重生成 + M30 类型比对器 + `RecordsView` 改为渲染。文案归后端一份。
+  - **B** 前端删掉本地文案，只在点击后显示后端 error：少一份实现，但徽标 hover 不再解释原因 = 体验倒退。
+  - **C（本轮新提法，改动面最小）** 明确分工：**判据归后端**（`undoable` 布尔）、**文案归前端**
+    （`noUndoTitle` 是唯一文案方），后端 `:2164/:2308` 改吐机器可读码由前端映射。不动接口、
+    不扩绑定点；代价是 11 处 `undoableReason*` 测试要重排，且 CLI/无前端场景丢文案。
+  - ★ 三条都不是"顺手就能改"的那一档 ⇒ 保持本批不动。
+
+### 26.3 M62（FC-1）+ M85（FC-1b）探测不了时倾向哪一侧 —— ★ 两条被点名的断言其实钉的是不同分支
+
+- **真读数**：兜底在 `internal/fscase/fscase.go:134 return Default()`（创建探针文件失败 ⇒ 只读卷/
+  无写权限/目录不存在）；`Default()` = build-tag 常量（`default_sensitive.go:7 true` /
+  `default_insensitive.go:7 false`，darwin+windows 为 false）。
+- ★ 登记说"修法还必然改两条既有断言（`fscase_test.go:57`、`:124`）"——**过宽**。两条钉的是不同分支：
+  - `:57`（`TestSensitiveFallsBackToDefaultWhenUnwritable`，函数在 `:47`）钉的是**不可写** ⇒ 退默认。
+    这正是 M85 危害的所在支。改"不可写 ⇒ 判敏感"只红这一条，且它属于**语义变更**（钉的就是要换掉的取向），
+    不是"改断言让门禁变绿"。
+  - `:124`（`TestProbeGivesUpWithoutTouchingStrangers`，函数在 `:118`）钉的是**重试用尽**（名字全被占）
+    ⇒ 退默认。这条与 M62 无关，任何修法下都**一字不动**。
+- **第三条腿（M85 自己给的）确实有地基**：`internal/media/probe_darwin.go:72 statfsInfo` 已在读
+  statfs 的类型名/挂载点/设备名（`networkFSTypes` 那张表），`internal/realbytes` 也留了 f_type 的
+  教训注释（"同一 f_type 换一个挂载实例就是另一份语义"）⇒ "按卷型推默认，而不是按平台推"在 darwin
+  可做，`probe_other.go` 说明非 darwin 目前一律 Unknown ⇒ 拿不到卷型的腿仍要一个兜底取向。
+- **裁定题**：A 探测不了 ⇒ 一律判敏感（登记修法，M85 危害落地）；B 一律判不敏感（现状，M62 危害
+  落地，方向是**少扫**不是错删）；C 采纳 M85 分岔：卷型已知（FAT/exFAT 天生不敏感）按卷型，
+  卷型未知按现状默认，另在 `Sensitive()` 上显式返回"无从判定"给上层计数。★ C 是唯一两条危害都收住的，
+  但它要新建一个三态出口，改动面比 A/B 大。
+
+### 26.4 M105（FLT-3）用户排除模式该不该区分大小写 —— 确认无任何既有口径
+
+- **真读数**：`internal/filter/filter.go:245`、`:252`、`:269` 三处 `path.Match`（大小写敏感），
+  `internal/sysguard/sysguard.go:109`、`:254` **两处** `strings.EqualFold`（登记只点了 `:109` 一处，
+  `:254` 是本轮补的）。
+- ★ 全仓再确认一遍：`model` 注释、手册 09、docs 里关于"排除模式大小写"的声明**确实为零**
+  （只有登记行自己在 04 `:2854`/`:2946` 提到它）⇒ 这不是"实现偏离文档"，是**文档欠一条口径**。
+- **危害方向要说准**：排除失败不是"多扫一点"那么轻 —— 被排除的目录一旦进了候选，用户下一步
+  确认执行就可能被合并/搬移。即"别碰这个目录"的意图被大小写挡掉。
+- **裁定题**：A 用户模式一律不敏感（对齐 sysguard 那两条腿，简单，但在真敏感卷上会**多挡**：
+  排除 `Temp` 会连 `TEMP`/`temp` 一起挡，把用户想扫的挡掉）；B 一律敏感（现状，`.gitignore` 惯例）；
+  C **按卷敏感度过渡**（与本产品"折叠判据按卷"的既有设计同构，最自洽，代价是 filter 要拿到
+  `fscase.Sensitive(dir)` ⇒ 判据穿透到遍历期）。
+
+### 26.5 M48（OPS-3）三处先查后用 —— ★ `claimExact` 对其中两处根本不适配
+
+- **真读数与函数归属**（登记没写函数名，本轮补上，避免下次再定位）：
+  - `undo.go:279` 区在 `undoHardlink`（函数 `:216-323`）：核验的是**已存在的我们自己那个硬链接**的
+    身份，随后 `:289 hardlinkRename(tmp, OrigPath)`。名字**被占着** ⇒ `claimExact` 只会返回 `ok=false`，
+    不适用。
+  - `undo.go:381-397` 区在 `undoSymlink`（函数 `:324-425`）：①`readlinkTarget` ②`Lstat(backup)` 后
+    `:402 os.Remove(OrigPath)` → 改名备份上位。这一处**可用**：Remove 之后槽位是空的，
+    接着 `claimExact(OrigPath)` 抢自己的槽，抢不到就说明第三方已落子 ⇒ 不再静默替换（现状是 replace）。
+  - `merge_guard.go:112-117 abandonForeignBackup`：`Lstat(dup)` 判空后 `hardlinkRename(backup, dup)`。
+    这一处**可直接套** undoTrash `:136` 已经写好的形状。
+- ⇒ **M48 实际是"两处可做 + 一处要换原语"**，不是登记说的"三处改走 claimExact"。那一处（undoHardlink）
+  要么接受"改名覆盖 + 残余窗口"并像 `undo.go:141-143` 那样把窗口写进注释，要么引入
+  "先原子改名腾位再复核"的新形状。
+- **程序性代价已被先例解决**：登记说"更正 §6.9.8 兑现边界 5 需裁定"，而该处（04 `:2101` "各自已有防线"）
+  要的是**加一条 dated 括注**——与 M64 交付时对 §6.9.9 M26 行做的更正同形（见 §6.12），
+  且约束本就允许"不改写原结论、加括注限定" ⇒ 这一条不构成需要用户裁决的障碍。
+
+### 26.6 M56（OPS-15）回撤落点契约 —— 现状：同一文件里两条腿取向不一致
+
+- **真读数**：`undoTrash` `undo.go:136-156` 已经是"先 `claimExact(OrigPath)`，抢不到就
+  `name.fdd-restored.ext` 另落"；`undoMove` `undo.go:197` 仍是 `MoveFile(DestPath, Dir(OrigPath))`
+  ⇒ 走重名递增（`photo_1.jpg`）。
+- ★ 这条对裁定有用：**"改走 `.fdd-restored`、与 undoTrash 同形"不再是引入第三种新约定**，
+  而是把一个函数里已有的两条腿补齐 —— 三个候选里它现在的实现代价最低。
+- 仍要裁的是语义：回撤成功后记录显示 `OrigPath`、盘上却是别的名字，这个偏差允许存在吗？
+  现有 `undo.go:204`（M113）已经把"两份并存 + 实际落点"回给上层 ⇒ 偏差至少是**可上报**的。
+
+### 26.7 M84（SCN-6b）遍历期双键 —— 纯改动面裁定，现状核实
+
+- `internal/scanner/scanner.go:28-33 dirQueue{ items []string }`（`:41 push(d string)`、`:49 pop() (string,bool)`）
+  ⇒ 队列元素确实还是 `string`。改成结构体要连带 `visited`、`rootsUnder`（`:169`）、剪枝与逃逸判据分叉。
+- 省事路线（emitted Path 直接换成真实路径）的代价上一批已实测：本机 `t.TempDir()` 全在
+  `/var` → `/private/var` 之下 ⇒ 数十条既有断言变红。**这条不是没测，是测出来贵**。
+
+### 26.8 M91（FSID-1）`(dev,ino)` 还号 —— ★ 修法 A 的调用点数字过期
+
+- **真读数**：`internal/fsid/fsid.go:43 func (a ID) SameIdentity(b ID) bool`，`:44-46` 任一侧未解析
+  即返回 true，`:47` 只比 `Dev`+`Ino`。合并入口两个：`ops/move.go:107 HardlinkMerge`、
+  `ops/symlink.go:53 SymlinkMerge`。
+- ★ 登记说 A 的代价是"`Merge` 签名与约 15 处调用点"。现跑真读数：**生产 2 处**
+  （`executor.go:682`、`:753`）+ **测试 44 处** = 46 处 ⇒ 数字要更正，但**结论方向不变**
+  （波及面比登记的更大，不是更小）。
+- 三选一的取向问题本轮没有新证据可加：A 内容级复核（多读一遍 dup）、B 隐藏硬锚点（新增必须清理的
+  名字、FAT/exFAT 不支持）、C Linux generation 号（APFS 不暴露，平台面变三份违 I5）。
+  ★ 本机不可复现这一点仍然成立（APFS 不还号）。
+
+### 26.9 M63（FC-2）与既有钉子的正面冲突 —— 现状核实
+
+- `internal/fscase/fscase.go:41-47 Fold(p, sensitive)` ⇒ `pathnorm.Slash(p, "\\")` **无条件**执行
+  （M64 收归后归一逻辑住在 pathnorm）⇒ 非 Windows 上 `a\b` 这个合法文件名里的 `\` 被当分隔符处理，
+  登记的现象仍为真。
+- 冲突对象仍在：`TestFoldSwapLegIsPlatformIndependent` 钉的正是"折叠腿刻意平台无关"。改 M63
+  必须先决定推翻那条钉子的哪一半（分隔符腿 vs 大小写腿），这是**上一批留下的裁定欠账**，
+  与九条同档 ⇒ 本轮一并提请，不自行选边。
+
+### 26.10 本批不做的事
+
+- **一条都不实施**：以上九条的取向都是产品/契约决定，登记时标"待裁定"的理由是"两条路各有真危害"
+  或"要动既有断言/接口"，本轮取证只把**代价算准**，不改判。
+- 取证产生的**四处更正**（§26.1 代价不成立、§26.3 两条断言不同分支、§26.5 claimExact 两处不适用一处可用、
+  §26.8 调用点 46 而非 15）属"现状描述"层面的更正，落在本设计段即可；是否同步回写 04 表行，
+  等裁定一起走三提交，避免同一行改两次。
