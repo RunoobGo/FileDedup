@@ -5795,3 +5795,52 @@ DeadlineExceeded 各一条。
 - 绿了以后，负控制两刀：① 把 `VerdictCtx` 的 select 换成"只等结论"（= 改前形状）⇒ cancel 那两条
   必须红在超时；② 删掉 `WalkWithGate` 里 `err != nil` 那道收口 ⇒ 扫描器那条必须红在
   "根集合不完整却照样扫出了文件"（`Visited > 0`）。
+
+**实施读数（本机 darwin/arm64，2026-09-23）**
+
+- **现状挂死的第一手读数**（临时取证文件 `internal/fscase/zztemp_current_test.go`，跑完即删、不进提交）：
+  装一个卡在 `fireProbeHook` 之后的探测，goroutine 里调 `Verdict(dir)`，随后 cancel ——
+  ```text
+  --- PASS: TestZZTempCurrentHangsOnCancel (2.00s)
+      zztemp_current_test.go:32: 现状读数：取消后 2s 内 Verdict 未返回（挂死在探测里），Scan 这条腿同形
+  ```
+  这条不是推断：`Verdict` 在取消之后仍然不返回，就是扫描停在 Scanning 的那格。
+- **RED（新 API 树上）**：`go test ./internal/fscase -run TestVerdict` →
+  `probe_ctx_test.go:66:13 / :171:16: undefined: VerdictCtx`，`[build failed]`。
+  挂死读数由上一条的现状树给出、由下面的 M28-a 复现，不由这条编译失败冒充。
+- **实现落地后**：`internal/fscase` 4 条新用例 + `internal/scanner` 3 条新用例全绿；
+  包内全量 `-count=1 -v` 逐条数到 fscase **22 PASS + 1 SKIP**（顶层用例 19 → 23）、
+  scanner **68 PASS + 3 SKIP**（68 → 71）。四条 SKIP 全是改前就在的平台条件格
+  （`TestVerdictFromUpperAbsentIsConfirmedSensitive` 与三处"大小写敏感卷"夹具——本机临时目录所在卷不敏感），
+  本批一条新增也没引入。
+- **变异四条**（`cp` 备份 + `cp` 还原 + `cmp` 自证，未用 `git checkout --`）：
+
+| 变异 | 形状 | 实测红 | 预测 |
+|---|---|---|---|
+| M28-a `dedupeRoots` 传 `context.Background()` 给探测 | 接线断开（= 改前形状） | `TestWalkWithGateAbortsPromptlyWhenProbeIsCancelled` 红在 3s 超时 | 一致 |
+| M28-b 删掉 `WalkWithGate` 的 `err != nil` 收口 | 带着没问全的折叠继续扫 | `TestWalkWithGateDoesNotScanWithIncompleteRoots`：`Visited=3 files=3` | 一致（这条是"不猜"那半句的实证） |
+| M28-c `VerdictCtx` 的 select 去掉 `<-ctx.Done()` 支 | fscase 侧不可中断 | `TestVerdictCtxAbortsBlockedProbe` + `TestVerdictCtxHonorsDeadline` 各红在 3s | 一致（两格分别钉 cancel 与 deadline） |
+| M28-d 取消那一支把 `defaulted()` 写进缓存 | 一次瞬时故障钉死整趟 | 同上两条红，但红在**缓存被钉**那两行断言（`{Sensitive:false Proven:false}`） | 一致（M126 的落点有独立钉子，不与 M28-c 混成一条） |
+
+- **实施期自己踩到的两格（不遮掩）**：
+  ① 扫描器那条"及时返回"的用例最初写成 `defer cancel()` —— 取消直到测试函数退出才发生，
+  于是它在**实现正确**的树上也红在 3s 超时。改成调用前显式 `cancel()`（现场取最早的那一格，
+  不用 sleep 碰运气）后才是真绿。红绿读数本身把它钉住了。
+  ② 批量换桩签名那段 python 脚本漏写了 `return` 关键字（三处）并弄丢了 m62 桩的参数名 `dir`，
+  由 `go vet` 当场抓到（`undefined: context` / 返回值个数不符）。机械改写测试不等于改写正确，
+  本批之后这类批量替换必须紧跟一次 `go vet`，已在提交前跑。
+- **回归**：`gofmt -l internal/ cmd/` 空、`go build ./...` 过、
+  `go vet ./...` × 3（darwin / GOOS=linux / GOOS=windows）全过、
+  `go test -race -count=2 ./internal/fscase ./internal/scanner ./internal/dedup` →
+  `ok 1.317s / 2.196s / 7.590s`。全量与根包 `-count=4` 随 B 批合跑（见 §30.5）。
+- **未兑现面（不许写成通过）**：
+  - **没有真死挂载实物**。"NFS 硬挂载 / 拔走的 SMB 上 syscall 永不返回"是这条腿的立项前提，
+    本机与 CI 都造不出来；测试证的是"探测观察 ctx、错误能让扫描收口"这个**形状**，
+    不是"某台真挂了 NFS 的机器上扫描能取消"。CI 三腿的绿灯不等于后者。
+  - 卡在内核态 syscall 里的那个 goroutine **本包救不了**，它要等该 syscall 自己返回或进程结束；
+    这条缝给的是"上层不再陪着等"。它留下的探测文件由 worktemp 的忽略规则兜住（M21 那一格）。
+  - ctx 只接到**扫描启动腿**。`fscase.Sensitive` 那三处二态调用方（`ops/keep.go:177/:234/:243`、
+    `cmd/benchgen`）与 app 层仍走不可中断的 `Verdict` —— 执行腿那一格是 Task B3（R2-3）的对象，
+    本条不冒称已覆盖。
+  - `VerdictCtx` 在 **Windows** 上未跑过（用例无平台假设：只依赖 ctx 与 goroutine，
+    以及"能进钩子"这一条平台无关的夹具）。

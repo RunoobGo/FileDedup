@@ -157,7 +157,11 @@ var cloudCheck = cloudfile.Of
 // = fscase.Sensitive），换成一条缝出两份读数是**必要**的而不是顺手美化：
 // 判重要用 Sensitive，而"这格是不是猜的"（Proven）要计入 CaseProbeUnproven，
 // 两条缝各问一次会让测试能注入互相矛盾的读数（一边说不敏感、一边说没实测）。
-var probeCaseVerdict = fscase.Verdict
+//
+// ★ R2-2（设计段 §30.4）：换成带 ctx 的 `fscase.VerdictCtx`。这一圈探测在 worker 启动
+// **之前**同步跑，探测不读 ctx 就等于"扫描启动腿不可取消"（死挂载上永久停在 Scanning）。
+// 缝多出来的那个 error 由 dedupeRoots 逐根检查，测试注入桩据此扮演"卡住后被松手的探测"。
+var probeCaseVerdict = fscase.VerdictCtx
 
 // visitKey 遍历期的比较键（M36，设计稿 §10.1）：**只归一分隔符，不做大小写折叠**。
 //
@@ -230,7 +234,15 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	// M105（设计稿 §28.3 补记二）：单根是否探测取决于**有没有排除模式**。判重（≥2 根）
 	// 那条消费方一直在；排除模式这条是这批新接上的，没有它时探测结果无人可读，
 	// C1 的"别往用户目录写探测文件"原口径继续成立。
-	cleaned, all, unproven, rootVerdicts := dedupeRoots(roots, len(f.ExcludePaths) > 0)
+	cleaned, all, unproven, rootVerdicts, err := dedupeRoots(ctx, roots, len(f.ExcludePaths) > 0)
+	if err != nil {
+		// R2-2：卷语义探测被中断 ⇒ 折叠判据没问全，**绝不**带着没问全的根集合继续扫
+		// （darwin/windows 的默认值是"不敏感"，在这里退默认等于把两棵真不同的树折成一棵，
+		// 后果是那棵整棵静默不被扫描、一条失败都不记）。
+		// 取消不是失败，不进 Failed（与 dedup/pipeline.go:351 那一支同口径：
+		// 由 ctx.Err() 收口成 StatusCancelled），也不在此处另造一种错误。
+		return res
+	}
 	res.CaseProbeUnproven = unproven
 	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
 	prefixes := rootPrefixes(cleaned)
@@ -615,7 +627,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 //
 // 第四个返回值 keepVerdicts 与 kept **同序**（不是与 all 同序）：调用点拿 relativeTo 的
 // 根下标去取，错位比不放宽更糟（把 A 卷的语义按到 B 卷的根上）。
-func dedupeRoots(roots []string, probeSingleRoot bool) ([]string, []string, int, []fscase.Result) {
+//
+// ★ R2-2（设计段 §30.4）第五个返回值：ctx 一到，探测立刻松手并把错误交出来。
+// 改前这一圈没有任何人读 ctx（`fscase.Verdict` 无 ctx 版本），而探测的三个 syscall 在
+// 死挂载上可以永远不返回 ⇒ 扫描停在 Scanning、Cancel 无效。错误**不**折成"退默认继续"：
+// darwin/windows 的默认值是"不敏感"（fscase/default_insensitive.go），在这里退默认就是把两棵
+// 真不同的树折成一棵（fscase 包注释 :5-8 写过两遍的那格静默漏扫）。
+func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]string, []string, int, []fscase.Result, error) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -628,7 +646,7 @@ func dedupeRoots(roots []string, probeSingleRoot bool) ([]string, []string, int,
 		out = append(out, filepath.Clean(abs))
 	}
 	if len(out) == 0 || (len(out) == 1 && !probeSingleRoot) {
-		return out, out, 0, nil
+		return out, out, 0, nil, nil
 	}
 	// M66（04 §6.11 SCN-4）：卷读数必须在排序**之前**算——排序键要用它。探测与顺序无关，
 	// 所以上移本身不改任何结论；单根只在 `probeSingleRoot` 为真时才走到这里（C1 的
@@ -638,7 +656,12 @@ func dedupeRoots(roots []string, probeSingleRoot bool) ([]string, []string, int,
 	verdicts := make([]fscase.Result, len(out))
 	unproven := 0
 	for i, r := range out {
-		verdicts[i] = probeCaseVerdict(r)
+		v, err := probeCaseVerdict(ctx, r)
+		if err != nil {
+			// 根集合已规范化（下面调用点仍拿得到它），但折叠判据没问全 ⇒ 不猜，直接交回错误。
+			return out, out, unproven, nil, err
+		}
+		verdicts[i] = v
 		if !verdicts[i].Proven {
 			unproven++
 		}
@@ -701,7 +724,7 @@ func dedupeRoots(roots []string, probeSingleRoot bool) ([]string, []string, int,
 			keepVerdicts = append(keepVerdicts, verdicts[i])
 		}
 	}
-	return kept, out, unproven, keepVerdicts
+	return kept, out, unproven, keepVerdicts, nil
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

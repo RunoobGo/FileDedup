@@ -33,19 +33,19 @@ func stubVerdict(t *testing.T, byBase map[string]fscase.Result) *atomic.Int32 {
 	t.Helper()
 	restoreProbeSeam(t)
 	var calls atomic.Int32
-	probeCaseVerdict = func(dir string) fscase.Result {
+	probeCaseVerdict = func(_ context.Context, dir string) (fscase.Result, error) {
 		calls.Add(1)
 		if r, ok := byBase[filepath.Base(dir)]; ok {
-			return r
+			return r, nil
 		}
-		return fscase.Result{Sensitive: true, Proven: true}
+		return fscase.Result{Sensitive: true, Proven: true}, nil
 	}
 	return &calls
 }
 
 func restoreProbeSeam(t *testing.T) {
 	t.Helper()
-	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
+	t.Cleanup(func() { probeCaseVerdict = fscase.VerdictCtx })
 }
 
 func provenSensitive() fscase.Result   { return fscase.Result{Sensitive: true, Proven: true} }
@@ -76,7 +76,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 		"beta":  defaultedResult(),
 		"gamma": defaultedResult(),
 	})
-	kept, _, unproven, _ := dedupeRoots(roots, false)
+	kept, _, unproven, _, _ := dedupeRoots(context.Background(), roots, false)
 	if len(kept) != 3 {
 		t.Fatalf("三棵互不包含的根应全保留，实得 %d：%v", len(kept), kept)
 	}
@@ -91,7 +91,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 	stubVerdict(t, map[string]fscase.Result{
 		"alpha": provenSensitive(), "beta": provenSensitive(), "gamma": provenInsensitive(),
 	})
-	if _, _, unproven, _ := dedupeRoots(roots, false); unproven != 0 {
+	if _, _, unproven, _, _ := dedupeRoots(context.Background(), roots, false); unproven != 0 {
 		t.Fatalf("全部确证 ⇒ 应为 0，实得 %d", unproven)
 	}
 
@@ -106,7 +106,7 @@ func TestDedupeRootsCountsUnprovenVerdicts(t *testing.T) {
 		filepath.Base(base): defaultedResult(),
 		"sub":               defaultedResult(),
 	})
-	kept, _, unproven, _ = dedupeRoots(nested, false)
+	kept, _, unproven, _, _ = dedupeRoots(context.Background(), nested, false)
 	if len(kept) != 1 {
 		t.Fatalf("子根应被宽根覆盖而丢弃，实得 kept=%v", kept)
 	}
@@ -144,7 +144,7 @@ func TestWalkReportsUnprovenVerdictCount(t *testing.T) {
 func TestSingleRootWithoutExcludesDoesNotAskAndCountsZero(t *testing.T) {
 	roots := siblingRoots(t)
 	calls := stubVerdict(t, map[string]fscase.Result{"alpha": defaultedResult()})
-	_, _, unproven, _ := dedupeRoots(roots[:1], false)
+	_, _, unproven, _, _ := dedupeRoots(context.Background(), roots[:1], false)
 	if n := calls.Load(); n != 0 {
 		t.Fatalf("单根且无排除模式不得发起卷探测（C1）：实得 %d 次", n)
 	}

@@ -26,7 +26,7 @@ import (
 // V2（设计稿 §10.3）：两个根扫"父根 + 另一无关目录"，父根子树里两棵大小写不同的
 // 目录都要收齐。修前 2（一棵被折掉，零失败记录），修后 3。
 func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
-	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
+	t.Cleanup(func() { probeCaseVerdict = fscase.VerdictCtx })
 	base := t.TempDir()
 	if !fscase.Sensitive(base) {
 		t.Skipf("临时目录所在卷不区分大小写（%s）：alpha/ 与 ALPHA/ 无法并存", base)
@@ -39,7 +39,9 @@ func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
 
 	// 扮演"两个根都在不敏感卷上"。真值 3 与卷语义无关——它测的是
 	// "遍历不该拿根卷的判定去折叠子树的拼写"。
-	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} }
+	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
+		return fscase.Result{Sensitive: false, Proven: true}, nil
+	}
 
 	res := Walk(context.Background(), []string{parent, other}, &model.Filters{}, 2)
 	if len(res.Files) != 3 {
@@ -56,14 +58,16 @@ func TestMultiRootWalkKeepsCaseVariantSubtrees(t *testing.T) {
 // （fail-closed），只记 ProtectedDirs，不把用户从没点过的目录放行成"已脱离保护"。
 // 修前折叠键让两者匹配 ⇒ 逃逸放行 + UnprotectedRoots 报出一个他没点过的根。
 func TestCaseMismatchedRootUnderProtectedDirIsNotRescued(t *testing.T) {
-	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
+	t.Cleanup(func() { probeCaseVerdict = fscase.VerdictCtx })
 	root := t.TempDir()
 	mkDirFiles(t, filepath.Join(root, "lost+found", "inner"), "x.bin")
 	mkDirFiles(t, filepath.Join(root, "keep"), "a.bin")
 	// 用户手输的大小写变体：在不敏感卷上 OS 认它（指向同一个目录），
 	// 而遍历里的拼写来自 ReadDir ⇒ 两者就此不同。
 	mismatch := filepath.Join(root, "LOST+FOUND", "inner")
-	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} } // 扮演"该卷不敏感"
+	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
+		return fscase.Result{Sensitive: false, Proven: true}, nil
+	} // 扮演"该卷不敏感"
 
 	res := Walk(context.Background(), []string{root, mismatch}, &model.Filters{}, 2)
 	if hasPathWith(res, "/lost+found/") {

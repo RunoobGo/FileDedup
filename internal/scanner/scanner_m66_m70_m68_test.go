@@ -43,11 +43,13 @@ func rootWant(t *testing.T, p string) string {
 // 不碰盘 ⇒ 这条探针在 darwin 与 Linux CI 上给出**同一个确定读数**，
 // 不需要 M36 V2 那种"两棵只差大小写的目录"真夹具（本机造不出来，只能 skip）。
 func TestDedupeRootsSortsByFoldKey(t *testing.T) {
-	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
-	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} } // 扮演"两个根都在不敏感卷上"
+	t.Cleanup(func() { probeCaseVerdict = fscase.VerdictCtx })
+	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
+		return fscase.Result{Sensitive: false, Proven: true}, nil
+	} // 扮演"两个根都在不敏感卷上"
 
 	// 原样串里 'B'(0x42) < 'b'(0x62) ⇒ 子根先排序在前；折叠后 "/data/b" 才是父根。
-	kept, all, _, _ := dedupeRoots([]string{"/data/B/A", "/data/b"}, false)
+	kept, all, _, _, _ := dedupeRoots(context.Background(), []string{"/data/B/A", "/data/b"}, false)
 	if len(all) != 2 {
 		t.Fatalf("去重前的全部根 = %v, want 2 条", all)
 	}
@@ -59,9 +61,11 @@ func TestDedupeRootsSortsByFoldKey(t *testing.T) {
 
 // P-1b（M66 的反向钉子）：修排序键不得把"本来就互不相干"的两个根折掉一个。
 func TestDedupeRootsKeepsUnrelatedRootsAfterSortFix(t *testing.T) {
-	t.Cleanup(func() { probeCaseVerdict = fscase.Verdict })
-	probeCaseVerdict = func(string) fscase.Result { return fscase.Result{Sensitive: false, Proven: true} }
-	kept, _, _, _ := dedupeRoots([]string{"/data/zz/sub", "/data/b"}, false)
+	t.Cleanup(func() { probeCaseVerdict = fscase.VerdictCtx })
+	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
+		return fscase.Result{Sensitive: false, Proven: true}, nil
+	}
+	kept, _, _, _, _ := dedupeRoots(context.Background(), []string{"/data/zz/sub", "/data/b"}, false)
 	want := []string{rootWant(t, "/data/b"), rootWant(t, "/data/zz/sub")}
 	if !reflect.DeepEqual(kept, want) {
 		t.Fatalf("kept = %v, want %v（无父子关系的两根都要留）", kept, want)

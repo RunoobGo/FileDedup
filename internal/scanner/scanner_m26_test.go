@@ -11,6 +11,7 @@ package scanner
 // E15 推翻）。⇒ 本文件的 V7 用 sep 注入 Windows 真值来复现真相。
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,7 +67,7 @@ func TestDedupeRootsStillMergesNestedNativeRoots(t *testing.T) {
 	}
 
 	// 故意倒序传入：合并结果与入参顺序无关（dedupeRoots 内部先排序）
-	kept, all, _, _ := dedupeRoots([]string{narrow, wide}, false)
+	kept, all, _, _, _ := dedupeRoots(context.Background(), []string{narrow, wide}, false)
 
 	if len(kept) != 1 || kept[0] != wide {
 		t.Fatalf("本机真实嵌套根未并成一棵（只该留宽根）：kept=%v want [%s]", kept, wide)

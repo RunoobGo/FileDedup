@@ -19,6 +19,7 @@
 package fscase
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -118,22 +119,55 @@ func fromVolumeType(dir string) Result {
 // Verdict 报告 dir 所在卷的大小写语义，**并说清这格有没有证据**。
 // 探测要写盘，故按目录缓存结论（缓存的是三态整体，不是 bool）；扫描根数量级为个位数，
 // 缓存无需淘汰。dir 为空时连问都不问 ⇒ 必须是未确证，别让"没问卷"在计数链里隐身。
+//
+// ★ R2-2（2026-09-23，设计段 §30.4）：这一层现在只是 VerdictCtx(Background) 的薄壳。
+// Background 永不到期 ⇒ 错误分支不可达，四处二态老调用方（cmd/benchgen/main.go:316、
+// ops/keep.go 那三处）行为一字未变；需要"探测能松手"的调用方自己去接 ctx。
 func Verdict(dir string) Result {
+	v, _ := VerdictCtx(context.Background(), dir) // Background 不会取消，err 恒 nil
+	return v
+}
+
+// VerdictCtx 是 Verdict 的**可中断**版（R2-2）：ctx 一到就交回 ctx.Err() 与零值结论，
+// 而不是等那次 syscall 自己松手。
+//
+// 为什么必须有这一条路：探测不是纯计算，`probe` 的 OpenFile / Lstat / Remove 全是
+// 真 syscall，死挂载（NFS 硬挂载、拔走的 SMB）上任意一个都可以**永远不返回**。
+// 扫描启动腿在 worker 起来之前同步问一圈（scanner.dedupeRoots），于是
+// 「取消」只是 cancel 一个没人读的 ctx ⇒ 扫描永久停在 Scanning。
+//
+// ★ 超时由调用方的 ctx 承载（context.WithTimeout），本包不自造常量：只有调用方知道
+// 这一次探测值多久，被服务的层反过来替服务方定"多慢算慢"就是猜。
+//
+// ★ 取消那一格**不进缓存**（M126：一次瞬时故障不许钉死整趟扫描）。"这格当时没问到"
+// 不是一条结论，把它钉进按目录缓存的表里就永久洗不白；下一次问卷重新探测。
+// 被放弃的探测迟到完成时只写进带缓冲的 channel 后退出——既不泄漏，也不越权替
+// 被取消的那一次写表。
+// ★ 边界如实写明：卡在内核态 syscall 里的这个 goroutine，本包**救不了**，
+// 它要等该 syscall 自己返回（或进程结束）。这条缝给的是"上层不再陪着等"，不是"探测变快了"。
+func VerdictCtx(ctx context.Context, dir string) (Result, error) {
 	if dir == "" {
-		return defaulted()
+		return defaulted(), nil
 	}
 	key := filepath.Clean(dir)
 	mu.Lock()
 	if v, ok := cache[key]; ok {
 		mu.Unlock()
-		return v
+		return v, nil
 	}
 	mu.Unlock()
-	v := probe(key)
-	mu.Lock()
-	cache[key] = v
-	mu.Unlock()
-	return v
+
+	done := make(chan Result, 1)
+	go func() { done <- probe(key) }()
+	select {
+	case v := <-done:
+		mu.Lock()
+		cache[key] = v
+		mu.Unlock()
+		return v, nil
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	}
 }
 
 // Sensitive 报告 dir 所在卷是否区分大小写。
