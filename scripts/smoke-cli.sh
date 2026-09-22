@@ -16,6 +16,13 @@
 #     组顺序随并发调度变化，不能直接比 JSON 文本。
 #
 # 不比较：mtime（同一文件必然一致，但对断言无增益）、elapsed/速度（天生抖动）。
+#
+# 除"三跑互比"外的四道硬断言（2026-09-23 第四轮审查 R1-2/R4-1，设计段 §30.2）：
+#   failed == 0、reclaimable 与 dup_files 等于 manifest 逐组推得的期望值、
+#   **逐组** (可释放字节, 组内路径集合) 整表等于 manifest 重建的期望表、
+#   manifest.shapes 的 symlink/case_pair 在场（case_pair 仅在 linux 判红，其余打印）。
+# 为什么要加：互比只能发现"不一致"，组数与语料总数只能发现"整组没了"，
+# 三者一起漏（某组成员被一致性剔除而组仍 ≥2 成员）在旧断言下是绿的。
 
 set -euo pipefail
 
@@ -87,11 +94,13 @@ def sig(tag):
         print("\nFAIL: stats 缺 cache_hits 字段（AS-K1 断言依赖它；改字段名请同步本脚本）",
               file=sys.stderr)
         sys.exit(1)
-    return cmp, int(s["cache_hits"])
+    # 第三个返回值是**逐组**读数（R1-2 的 manifest 对账要用；上面那个 digest 只能互比，
+    # 发现不了"三跑一起漏"，也定位不到是哪一组漏了哪个成员）。
+    return cmp, int(s["cache_hits"]), groups
 
-vals, hits = {}, {}
+vals, hits, grps = {}, {}, {}
 for t in tags:
-    vals[t], hits[t] = sig(t)
+    vals[t], hits[t], grps[t] = sig(t)
 for t in tags:
     print(f"    {t:7s} {vals[t]} cache_hits={hits[t]}")
 
@@ -99,6 +108,13 @@ base = vals[tags[0]]
 bad = [t for t in tags if vals[t] != base]
 if bad:
     print(f"\nFAIL: {','.join(bad)} 与 {tags[0]} 不一致", file=sys.stderr)
+    sys.exit(1)
+# R1-2（第四轮审查，设计段 §30.2）：failed 原先**只进三跑互比键**（上面那个 cmp dict），
+# 三跑一起失败照样逐字一致 ⇒ 这条断言从来没有存在过。门禁语料是本地合成、无权限障碍的
+# 干净树，任何一条失败项都说明扫描器/流水线在吃错误。
+if base["failed"] != 0:
+    print(f"\nFAIL: failed={base['failed']}，门禁语料不允许有失败项"
+          "（一致性剔除、预筛、权限任一处的失败都会把整组成员悄悄带走）", file=sys.stderr)
     sys.exit(1)
 if base["groups"] == 0:
     print("\nFAIL: 数据集未产生任何重复组，冒烟失去意义", file=sys.stderr)
@@ -135,7 +151,83 @@ if base["files_total"] != want_total:
     print(f"\nFAIL: files_total={base['files_total']}，manifest 语料={want_total}"
           "（语料口径回归，见 B3-6）", file=sys.stderr)
     sys.exit(1)
-print(f"\nOK: 三跑一致、缓存命中生效且与 manifest 对账通过"
-      f"（{base['groups']} 组 / 可释放 {base['reclaimable']} B / 语料 {base['files_total']} 文件 / "
-      f"复扫命中 {hits['cache2']}）")
+
+# ---- R1-2：逐组对账（旧的两项"组数 / 语料总数"粒度粗于数据面） ----
+# 组内成员被一致性剔除一个而组仍 ≥2 成员时：组数不变、files_total 不变、三跑照样一致
+# ⇒ 上面四条断言全绿。这里按 manifest 逐组重建期望的 (可释放字节, 组内路径集合)，
+# 与报告交出的那一串**整表**比对，并顺手把两个聚合量也钉住（红的时候一眼看得出是哪一维）。
+def norm(p):
+    # 只做分隔符归一：manifest 的 rel 由 Go 的 filepath.Rel 产出（Windows 上是反斜杠），
+    # 报告里的 path 由扫描器产出。比对的是"组成员集合"，不是拼写口径。
+    return str(p).replace("\\", "/")
+
+root = norm(work / "bench")
+exp = []
+exp_reclaimable = 0
+exp_dup = 0
+for g in mani["groups"]:
+    files = sorted(f"{root}/{norm(f)}" for f in g["files"])
+    n = len(files)
+    if n < 2:
+        print(f"\nFAIL: manifest 有一组只有 {n} 个成员（{files}）——生成器产出了不成组的组，"
+              "逐组期望值无法定义", file=sys.stderr)
+        sys.exit(1)
+    exp.append((int(g["size"]) * (n - 1), "\n".join(files)))
+    exp_reclaimable += int(g["size"]) * (n - 1)
+    # ★ duplicate_files 的定义是"**位于重复组内的文件数**"（含每组那个保留项），
+    #   不是冗余项数——现场取证：cmd/fdd-cli/main.go:156 对 g.Files 逐个自增，
+    #   而 reclaimable 走的是 g.Reclaimable（已扣除保留项）。本脚本第一次跑新断言时
+    #   按"冗余项"推得 313、实报 518，差值恰为组数 205 ⇒ 钉的是 Σn 这一格。
+    #   将来谁把这个字段改成冗余项数，这里必须红一次并要求同步。
+    exp_dup += n
+exp.sort(key=lambda x: x[1])
+act = grps[tags[0]]
+
+if base["reclaimable"] != exp_reclaimable:
+    print(f"\nFAIL: reclaimable={base['reclaimable']}，manifest 逐组期望 {exp_reclaimable}"
+          "（组成员被一致性剔除在此暴露）", file=sys.stderr)
+    sys.exit(1)
+if base["dup_files"] != exp_dup:
+    print(f"\nFAIL: dup_files={base['dup_files']}，manifest 逐组期望 {exp_dup}"
+          "（口径：位于重复组内的文件数，每组 n 个成员计 n 个，含保留项）", file=sys.stderr)
+    sys.exit(1)
+if act != exp:
+    only_exp = [e for e in exp if e not in act][:3]
+    only_act = [a for a in act if a not in exp][:3]
+    print(f"\nFAIL: 逐组对账不一致（期望 {len(exp)} 组 / 实报 {len(act)} 组）", file=sys.stderr)
+    for e in only_exp:
+        print(f"      仅 manifest 有此组: reclaimable={e[0]} files={e[1].splitlines()}",
+              file=sys.stderr)
+    for a in only_act:
+        print(f"      仅报告有此组: reclaimable={a[0]} files={a[1].splitlines()}",
+              file=sys.stderr)
+    sys.exit(1)
+
+# ---- R4-1：消费 manifest.shapes（benchgen 早就在写，本脚本此前全文不读） ----
+# benchgen 的注释承诺"造不出来的形态必须与造出来了可区分，否则门禁把'本轮未覆盖'
+# 读成'覆盖且通过'"（AS-K3 同族）。这句话原先只落在 manifest 里，没人接。
+shapes = mani.get("shapes", {})
+if not isinstance(shapes, dict):
+    print(f"\nFAIL: manifest.shapes 是 {type(shapes).__name__}，应为对象", file=sys.stderr)
+    sys.exit(1)
+if not shapes.get("symlink", False):
+    # 符号链接在 Linux/macOS 上无特权要求，造不出来只能是 runner 文件系统退化；
+    # 冒烟的"扫描器不跟随符号链接"这条防线会随之一同消失，不许只留 warning。
+    print("\nFAIL: manifest.shapes.symlink=false——语料形态退化，冒烟覆盖面缩水"
+          "（软链接不跟随这条防线本轮没有任何实物见证）", file=sys.stderr)
+    sys.exit(1)
+if not shapes.get("case_pair", False):
+    # darwin 默认卷不区分大小写（APFS 区分大小写案是显式创建的），那一格造不出来是**事实**，
+    # 而 linux（CI 腿）上 /tmp 恒区分大小写，造不出来就是退化 ⇒ 分平台判，且必须打印。
+    if sys.platform == "linux":
+        print(f"\nFAIL: shapes.case_pair=false（平台 {sys.platform}）——"
+              "遍历器路径折叠（fscase/I2）在冒烟里唯一的实物见证消失了", file=sys.stderr)
+        sys.exit(1)
+    print(f"    WARN: shapes.case_pair=false（平台 {sys.platform}）："
+          "本卷不区分大小写，该形态本轮未覆盖（不进通过判定）")
+
+print(f"\nOK: 三跑一致、缓存命中生效，并与 manifest **逐组**对账通过"
+      f"（{base['groups']} 组 / 可释放 {base['reclaimable']} B = 期望值 / "
+      f"组内文件 {base['dup_files']} 个 = 期望值 / 语料 {base['files_total']} 文件 / "
+      f"失败 {base['failed']} / 复扫命中 {hits['cache2']} / shapes={shapes}）")
 PY
