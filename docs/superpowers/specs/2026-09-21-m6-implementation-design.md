@@ -6571,6 +6571,54 @@ version-sync / 三个冒烟脚本）。
   **没有真机插过 FAT/exFAT 卷**（与 §28.6、与 windows CI 腿同一档欠账）。
 - F6 只消除了"§3.1 与 §3.2 互相矛盾"，**没有**让 §3.1 变成实时值；783 这个数在 E2 之前仍是本稿独有的。
 
+### 30.11 J-6 一行级六条（Task F1）：注释与生命周期的小修——先分"可测面"再动手
+
+六条坐标全部来自代理报告，逐条开码重取。**两条坐标是错的**（③④），一条的实际影响比报告写的窄（①）：
+
+| # | 计划坐标 | 实读坐标 | 有无行为面 | 可测性判定 |
+|---|---|---|---|---|
+| ① | `app.go:592-628` StartScan 锁内重置 `a.lastEvs` | 成立：`:602-624` 清了 `groups/byID/keepIDs/failed/resultsReady/curHistID`，**独漏 `lastEvs`**（`NewApp:277` 只在进度回调里写） | 有（后端接口） | **可测**：包级 nil 缝卡住第一轮进度回调 ⇒ `GetScanProgress` 的读数与"新轮第一条事件"完全解耦 |
+| ② | `app.go:684-699` superseded 判定前移，不落历史行 | 成立且顺序正好相反：`SaveScan` 在 `:685`，`superseded()` 早退在 `:696` ⇒ 被取代的那一轮**先落库后弃写** | 有（历史配额） | **可测**：同一枚缝（见下）放在 SaveScan 之前 |
+| ③ | `app.go:703-707` `scanInFlight` 注释改真 | 坐标对，但**错处有两处**：`:217` 说"扫描 goroutine 在途"（实际在 `:680` 结果集写回那一拍就复位，`:631/:642` 才是兜底），`:705` 说"在扫描体第一行就复位"（第一行根本没复位它） | 纯注释 | 静态钉 |
+| ④ | `internal/ops/cache.go:35` Dev 注释与 fsid I7 对齐 | **该文件不存在**。真坐标 `internal/cache/cache.go:35` | 纯注释 | 静态钉 |
+| ⑤ | `cmd/fdd-cli/main.go:124` `defer Close` 移到 os.Exit 前 | 成立：`defer cch.Close()` 在 `main()` 内注册，其后 `:133`（扫描失败）、`:183`、`:192`（编码失败）三条 `os.Exit(1)` 全部绕过它；`:185` 的 `defer f.Close()` 同形 | 有（退出路径） | **本机不可测**（CLI 单测跑不到 `main` 的 os.Exit 分支）⇒ 只能静态钉 |
+| ⑥ | `app.go:2111-2116` `GetOpRecord` 登记网络卷风险，不改行为 | 成立：`:2126` 对每个 `StateDone` 条目同步 `ops.SymlinkStatus(OrigPath)`（逐条 Lstat），条数无上限 | 纯注释 | 静态钉 |
+
+**①②共用的那一枚缝（本项唯一的实现新增）**
+
+两条都要"在 A 的收尾途中插入一次 B 的 StartScan"才取得到红，现有码里没有任何卡点
+（`a.emit` 在 SaveScan **之后**，`a.hist` 是具体结构体、没有可换装的函数字段）。
+按仓库既有惯例（`fscase.fireProbeHook`、`ops.beforeActContentRecheck`）**新增包级 nil 钩子**
+`scanBeforeHistorySave func()`，位置钉在 `histSnapshot()` 之前、`:681` 的 Unlock 之后（不持锁，
+钩子里可以安全调 StartScan）。生产恒 nil ⇒ 零开销；测试注入"等 B 起跑再放行"。
+
+★ **改前红这一格不存在**，与设计稿 §6.23 四"四条共同的形状：缝是新增的，改前红就不存在"同一档，
+也与本批 C1 的 R3-1 说明同形：新符号 import 只得到"没有这个导出"，那是红在错误的格子上。
+⇒ 本项的"改对必红"由**变异**提供：
+- **变异 Fa**：把 `:696` 的 `superseded()` 早退挪回 SaveScan 之后（= 只回退②）⇒ ②的用例必须红（历史从 1 行变 2 行）；
+- **变异 Fb**：删掉 StartScan 锁内那句 `a.lastEvs = model.ProgressEvent{}` ⇒ ①的用例必须红（回吐上一轮终值）；
+- **变异 Fc**：把⑤的显式 Close 删成只剩 `defer` ⇒ 静态钉必须红。
+
+**①的一条如实收窄**：`GetScanProgress` 在前端**没有消费者**（全仓只有 `wails.ts:386` 的包装函数，
+`frontend/src` 无任何调用点；`ScanView.vue:124` 读的是事件流 `store.progress`，`startScan` 已 `progress.value = null`）。
+⇒ ①修的是**绑定层契约**（注释自称的"断线重连语义"目前给的是旧数据），不是界面上看得见的缺陷。
+不许写成"修好了一处界面显示错误"。
+
+**②的一条如实边界**：前移只把窗口从"SaveScan + 两拍"收窄到"钩子点到 SaveScan 起跑之间"，
+**不消除**——`SaveScan` 依 App.hist 的既有约束必须在锁外，"判代际"与"落库"之间天然有一次让锁，
+新扫描插进来照样会留下一行。残余窗口在注释里写明，并按 J-6 取向随批登记为欠账（不修）。
+
+**④⑥的注释要说什么（不写推测）**
+- ④：`fsid_windows.go:185-206` 自 I7 起从**句柄查询**拿卷序列号 + 文件索引（`index==0 \|\| VolumeSerialNumber==0`
+  才返回未解析 `ID{}`），unix 腿在 `fsid_unix.go:16` 取 `st_dev` ⇒ "Windows 恒 0（fsid 未解析）"是 I7 **之前**的事实。
+  真值改成：Dev/Ino/CtimeNs 是平台物理身份；"比较平凡通过"那一格的条件是 `!id.Resolved`（`cache.go:303`），
+  与平台无关，Windows 只在句柄查询失败或卷不给稳定索引（FAT/exFAT）时才落到那一格。
+- ⑥：登记的是"条数无上限 + 逐条同步 Lstat ⇒ 死挂载/网络卷上这条 RPC 可以长时间不返回"，
+  与 B2（R2-2）那条"探测听取消"同族但**本项不改行为**（改法要动 `OpRecordItem` 的检测时机或加超时，属接口/裁定面）。
+
+**回归配方（本项局部）**：`go build ./...` + `go vet ./...` + `go test -race -count=4 .` + 静态钉
+（`go test -run 'TestStaticAnchors_F1'`）+ 变异 Fa/Fb/Fc 各一次；全量 15 行门禁照例留到 E2 收口。
+
 **实施读数（2026-09-23，HEAD `ad6c2e0` 之上）**
 
 六条全部落地：`docs/09`（§3.1 卷型档 / §5.2 两格分开 / §6.2 保留目录分隔符腿）、`README.md`
