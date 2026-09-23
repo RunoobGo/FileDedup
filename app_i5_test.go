@@ -16,7 +16,7 @@ func TestStarSuggestionMatchesShortestPolicy(t *testing.T) {
 	// 隐藏目录里的那份路径更短：纯长度规则会选中它，非隐藏优先规则不会。
 	g := mkGroup(1, 100, "/h/.k/a", "/vis/aa.bin")
 
-	v := toGroupView(g, nil) // 无保留决策 → 走默认建议
+	v := toGroupView(g, nil, nil) // 无保留决策 → 走默认建议
 	var starred string
 	for _, f := range v.Files {
 		if f.IsKeep {
@@ -47,7 +47,7 @@ func TestStarSuggestionMatchesShortestPolicy(t *testing.T) {
 // TestStarSuggestionFollowsExplicitKeep 已有保留决策时星标以决策为准（不被建议覆盖）。
 func TestStarSuggestionFollowsExplicitKeep(t *testing.T) {
 	g := mkGroup(1, 100, "/h/.k/a", "/vis/aa.bin")
-	v := toGroupView(g, map[uint64]bool{g.Files[0].ID: true})
+	v := toGroupView(g, map[uint64]bool{g.Files[0].ID: true}, nil)
 	n := 0
 	for _, f := range v.Files {
 		if f.IsKeep {

@@ -31,6 +31,17 @@ function reveal(id: number) {
 
 // R3-1：三句措辞不在本文件——见 utils/opdisplay.ts 的 selectionWording 注释。
 const sel = selectionWording()
+
+// 功能 3（2026-09-23）：开着「隐藏非拟处理项」时只渲染 isPending 的行。
+// isPending 是后端在**全量结果集**上跑拟处理内核得到的投影（见 wails.ts
+// FileView.isPending 注释），组件只消费布尔值，绝不按 isKeep/路径重算——
+// 那会是对"谁会被处理"的第二份实现（AS-H6/I5 两类事故的共同形状：
+// 第二份实现一漂移，界面对"不会动的文件"做承诺或把该留的藏了）。
+// 组级行为（头部全选三态、groupSelCount）仍按整组计：与 M18 同一裁定——
+// 全选覆盖看不见/折叠的行，隐藏只是显示层，不改变选择语义。
+const visibleFiles = computed(() =>
+  store.hideNonPending ? props.group.files.filter(f => f.isPending) : props.group.files)
+const hiddenCount = computed(() => props.group.files.length - visibleFiles.value.length)
 </script>
 
 <template>
@@ -51,11 +62,17 @@ const sel = selectionWording()
       <span class="size">{{ humanBytes(group.size) }}</span>
       <span class="sep" aria-hidden="true"></span>
       <span class="count">{{ group.files.length }} 个文件</span>
+      <!-- 功能 3：藏了多少要写在明面上——"3 个文件"的组里只剩 1 行时，
+           不标注会被读成"另外两个不见了"，而不是"被策略滤出视野"。 -->
+      <span v-if="hiddenCount" class="count hidden-note"
+        :title="`已按处理策略隐藏 ${hiddenCount} 个不会被处理的文件；关闭「隐藏非拟处理项」或调整策略可见`">
+        （已藏 {{ hiddenCount }}）
+      </span>
       <span class="reclaim">可释放 {{ humanBytes(group.reclaimable) }}</span>
       <span v-if="group.files.some(f => /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(f.path))" class="tag">图片组</span>
     </div>
     <div v-show="expanded" class="files">
-      <div v-for="f in group.files" :key="f.id" class="file"
+      <div v-for="f in visibleFiles" :key="f.id" class="file"
         :class="{ keep: f.isKeep, current: store.currentFileID === f.id }"
         @click="store.currentFileID = f.id" title="点击设为当前项（Space 预览）">
         <!-- P1-5：用 label 包裹，把命中区域从原生控件的 13×13 扩到 26×26 -->

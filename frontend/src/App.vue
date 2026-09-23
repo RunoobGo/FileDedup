@@ -7,6 +7,7 @@ import ResultView from './views/ResultView.vue'
 import RecordsView from './views/RecordsView.vue'
 import SettingsView from './views/SettingsView.vue'
 import FailedDrawer from './components/FailedDrawer.vue'
+import PendingDrawer from './components/PendingDrawer.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import ToastHost from './components/ToastHost.vue'
 import Icon from './components/Icon.vue'
@@ -23,6 +24,7 @@ function onKeydown(e: KeyboardEvent) {
   const inInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement)?.tagName ?? '')
   if (e.key === 'Escape') {
     if (store.preview) { store.preview = null; e.preventDefault(); return }
+    if (store.pendingOpen) { store.closePendingDrawer(); e.preventDefault(); return }
     if (store.failedOpen) { store.failedOpen = false; e.preventDefault(); return }
     return
   }
@@ -87,6 +89,7 @@ const navs: { key: 'scan' | 'result' | 'records' | 'settings'; label: string; ic
     </main>
 
     <FailedDrawer />
+    <PendingDrawer />
     <PreviewPanel />
     <ToastHost />
   </div>

@@ -35,11 +35,17 @@ type FileEntry struct {
 // 旧 settings.json、旧历史行、以及前端尚未跟进的 emptyFilters() 三种情形都解成
 // false＝跳过占位，不需要任何迁移代码（设计稿 §4.2）。
 type Filters struct {
-	IncludeExts   []string // 空 = 全部，如 ".jpg"
-	ExcludeExts   []string
-	MinSize       uint64   // 0 = 不限（默认 0）
-	MaxSize       uint64   // 0 = 不限
-	ExcludePaths  []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
+	IncludeExts  []string // 空 = 全部，如 ".jpg"
+	ExcludeExts  []string
+	MinSize      uint64   // 0 = 不限（默认 0）
+	MaxSize      uint64   // 0 = 不限
+	ExcludePaths []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
+	// ExcludeDirs 精确目录路径（目录选择器/粘贴，非 glob）：遍历中发现的子目录
+	// 命中该目录**及其整个子树**即剪枝。与 ExcludePaths、系统保护清单三条通道
+	// 相互独立。显式指定的扫描根本身不经此判据（指名优先，同保护清单的放行
+	// 裁定）；若排除表与被点名的根自相矛盾（根恰在表内），其子目录按表剪枝——
+	// 少扫落在删除安全侧，不为此情形另开第二条逃逸通道。
+	ExcludeDirs   []string
 	IncludeHidden bool
 	// AllowCloudHydration=true 时**照常读取云端占位文件**（即隐式触发按需下载），
 	// 且不计数。默认 false＝跳过并计 SkippedCloudFiles。
@@ -204,6 +210,18 @@ type OpRequest struct {
 	// 不是会话级状态。随请求传参天然同步，不需要额外的 set/get 配对调用，
 	// 也就不会出现"前端设了但没生效"或"上次设的还在"这类状态漂移。
 	ProcessDirs []string
+
+	// ExcludeDirs 「不处理的文件夹」黑名单（2026-09-23 功能 2）：
+	// 实际处理范围再减去 {位于这些目录下的文件}。
+	//
+	// 与 ProcessDirs 的关系是**两个方向相反的过滤器串联**，判据同一份
+	// （pendingIDsLocked）：白名单没放行谈不上黑名单，短路序
+	// gone→keep→outside→excluded。
+	//
+	// ★ 它不改变保留判定：黑名单内文件仍可被选为保留锚点、仍出现在结果集，
+	// 唯一效果是永不进入拟处理集（用户拍板的语义——"不处理"不等于"不存在"）。
+	// 空 = 未启用，走与新增本字段之前完全一致的代码路径。
+	ExcludeDirs []string
 }
 
 // OpsProgress 操作进度事件载荷。

@@ -43,7 +43,7 @@ func TestPreviewProcessPolicyDoesNotProbeUnderLock(t *testing.T) {
 	})
 	t.Cleanup(func() { fscase.SetProbeHook(nil) })
 
-	if _, err := a.PreviewProcessPolicy([]string{dir}, nil); err != nil {
+	if _, err := a.PreviewProcessPolicy([]string{dir}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	fscase.SetProbeHook(nil)
@@ -85,7 +85,7 @@ func TestWarmSensitivityIsCacheHitAfterWarm(t *testing.T) {
 			}
 		})
 		defer fscase.SetProbeHook(nil)
-		if _, err := a.PreviewProcessPolicy([]string{dir}, nil); err != nil {
+		if _, err := a.PreviewProcessPolicy([]string{dir}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		return n

@@ -1,7 +1,7 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind, PendingPage } from '../wails'
 import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
 import { undoBlockedText } from '../utils/undoReason'
@@ -17,6 +17,8 @@ export const emptyFilters = (): Filters => ({
   MinSize: 0,
   MaxSize: 0,
   ExcludePaths: [],
+  // 功能1：精确目录排除，默认空＝不排除。与 ExcludeDirs 的 Go 零值同安全侧。
+  ExcludeDirs: [],
   IncludeHidden: false,
   // M6-P1：默认不读取云端占位（安全档）。必须在此显式列出——payload 由
   // {...filters} 浅合并且空清单会 `delete Filters.IncludeExts`，隐式缺省会让
@@ -106,6 +108,23 @@ export const useScanStore = defineStore('scan', () => {
   //        界面上列着的目录 ≠ 仍在生效的保护：后端每次新扫描都会清空 a.keepIDs
   //        （app.go StartScan 的复位段），得重新点一次「应用保留策略」才恢复。
   const procDirs = ref<string[]>([])
+  // 功能 2（2026-09-23）：「不处理的文件夹」黑名单。
+  //
+  // 与 procDirs 同生命周期（仅本次结果集，换结果集必清）、同并集语义
+  // （无序、不提供排序）。方向相反：procDirs 圈"要处理谁"，这里划
+  // "永不处理谁"。★ 它**不**改变保留判定——黑名单内文件仍可被选为
+  // 保留锚点、仍出现在结果集，唯一效果是永不进入拟处理集；
+  // 判据在后端与白名单同一内核（pendingIDsLocked），短路序
+  // gone→keep→outside→excluded。
+  const procExcludeDirs = ref<string[]>([])
+  // 功能 3（2026-09-23）：「隐藏非拟处理项」显示开关。
+  //
+  // 开着时：①每次结果页请求带上两把策略过滤器，让回包里逐行 isPending 是
+  // 当前策略的投影（判据在后端 pendingSetLocked，前端只消费布尔值）；
+  // ②策略变更后重取本页，藏/显行不读陈旧投影。
+  // 关着时：目录不上送——非空 dirs 会让后端预热卷语义（写探测文件），
+  // 翻页是高频路径，不该为显示层开关默认付这笔 I/O。
+  const hideNonPending = ref(false)
   // 最近一次执行的过滤结果，供结果页横幅说明「实际处理了几项」。
   // 不持久化——它描述的是一次已经发生的操作。
   const lastFilter = ref<{ matched: number; selected: number; unmatched: string[] } | null>(null)
@@ -208,6 +227,7 @@ export const useScanStore = defineStore('scan', () => {
     resultExt.value = ''
     resetSelection()
     clearProcDirs() // 优先文件夹是"仅本次结果集"的，结果集作废即清空
+    clearProcExcludeDirs() // 黑名单同理——残留会把"不该动的别动"扩大到下一份结果
     lastFilter.value = null
   }
 
@@ -284,6 +304,10 @@ export const useScanStore = defineStore('scan', () => {
         pageSize,
         sort: resultSort.value,
         ext: resultExt.value,
+        // 功能 3：开着「隐藏非拟处理项」才把策略目录随查询上送（见 hideNonPending 注释）。
+        ...(hideNonPending.value
+          ? { dirs: usableProcDirs(), excludeDirs: usableProcExcludeDirs() }
+          : {}),
       })
       if (gen !== resultGen) return // 结果集已被新扫描/新历史作废，回包不得盖回界面
       if (append) {
@@ -363,7 +387,11 @@ export const useScanStore = defineStore('scan', () => {
       currentFileID.value = null
       opsResult.value = null
       resetSelection()
+      // 先按"无结果"再清策略：clearProc* 挂着功能 3 的投影重取腿
+      // （refreshPendingProjection），不先落闸会在换代窗口里多问一次旧结果。
+      hasResult.value = false
       clearProcDirs() // 结果集已换，优先文件夹不再对应当前内容
+      clearProcExcludeDirs()
       resultExt.value = '' // M17：同 clearStaleResult，过滤不跨结果集存活
       lastFilter.value = null
       hasResult.value = true
@@ -588,15 +616,26 @@ export const useScanStore = defineStore('scan', () => {
   // procActive 是否启用了处理策略（列表里有非空白项）。
   const procActive = computed(() => procDirs.value.some(d => (d ?? '').trim() !== ''))
   const usableProcDirs = () => procDirs.value.filter(d => (d ?? '').trim() !== '')
+  // procExcludeActive 是否启用了黑名单（功能 2）。policyActive 才是"要不要问后端"
+  // 的总闸：只启用黑名单时命中数同样会收窄，按钮同样得等真值。
+  const procExcludeActive = computed(() =>
+    procExcludeDirs.value.some(d => (d ?? '').trim() !== ''))
+  const usableProcExcludeDirs = () =>
+    procExcludeDirs.value.filter(d => (d ?? '').trim() !== '')
+  const policyActive = computed(() => procActive.value || procExcludeActive.value)
 
-  // procSelKey 当前「优先目录 + 勾选路径」的指纹：变了就得重新问后端。
+  // procSelKey 当前「优先目录 + 黑名单目录 + 勾选路径」的指纹：变了就得重新问后端。
   // 用 JSON 而不是字符串拼接，是为了不让路径里的分隔符混出假指纹
   // （["a","b"] 与 ["a\u0000b"] 直接拼起来同串，JSON 不会）。
   const procSelKey = computed(() =>
-    procActive.value ? JSON.stringify([usableProcDirs(), selectedFiles.value.map(f => f.path)]) : '',
+    policyActive.value
+      ? JSON.stringify([usableProcDirs(), usableProcExcludeDirs(), selectedFiles.value.map(f => f.path)])
+      : '',
   )
 
-  // procMatch 后端给回的真值：命中的是**勾选序列里的第几个下标**。
+  // procMatch 后端给回的真值：命中的是**勾选序列里的第几个下标**，
+  // 已是「白名单命中 − 黑名单命中」的合并结果（两半都出自后端 FilterInDirs，
+  // 与执行侧同一判据；前端只做下标集合运算，不判路径）。
   const procMatch = ref<{ key: string; idx: number[] } | null>(null)
   const procCountError = ref('')
   let procReqSeq = 0
@@ -604,25 +643,33 @@ export const useScanStore = defineStore('scan', () => {
   // refreshProcCounts 向后端问一次命中下标。
   // 只认最后一次请求的回执（用户在途改了勾选时，旧回包不得覆盖新状态）。
   async function refreshProcCounts(): Promise<void> {
-    if (!procActive.value) {
+    if (!policyActive.value) {
       procMatch.value = null
       procCountError.value = ''
       return
     }
     const key = procSelKey.value
     if (!key || procMatch.value?.key === key) return
-    const [dirs, paths] = JSON.parse(key) as [string[], string[]]
+    const [dirs, excludeDirs, paths] = JSON.parse(key) as [string[], string[], string[]]
     const seq = ++procReqSeq
     try {
-      const idx = await api.filterInDirs(dirs, paths)
+      const [inIdx, exIdx] = await Promise.all([
+        dirs.length > 0
+          ? api.filterInDirs(dirs, paths)
+          : Promise.resolve(paths.map((_, i) => i)),
+        excludeDirs.length > 0
+          ? api.filterInDirs(excludeDirs, paths)
+          : Promise.resolve([] as number[]),
+      ])
       if (seq !== procReqSeq) return
-      procMatch.value = { key, idx }
+      const drop = new Set(exIdx)
+      procMatch.value = { key, idx: inIdx.filter(i => !drop.has(i)) }
       procCountError.value = ''
     } catch (e: any) {
       if (seq !== procReqSeq) return
       procMatch.value = null
       procCountError.value = String(e?.message ?? e ?? '后端判定失败')
-      toast().notifyError('优先文件夹命中数计算失败', e)
+      toast().notifyError('处理范围命中数计算失败', e)
     }
   }
 
@@ -632,10 +679,10 @@ export const useScanStore = defineStore('scan', () => {
     await refreshProcCounts()
   }
 
-  // procCountPending 启用了策略但后端真值还没到位。
+  // procCountPending 启用了任一过滤器但后端真值还没到位。
   // 此刻任何"将处理 N"的数字都无从谈起，UI 必须显式说"计算中"而不是显示 0。
   const procCountPending = computed(() =>
-    procActive.value && procMatch.value?.key !== procSelKey.value,
+    policyActive.value && procMatch.value?.key !== procSelKey.value,
   )
 
   let procTimer: ReturnType<typeof setTimeout> | null = null
@@ -646,11 +693,11 @@ export const useScanStore = defineStore('scan', () => {
   onScopeDispose(() => { if (procTimer) clearTimeout(procTimer) })
 
   // effectiveFiles 真正会被处理的那部分勾选项。
-  // 未启用时恒等于 selectedFiles——不做任何过滤，走与新增本功能前一致的路径。
+  // 两把过滤器都没启用时恒等于 selectedFiles——走与新增本功能前一致的路径。
   // 启用但真值未到位时返回空：宁可不给数字，也不给一个可能虚高或虚低的数字
   // （按钮因此灰掉，用户被引导去等那 150ms，而不是被误导去点确认）。
   const effectiveFiles = computed(() => {
-    if (!procActive.value) return selectedFiles.value
+    if (!policyActive.value) return selectedFiles.value
     const m = procMatch.value
     if (!m || m.key !== procSelKey.value) return []
     const hit = new Set(m.idx)
@@ -659,17 +706,17 @@ export const useScanStore = defineStore('scan', () => {
 
   const effectiveBytes = computed(() => effectiveFiles.value.reduce((s, f) => s + f.size, 0))
   const effectiveCount = computed(() => effectiveFiles.value.length)
-  // procExcluded 勾选了、却因为不在优先目录内而不会被处理的项数。
+  // procExcluded 勾选了、却因白名单没放行或黑名单拦下而不会被处理的项数。
   // 真值未到位时给 0 而不是 selectedFiles.length：effectiveFiles 此刻是空的，
   // 直接相减会算出"全部勾选项都被排除了"，那是一句假话（而且比数字缺失更糟——
   // 它会点亮"已收窄"的提示行，用户以为策略把所有东西都滤掉了）。
   const procExcluded = computed(() =>
-    procActive.value && !procCountPending.value
+    policyActive.value && !procCountPending.value
       ? selectedFiles.value.length - effectiveFiles.value.length
       : 0,
   )
   // procFiltering 是否需要提示"正在收窄"。只在真的收窄了东西时才提示：
-  // 勾选项全都在优先目录内时提示"已收窄"是噪音。
+  // 勾选项全都在处理范围内时提示"已收窄"是噪音。
   const procFiltering = computed(() => procExcluded.value > 0)
 
   // addProcDir 去重追加。**不提供** moveProcDir——见 procDirs 的注释。
@@ -677,9 +724,111 @@ export const useScanStore = defineStore('scan', () => {
     const d = (dir ?? '').trim()
     if (!d || procDirs.value.includes(d)) return
     procDirs.value.push(d)
+    refreshPendingProjection()
   }
-  function removeProcDir(i: number) { procDirs.value.splice(i, 1) }
-  function clearProcDirs() { procDirs.value = [] }
+  function removeProcDir(i: number) { procDirs.value.splice(i, 1); refreshPendingProjection() }
+  function clearProcDirs() { procDirs.value = []; refreshPendingProjection() }
+
+  // 黑名单一侧同构（并集、无序、去重追加，不提供排序）。
+  function addProcExcludeDir(dir: string) {
+    const d = (dir ?? '').trim()
+    if (!d || procExcludeDirs.value.includes(d)) return
+    procExcludeDirs.value.push(d)
+    refreshPendingProjection()
+  }
+  function removeProcExcludeDir(i: number) { procExcludeDirs.value.splice(i, 1); refreshPendingProjection() }
+  function clearProcExcludeDirs() { procExcludeDirs.value = []; refreshPendingProjection() }
+
+  // refreshPendingProjection 在「隐藏非拟处理项」开着时重取本页（功能 3）：
+  // 行的藏/显读的是后端按**当前策略**算出的 isPending 投影，策略一变，
+  // 已加载行的投影即刻陈旧——多显示是把"不会动的"留在场上，少显示是把
+  // "会动的"藏起来，两个方向都是界面对处理范围说谎（AS-H6 同族）。
+  // hasResult 门槛：clearStaleResult（换代）也会经 clearProc* 走到这里，
+  // 那时重取会把**旧结果集**的行盖回刚清空的界面（新扫描正在途）。
+  function refreshPendingProjection() {
+    if (hideNonPending.value && hasResult.value) void loadResultPage(false)
+  }
+
+  // toggleHideNonPending 翻开关；只在**打开**时需要重取——打开前加载的行
+  // 是没带策略算的投影（只反映"非保留"），不重取就藏不全。
+  // 关闭不需要：isPending 不再被读，陈旧值无害。
+  // 重取的连带效果是勾选被重置（Y8 纪律：行集被替换 ⇒ 清空勾选），
+  // 与改排序/筛选同一形状——这里更该如此：被藏掉的行若还背着勾，
+  // "已选 N"就在替看不见的东西说话。
+  function toggleHideNonPending() {
+    hideNonPending.value = !hideNonPending.value
+    refreshPendingProjection()
+  }
+
+  // ---------- 拟处理清单抽屉（2026-09-23，设计段 §4） ----------
+  //
+  // 与 proc 命中数腿（filterInDirs + 150ms debounce）是**两个读者、一份判据**：
+  // 清单直接问 GetPendingFiles（后端同一内核 pendingIDsLocked 的明细投影）。
+  // 刻意不做订阅式刷新：清单的语义是"点开这一刻的快照"，勾选变化后重开即重取；
+  // 若也挂 debounce 跟命中数腿互相踩，就是 AS-H6 双判据事故的另一种复发形式。
+  // 代价如实告知：抽屉开着时改勾选，画面不会自己变——分节文案里明写"重新打开可刷新"。
+  const pendingOpen = ref(false)
+  const pendingPage = ref(0)
+  const pendingSort = ref('group')
+  const pendingData = ref<PendingPage | null>(null)
+  const pendingLoading = ref(false)
+  const pendingError = ref('')
+  const PENDING_PAGE_SIZE = 50
+  let pendingReqSeq = 0
+
+  // refreshPending 拉当前页。只认最后一次请求的回执（procReqSeq 同族手法）：
+  // 用户在途翻页/改排序时，旧回包不得覆盖新状态，也不得把 loading 按灭。
+  async function refreshPending(): Promise<void> {
+    const seq = ++pendingReqSeq
+    pendingLoading.value = true
+    pendingError.value = ''
+    try {
+      const pg = await api.getPendingFiles({
+        selectedIds: selectedFiles.value.map(f => f.id),
+        dirs: usableProcDirs(),
+        excludeDirs: usableProcExcludeDirs(),
+        page: pendingPage.value,
+        pageSize: PENDING_PAGE_SIZE,
+        sort: pendingSort.value,
+      })
+      if (seq !== pendingReqSeq) return
+      pendingData.value = pg
+    } catch (e: any) {
+      if (seq !== pendingReqSeq) return
+      pendingData.value = null
+      pendingError.value = String(e?.message ?? e ?? '清单拉取失败')
+    } finally {
+      if (seq === pendingReqSeq) pendingLoading.value = false
+    }
+  }
+
+  function openPendingDrawer() {
+    pendingPage.value = 0
+    pendingOpen.value = true
+    void refreshPending()
+  }
+  function closePendingDrawer() {
+    pendingOpen.value = false
+    // 作废在途回执：否则一次慢回包会把"上一次打开"的清单塞进下一次打开的第一帧。
+    pendingReqSeq++
+    pendingLoading.value = false
+  }
+  function pendingGotoPage(p: number) {
+    if (p < 0 || p === pendingPage.value) return
+    pendingPage.value = p
+    void refreshPending()
+  }
+  function pendingSetSort(s: string) {
+    if (s === pendingSort.value) return
+    pendingSort.value = s
+    pendingPage.value = 0 // 换排序必须回第 0 页：停在旧页会读到一条没排过的尾巴
+    void refreshPending()
+  }
+  const pendingTotalPages = computed(() =>
+    pendingData.value && pendingData.value.total > 0
+      ? Math.ceil(pendingData.value.total / PENDING_PAGE_SIZE)
+      : 1,
+  )
 
   async function applyKeep(kind: string, dirs: string[] = []) {
     if (!guard('应用保留策略')) return
@@ -719,6 +868,7 @@ export const useScanStore = defineStore('scan', () => {
     // 优先目录为空时不传字段（而不是传空数组）：后端对两者都判为"未启用"，
     // 但传 undefined 能让"这个请求没用到处理策略"在日志/抓包里一眼可见。
     const dirs = usableProcDirs()
+    const exDirs = usableProcExcludeDirs()
     if (!guard('执行清理操作')) return
     // M77（04 §6.11 FE-4）：上锁必须在**第一个 await 之前**。改先是 `await ensureProcCounts()`
     // 之后才置 opsRunning，于是同一窗口里的两次点击都通过 guard；第二次还会在自己的 catch 里
@@ -742,6 +892,8 @@ export const useScanStore = defineStore('scan', () => {
       await api.executeOperation({
         Kind: kind, FileIDs: ids, TargetDir: targetDir ?? '', ConfirmDanger: confirmDanger,
         ProcessDirs: dirs.length > 0 ? dirs : undefined,
+        // 黑名单与白名单同一处理：空就不传，让"没用到这把过滤器"在抓包里可见。
+        ExcludeDirs: exDirs.length > 0 ? exDirs : undefined,
       })
     } catch (e: any) {
       opsRunning.value = false
@@ -957,9 +1109,17 @@ export const useScanStore = defineStore('scan', () => {
     keepDirs, addKeepDir, removeKeepDir, moveKeepDir,
     // 处理策略只导出 add/remove/clear —— 没有 move 是有意的，见 procDirs 注释
     procDirs, addProcDir, removeProcDir, clearProcDirs,
+    // 黑名单一侧同构（功能 2），同样不提供排序
+    procExcludeDirs, addProcExcludeDir, removeProcExcludeDir, clearProcExcludeDirs,
+    // 功能 3：「隐藏非拟处理项」开关（消费的是后端 isPending 投影，前端不自算）
+    hideNonPending, toggleHideNonPending,
+    procExcludeActive,
     procActive, procFiltering, procExcluded, lastFilter,
     // AS-H6：命中数来自后端，UI 需要知道"还没到位"和"问失败了"
     procCountPending, procCountError, ensureProcCounts,
+    // 拟处理清单抽屉（快照式：open 时拉取，翻页/换排序重拉，close 作废在途回包）
+    pendingOpen, pendingPage, pendingSort, pendingData, pendingLoading, pendingError,
+    pendingTotalPages, openPendingDrawer, closePendingDrawer, pendingGotoPage, pendingSetSort,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     effectiveFiles, effectiveBytes, effectiveCount,

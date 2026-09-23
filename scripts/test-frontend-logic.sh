@@ -209,6 +209,40 @@ wiring 'src/views/RecordsView.vue' 'if (!accepted) undoingItem.value = null' '' 
 wiring 'src/views/SettingsView.vue' 'confirmClearCache' 'if (!confirm(' \
 	'清空缓存走两段式就地确认（R3-5：原生 confirm() 是全仓唯一残留，绕开 useModal 收口的那套）'
 
+# 拟处理清单（2026-09-23，设计段 specs/2026-09-23-pending-files-query-design.md §5）：
+# 抽屉与 store 状态机有 node 用例钉，但 .vue 打不进 node --test（M116/M118 同族限制）——
+# 视图接线只能走锚。三条都锚**标识符**，不锚中文文案（改措辞安全）。
+wiring 'src/views/ResultView.vue' 'store.openPendingDrawer()' '' \
+	'结果页入口问的是 store 的清单动作（判据归后端、清单腿不许视图自算，AS-H6 同一纪律）'
+wiring 'src/stores/scan.ts' 'api.getPendingFiles(' '' \
+	'清单数据来自后端 GetPendingFiles（与预览同一内核的两个投影，前端不重算拟处理集）'
+wiring 'src/components/PendingDrawer.vue' 'store.pendingData' '' \
+	'抽屉渲染消费 store.pendingData（常驻挂载+store 控显隐，FailedDrawer 同族形状）'
+
+# 功能 3（2026-09-23「隐藏非拟处理项」）：藏行的判据是后端逐行 isPending 投影，
+# 视图只许消费（请求上送链由 scan-hide-nonpending.test.ts 的 node 用例钉）。
+# .vue 打不进 node --test（M116/M118 同族限制），这里钉"有没有去用"这一刀。
+# ★ 只锚标识符，不锚中文文案（改措辞安全）。
+wiring 'src/components/GroupCard.vue' 'f.isPending' 'files.filter(f => f.isKeep' \
+	'GroupCard 藏行消费后端 isPending（功能 3：组件不得按 isKeep/路径重算拟处理集，AS-H6 同一纪律）'
+wiring 'src/views/ResultView.vue' 'g.files.some(f => f.isPending)' '' \
+	'整组无拟处理项才隐藏整卡，判据同样取自 isPending 投影（功能 3）'
+wiring 'src/views/ResultView.vue' 'store.toggleHideNonPending()' '' \
+	'开关走 store 动作（重取/上送链收在 store，视图不自拼请求，功能 3）'
+
+# 功能 4（2026-09-23「失败清单逐行打开文件/所在目录」）：抽屉的按钮腿。
+# 交接与抛错这两件事由 frontend/tests/failed-reveal-path.test.ts 钉（那是 wails.ts
+# 的 api 包装，node 打得进）；这里钉的是"抽屉有没有真的去调这两个包装"。
+# ★ 只锚标识符，不锚中文文案（改措辞安全）。
+wiring 'src/components/FailedDrawer.vue' 'api.revealPath(' '' \
+	'失败清单逐行走后端路径绑定定位（功能 4：不得复用按 ID 的 revealInFolder，失败项没进结果集）'
+wiring 'src/components/FailedDrawer.vue' 'api.openPath(' '' \
+	'失败清单逐行走后端路径绑定打开（功能 4）'
+# 被禁写法正是"前端先替后端判这条路径能不能开"：判据全在 Go 侧 checkRevealPath，
+# 视图把按钮藏起来只会让用户以为功能坏了（M83 那一族"点了没反应"的镜像——这次是"没点可点"）。
+wiring 'src/components/FailedDrawer.vue' 'api.openPath(' 'v-if="f.Path"' \
+	'按钮不因路径看着为空就消失（功能 4：AS-H6，前端不重算判据）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1

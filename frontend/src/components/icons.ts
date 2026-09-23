@@ -12,6 +12,7 @@ export type IconName =
   | 'layers' // 结果（导航）—— 重复组 = 叠层副本
   | 'gear' // 设置（导航）
   | 'eye' // 预览
+  | 'external' // 用系统默认应用打开该项本身（失败清单逐行；与 eye「应用内预览」区分）
   | 'folder-open' // 打开所在文件夹
   | 'star' // 保留
   | 'close' // 冗余 / 关闭 / 移除
@@ -92,6 +93,11 @@ export const ICONS: Record<IconName, IconDef> = {
   info: { viewBox: ICON_SIZE, d: ['M12 16v-4', 'M12 8h.01'], circle: [12, 12, 10] },
   skip: { viewBox: ICON_SIZE, d: ['m15 14 5-5-5-5', 'M4 20v-7a4 4 0 0 1 4-4h12'] },
   'chevron-down': { viewBox: ICON_SIZE, d: ['m6 9 6 6 6-6'] },
+  // lucide external-link：交给系统默认应用打开（与 eye「应用内预览」是两件事）
+  external: {
+    viewBox: ICON_SIZE,
+    d: ['M15 3h6v6', 'M10 14 21 3', 'M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'],
+  },
   // lucide clock：圆 + 指针（扫描/清理历史）
   history: {
     viewBox: ICON_SIZE,

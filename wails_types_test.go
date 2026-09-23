@@ -68,6 +68,9 @@ var wailsMirrors = []mirrorPair{
 	// M44/G10（2026-09-21 审查）：Go 下发但 TS 压根没有镜像的类型，M30 的枚举方向
 	// 看不到（§14.0 G10）——它是 PreviewProcessPolicy 的返回类型。
 	{"ProcessPreview", reflect.TypeOf(ProcessPreview{}), ""},
+	{"PendingQuery", reflect.TypeOf(PendingQuery{}), ""},
+	{"PendingRow", reflect.TypeOf(PendingRow{}), ""},
+	{"PendingPage", reflect.TypeOf(PendingPage{}), ""},
 	// 豁免三条：没有可反射的 Go 对象。
 	{"OpsFiltered", nil, "Go 侧是 ops:filtered 的 map[string]any 字面量（app.go 的 emit 点），无结构体可反射；载荷要升级成结构体时随之收编"},
 	{"BackendAPI", nil, "方法面（Promise 签名），不是数据镜像"},
@@ -285,7 +288,7 @@ func TestTSInterfaceFieldsParsesRealFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"Kind", "FileIDs", "TargetDir", "ConfirmDanger", "ProcessDirs"}
+		want := []string{"Kind", "FileIDs", "TargetDir", "ConfirmDanger", "ProcessDirs", "ExcludeDirs"}
 		assertSameOrder(t, "OpRequest", want, got)
 	})
 	t.Run("真文件：内联对象元素里的键不算本层字段", func(t *testing.T) {

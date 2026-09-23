@@ -71,6 +71,19 @@ type FileView struct {
 	// false 时不参与跨卷判定（保守按"同卷"处理，不显示按钮）：
 	// 与其猜错让用户点出一个注定失败的按钮，不如不显示。
 	VolumeResolved bool `json:"volumeResolved"`
+
+	// IsPending 表示"策略上这一项可被处理"（功能 3，2026-09-23「隐藏非拟处理项」）。
+	// 口径 = 拟处理内核（pendingIDsLocked）在**全量结果集**上的投影：
+	// 非保留 ∩（若启用）优先目录 −（若启用）黑名单目录，**与勾选无关**
+	// （GetResultGroups 看不到勾选上下文，勾选是显示层的另一层过滤）。
+	//
+	// ★ 为什么由后端填而不是前端自算：前端手里只有 isKeep 和路径，路径归属
+	// 判据（大小写折叠、Clean 归一、卷语义）全在后端——前端重算就是第二份
+	// 实现，AS-H6/I5 两类事故（界面对"不会动的文件"做承诺 / 藏错行）的温床。
+	// 前端只许消费这个布尔值。
+	// 注意 ResultQuery 不带 dirs/excludeDirs 时它只反映"非保留"——白/黑名单
+	// 没上送就没有那个维度的信息，界面若开着"隐藏"必须把它们一起上送。
+	IsPending bool `json:"isPending"`
 }
 
 // GroupView 重复组视图。
@@ -102,6 +115,14 @@ type ResultQuery struct {
 	PageSize int    `json:"pageSize"`
 	Sort     string `json:"sort"` // reclaimable(默认)/size/count
 	Ext      string `json:"ext"`  // 扩展名筛选（含点，空=全部）
+	// Dirs/ExcludeDirs 「优先处理的文件夹」白名单与「不处理的文件夹」黑名单（功能 3）。
+	// **只服务 FileView.IsPending 这一个投影**——不改分组、不改排序、不改聚合口径
+	// （TestIsPendingDoesNotChangeAggregates 钉死）。不送 = 投影只反映"非保留"。
+	// ★ 开着"隐藏非拟处理项"的每一次分页都必须带上，否则藏行用的是陈旧策略。
+	// 副作用提醒：非空时后端要预热卷语义（会写探测文件），所以前端只在开关
+	// 打开时才上送，别把它变成每次翻页的固定 I/O。
+	Dirs        []string `json:"dirs"`
+	ExcludeDirs []string `json:"excludeDirs"`
 }
 
 // PagedResult 分页结果（01 §7.2）。
@@ -119,6 +140,47 @@ type PagedResult struct {
 type sortKey struct {
 	sort string
 	ext  string
+}
+
+// ---------- 拟处理清单查询（2026-09-23，设计段 2026-09-23-pending-files-query §2） ----------
+
+// PendingQuery GetPendingFiles 查询参数。SelectedIDs/Dirs 与 PreviewProcessPolicy
+// 同源（前端勾选 + 处理策略目录），判据共用 pendingIDsLocked，见那里。
+type PendingQuery struct {
+	SelectedIDs []uint64 `json:"selectedIds"` // 前端当前勾选（含会被排除项，用于逐行 reason）
+	Dirs        []string `json:"dirs"`        // 「优先处理的文件夹」；空=未启用处理策略
+	// ExcludeDirs 「不处理的文件夹」黑名单（功能 2）；空=未启用。
+	// 落在此列表内的非保留项永不进拟处理集，归类 reason=excluded。
+	ExcludeDirs []string `json:"excludeDirs"`
+	Page        int      `json:"page"`
+	PageSize    int      `json:"pageSize"`
+	Sort        string   `json:"sort"` // group(默认，结果集组序)/size/path
+}
+
+// PendingRow 清单一行。Pending=false 时 Reason 说明为什么"点了执行也不会动它"。
+type PendingRow struct {
+	ID      uint64 `json:"id"`
+	Path    string `json:"path"`
+	Name    string `json:"name"`
+	Size    uint64 `json:"size"`
+	GroupID uint64 `json:"groupId"`
+	Pending bool   `json:"pending"`
+	Reason  string `json:"reason"` // ""/keep/outside/gone/excluded，见 Pending* 常量
+}
+
+// PendingPage 拟处理清单分页结果。计数一律全量口径（跨页），与 PagedResult 的
+// TotalReclaimable 同一纪律（M4"部分当全部"教训）。
+type PendingPage struct {
+	Total        int `json:"total"` // = pending+excluded 去重后总行数
+	Page         int `json:"page"`
+	PageSize     int `json:"pageSize"`
+	PendingCount int `json:"pendingCount"` // 前段行数=分界索引
+	KeepCount    int `json:"keepCount"`
+	OutsideCount int `json:"outsideCount"`
+	GoneCount    int `json:"goneCount"`
+	// ExcludedCount 落在「不处理的文件夹」黑名单内的行数（功能 2）。
+	ExcludedCount int          `json:"excludedCount"`
+	Rows          []PendingRow `json:"rows"`
 }
 
 // viewCacheEntry 缓存的有序组列表 + 生成时的结果集指纹。
@@ -859,7 +921,16 @@ func (a *App) GetStatus() string { return string(a.pipe.Status()) }
 // ---------- 结果查询 ----------
 
 // GetResultGroups 分页查询重复组（M2-T07 排序/筛选；Y3 排序缓存）。
+//
+// 功能 3（2026-09-23）：q.Dirs/q.ExcludeDirs 非空时逐行填 FileView.IsPending，
+// 投影与执行判据同收归 pendingIDsLocked（见 pendingSetLocked），这里只是把
+// 全量结果集的 ID 喂进内核。预热（写探测文件）必须保持在取锁**之前**（AS-R3），
+// 且仅在有策略目录时才发生——翻页是高频动作，无策略时零额外 I/O。
 func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
+	var resolve ops.SensResolver
+	if all := warmDirs(q.Dirs, q.ExcludeDirs); len(all) > 0 {
+		resolve = ops.WarmSensitivity(all)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -910,8 +981,11 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 		end = len(gs)
 	}
 	views := make([]GroupView, 0, end-start)
+	// IsPending 投影：只在这里算一次（本页所有组共用同一份集合）。
+	// 放在切片判空之后：空页不必为"没有行的结果"遍历整个 byID。
+	pending := a.pendingSetLocked(q.Dirs, q.ExcludeDirs, resolve)
 	for _, g := range gs[start:end] {
-		views = append(views, toGroupView(g, a.keepIDs))
+		views = append(views, toGroupView(g, a.keepIDs, pending))
 	}
 	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, TotalReclaimableActual: totalReclaimActual, Groups: views}, nil
 }
@@ -998,7 +1072,10 @@ func groupHasExt(g *model.DuplicateGroup, ext string) bool {
 }
 
 // toGroupView 转换为 UI 视图：保留标记 = 当前决策（若有）否则路径最短建议（01 §9）。
-func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
+// pending 为拟处理投影集合（见 pendingSetLocked）；nil 表示本次不投影
+// （单元测试直调路径），届时 IsPending 一律 false——生产路径（GetResultGroups）
+// 永远传内核算出的集合，不存在"忘了传"这一态可被界面读到。
+func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool, pending map[uint64]bool) GroupView {
 	// 防御：空组没有成员可展示，`g.Files[0].Size` 会越界 panic。走到这里就说明
 	// 上游已经把畸形组放进了结果集（扫描流水线输出前有 len<2 过滤，故只可能来自
 	// history.LoadScan 读到被外部改写/损坏的历史库）。视图层不该因此崩掉整页
@@ -1038,6 +1115,7 @@ func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
 			IsKeep:         i == keep,
 			Volume:         vol,
 			VolumeResolved: volOK,
+			IsPending:      pending[f.ID],
 		})
 	}
 	return v
@@ -1262,6 +1340,93 @@ func startCmd(cmd *exec.Cmd, onExit func(error)) error {
 	return nil
 }
 
+// execRevealCmd 是路径类外部命令的执行缝（M155 卷型注入缝同族）。
+//
+// 抽出来只为一个理由：RevealPath/OpenPath 的用例不许真的弹出 Finder/文件管理器
+// 窗口——那是劫持用户的桌面。生产值恒为 startCmd，测试期整只替换成"只记录不启动"。
+// 卷型缝收在 mu 里面（M155 的教训：注入点必须自身线程安全），这里没有那个问题：
+// 缝只在绑定方法入口处读一次，读与用之间不跨锁、不跨 goroutine。
+var execRevealCmd = startCmd
+
+// checkRevealPath 校验前端回送的路径，返回规整后的绝对化入参与 stat 结果。
+//
+// 失败清单里的路径是"后端算出 → 前端展示 → 原样送回"的一圈往返，属于新的信任
+// 边界（ID 走不到它们：失败项压根没进 byID）。所以两条硬规则先于任何装配执行：
+//   - 空白路径拒掉：空的 open 调用在 darwin 上会打开"当前目录"的 Finder，
+//     属于用户没要求的跳转；
+//   - stat 不到的路径拒掉：失败清单里躺着的多半正是"访问不了"的东西，
+//     把 ENOENT 原样抛回去，比弹一个空窗或让外部工具静默失败有用。
+func checkRevealPath(raw string) (string, os.FileInfo, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", nil, fmt.Errorf("路径为空")
+	}
+	info, err := os.Lstat(p)
+	if err != nil {
+		return "", nil, fmt.Errorf("路径不存在或无法访问（%s）：%v", p, err)
+	}
+	return p, info, nil
+}
+
+// openCmd 组装"打开这个路径本身"的命令（文件交给默认应用，目录开窗口）。
+// 与 revealCmd 的区别只有一条：不带选中参数。Linux 同样要探测，否则
+// 命令不存在时报的是"exec 失败"，用户分不清是没装工具还是操作失败。
+func openCmd(path string) (*exec.Cmd, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path), nil
+	case "windows":
+		return exec.Command("explorer", path), nil
+	}
+	for _, c := range []struct {
+		exe  string
+		args []string
+	}{
+		{"xdg-open", []string{path}},
+		{"gio", []string{"open", path}},
+	} {
+		if _, err := exec.LookPath(c.exe); err == nil {
+			return exec.Command(c.exe, c.args...), nil
+		}
+	}
+	return nil, fmt.Errorf("未找到可用的打开命令（xdg-open/gio），无法打开 %s", path)
+}
+
+// RevealPath 按路径"打开所在文件夹并选中"（功能 4：失败清单逐行定位）。
+// 目录例外——直接打开自身：对目录做"到父目录里选中它"没有使用价值，用户想看的
+// 是里面有什么（权限错在哪个子项上）。
+func (a *App) RevealPath(path string) error {
+	p, info, err := checkRevealPath(path)
+	if err != nil {
+		return err
+	}
+	cmd, err := revealCmd(p)
+	if info.IsDir() {
+		cmd, err = openCmd(p)
+	}
+	if err != nil {
+		return err
+	}
+	return execRevealCmd(cmd, func(werr error) {
+		a.warnBackground("reveal", fmt.Sprintf("打开所在文件夹失败（%s）：%v", p, werr))
+	})
+}
+
+// OpenPath 按路径打开文件/目录本身（失败清单里"路径还能看，只是处理失败"的那些行）。
+func (a *App) OpenPath(path string) error {
+	p, _, err := checkRevealPath(path)
+	if err != nil {
+		return err
+	}
+	cmd, err := openCmd(p)
+	if err != nil {
+		return err
+	}
+	return execRevealCmd(cmd, func(werr error) {
+		a.warnBackground("open", fmt.Sprintf("打开失败（%s）：%v", p, werr))
+	})
+}
+
 // ---------- 设置（单一事实源，01 §7.3） ----------
 
 // settingsPath 给出 settings.json 的路径；配置目录不可用时以错误收口。
@@ -1361,20 +1526,32 @@ func (a *App) GetStartupNotice() string {
 // GetVersion 当前版本。
 func (a *App) GetVersion() string { return AppVersion }
 
-// emptyIntersectionMsg 处理策略把勾选全部过滤掉时的拒绝文案。
+// emptyIntersectionMsg 过滤器（白名单/黑名单）把勾选全部拦下时的拒绝文案。
 //
 // 措辞要点：
 //   - 说清"发生了什么"（已选 N、命中 0）——让用户自己能判断是不是范围配错了；
 //   - 说"已取消操作"而不是"请重试"——用户最怕"以为做了其实没做"，这句直接消歧义；
-//   - 顺带提示未命中的文件夹数——那通常就是配错的那一条。
-func emptyIntersectionMsg(selected, unmatchedDirs int) string {
+//   - 顺带提示未命中的文件夹数——那通常就是配错的那一条；
+//   - hasDirs/hasExcludes 决定点名哪把尺子，只说真的生效的那把——
+//     功能 2 前此函数只有白名单一路，文案逐字保留（FC 类回归钉）。
+func emptyIntersectionMsg(selected, unmatchedDirs int, hasDirs, hasExcludes bool) string {
 	extra := ""
 	if unmatchedDirs > 0 {
 		extra = fmt.Sprintf("；其中 %d 个文件夹内没有任何可处理的重复文件（可能写错了路径）", unmatchedDirs)
 	}
-	return fmt.Sprintf("所选文件均不在「优先处理的文件夹」范围内（已选 %d 项，命中 0 项%s），"+
-		"已取消操作，未改动任何文件。请调整优先文件夹，或清空该设置后重试。",
-		selected, extra)
+	if hasDirs && !hasExcludes {
+		return fmt.Sprintf("所选文件均不在「优先处理的文件夹」范围内（已选 %d 项，命中 0 项%s），"+
+			"已取消操作，未改动任何文件。请调整优先文件夹，或清空该设置后重试。",
+			selected, extra)
+	}
+	scope := "「不处理的文件夹」黑名单内"
+	advice := "请调整不处理目录，或清空该设置后重试。"
+	if hasDirs {
+		scope = "本次处理范围内（受「优先处理的文件夹」与「不处理的文件夹」共同限定）"
+		advice = "请调整这两项文件夹设置，或清空后重试。"
+	}
+	return fmt.Sprintf("所选文件均在%s（已选 %d 项，命中 0 项%s），已取消操作，未改动任何文件。%s",
+		scope, selected, extra, advice)
 }
 
 // ProcessPreview 处理策略的实际生效范围预览（供 UI 在执行前展示真实数量）。
@@ -1382,6 +1559,123 @@ type ProcessPreview struct {
 	EffectiveIDs   []uint64 `json:"effectiveIds"`   // 勾选中位于优先文件夹内的 ID
 	EffectiveCount int      `json:"effectiveCount"` // = len(EffectiveIDs)
 	UnmatchedDirs  []string `json:"unmatchedDirs"`  // 一个可处理文件都没命中的目录
+}
+
+// PendingKeep/PendingOutside/PendingGone/PendingExcluded 拟处理清单的排除原因
+// （PendingRow.Reason 的四值）。
+const (
+	PendingKeep     = "keep"     // 保留项：执行器硬拒绝，勾选了也不会动
+	PendingOutside  = "outside"  // 不在任何「优先处理的文件夹」内（处理策略把它滤掉）
+	PendingGone     = "gone"     // 已不在当前结果集（扫描收尾清理、切换历史后勾选残留）
+	PendingExcluded = "excluded" // 落在「不处理的文件夹」黑名单内（功能 2）
+)
+
+// warmDirs 合并两批待预热目录（白名单 + 黑名单）。必须新建切片——
+// append(dirs, excludeDirs...) 在 dirs 有余量时会**改写调用方**（前端状态里
+// 的 procDirs），那是"预览顺手改了用户设置"级别的事敌。
+func warmDirs(dirs, excludeDirs []string) []string {
+	if len(excludeDirs) == 0 {
+		return dirs
+	}
+	if len(dirs) == 0 {
+		return excludeDirs
+	}
+	all := make([]string, 0, len(dirs)+len(excludeDirs))
+	all = append(all, dirs...)
+	all = append(all, excludeDirs...)
+	return all
+}
+
+// pendingIDsLocked 是「拟处理集」判据的唯一内核：
+// 勾选 ∩ 结果集内非保留 ∩（若启用）优先目录 −（若启用）黑名单目录。
+//
+// 为什么必须收归一份（设计段 §3）：预览计数、拟处理清单、执行派发三处都要问
+// "哪些文件真的会被动"。此前预览与执行已按 M10c 修齐口径但仍是两段相似代码，
+// 清单再加一段就是三套判据——AS-H6/I5 两类事故（判据漂移 ⇒ 界面对"不会动的
+// 文件"做承诺）的温床。现在三处只有这一份实现。
+//
+// 返回：ids 按 selectedIDs 顺序去重（同 planOpItems 的 seen）；reason 给每个
+// 被排除的勾选 id 归类（keep/outside/gone/excluded，见 Pending* 常量）；unmatched 是
+// 一个可处理文件都没命中的优先目录（用户原文，回显定位用）。
+//
+// 须持 a.mu 调用；resolve 由调用方在**取锁之前**用 ops.WarmSensitivity 预热（AS-R3：
+// 卷语义探测要写用户目录探测文件，锁内做 I/O 会被死挂载连坐卡死全部绑定）。
+// 预热必须覆盖 dirs 与 excludeDirs **两批**目录——黑名单漏预热就是锁内写盘。
+//
+// 分岔语义与修正前逐格一致（M10c）：dirs 为空走 byID 存在性 + keepIDs 过滤；
+// 非空走引擎 MatchIDs（引擎已剔保留项）。排除归类按 gone→keep→outside→excluded
+// 四个判据**短路**——最先拦住它的是谁就记谁：白名单没放行谈不上黑名单，
+// 保留项在执行器里本来就是硬拒绝，excluded 的说法会夸大黑名单的能力。
+// 对结果集外的陈旧 id，两分支归类相同（gone），生效集合不变。
+//
+// excludeDirs 匹配走与 ProcessDirs 完全相同的引擎（ApplyProcessPolicyWith 的
+// inAnyDir 判据，含卷大小写敏感性折叠）：黑名单判错的后果是"说了不处理却
+// 处理了"（fail-dangerous），必须与白名单同一把尺子。keepIDs 传 nil——这里只要
+// "路径归属"，保留项已在上一格短路，不该被引擎再吞一次归类信息。
+func (a *App) pendingIDsLocked(dirs, excludeDirs []string, resolve ops.SensResolver,
+	selectedIDs []uint64) (ids []uint64, reason map[uint64]string, unmatched []string) {
+	var match map[uint64]bool
+	if len(dirs) > 0 {
+		out := ops.ApplyProcessPolicyWith(a.groups, dirs, a.keepIDs, resolve)
+		match = out.MatchIDs
+		unmatched = out.UnmatchedDirs
+	}
+	var excluded map[uint64]bool
+	if len(excludeDirs) > 0 {
+		excluded = ops.ApplyProcessPolicyWith(a.groups, excludeDirs, nil, resolve).MatchIDs
+	}
+	ids = []uint64{} // 空集合回 [] 不回 nil：这条线直达 JSON，nil 会序列化成 null
+	reason = make(map[uint64]string, len(selectedIDs))
+	seen := make(map[uint64]bool, len(selectedIDs))
+	for _, id := range selectedIDs {
+		if seen[id] {
+			continue // 重复勾选只算一次（同 planOpItems 的 seen）
+		}
+		seen[id] = true
+		if _, ok := a.byID[id]; !ok {
+			reason[id] = PendingGone
+			continue
+		}
+		if a.keepIDs[id] {
+			reason[id] = PendingKeep
+			continue
+		}
+		if match != nil && !match[id] {
+			reason[id] = PendingOutside
+			continue
+		}
+		if excluded[id] {
+			reason[id] = PendingExcluded
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, reason, unmatched
+}
+
+// pendingSetLocked 结果页投影用的「策略可处理」集合（功能 3）：把 byID 全量
+// 当候选集喂进 pendingIDsLocked，返回 ID 集合。
+//
+// ★ 为什么不另写一份"非保留 ∩ 白 − 黑"：那会是拟处理判据的第二实现——
+// AS-H6（前端自算命中）与 I5（视图自选保留者）两类事故都是同一个形状：
+// 第二份实现漂移后，界面对"不会动的文件"做承诺、或把该留的藏了。
+// 这里付出的 O(结果文件数) 每次翻页一遍，换"藏的行 == 引擎会动的行"这个不变式。
+//
+// gone 归类天然不会命中（候选集就是结果集全量）；勾选上下文不在口径里——
+// IsPending 说"策略上可处理"，"用户勾没勾"是显示层的另一层，见 FileView.IsPending。
+//
+// 须持 a.mu；resolve 由调用方在取锁前预热（AS-R3，与 pendingIDsLocked 同一约定）。
+func (a *App) pendingSetLocked(dirs, excludeDirs []string, resolve ops.SensResolver) map[uint64]bool {
+	all := make([]uint64, 0, len(a.byID))
+	for id := range a.byID {
+		all = append(all, id)
+	}
+	ids, _, _ := a.pendingIDsLocked(dirs, excludeDirs, resolve, all)
+	set := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
 }
 
 // PreviewProcessPolicy 在**不执行任何操作**的前提下，算出处理策略的实际生效范围。
@@ -1392,19 +1686,20 @@ type ProcessPreview struct {
 //
 // 参数带上 selectedIDs 并在此处求交，是为了让"交集"只有一份实现——
 // 若让前端自己算，就又出现两处独立实现，正是 I5 那类事故的温床。
+// 2026-09-23 起该求交收进 pendingIDsLocked，与 GetPendingFiles 共用；
+// 同日功能 2 加 excludeDirs（「不处理的文件夹」黑名单），判据仍只有那一份。
 //
 // 无副作用：只读 groups/keepIDs 快照，不置 opsRunning、不写账本、不动文件系统。
 // 因此它**不受 opsRunning 互斥限制**（预览是只读的，不该被正在进行的清理挡住）。
-func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (ProcessPreview, error) {
-	pv := ProcessPreview{EffectiveIDs: []uint64{}, UnmatchedDirs: []string{}}
-
+func (a *App) PreviewProcessPolicy(dirs, excludeDirs []string, selectedIDs []uint64) (ProcessPreview, error) {
 	// ★ AS-R3（2026-09-20 全仓审计）：卷语义探测要**往用户目录写探测文件**，
 	// 属于 I/O，必须在取锁之前做完——死挂载（网络盘拔走后 stat 挂死）时，
 	// 锁内一次写盘就能把 a.mu 连同全部 Wails 绑定一起卡住，而预览本应是只读操作。
 	// 预热之后（结论按目录缓存），锁内那次调用是纯查表 + 纯比较。
+	// 黑名单与白名单走同一引擎，预热也必须一并覆盖（功能 2）。
 	var resolve ops.SensResolver
-	if len(dirs) > 0 {
-		resolve = ops.WarmSensitivity(dirs)
+	if all := warmDirs(dirs, excludeDirs); len(all) > 0 {
+		resolve = ops.WarmSensitivity(all)
 	}
 
 	// 全程持锁：这里只剩纯内存计算（无 I/O、不回调整个 App），
@@ -1415,38 +1710,178 @@ func (a *App) PreviewProcessPolicy(dirs []string, selectedIDs []uint64) (Process
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	var out ops.ProcessPolicyOutcome
-	if len(dirs) > 0 {
-		out = ops.ApplyProcessPolicyWith(a.groups, dirs, a.keepIDs, resolve)
-	}
-	seen := make(map[uint64]bool, len(selectedIDs))
-	for _, id := range selectedIDs {
-		// M10c（2026-09-21 全仓审计 §五 10）：修正前"未启用处理策略"这一路直接
-		// `append(EffectiveIDs, selectedIDs...)`，把**保留项**与**结果集外的 id**
-		// 都算进生效范围——与执行侧 planOpItems（"在结果集内且未被标为保留"）和
-		// ApplyProcessPolicyWith（保留项 continue）口径相反，界面上的"将处理 N"
-		// 比真正会动的文件多，等于对保留项许了假承诺。现在两条分支共用同一内核，
-		// 并按 selectedIDs 顺序去重（同 planOpItems 的 seen）。
-		if len(dirs) == 0 {
-			if _, ok := a.byID[id]; !ok || a.keepIDs[id] {
-				continue
-			}
-		} else if !out.MatchIDs[id] {
-			continue
-		}
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		pv.EffectiveIDs = append(pv.EffectiveIDs, id)
-	}
-	pv.EffectiveCount = len(pv.EffectiveIDs)
+	ids, _, unmatched := a.pendingIDsLocked(dirs, excludeDirs, resolve, selectedIDs)
+	pv := ProcessPreview{EffectiveIDs: ids, EffectiveCount: len(ids), UnmatchedDirs: []string{}}
 	// 空结果集也要算出未命中目录（用户加了目录但当前没有重复文件，
 	// 正是最需要提示的场景），所以不在这里提前返回。
-	if out.UnmatchedDirs != nil {
-		pv.UnmatchedDirs = append(pv.UnmatchedDirs, out.UnmatchedDirs...)
+	if unmatched != nil {
+		pv.UnmatchedDirs = append(pv.UnmatchedDirs, unmatched...)
 	}
 	return pv, nil
+}
+
+// GetPendingFiles 分页查询「执行前拟处理清单」：勾选里哪些真的会被处理、
+// 哪些不会（及原因）。2026-09-23 新增（设计段 2026-09-23-pending-files-query）。
+//
+// 与 PreviewProcessPolicy 的关系：同一内核（pendingIDsLocked）的两个投影——
+// 预览给计数（按钮禁用、确认框用），清单给明细（用户核对"到底动哪几个文件"）。
+// 二者对同一输入必须逐 id 相等，由 TestPendingFilesMirrorsPreviewKernel 钉住。
+//
+// 行序：先「将处理」段（按 Sort：group=结果集组序、size 降序、path 升序，
+// tie-break 一律落到 GroupID→ID——M144 教训：同值不落地就会翻页跳行），
+// 后「不会处理」段（勾选原序）。分界索引 = PendingCount，前端据此插分区标题。
+//
+// 锁与副作用语义与 PreviewProcessPolicy 逐条相同（只读、持 a.mu、锁外预热、
+// 不受 opsRunning 互斥限制）。分页钳位与溢出安全同 GetResultGroups（M10a）。
+func (a *App) GetPendingFiles(q PendingQuery) (PendingPage, error) {
+	var resolve ops.SensResolver
+	if all := warmDirs(q.Dirs, q.ExcludeDirs); len(all) > 0 {
+		resolve = ops.WarmSensitivity(all)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if q.PageSize <= 0 {
+		q.PageSize = 100
+	} else if q.PageSize > 500 {
+		q.PageSize = 500
+	}
+	if q.Page < 0 {
+		q.Page = 0
+	}
+
+	ids, reason, _ := a.pendingIDsLocked(q.Dirs, q.ExcludeDirs, resolve, q.SelectedIDs)
+	pending := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		pending[id] = true
+	}
+
+	// 组内位置一次遍历拿齐：GroupID 展示用，(组序, 组内序) 是 group 排序键。
+	// 覆盖所有勾选（含被排除项）——"属于哪个组"对排除行同样是有效信息。
+	type loc struct {
+		gid     uint64
+		grpIdx  int
+		fileIdx int
+	}
+	sel := make(map[uint64]bool, len(q.SelectedIDs))
+	for _, id := range q.SelectedIDs {
+		sel[id] = true
+	}
+	pos := make(map[uint64]loc, len(sel))
+	for gi, g := range a.groups {
+		for fi, f := range g.Files {
+			if sel[f.ID] {
+				pos[f.ID] = loc{g.GroupID, gi, fi}
+			}
+		}
+	}
+
+	rows := make([]PendingRow, 0, len(ids))
+	excludedRows := make([]PendingRow, 0, len(q.SelectedIDs)-len(ids))
+	var keepN, outsideN, goneN, excludedN int
+	emitted := make(map[uint64]bool, len(q.SelectedIDs)) // 重复勾选只出一行（与内核 seen 同口径）
+	for _, id := range q.SelectedIDs {
+		if emitted[id] {
+			continue
+		}
+		emitted[id] = true
+		if pending[id] {
+			e := a.byID[id]
+			p := pos[id]
+			rows = append(rows, PendingRow{
+				ID: id, Path: e.Path, Name: filepath.Base(e.Path),
+				Size: e.Size, GroupID: p.gid, Pending: true,
+			})
+			continue
+		}
+		r := reason[id]
+		if r == "" {
+			// 理论不可达：pendingIDsLocked 对每个被排除 id 必归三类之一。
+			// 兜成 gone（最保守的说法——"它不在会被动的清单里"为大方向真），
+			// 而不是 panic 或漏行：漏行会让 Total 说谎。
+			r = PendingGone
+		}
+		switch r {
+		case PendingKeep:
+			keepN++
+		case PendingOutside:
+			outsideN++
+		case PendingExcluded:
+			excludedN++
+		default:
+			goneN++
+		}
+		// gone 的 id 已不在 byID，路径无从得知——行里只有 ID+原因。
+		// 这是能力的边界不是实现的偷懒：给它编一个"上一条已知路径"就是说谎。
+		var e *model.FileEntry
+		if r != PendingGone {
+			e = a.byID[id]
+		}
+		row := PendingRow{ID: id, Reason: r, GroupID: pos[id].gid} // 组已消散时零值 0，仅展示用
+		if e != nil {
+			row.Path = e.Path
+			row.Name = filepath.Base(e.Path)
+			row.Size = e.Size
+		}
+		excludedRows = append(excludedRows, row)
+	}
+	pendingRows := rows
+	// 「将处理」段按 Sort 重排；「不会处理」段保持勾选原序（它只是备注，
+	// 给它排序只会让人怀疑"排除也有优先级"——处理策略没有优先级，见 keep.go）。
+	switch q.Sort {
+	case "size":
+		sort.SliceStable(pendingRows, func(i, j int) bool {
+			if pendingRows[i].Size != pendingRows[j].Size {
+				return pendingRows[i].Size > pendingRows[j].Size
+			}
+			if pendingRows[i].GroupID != pendingRows[j].GroupID {
+				return pendingRows[i].GroupID < pendingRows[j].GroupID
+			}
+			return pendingRows[i].ID < pendingRows[j].ID
+		})
+	case "path":
+		sort.SliceStable(pendingRows, func(i, j int) bool {
+			if pendingRows[i].Path != pendingRows[j].Path {
+				return pendingRows[i].Path < pendingRows[j].Path
+			}
+			return pendingRows[i].ID < pendingRows[j].ID
+		})
+	default: // group：结果集组序 → 组内成员序 → ID 兜底（三键全序，翻页必稳定）
+		sort.SliceStable(pendingRows, func(i, j int) bool {
+			pi, pj := pos[pendingRows[i].ID], pos[pendingRows[j].ID]
+			if pi.grpIdx != pj.grpIdx {
+				return pi.grpIdx < pj.grpIdx
+			}
+			if pi.fileIdx != pj.fileIdx {
+				return pi.fileIdx < pj.fileIdx
+			}
+			return pendingRows[i].ID < pendingRows[j].ID
+		})
+	}
+	all := append(pendingRows, excludedRows...)
+	total := len(all)
+
+	page := PendingPage{
+		Total: total, Page: q.Page, PageSize: q.PageSize,
+		PendingCount: len(pendingRows), KeepCount: keepN, OutsideCount: outsideN,
+		GoneCount: goneN, ExcludedCount: excludedN,
+		Rows: []PendingRow{},
+	}
+	// M10a 同形的溢出安全起点：Page/PageSize 是绑定层入参，乘积回绕会把
+	// "远在集合外"读成合法页或直接 panic。溢出只有一种含义——空页但计数照给。
+	if q.Page > 0 && q.PageSize > math.MaxInt/q.Page {
+		return page, nil
+	}
+	start := q.Page * q.PageSize
+	if start >= total {
+		return page, nil
+	}
+	end := start + q.PageSize
+	if end > total {
+		end = total
+	}
+	page.Rows = all[start:end]
+	return page, nil
 }
 
 // FilterInDirs 批量判定「哪些路径位于任一优先目录下」，返回 paths 的下标（升序、不重复）。
@@ -1853,8 +2288,8 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	// 却会把 opsRunning 永久钉成"清理操作执行中"：resetOps 在那条永不返回的 I/O 之后，
 	// 此后每次清理（:1823）与每次新扫描（:611）都被拒，CancelOperation 也解不了。
 	var resolve ops.SensResolver
-	if len(op.ProcessDirs) > 0 {
-		resolve = ops.WarmSensitivity(op.ProcessDirs)
+	if all := warmDirs(op.ProcessDirs, op.ExcludeDirs); len(all) > 0 {
+		resolve = ops.WarmSensitivity(all)
 	}
 	// P1-1：快照读取与 opsRunning 置位在同一个临界区内完成。
 	// 修正前分了两段（读快照 → 释放锁 → 查状态 → 再取锁双检置位），
@@ -1900,6 +2335,44 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("永久删除需要显式确认（ConfirmDanger），已拒绝且未写入历史记录")
 	}
+	// 过滤器收窄（2026-09-20 白名单 / 2026-09-23 功能 2 黑名单）：
+	// 实际处理范围 = FileIDs ∩ 优先文件夹 −（若启用）不处理目录。
+	//
+	// ★ 判据收进 pendingIDsLocked（功能 2 起）：此前这里自带一段
+	// ApplyProcessPolicyWith 求交，与预览/清单是三份相似代码——AS-H6 的
+	// 温床形状。现在执行/预览/清单同一内核，"将处理 N"与实际处理 N 不可能漂移。
+	//
+	// 为什么在**这里**取交集，而不是下沉到 ops.Execute：
+	//   ① ops.Execute 是纯执行器，不该感知"处理策略"这个业务概念；
+	//   ② 它在 len(FileIDs)==0 时会早退——若把过滤下沉，勾选全部落空时
+	//      会**静默执行 0 个文件**，用户以为做了其实什么都没做。这正是要避免的。
+	//   ③ 写前账本（beginJournal → planOpItems）也用 op.FileIDs，必须在此之前
+	//      收窄，否则账本记录的范围超出实际执行范围，账本失真。
+	//
+	// 为什么挪进锁内（相对 2026-09-20 的位置）：pendingIDsLocked 要求持 a.mu；
+	// 且拒绝路径因此落在 opsRunning 置位**之前**——不再有"先占闸再撤闸"的
+	// 复位舞蹈，P2 死锁形状从结构上不存在了。resolve 是入口那次锁外预热的
+	// 查表版（R2-3）：预热覆盖 dirs+excludeDirs 同一批目录，表必命中，
+	// 锁内这一段没有任何写盘 I/O。
+	//
+	// op 是值传递：op.FileIDs = kept 只改本地副本，前端勾选状态不受影响。
+	filtered := len(op.ProcessDirs) > 0 || len(op.ExcludeDirs) > 0
+	var filteredMatched, filteredSelected int
+	var filteredUnmatched []string
+	if filtered {
+		filteredSelected = len(op.FileIDs) // 过滤前的勾选数，用于事件与拒绝文案
+		kept, _, um := a.pendingIDsLocked(op.ProcessDirs, op.ExcludeDirs, resolve, op.FileIDs)
+		if len(kept) == 0 {
+			// 交集为空必须**明确拒绝**，不能静默执行 0 项。此刻还没置
+			// opsRunning、没建 opCtx——直接放锁返回即可，无需任何复位。
+			a.mu.Unlock()
+			return "", fmt.Errorf("%s", emptyIntersectionMsg(
+				filteredSelected, len(um), len(op.ProcessDirs) > 0, len(op.ExcludeDirs) > 0))
+		}
+		op.FileIDs = kept
+		filteredMatched = len(kept)
+		filteredUnmatched = um
+	}
 	groups := a.groups
 	keepIDs := a.keepIDs
 	failed := a.failed
@@ -1912,47 +2385,16 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 
 	opID := fmt.Sprintf("ops-%s-%d", time.Now().Format("150405"), a.taskSeq.Add(1))
 
-	// 处理策略过滤（2026-09-20）：实际处理范围 = FileIDs ∩ 优先文件夹内。
-	//
-	// 为什么在**这里**取交集，而不是下沉到 ops.Execute：
-	//   ① ops.Execute 是纯执行器，不该感知"处理策略"这个业务概念；
-	//   ② 它在 len(FileIDs)==0 时会早退——若把过滤下沉，勾选全部落在范围外时
-	//      会**静默执行 0 个文件**，用户以为做了其实什么都没做。这正是要避免的。
-	//   ③ 写前账本（beginJournal → planOpItems）也用 op.FileIDs，必须在此之前
-	//      收窄，否则账本记录的范围超出实际执行范围，账本失真。
-	//
-	// op 是值传递：op.FileIDs = kept 只改本地副本，前端勾选状态不受影响。
-	if len(op.ProcessDirs) > 0 {
-		// resolve 是入口那次锁外预热的查表版（R2-3）：预热与这里用的是同一批 dirs，
-		// 表必命中 ⇒ 这一段不再有任何写盘 I/O。
-		pout := ops.ApplyProcessPolicyWith(groups, op.ProcessDirs, keepIDs, resolve)
-		selectedCount := len(op.FileIDs) // 过滤前的勾选数，用于事件与拒绝文案
-		kept := make([]uint64, 0, selectedCount)
-		for _, id := range op.FileIDs {
-			if pout.MatchIDs[id] {
-				kept = append(kept, id)
-			}
-		}
-		if len(kept) == 0 {
-			// 交集为空必须**明确拒绝**，不能静默执行 0 项。
-			// 复位 opsRunning/opsCancel 照抄下面 beginJournal 失败分支——
-			// 漏了会让应用永久卡在"操作执行中"（P2 死锁终防的教训）。
-			a.mu.Lock()
-			a.opsRunning = false
-			a.opsCancel = nil
-			a.mu.Unlock()
-			cancelOp()
-			return "", fmt.Errorf("%s", emptyIntersectionMsg(selectedCount, len(pout.UnmatchedDirs)))
-		}
-		op.FileIDs = kept
-		// 通知前端本次过滤的实际范围。用事件而不是改返回值：ExecuteOperation
-		// 的返回值是 opID，改签名会波及 Wails 绑定、TS 签名与一批后端测试。
-		// 事件在派发前发出，前端据此在执行完成横幅里说明"已选 M 项中 K 项未处理"。
+	// 收窄已在锁内完成（见上）。通知前端本次过滤的实际范围——用事件而不是
+	// 改返回值：ExecuteOperation 的返回值是 opID，改签名会波及 Wails 绑定、
+	// TS 签名与一批后端测试。事件在派发前发出，前端据此在执行完成横幅里
+	// 说明"已选 M 项中 K 项未处理"。
+	if filtered {
 		if a.emit != nil && a.ctx != nil {
 			a.emit(a.ctx, "ops:filtered", map[string]any{
-				"matched":   len(kept),
-				"selected":  selectedCount,
-				"unmatched": pout.UnmatchedDirs,
+				"matched":   filteredMatched,
+				"selected":  filteredSelected,
+				"unmatched": filteredUnmatched,
 			})
 		}
 	}

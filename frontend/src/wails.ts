@@ -7,6 +7,10 @@ export interface Filters {
   MinSize: number
   MaxSize: number
   ExcludePaths: string[]
+  // ExcludeDirs 精确目录排除（与 ExcludePaths 的 glob 分属两条通道）：
+  // 命中该目录及其整个子树即在遍历层剪枝；条目来自目录选择器。
+  // Go 侧零值（缺省/空）＝不排除，安全侧；显式列出同 AllowCloudHydration 的理由。
+  ExcludeDirs: string[]
   IncludeHidden: boolean
   // M6-P1 云端占位：true = 照常读取（隐式触发按需下载）且不计数；
   // false = 跳过并计入 skippedCloudFiles。Go 侧零值即安全档，但这里必须
@@ -96,6 +100,11 @@ export interface FileView {
   // Windows 盘符不等于卷（挂载点会把别的卷挂到某目录下），
   // 拿路径前缀猜会把用户引向注定失败的按钮。见 isGroupCrossVolume。
   volumeResolved: boolean
+  // 「策略上可处理」（功能 3，app.go FileView.IsPending）：拟处理内核在全量
+  // 结果集上的投影=非保留 ∩ 白名单 − 黑名单，与勾选无关。判据只在后端一份，
+  // 前端只许消费这个布尔值（AS-H6 纪律）；查询没带 dirs/excludeDirs 时它只
+  // 反映"非保留"——开着「隐藏非拟处理项」翻页必须把两把过滤器一起上送。
+  isPending: boolean
 }
 
 export interface GroupView {
@@ -116,6 +125,11 @@ export interface ResultQuery {
   pageSize: number
   sort: string
   ext: string
+  // 处理策略白/黑名单（功能 3）：**只喂 FileView.isPending 投影**，不改变
+  // 分组、排序与聚合。空/缺省=未启用该维度。只在「隐藏非拟处理项」开着时
+  // 上送——非空会让后端预热卷语义（写探测文件），翻页是高频路径。
+  dirs?: string[]
+  excludeDirs?: string[]
 }
 
 export interface PagedResult {
@@ -203,6 +217,12 @@ export interface OpRequest {
   // 注意它**不会**改变用户的勾选状态：显式勾选是用户的明确表达，
   // 一个策略设置不该悄悄改写它——后端也只收窄本次操作，不回写 selection。
   ProcessDirs?: string[]
+  // ExcludeDirs 「不处理的文件夹」黑名单（2026-09-23 功能 2 新增）：
+  // 实际处理范围再减去位于这些目录下的文件。与 ProcessDirs 同一内核
+  // （pendingIDsLocked），短路序 gone→keep→outside→excluded。
+  // ★ 不影响保留判定：黑名单内文件仍可当保留锚点、仍在结果集，
+  // 唯一效果是永不进拟处理集。空/不传 = 未启用。
+  ExcludeDirs?: string[]
 }
 
 // OpsFiltered 处理策略收窄了实际执行范围（后端事件 ops:filtered）。
@@ -295,6 +315,39 @@ export interface ProcessPreview {
   unmatchedDirs: string[]
 }
 
+// ---------- 拟处理清单查询（2026-09-23，Go 侧 app.go 同名结构体逐字段镜像） ----------
+
+export interface PendingQuery {
+  selectedIds: number[]
+  dirs: string[]
+  excludeDirs: string[] // 「不处理的文件夹」黑名单（功能 2）；空=未启用
+  page: number
+  pageSize: number
+  sort: string // group(默认)/size/path
+}
+
+export interface PendingRow {
+  id: number
+  path: string
+  name: string
+  size: number
+  groupId: number
+  pending: boolean
+  reason: string // ''/keep/outside/gone/excluded，见 Go 侧 Pending* 常量
+}
+
+export interface PendingPage {
+  total: number
+  page: number
+  pageSize: number
+  pendingCount: number
+  keepCount: number
+  outsideCount: number
+  goneCount: number
+  excludedCount: number // 落在「不处理的文件夹」黑名单内的行数（功能 2）
+  rows: PendingRow[]
+}
+
 // Wails 注入对象（最小接口约束，替代 any 边界；响应字段与 Go json tag 一致）
 export interface BackendAPI {
   SelectDirectory(): Promise<string>
@@ -310,8 +363,19 @@ export interface BackendAPI {
   // PreviewProcessPolicy 只读预览"处理策略实际会命中哪些"（无副作用、不写账本、
   // 不动文件系统，因此不受 opsRunning 互斥限制）。声明在方法面钉子里（G5）：
   // 缺声明 = 后端有、前端按类型调不到。
-  PreviewProcessPolicy(dirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
+  PreviewProcessPolicy(dirs: string[], excludeDirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
+  // GetPendingFiles 分页查询"执行前拟处理清单"明细（与上一绑定同一内核的两个投影：
+  // 预览给计数、清单给逐行可读明细 + 被排除项的 reason）。同为只读，不受
+  // opsRunning 互斥限制。
+  GetPendingFiles(q: PendingQuery): Promise<PendingPage>
   RevealInFolder(id: number): Promise<void>
+  // RevealPath / OpenPath 是**路径版**定位与打开（功能 4：失败清单逐行）。
+  // 为什么不能复用上面的 RevealInFolder：它按结果集 ID 查，而失败项压根没进
+  // 结果集（扫描中途失败的条目没有 byID 记录），ID 到不了它们。
+  // 判据全在后端（AS-H6）：空路径、路径不存在、是文件还是目录，都由 Go 侧
+  // checkRevealPath 定，前端只负责把显示的那条路径原样送回去、把拒绝原样报出来。
+  RevealPath(path: string): Promise<void>
+  OpenPath(path: string): Promise<void>
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
@@ -388,6 +452,13 @@ export const api = {
   getFailedItems: (): Promise<FailedItem[]> => backend().GetFailedItems(),
   previewFile: (id: number): Promise<PreviewData> => backend().PreviewFile(id),
   revealInFolder: (id: number): Promise<void> => backend().RevealInFolder(id),
+  // revealPath / openPath：失败清单的逐行出口（功能 4）。
+  //
+  // 这一腿前端**只做交接**：路径逐字节原样送出，后端的拒绝原样抛回。
+  // 不在这里判"路径看着像不存在就不发了"——判据全在后端（AS-H6），前端拦下来
+  // 只会把失败变成 M83 那一族的"点了没反应"。
+  revealPath: (path: string): Promise<void> => backend().RevealPath(path),
+  openPath: (path: string): Promise<void> => backend().OpenPath(path),
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),
@@ -412,6 +483,8 @@ export const api = {
   // dirs 全空白时返回空数组 = 未启用处理策略，调用方走"不过滤"的原路径。
   filterInDirs: (dirs: string[], paths: string[]): Promise<number[]> =>
     backend().FilterInDirs(dirs, paths).then(r => r ?? []),
+  // getPendingFiles 拟处理清单明细（与预览同一内核；见 BackendAPI 声明处注释）。
+  getPendingFiles: (q: PendingQuery): Promise<PendingPage> => backend().GetPendingFiles(q),
   cancelOperation: (): Promise<void> => backend().CancelOperation(),
   openTrash: (): Promise<void> => backend().OpenTrash(),
   listOpRecords: (): Promise<OpRecord[]> => backend().ListOpRecords(),
