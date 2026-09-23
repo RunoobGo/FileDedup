@@ -15,7 +15,9 @@
 #
 # 尚未纳入（原因见同文 §7.5 与 docs/04 §4.3）：
 #   - eslint：前端未配置 lint 规则集
-#   - 契约 diff 检查：需专门的"Go json tag ↔ TS 接口"校验器（尚未实现）
+#   - 契约 diff 检查：〔2026-09-24 更正：已纳入，此行原文滞后——根包
+#     wails_types_test.go（M30，docs/04 §6.9.12）随上述各腿的 go test 执行，
+#     双向比对 wails.ts 镜像接口与 Go json tag〕
 #   - macOS/Linux 真实回收站与 GUI 端到端：需人工或桌面会话
 #   - macOS 侧跨卷冒烟：harness 依赖 losetup/mount -o loop，仅 Linux 可用
 
