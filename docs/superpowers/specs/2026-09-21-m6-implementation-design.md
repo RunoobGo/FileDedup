@@ -6214,3 +6214,83 @@ ScanView 的"上次扫描 → 恢复"是同形漏网：它只问 `store.opsRunni
 - **组级全选那两句（`该组待清理项`）住在组件模板里、没进集中出口**：node 用例钉它，
   但"卡片内两处同词"目前靠测试维持而不是靠结构维持。收进 `selectionWording()` 会牵动
   `store.groupSelCount` 的既有锚，本项按"最小改动"未做。
+
+---
+
+### 30.8 R3-2（Task C2）：高危判据的两处零覆盖补齐——`isGroupCrossVolume` 与 `procReqSeq`
+
+**这一步在防什么**：本批 A/B 两批反复出现同一形状——"判据改对了，但没有任何用例站在那条判据上"。
+C2 处理审查点到的两处：前端唯一保留的路径/卷判据、以及确认框那个"将处理 N"的数字来源。
+两者都是**判错就直接影响用户决策**的格子，且都在 60 例 node 用例里零覆盖（实测：
+`grep -rl "isGroupCrossVolume\|FilterInDirs" frontend/tests/` 只命中 `scan-execute-lock.test.ts`，
+而它用的是常量 responder，从不制造交错）。
+
+**★ 计划给的用例清单有一格已经不存在了（开码核对后改正，不照抄）**
+
+计划 Step 1 写"同卷/跨卷/**Windows 盘符/UNC/尾分隔符/相对路径**混至少 6 例"。
+读现实现（`frontend/src/utils/pathpolicy.ts:20`）：
+
+```ts
+export function isGroupCrossVolume(files: { volume: string; volumeResolved: boolean }[]): boolean {
+  if (files.length < 2) return false
+  if (files.some(f => !f.volumeResolved)) return false
+  const first = files[0].volume
+  return files.some(f => f.volume !== first)
+}
+```
+
+它的输入是**后端算好的卷标识**（`app.go:1001 fileVolume` 的 `vid:<id>` 或
+`root:<filepath.VolumeName>`），函数体里没有任何路径解析、折叠或分隔符处理。
+"盘符 / UNC / 尾分隔符 / 相对路径"那四类是 D-1（AS-H6，2026-09-20）删掉前端那套
+`fsCaseSensitiveForPath / foldPath / normDir / dirContains` 之前的考题——今天给它们写用例
+等于替一段不存在的代码编期望，正是本批反对的"按记忆写期望"。
+所以用例按**现实现的三条短路**重写，盘符那一格保留但换了含义（见 U-6）。
+
+**用例清单（U-1…U-9，方向全部取自现实现，非记忆）**
+
+| # | 输入 | 期望 | 钉的是哪一条短路 |
+|---|---|---|---|
+| U-1 | `[]` 空组 | `false`，且**不抛** | `length < 2`（去掉短路后 `files[0].volume` 会 TypeError） |
+| U-2 | 单成员 | `false` | 同上 |
+| U-3 | 三成员全 `vid:7` 已解析 | `false` | 同卷不显示跨卷入口 |
+| U-4 | `vid:7` + `vid:8` 都已解析 | `true` | 真跨卷必须判出来（假阴性方向） |
+| U-5 | `vid:7`(res) + `''`(未解析) | **`false`** | ★ M7 那一格：未解析者排在**非首位**时也不许判跨卷 |
+| U-6 | `root:C:` + `root:D:` 都 `volumeResolved:false` | `false` | 前端**不解释内容**：盘符形状也不猜 |
+| U-7 | 三成员，未解析那位分别排在 0 / 1 / 2 | 三格全 `false` | 判据与顺序无关 |
+| U-8 | `[A,B]` 与 `[B,A]` 都 `true`；`[A,A,B]`、`[B,A,A]` 都 `true` | `true` | 差异藏在中间或末尾都得抓到（防 `every` 化） |
+| U-9 | 混合：一个已解析 `vid:7`、一个已解析 `vid:8`、一个未解析 | `false` | 保守优先：**任何**缺可信身份即整体降级 |
+
+**变异预测（绿后回砍，逐条预测谁会红）**
+- **M-a** 把第二条短路改回 M7 改前原句 `some(f => !f.volumeResolved || f.volume !== first)`
+  ⇒ 只应红在 U-5 / U-6 / U-7(位 1、2) / U-9，其余全绿 ⇒ 证明"未解析者在首位"从来不是这一格的判据。
+- **M-b** 删掉 `length < 2` 短路 ⇒ 只应红在 U-1（TypeError），U-2 仍绿（`some` 对单元素数组
+  在第一条短路后走不到）⇒ 记录哪一格是空的。
+- **M-c** `some(f => f.volume !== first)` 换成 `every` ⇒ 红在 U-8 的 `[A,A,B]` / `[B,A,A]`
+  与 U-4，**不红**在 U-3/U-5/U-9（它们本就是 false）⇒ 假阴性方向只有这一条能抓。
+
+**`procReqSeq` 那一侧（R3-2 的第二处）**
+
+现状 `scan.ts:596-622`：`procMatch`/`procCountError` 是确认框"将处理 N / 已排除 M"的**唯一数字来源**，
+`procCountPending` 决定按钮灰不灰；守卫是 `const seq = ++procReqSeq` + 回执处 `if (seq !== procReqSeq) return`
+（成功与 catch 两条腿各一次）。同文件的 `resultGen`/`histGen` 两条腿都有 race 用例
+（`scan-race.test.ts`、`scan-history-race.test.ts`），**只有这一条没有** ⇒ 同一缺陷族测了两腿留一腿。
+
+用例（P-1…P-4，形状照抄 `scan-execute-lock.test.ts` 的 `deferred()` + `flush()`）：
+
+| # | 时序 | 断言 |
+|---|---|---|
+| P-1 | 请求 1 在途时勾选变化 → 请求 2 发出；**请求 1 后回**（`[0]` vs `[0,1]`） | 旧回包不得覆盖：`procMatch` 必须是 key2 的那份；`effectiveCount` 按新勾选序列算 |
+| P-2 | 同上但**新回包先到**、旧的后到 | 同上（两种到达顺序都得同一终态，这才叫守卫而不是运气） |
+| P-3 | 旧回包**失败**（reject）而后新回包已成功 | `procCountError === ''`、`procMatch` 仍是新那份、`invoked('FilterInDirs')===2`（没有第三次）——陈旧失败不许把已到位的真值打回"计算中" |
+| P-4 | 同一份勾选 + 同一份优先目录连问两次 | 只发一次 RPC（`procMatch.value?.key === key` 那条短路是承重结构，不是优化） |
+
+**为什么 P-1/P-2 都要写**：只写"旧的先到"这一种，`seq` 守卫删掉也照样绿（先到先写、后到覆盖成更新值，
+终态恰好相同）——那是一枚会静默空转的守卫，正是 §30.1 以来反复抓的形状。**能杀掉"删守卫"这一刀的
+只有"旧后到"那个顺序**，所以它必须是独立的一条用例而不是同一条里的一个分支。
+
+**不做的边界**
+- 不给 `isGroupCrossVolume` 加"路径解析"用例：它不该知道路径长什么样（AS-H6 的全部意义）。
+  卷标识怎么算出来的归 Go 侧（`fileVolume` / `internal/ops/volume.go`），那边已有真机与夹具用例。
+- 不动 `procReqSeq` 的实现：本项是**测试面**补齐（审查裁定 R3-2 = 中危·测试面），除非用例把
+  另一条真实缺陷带出来；带来的一律按流程先写设计段再改码。
+- 不引入 vitest / jsdom：继续用仓库既有的 node 原生 TS 剥离 + `harness.mjs` 桩（零依赖决策未变）。
