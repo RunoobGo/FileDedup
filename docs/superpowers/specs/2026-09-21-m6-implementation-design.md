@@ -1,5 +1,12 @@
 # M6 实施细化设计（真实工况安全 · 逐项设计段）
 
+> **历史设计存档 + 逐条实施读数（本稿不整体回填）**：本稿是 M6 四项与其后各批（直至 §30 的第四轮全仓审查批）
+> 的**逐项设计段**，每条附"开码取证 / 实施读数 / 未兑现面"。两条贯穿全稿的用法规矩：
+> ① 设计段的**预判被码推翻**时在原处打 ★ 追记，不重写当时的结论；
+> ② 表格里那类"清单 / 判据快照"**不随实现回填**——它们是"当时怎么定的"的证据，现值以代码为准。
+> E1（2026-09-23）按②在 §2.2 与 §2.3 的 `/private` 写法上各加了一条 dated 括注
+> （实态：M84 已收窄为八条后代子树，见 §27.5 与 `internal/sysguard/sysguard.go:149-161`）。
+
 - 日期：2026-09-21
 - 上位依据：`2026-09-20-scenario-optimization-design.md`（工况总纲）§2.1~§2.4、§4、§5；
   登记处 `docs/04-开发与测试计划.md` §6.7 C 组 1~4 项；§7 另接 04 §6.8.8 M21
@@ -96,7 +103,7 @@
 | 类型 | 判据 | 大小写 | 用哪些条目 |
 |---|---|---|---|
 | `dirName` | 路径**最后一段**等于/前缀命中该名字，出现在任意深度即剪枝 | 不敏感比对（`strings.EqualFold`） | `$Recycle.Bin`、`System Volume Information`、`WindowsApps`、`lost+found`、`.Spotlight-V100`、`.fseventsd`、`.Trashes`、`.DocumentRevisions-V100`、TM 快照目录（前缀+后缀式） |
-| `absPath` | 折叠后的**绝对路径**等于该值或是其后代（`p==e \|\| HasPrefix(p, e+"/")`） | **精确**比对 | Linux `/proc`、`/sys`、`/dev`、`/run`；macOS `/private`、`/System` |
+| `absPath` | 折叠后的**绝对路径**等于该值或是其后代（`p==e \|\| HasPrefix(p, e+"/")`） | **精确**比对 | Linux `/proc`、`/sys`、`/dev`、`/run`；macOS `/private`、`/System`〔★ dated：`/private` 那条整片锚定已按 **M84** 收窄为八条后代子树，见 §27.5 与 `sysguard.go:149-161`；本表留原写法作设计阶段快照〕 |
 | `pseudoFileAtRoot` | 文件名相等 **且** 其父目录恰是本次的某个扫描根 | 不敏感比对 | `pagefile.sys`、`hiberfil.sys`、`swapfile.sys`、`DumpStack.log.tmp` |
 | `winReservedName` | 去扩展名后的主体 ∈ {CON,PRN,AUX,NUL,COM1-9,LPT1-9}，仅当平台为 Windows | 不敏感比对 | 保留名 |
 
@@ -143,7 +150,7 @@
 |---|---|---|
 | `/.Spotlight-V100`、`/.fseventsd`、`/.Trashes`、`/.DocumentRevisions-V100` | dirName | 每卷都有的元数据目录（注意：外接卷根同样有，故按名字而非按 `/` 绝对路径） |
 | `System Volume Information` | dirName | 扫 NTFS 外接盘时同一条规则直接复用，不必为 macOS 另写 |
-| `/private`、`/System` | absPath | `/System/Volumes/Data` 是 Firmlink 下真实数据的挂载点，**从 `/` 扫会走两遍用户数据**；`/private` 下是 `var/folders` 等运行时垃圾 |
+| `/private`、`/System` | absPath | `/System/Volumes/Data` 是 Firmlink 下真实数据的挂载点，**从 `/` 扫会走两遍用户数据**；`/private` 下是 `var/folders` 等运行时垃圾〔★ dated：这条整片写法在实施时**被推翻**——`/private/var/folders` 正是本机全部 `t.TempDir()` 夹具的真身，整片锚定等于误伤普通根扫描。M84 裁定改为**八条后代子树**（`etc` / `var/{db,log,root,spool,at,empty,run}`），**刻意不含** `/private/var/folders` 与 `/private/tmp`，见 §27.5 与 `sysguard.go:149-161`〕 |
 | `.com.apple.TimeMachine-*.snapshots` | dirName（前缀+后缀） | TM 本地快照，整卷的历史副本——不挡的话"重复文件"里全是快照，删了等于删备份 |
 
 **Linux**
@@ -6563,3 +6570,26 @@ version-sync / 三个冒烟脚本）。
 - F1 的"卷型档 ⇒ 排除随之放宽"这一格目前只有源码读数；手册里那两句是照源码写的，
   **没有真机插过 FAT/exFAT 卷**（与 §28.6、与 windows CI 腿同一档欠账）。
 - F6 只消除了"§3.1 与 §3.2 互相矛盾"，**没有**让 §3.1 变成实时值；783 这个数在 E2 之前仍是本稿独有的。
+
+**实施读数（2026-09-23，HEAD `ad6c2e0` 之上）**
+
+六条全部落地：`docs/09`（§3.1 卷型档 / §5.2 两格分开 / §6.2 保留目录分隔符腿）、`README.md`
+（可回撤范围补一项 + 功能列表补一条）、`docs/04` 附录 A（拆两勾）、§3.1 表 L1/L6（改为指针）、
+两份 spec（顶部存档说明 + 三处 `/private` dated 括注）。`check-version-sync.sh` rc=0，6 取值位仍全对齐 0.5.0。
+
+★ 三条**设计段自己写错、被开码纠正**的地方（这就是"先取证再落笔"对本批的实际收益）：
+
+1. **F5 的坐标错了**：计划与本稿 §30.10 都写"`/private` 见 m6 spec §2/§6"。实读 m6 稿的 `## ` 层级：
+   `:99` 落在 **§2.2 判据模型表**、`:146` 落在 **§2.3 清单初版表**（§6 是"C1：fscase 单根探测缺口"，与 `/private` 无关）。
+   另：总纲稿那条在 **§2.4**，不是"§2 / §6"。括注按真坐标写。
+2. **F6 的核次写错了**：本稿初稿说 516 是"第五次核对的快照"。实读 `docs/04:1403` 那句
+   "与 §3.2 **第四次**核对表逐值相同"，且同一张门禁表里躺着"19 例全过"⇒ 516 与 19 同属
+   **§6.8.9（2026-09-21 第四次核对）**。落笔的指针改为引 §6.8.9，不引一个不存在的"第五次快照"。
+3. **F1 的自证工具不能算证据**：本稿说"动 09 首部即被门禁"，实读 `check-version-sync.sh:41` 只 `sed` 取
+   一行 「适用版本：」⇒ 它对 09 的覆盖面**只有那一行**，六条错位一条都管不到。跑它的意义限定为
+   "改手册没把版本位改坏"，已在上面把这句改口为回归自检。
+
+★ 指针写法的一条取舍：F6 落点里那句"条数以该脚本收尾自报的「node 用例 + 接线锚」为准"是**复核过脚本真会打印**
+（`scripts/test-frontend-logic.sh:187` 那行 `node 用例 %s 项 + 接线断言 %s 项 = 合计 %s 项全部通过`）才写的——
+指一个不存在的自报口径，等于用一个新的错位替掉旧的。同理 F1 没有把 linux 的 `vfat`/`msdosfs` 写进手册，
+因为 `fscase.go:86-89` 注明 `volumeTypeName` 真实现只在 darwin 有读数，另两平台恒 `""`。
