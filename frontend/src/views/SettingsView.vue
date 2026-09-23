@@ -17,8 +17,14 @@ const cacheStats = ref<CacheStats | null>(null)
 async function refreshCache() {
   try { cacheStats.value = await api.cacheStats() } catch { cacheStats.value = null }
 }
+// R3-5：原先这里是一句原生 `confirm(...)`——全仓唯一残留。
+// 原生弹窗的样式与键盘行为都不受本应用控制，且绕开了 useModal 收口过的那套
+// （role/aria-modal/焦点归还原，P2-3）；在 webview 里它甚至可能被静默挡掉，
+// 于是"点了清空缓存却没反应"。改用与 RecordsView 清空记录同一形状的**两段式就地确认**。
+const confirmClearCache = ref(false)
 async function clearCache() {
-  if (!confirm('确认清空哈希缓存？下次扫描将退化为首次扫描速度。')) return
+  if (!confirmClearCache.value) { confirmClearCache.value = true; return }
+  confirmClearCache.value = false
   try {
     await api.cacheClear()
     toast.notifySuccess('哈希缓存已清空')
@@ -99,7 +105,16 @@ async function save() {
       <div class="row">
         <label>管理</label>
         <button class="btn-ghost" @click="refreshCache">刷新统计</button>
-        <button class="btn-ghost" @click="clearCache">清空缓存</button>
+        <!-- R3-5：两段式就地确认（第一下只把风险说清，第二下才动手）。
+             清空缓存不毁数据，但会让下次扫描退回首次速度，值得一句确认。 -->
+        <template v-if="!confirmClearCache">
+          <button class="btn-ghost" @click="confirmClearCache = true">清空缓存</button>
+        </template>
+        <template v-else>
+          <span class="hint">确认清空哈希缓存？下次扫描将退化为首次扫描速度。</span>
+          <button class="btn-danger" @click="clearCache">确认清空</button>
+          <button class="btn-ghost" @click="confirmClearCache = false">取消</button>
+        </template>
       </div>
 
       <div class="sec">关于</div>

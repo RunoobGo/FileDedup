@@ -160,6 +160,18 @@ wiring 'src/views/ScanView.vue' 'store.histBusy' ':disabled="store.opsRunning"' 
 #   新文案本身的真伪归 node 层（frontend/tests/selection-wording.test.ts 读源文件断言）。
 wiring 'src/views/RecordsView.vue' 'm.undoable' '并支持对回收站' \
 	'记录页空态不再替所有记录打包票，可撤性指回逐条徽标（R3-1：Windows 回收站不可应用内回撤）'
+# R3-3 / R3-4 / R3-5（2026-09-23 第四轮全仓审查，设计段 §30.9）：三条 UI 小修。
+# 同样只锚标识符（①③）与"新写法的必要一行"（②——那是代码形状不是文案，锚它不会因改字误报）。
+wiring 'src/components/ConfirmDialog.vue' 'store.procCountError' '' \
+	'确认框看得见"命中数算失败了"（R3-3：不读 procCountError 就永久停在"正在核算…"，没有出口）'
+# ★ 这一条**只有必须侧**：被禁的旧写法 `store.undoItem(m.id, it.id)`（裸调用、不等返回值）
+#   是新代码 `const accepted = await store.undoItem(m.id, it.id)` 的子串，锚不住——
+#   grep 走的是 -F 定长匹配，没有行尾锚可用。退回"锚新写法的必要一行"：
+#   `if (!accepted) undoingItem.value = null` 一删就红（变异 M-c 实测）。
+wiring 'src/views/RecordsView.vue' 'if (!accepted) undoingItem.value = null' '' \
+	'单项回撤被互斥挡下时立即收回"执行中…"（R3-4：问的是 store 的返回值，不是视图自查 busy）'
+wiring 'src/views/SettingsView.vue' 'confirmClearCache' 'if (!confirm(' \
+	'清空缓存走两段式就地确认（R3-5：原生 confirm() 是全仓唯一残留，绕开 useModal 收口的那套）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

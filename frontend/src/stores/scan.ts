@@ -442,8 +442,10 @@ export const useScanStore = defineStore('scan', () => {
 
   // undoRecord 回撤一条清理记录。后端同步拒绝（不可撤/在途）时走 catch；
   // 受理后的终止事件是 ops:undo:done（复用 opsRunning 互斥）。
-  async function undoRecord(opId: number) {
-    if (!guard('回撤')) return
+  // undoRecord 回撤整条记录。返回**是否受理**（R3-4）：false = 被互斥挡下、什么都没做。
+  // 视图必须消费这个值——被拒时 opsRunning 从未置位，靠下降沿复位的写法永远不会收尾。
+  async function undoRecord(opId: number): Promise<boolean> {
+    if (!guard('回撤')) return false
     opsRunning.value = true
     opsProgress.value = { Done: 0, Total: 0, Current: '' }
     try {
@@ -453,11 +455,13 @@ export const useScanStore = defineStore('scan', () => {
       opsProgress.value = null
       toast().notifyError('回撤失败', undoBlockedText(toast().errText(e)))
     }
+    return true
   }
 
   // undoItem 回撤记录中的单个条目（done/undo_failed 可撤），事件与互斥同 undoRecord。
-  async function undoItem(opId: number, itemId: number) {
-    if (!guard('回撤')) return
+  // 契约（含"返回是否受理"）与 undoRecord 同一条，理由见那里。
+  async function undoItem(opId: number, itemId: number): Promise<boolean> {
+    if (!guard('回撤')) return false
     opsRunning.value = true
     opsProgress.value = { Done: 0, Total: 0, Current: '' }
     try {
@@ -467,6 +471,7 @@ export const useScanStore = defineStore('scan', () => {
       opsProgress.value = null
       toast().notifyError('回撤失败', undoBlockedText(toast().errText(e)))
     }
+    return true
   }
 
   async function clearOps() {

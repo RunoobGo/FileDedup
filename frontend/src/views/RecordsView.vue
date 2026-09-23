@@ -119,9 +119,13 @@ function canUndoItem(m: OpRecord, it: OpRecordItem): boolean {
   return m.undoable && (it.state === 'done' || it.state === 'undo_failed')
 }
 
-function undoOne(m: OpRecord, it: OpRecordItem) {
+async function undoOne(m: OpRecord, it: OpRecordItem) {
   undoingItem.value = it.id
-  store.undoItem(m.id, it.id)
+  // ★ 必须先问"受理了没有"再决定留不留这个"执行中…"（R3-4）：guard 拒掉那一次
+  //   opsRunning 根本没置位，下面那个下降沿 watch 就永远不会来清，
+  //   这一行会永久挂着"执行中…"，而它看上去像一个还在跑的任务。
+  const accepted = await store.undoItem(m.id, it.id)
+  if (!accepted) undoingItem.value = null
 }
 
 async function reloadDetail() {

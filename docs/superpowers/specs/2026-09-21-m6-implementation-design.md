@@ -6413,3 +6413,53 @@ export function isGroupCrossVolume(files: { volume: string; volumeResolved: bool
 - 不把 `undoRecord` 的批量路径接上返回值消费：它的按钮在 `confirmUndoId` 两段式里，
   标签由 `store.busy` 说话，没有"卡住的行"这一形。只统一签名，不改它的呈现。
 - 不引入通用 Confirm/Modal 组件（③）。
+
+**实施读数（HEAD `8f42133` 之上新增，逐项实跑）**：
+
+- 改动面：`scan.ts`（`undoRecord`/`undoItem` 改 `Promise<boolean>`，成功腿末尾 `return true`、
+  被拒腿 `return false`）、`RecordsView.vue`（`undoOne` 改 async 并消费返回值）、
+  `ConfirmDialog.vue`（error 分支置于 pending 之前 + 「重新计算」按钮 + `.procerr` 样式一格）、
+  `SettingsView.vue`（原生 `confirm()` → `confirmClearCache` 两段式，与 RecordsView 同形）、
+  `scripts/test-frontend-logic.sh`（锚 +3，17→20→**23**）、新测试 `scan-undo-accepted.test.ts`（4 条）、
+  `docs/09` 三处（§4.7 清空缓存两段式、§6.2.1 计数"问不到数会明说"表、§6.7 单项回撤收回）。
+- **修前红面貌（两条通道各取一次，都在 `FRONTEND_DIR` 隔离副本上跑，工作树未动）**：
+  - 锚层：HEAD 版四份源码 + 新锚（去掉 node 用例）⇒ **3 条红**，逐字为
+    `（未引用 store.procCountError）`、`（未引用 if (!accepted) undoingItem.value = null）`、
+    `（未引用 confirmClearCache）`。
+  - node 层：`scan-undo-accepted.test.ts` 四条在实现前全红，红在 `undefined !== true` /
+    `undefined !== false` ⇒ 新契约这一族是**断言不符**（不是"接口不存在"，函数本来就在）。
+- **绿面貌**：`node 用例 78 项 + 接线断言 23 项 = 合计 101 项全部通过`；
+  `vue-tsc --noEmit` rc=0；`vite build` ✓ 489ms；
+  全套 `run-gates` **`rows=15 PASS=14 SKIP=1 FAIL=0`**（`/tmp/gates_c3.log`，
+  唯一 SKIP 仍是需 root 的 `smoke-symlink`，按 AS-K2 只算未取读数）。
+- **变异四刀（`cp` 备份 → `cp` 还原 → `cmp` 自证，未用 `git checkout`；
+  `MA/MB/MC/MD-RESTORE cmp ok` + `MC2-RESTORE cmp ok`）**：
+  - **M-a** 删掉 `ConfirmDialog` 的 error 分支 ⇒ 只红 N-1（`✗ …（未引用 store.procCountError）`），
+    N-3/N-4 与 78 例 node 全绿 ⇒ "这一格只有这一把钉"成立。
+  - **M-b** `undoItem` 被拒腿退回 `return`（不给 false）⇒ node 层红在"被互斥挡下时返回 false"那一条；
+    ★ 同棵副本**去掉 N-2 那份用例后单跑锚层** ⇒ `node 74 + 接线 23 = 97 全通过`，
+    即 store 契约退化**三把锚一把都抓不到**。设计段预言的"两层必须都在"是量出来的，不是说的。
+  - **M-c / M-c2** `undoOne` 退回"先置位、不等返回值"⇒ 锚 N-3 红（改锚前后各取一次，同一读数）。
+  - **M-d** `clearCache` 里塞回原生 `if (!confirm(` ⇒ 只红 N-4（`出现被禁写法：if (!confirm(`）。
+- ★ **实施中自己踩到的一枚空转锚，已当场改正并复跑**：N-3 的禁项第一版写成
+  `store.undoItem(m.id, it.id)$`，而 `wiring()` 用的是 `grep -qF`（**定长匹配、没有行尾锚**）
+  ⇒ 那个 `$` 是字面量，禁项**永远不会命中**，是一枚看起来在、实际空转的守卫。
+  且旧写法本就是新代码 `const accepted = await store.undoItem(m.id, it.id)` 的子串，
+  按子串禁根本禁不掉 ⇒ 改为**只留必须侧**（删掉那行就红，M-c2 复测照红），并在脚本里写明为什么这条没有禁项。
+  同批 N-4 的禁项 `if (!confirm(` 是普通子串、无 `$`，实测命中（M-d）⇒ 未受影响。
+- ★ 一条设计段没写、实施时才浮出的形状差异：`undoRecord`/`undoItem` 的**成功腿不解 `opsRunning`**
+  （由后端 `ops:done` 事件收尾），所以 `return true` 落在 try/catch 之后而不是紧跟上锁之后。
+  契约注释按这个事实写（"true = 已开始、由下降沿收尾"），免得后来人以为返回值 true 意味着做完。
+
+**本项之后仍不成立的声明（未兑现面）**：
+- **三处都没有浏览器实测**：本机不跑 GUI。「重新计算」按钮能不能真把状态拉回真值、
+  两段式清空缓存的第二下、以及被拒那一行收回后标签的实际呈现，全部只有源码与判据层读数 ⇒
+  **代码已改、验证未兑现**。
+- **「重新计算」没有 node 用例**：它是一次 `store.ensureProcCounts()` 调用，
+  而"失败后 `procMatch` 为 null ⇒ 那条 key 短路不会吞掉重问"这一格目前靠 `scan-proc-race` 的
+  O4/O5 间接覆盖（同指纹不重问 / 当前失败看得见），**没有一条用例专门问"失败之后再问一次会发 RPC"**。
+  这一格留作登记（E2 划账时列入低危欠账）。
+- `undoRecord` 的返回值本项只统一了签名，**没有任何视图消费它**（批量那条走 `store.busy` 的灰态，
+  没有"卡住的行"这一形）⇒ 它的 true/false 目前是无人读的性质，只被 N-2 的第三条用例钉住。
+- 两段式确认没有"离开页面即失效"的处理：`confirmClearCache` 是视图局部 ref，
+  切走再回来会退回第一下（RecordsView 的 `confirmClearOps` 同形，本项跟随既有约定，不单独加严）。

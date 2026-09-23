@@ -124,10 +124,20 @@ useModal(dlgRef)
       <div id="confirm-dialog-title" class="t" :class="{ danger: meta.danger }">{{ meta.title }}</div>
       <p class="d">{{ meta.desc }}</p>
       <div class="box">
+        <!-- R3-3：算失败与还在算必须分得开。失败时 procMatch 被置 null ⇒ procCountPending
+             恒真，原先这一支永久命中，界面把"不知道"演成"正在算"且没有任何出口
+             （watch 只跟 procSelKey，失败不改 key）。判据不动：仍然不给确认，
+             只是把"为什么不许"和"再问一次"摆出来。 -->
+        <template v-if="store.procCountError">
+          <div class="procerr">
+            命中数没算出来：{{ store.procCountError }}
+            <button class="btn-ghost" @click="void store.ensureProcCounts()">重新计算</button>
+          </div>
+        </template>
         <!-- 命中数尚未从后端返回：既不说"将处理 N 项"，也不说 0 项，只说在算。
              结果页的操作按钮此时已经是灰的，走到这一步通常是 debounce 与弹窗
              竞速的极窄窗口；ensureProcCounts 会在挂载时立刻补一次，几毫秒后就换真数。 -->
-        <template v-if="store.procCountPending">
+        <template v-else-if="store.procCountPending">
           <div>正在核算实际处理范围（优先文件夹内的命中数尚未返回）…</div>
         </template>
         <template v-else-if="narrowed">
@@ -170,6 +180,8 @@ useModal(dlgRef)
 .box { background: var(--bg-hover); border-radius: var(--r-sm); padding: 10px 14px; display: flex; gap: var(--sp-5); font-size: var(--fs-sm); color: var(--text-2); }
 .box b { color: var(--text); font-variant-numeric: tabular-nums; }
 .proctip { color: var(--warn-ink, var(--text-2)); font-size: var(--fs-sm); margin: 0; }
+/* R3-3：算失败那一支。.box 本身是 flex 行，这一格要自带换行——文字长度来自后端错误串。 */
+.procerr { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); color: var(--danger-ink); }
 .moverow { display: flex; gap: var(--sp-2); }
 .moverow input { flex: 1; }
 .ack { display: flex; gap: var(--sp-1); align-items: center; color: var(--danger-ink); font-size: var(--fs-sm); }
