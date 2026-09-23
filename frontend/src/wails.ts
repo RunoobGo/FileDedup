@@ -7,6 +7,10 @@ export interface Filters {
   MinSize: number
   MaxSize: number
   ExcludePaths: string[]
+  // ExcludeDirs 精确目录排除（与 ExcludePaths 的 glob 分属两条通道）：
+  // 命中该目录及其整个子树即在遍历层剪枝；条目来自目录选择器。
+  // Go 侧零值（缺省/空）＝不排除，安全侧；显式列出同 AllowCloudHydration 的理由。
+  ExcludeDirs: string[]
   IncludeHidden: boolean
   // M6-P1 云端占位：true = 照常读取（隐式触发按需下载）且不计数；
   // false = 跳过并计入 skippedCloudFiles。Go 侧零值即安全档，但这里必须

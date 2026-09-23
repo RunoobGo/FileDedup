@@ -445,6 +445,13 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						if matcher.ExcludeDir(drel, de.Name(), verdictFor(rootVerdicts, dridx)) {
 							continue
 						}
+						// 功能1（2026-09-23）：ExcludeDirs 精确目录剪枝。与上面的 glob
+						// 剪枝分属两条通道：这里比**绝对路径**的段边界前缀，命中即整棵
+						// 子树不遍历。剪枝只发生在"遍历中发现的子目录"上——显式指定的
+						// 扫描根不查此表（指名优先，同保护清单的放行裁定）。
+						if matcher.ExcludeDirPath(full) {
+							continue
+						}
 						key := visitKey(full)
 						mu.Lock()
 						_, seen := visited[key]

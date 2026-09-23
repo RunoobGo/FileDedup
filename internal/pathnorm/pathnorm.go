@@ -60,3 +60,14 @@ func TrimTailKeepRoot(p string) string {
 	}
 	return p
 }
+
+// DirKey 把一个目录路径变成可做 Under 比较的键：换分隔符 + 去尾斜杠。
+//
+// ExcludeDirs 的条目侧（Compile 期）与查询侧（遍历期每个目录一次）必须过
+// 同一份归一，否则又会长出第五份分隔符实现（M64 的教训，见包注释）。
+// sep 的给法与 Slash 同规：调用点写明是平台真值还是字面 "\\"。
+// 空白条目原样返回空串，由调用方丢弃——空键在 Under 里对绝对路径恒真，
+// "什么都不排除"与"全盘排除"不许长成一个样子，丢弃判据归消费方。
+func DirKey(p, sep string) string {
+	return TrimTailKeepRoot(Slash(p, sep))
+}

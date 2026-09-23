@@ -35,11 +35,17 @@ type FileEntry struct {
 // 旧 settings.json、旧历史行、以及前端尚未跟进的 emptyFilters() 三种情形都解成
 // false＝跳过占位，不需要任何迁移代码（设计稿 §4.2）。
 type Filters struct {
-	IncludeExts   []string // 空 = 全部，如 ".jpg"
-	ExcludeExts   []string
-	MinSize       uint64   // 0 = 不限（默认 0）
-	MaxSize       uint64   // 0 = 不限
-	ExcludePaths  []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
+	IncludeExts  []string // 空 = 全部，如 ".jpg"
+	ExcludeExts  []string
+	MinSize      uint64   // 0 = 不限（默认 0）
+	MaxSize      uint64   // 0 = 不限
+	ExcludePaths []string // glob：无 "/" 匹配任意路径段；有 "/" 匹配相对路径前缀
+	// ExcludeDirs 精确目录路径（目录选择器/粘贴，非 glob）：遍历中发现的子目录
+	// 命中该目录**及其整个子树**即剪枝。与 ExcludePaths、系统保护清单三条通道
+	// 相互独立。显式指定的扫描根本身不经此判据（指名优先，同保护清单的放行
+	// 裁定）；若排除表与被点名的根自相矛盾（根恰在表内），其子目录按表剪枝——
+	// 少扫落在删除安全侧，不为此情形另开第二条逃逸通道。
+	ExcludeDirs   []string
 	IncludeHidden bool
 	// AllowCloudHydration=true 时**照常读取云端占位文件**（即隐式触发按需下载），
 	// 且不计数。默认 false＝跳过并计 SkippedCloudFiles。

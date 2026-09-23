@@ -19,6 +19,10 @@ type Matcher struct {
 	incExt   extSet
 	excExt   extSet
 	excPaths []string // 2026-09-18 审查 I1：已归一为 "/" 分隔的排除模式
+	// excDirs 是 ExcludeDirs 的归一键（"/" 分隔、去尾斜杠、空白项丢弃）。
+	// 与 excPaths 分属两条通道：这里比绝对路径前缀，不做 glob、不看卷大小写
+	// 敏感度（条目来自本机选择器，拼写即真值；错拼的后果是不命中=多扫，安全向）。
+	excDirs []string
 	// invalid 是**语法无效**的排除模式（原文，未归一），由 Compile 逐段探出（R2-4）。
 	// 它们**仍在 excPaths 里**：本字段只负责"说出来了"，不负责改判（方向仍是少排除=多扫）。
 	invalid []string
@@ -138,11 +142,23 @@ func Compile(f *model.Filters) *Matcher {
 			}
 		}
 	}
+	var excDirs []string
+	for _, d := range f.ExcludeDirs {
+		// 归一走 pathnorm.DirKey（平台分隔符口径，与遍历侧同一函数）；
+		// 空白项按未配置丢弃：空键在 Under 下对绝对路径恒真，一条空串
+		// 就等价于"排除全盘"，这一格必须钉死（见 TestExcludeDirPathInactiveIsAlwaysFalse）。
+		key := pathnorm.DirKey(strings.TrimSpace(d), string(filepath.Separator))
+		if key == "" {
+			continue
+		}
+		excDirs = append(excDirs, key)
+	}
 	return &Matcher{
 		f:        f,
 		incExt:   newExtSet(normalizeExtList(f.IncludeExts)),
 		excExt:   newExtSet(normalizeExtList(f.ExcludeExts)),
 		excPaths: excPaths,
+		excDirs:  excDirs,
 		invalid:  invalid,
 	}
 }
@@ -257,6 +273,22 @@ func (m *Matcher) ExcludeDir(rel, name string, caseMode fscase.Result) bool {
 			continue
 		}
 		if matchPath(pat, rel, name, insensitive) {
+			return true
+		}
+	}
+	return false
+}
+
+// ExcludeDirPath 判定绝对目录路径 full（含其整个子树）是否命中 ExcludeDirs。
+// true = 遍历层直接剪枝，不再深入。条目侧与查询侧共用 pathnorm.DirKey 一份归一
+// （M64：分隔符判据只许一处实现）。nil *Matcher / 空列表恒 false，同三处 nil 短路契约。
+func (m *Matcher) ExcludeDirPath(full string) bool {
+	if m == nil || len(m.excDirs) == 0 {
+		return false
+	}
+	key := pathnorm.DirKey(full, string(filepath.Separator))
+	for _, d := range m.excDirs {
+		if pathnorm.Under(key, d) {
 			return true
 		}
 	}

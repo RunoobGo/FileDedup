@@ -74,6 +74,19 @@ onUnmounted(() => {
 })
 function removeRoot(i: number) { store.roots.splice(i, 1) }
 
+// 功能1：排除目录（精确路径通道，命中目录及其整个子树不扫描）
+async function addExcludeDirByPicker() {
+  try {
+    const dir = await api.selectDirectory()
+    if (dir && !store.filters.ExcludeDirs.includes(dir.trim())) {
+      store.filters.ExcludeDirs.push(dir.trim())
+    }
+  } catch (e: any) {
+    toast.notifyError('选择目录失败', e)
+  }
+}
+function removeExcludeDir(i: number) { store.filters.ExcludeDirs.splice(i, 1) }
+
 const extInclude = computed({
   get: () => store.filters.IncludeExts.join(','),
   set: (v) => { store.filters.IncludeExts = v.split(',').map(s => s.trim()).filter(Boolean) },
@@ -198,6 +211,17 @@ const progressPercent = computed(() => {
           <label>包含扩展名<input v-model="extInclude" type="text" placeholder=".jpg,.png（空 = 全部）" /></label>
           <label>排除扩展名<input v-model="extExclude" type="text" placeholder=".tmp,.log" /></label>
           <label class="wide">排除路径（glob）<input v-model="excludePaths" type="text" placeholder="node_modules, build/**, *.tmp" /></label>
+          <div class="wide exc-dirs">
+            <div class="exc-title">排除目录（含整个子树不扫描）</div>
+            <div v-if="store.filters.ExcludeDirs.length === 0" class="exc-empty">未添加；显式设为扫描根的目录不受排除影响</div>
+            <div v-for="(d, i) in store.filters.ExcludeDirs" :key="d" class="exc-item">
+              <span class="path" :title="d">{{ d }}</span>
+              <button class="x" :aria-label="`移除排除目录`" :title="`移除目录 ${d}`" @click="removeExcludeDir(i)">
+                <Icon name="close" :size="14" />
+              </button>
+            </div>
+            <button class="btn-ghost exc-add" @click="addExcludeDirByPicker">添加排除目录</button>
+          </div>
           <label>线程数<input v-model.number="store.threads" type="number" min="0" placeholder="0 = 自动（核数-1）" /></label>
         </div>
         <div class="filter-foot">
@@ -304,6 +328,17 @@ const progressPercent = computed(() => {
 .toggle .chev { margin-left: 4px; transition: transform 0.18s ease; }
 .toggle .chev.open { transform: rotate(180deg); }
 .adv { border-top: 1px dashed var(--border); padding-top: 10px; }
+/* 功能1：排除目录清单。列表行复用 .path/.x（与扫描目录同一控件语言），
+   但排除项多一条空态说明——"显式根不受排除"是判据的一部分，不许只写在后端注释里。 */
+.exc-dirs { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); }
+.exc-title { color: var(--text-2); }
+.exc-empty { color: var(--text-3); }
+.exc-item {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 4px 8px; border-radius: var(--r-md);
+  background: var(--bg-hover); user-select: text;
+}
+.exc-add { align-self: flex-start; margin-top: var(--sp-1); }
 .filter-foot { display: flex; justify-content: flex-end; gap: var(--sp-3); margin-top: 14px; }
 .start { font-size: var(--fs-lg); padding: 9px 22px; }
 </style>

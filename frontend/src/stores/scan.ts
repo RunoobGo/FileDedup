@@ -17,6 +17,8 @@ export const emptyFilters = (): Filters => ({
   MinSize: 0,
   MaxSize: 0,
   ExcludePaths: [],
+  // 功能1：精确目录排除，默认空＝不排除。与 ExcludeDirs 的 Go 零值同安全侧。
+  ExcludeDirs: [],
   IncludeHidden: false,
   // M6-P1：默认不读取云端占位（安全档）。必须在此显式列出——payload 由
   // {...filters} 浅合并且空清单会 `delete Filters.IncludeExts`，隐式缺省会让
