@@ -6154,3 +6154,63 @@ ScanView 的"上次扫描 → 恢复"是同形漏网：它只问 `store.opsRunni
 - 不给空态句子再造一个"唯一文案方"函数：全仓只有这一处（grep 过 `支持对回收站`），
   为单点建出口是本批反对的过度抽象。
 - 不改五颗按钮的名字与确认框文案（M15/M22 已收口，`reclaimLine` 逐类显式）。
+
+**实施读数（HEAD `5378571` 之上新增，逐项实跑）**：
+
+- 改动面：`frontend/src/utils/opdisplay.ts`（新增 `SelectionWording` 接口 + `selectionWording()`
+  集中出口）、`GroupCard.vue` 三处措辞改为引用它、`ScanView.vue:146` 恢复按钮的禁用判据换成
+  `store.histBusy`、`RecordsView.vue:259` 空态那句改口、`scripts/test-frontend-logic.sh` 接线锚 +3、
+  新测试文件 `frontend/tests/selection-wording.test.ts`（**5 条**）。Go 侧零改动。
+- ★ **设计段的钉子 3 有一格是错的，按实测改正**：原文写"必须出现 `以每条记录的徽标为准`"，
+  那是**锚中文文案** ⇒ 直接违反本脚本第 63 行自己立的规矩（"只锚标识符、锚文案会误报"）。
+  改成锚标识符 `m.undoable`（逐条徽标的判据本身）+ 禁旧整句 `并支持对回收站`，
+  而"这句话现在说得对不对"下沉到 node 层的正则（新增两条：记录页空态、扫描页 `:disabled` 表达式）。
+  这一改不是审美：**修前树上新锚确实照红**（读数见下 A），而"锚文案"那版只是把误报风险留给了未来。
+- **A. 修前红面貌（用 `FRONTEND_DIR` 隔离副本复批，未动工作树）**：把 HEAD 的四份源码
+  （`GroupCard.vue`/`ScanView.vue`/`RecordsView.vue`/`opdisplay.ts`）+ 新锚 + 去掉新用例 ⇒
+  `3 条接线断言失败`，逐字为
+  `（未引用 selectionWording(）`、`（未引用 store.histBusy）`、`（出现被禁写法：并支持对回收站）`，
+  同跑 17 ✓ / 3 ✗ = 20 条 ⇒ 锚数从 17 涨到 20 是量出来的。
+  另把新用例放回同一副本 ⇒ node 层红在
+  `SyntaxError: The requested module '../src/utils/opdisplay' does not provide an export named 'selectionWording'`
+  ——与设计段预言一致，记为"接口不存在"而非"断言不符"。
+  ★ 两条**新增的 node 用例**在修前树上也各自红（临时探针跑完即删、未进树）：
+  空态那条红在 `actual: '清理操作会自动留痕，并支持对回收站/移动/硬链接合并进行回撤。' expected: /徽标/`，
+  恢复按钮那条红在 `actual: 'store.opsRunning'`。⇒ 它们不是"改后补的绿灯"。
+- **B. 绿面貌**：`test-frontend-logic: node 用例 60 项 + 接线断言 20 项 = 合计 80 项全部通过`
+  （改前 55 + 17 = 72；+5 用例 / +3 锚，逐条对得上）；`vue-tsc --noEmit` rc=0；`vite build` ✓ 476ms。
+- **变异（三刀，全部 `cp` 备份 → `cp` 还原 → `cmp` 自证，未用 `git checkout`）**：
+  - **Ma** `GroupCard` 的 aria-label 改回内联 `` `标记为删除 ${f.name}` `` ⇒ 红在 node 层
+    （`expected: /sel\.ariaVerb/`）。★ 这里有个**必须写下来的层次事实**：脚本在 `node --test`
+    失败时 `exit 1`，**接线锚根本没跑到** ⇒ "锚 1 也会红"这句只是推断（禁项字面量确实回到了被读文件里），
+    真正的锚面读数由 A 那份隔离副本给出（同一格、同一禁项，实测红）。首跑时我把这条读成了
+    "锚被杀"，是不准确的，按现读法改正。
+  - **Mb** `ScanView` 的 `:disabled` 退回 `store.opsRunning` ⇒ 锚 2 红
+    （`✗ 扫描页历史横幅的恢复按钮问 store.histBusy（…）（出现被禁写法：:disabled="store.opsRunning"）`），
+    其余 19 条锚与 58 例 node 全绿 ⇒ 这一格只有这一把锁，锁得住。
+  - **Mc** `selectionWording()` 的两句改回带"删除"⇒ 只有 node 例红（2 条：
+    `三句里都不许出现"删除"` / `单项勾选与组级全选同词`）。★ 设计段预言"三条锚全绿"这句
+    **不能从脚本读数直接得到**（同上：node 层先 `exit 1`）。取证方式：同一棵副本树删掉文案用例后
+    **单跑锚层** ⇒ `node 用例 55 项 + 接线断言 20 项 = 合计 75 项全部通过`，
+    并且直接数被读文件的引用数（`GroupCard` 里 `selectionWording(` 出现 1 次、`标记为删除` 0 次）
+    ⇒ "锚接线看不见文案"是实测，不是推理。**这一刀证明了两层缺一不可**：只留锚，文案能悄悄变回假话；
+    只留 node 例，判据能被改回内联而无人红。
+- **顺带把 `FRONTEND_DIR` 这条既有通道真用起来**（脚本 17-19 行为负控制预留，此前没人用过）：
+  踩到一处必需条件——副本必须同时带 `package.json` 与可解析的 `node_modules`（否则
+  `toast-head.test.ts` 报 `Cannot find package 'pinia'`，读数会假红成一堆不相干的用例失败）。
+  首次尝试只拷 `src`/`tests` 就吃到这个假红，补 symlink 后基线复绿才继续。**记进读本，将来别照抄第一版。**
+- **回归（全套 15 行，`/tmp/gates_c1.log`）**：`rows=15 PASS=14 SKIP=1 FAIL=0`，
+  唯一 SKIP 仍是需要 root 的第 15 行 `smoke-symlink`（`rc=2`，按 AS-K2 不算通过、只算未取读数，
+  与本项无关且改前同形）。行 6/7/8 的 Go 腿一并复跑未动（本项零 Go 改动）。
+
+**本项之后仍不成立的声明（未兑现面）**：
+- **三句措辞没有浏览器实测**：本机不跑 GUI，`title`/`aria-label` 只在源码与判据层钉住；
+  屏幕阅读器实际播报、悬浮提示的实际呈现**未取读数**。
+- **锚 2 与 node 用例 5 是同一格的两把锁，但两把都在静态层**：`store.histBusy` 的判据本身
+  （`scan.ts:151` 那条含 `histLoading` 的合取）FE-3 已收口，本项只补引用点；
+  "双回包交错 bumpResultGen"这条**时序**后果没有并发用例覆盖 ⇒ 仍是代码已改、行为未证。
+- **空态那句仍是一句总述**（只是把可撤性指回徽标）：没有把"哪几类可撤"逐类列进空态，
+  因为那要把后端 `undoableFor` 的平台判据在前端复述一遍——正是 M79 判的那类分叉。
+- **组级全选那两句（`该组待清理项`）住在组件模板里、没进集中出口**：node 用例钉它，
+  但"卡片内两处同词"目前靠测试维持而不是靠结构维持。收进 `selectionWording()` 会牵动
+  `store.groupSelCount` 的既有锚，本项按"最小改动"未做。

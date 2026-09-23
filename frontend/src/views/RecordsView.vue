@@ -256,7 +256,7 @@ function danglingTitle(it: OpRecordItem): string {
       <div v-if="!store.opList.length" class="empty panel">
         <Icon class="empty-ico" name="undo" :size="32" :stroke="1.7" />
         <div class="empty-title">暂无清理记录</div>
-        <p class="empty-desc">清理操作会自动留痕，并支持对回收站/移动/硬链接合并进行回撤。</p>
+        <p class="empty-desc">清理操作会自动留痕；多数操作支持回撤，能不能撤以每条记录的徽标为准。</p>
       </div>
       <table v-else class="panel hist-table">
         <thead>

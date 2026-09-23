@@ -140,7 +140,10 @@ const progressPercent = computed(() => {
         <span class="hb-text">上次扫描 {{ formatUnixSec(lastScan.savedAt) }} ·
           <span class="hb-roots" :title="lastScan.roots.join('\n')">{{ rootsBrief(lastScan.roots) }}</span>
           · {{ lastScan.groups }} 组可释放 {{ humanBytes(lastScan.reclaimable) }}</span>
-        <button class="btn-ghost" :disabled="store.opsRunning"
+        <!-- R3-1：禁用判据用 store.histBusy 而不是 opsRunning —— FE-3 把"历史行动作"的
+             互斥收进 histBusy（含 histLoading），这里曾是同形漏网：openHistory 在途时
+             这颗按钮还能点，两次回包交错就会把结果集换成"另一条记录"的数据。 -->
+        <button class="btn-ghost" :disabled="store.histBusy"
           title="恢复该结果集并可继续清理" @click="store.openHistory(lastScan.id)">恢复</button>
         <button class="btn-ghost" @click="store.switchView('records')">查看历史</button>
       </div>

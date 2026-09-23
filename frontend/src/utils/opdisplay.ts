@@ -104,3 +104,26 @@ export function opFailedLabel(opFailed: number, listTotal: number): string {
   if (listTotal > opFailed) return `本次失败 ${n}（查看）`
   return `失败 ${n}（查看）`
 }
+
+export interface SelectionWording {
+  checkTitle: string
+  ariaVerb: string
+  redundantTitle: string
+}
+
+// selectionWording 组卡片里"勾了一个冗余项"这件事的措辞（R3-1，2026-09-23）。
+//
+// 为什么这三句必须集中在这一份：勾上之后到底发生什么，取决于用户随后按五颗按钮里的
+// 哪一颗（回收站 / 移动 / 硬链接 / 软链接 / 永久删除），**只有 delete 是删除**——
+// trash 是改名进回收站（M22 已裁定它不得说"释放/删除"）、hardlink 与 symlink 保留项
+// 仍可访问、move 只是离开原位置；处理策略还会把实际范围再收窄一次。
+// 而改前 GroupCard 自己在同一张卡片里说两种话：组级全选（:37/:43）写"待清理项"，
+// 单项勾选（:61/:68/:75）写"待删除项 / 标记为删除 / 勾选后将被删除"。
+// 单项那一条尤其重：aria-label 是屏幕阅读器用户唯一的来源。
+export function selectionWording(): SelectionWording {
+  return {
+    checkTitle: '勾选为待清理项',
+    ariaVerb: '标记为待清理',
+    redundantTitle: '冗余项（勾选后按所选操作处理）',
+  }
+}

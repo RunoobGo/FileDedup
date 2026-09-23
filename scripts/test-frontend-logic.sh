@@ -149,6 +149,17 @@ wiring 'src/views/RecordsView.vue' 'undoBlockedTitle(' '不支持应用内回撤
 	'记录页的不可回撤说明取自 utils/undoReason（M79：不得在视图里内联整句）'
 wiring 'src/stores/scan.ts' 'undoBlockedText(' "notifyError('回撤失败', e)" \
 	'回撤失败的 toast 正文经 utils/undoReason 翻译（M79：后端串不得原样上屏）'
+# R3-1（2026-09-23 第四轮全仓审查，设计段 §30.7）：三处"唯一判据/唯一文案方"的漏网入口。
+# ★ 三条都锚**标识符**、禁的是**被取代的旧写法** ⇒ 日后改措辞不会误报。
+wiring 'src/components/GroupCard.vue' 'selectionWording(' '标记为删除' \
+	'勾选项措辞取自 utils/opdisplay 的 selectionWording（R3-1：组件不得内联"删除"承诺——五种操作只有 delete 是删除）'
+wiring 'src/views/ScanView.vue' 'store.histBusy' ':disabled="store.opsRunning"' \
+	'扫描页历史横幅的恢复按钮问 store.histBusy（R3-1：FE-3 判据的漏网点，openHistory 在途可再点）'
+# ★ 必须侧锚的是**标识符**（逐条徽标的判据本身），不是新写的中文句：本脚本开头就立了
+#   "只锚标识符、锚文案会误报"这条规矩，这里若锚新文案，将来改一句话就多一处假红。
+#   新文案本身的真伪归 node 层（frontend/tests/selection-wording.test.ts 读源文件断言）。
+wiring 'src/views/RecordsView.vue' 'm.undoable' '并支持对回收站' \
+	'记录页空态不再替所有记录打包票，可撤性指回逐条徽标（R3-1：Windows 回收站不可应用内回撤）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

@@ -4,6 +4,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import type { GroupView } from '../wails'
 import { api } from '../wails'
 import { humanBytes, formatMtime } from '../utils/format'
+import { selectionWording } from '../utils/opdisplay'
 import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import Icon from './Icon.vue'
@@ -27,6 +28,9 @@ function reveal(id: number) {
   store.preview = null
   api.revealInFolder(id).catch((e: any) => toast.notifyError('打开文件夹失败', e))
 }
+
+// R3-1：三句措辞不在本文件——见 utils/opdisplay.ts 的 selectionWording 注释。
+const sel = selectionWording()
 </script>
 
 <template>
@@ -58,21 +62,21 @@ function reveal(id: number) {
         <label
           class="check-wrap"
           :class="{ off: f.isKeep }"
-          :title="f.isKeep ? '保留项（不可勾选）' : '勾选为待删除项'"
+          :title="f.isKeep ? '保留项（不可勾选）' : sel.checkTitle"
         >
           <input
             class="check"
             type="checkbox"
             :checked="store.selection.has(f.id)"
             :disabled="f.isKeep"
-            :aria-label="f.isKeep ? `保留项 ${f.name}（不可勾选）` : `标记为删除 ${f.name}`"
+            :aria-label="f.isKeep ? `保留项 ${f.name}（不可勾选）` : `${sel.ariaVerb} ${f.name}`"
             @change="store.toggleSelect(f.id)"
           />
         </label>
         <span
           class="keep-tag"
           :class="{ on: f.isKeep }"
-          :title="f.isKeep ? '保留项（当前决策）' : '冗余项（勾选后将被删除）'"
+          :title="f.isKeep ? '保留项（当前决策）' : sel.redundantTitle"
         >
           <Icon :name="f.isKeep ? 'star' : 'close'" :size="12" />
           {{ f.isKeep ? '保留' : '冗余' }}
