@@ -12,6 +12,15 @@ package main
 //     路径里带 `; rm -rf` 之类只会是一个文件名，不会是一段指令。V5 钉的就是
 //     "带空格与元字符的路径在 Args 里恰好是一个元素"。
 //
+// ★ V5 跨平台断言的边界（CI run 35886993233 在 ubuntu 上把这条写红了）：
+// revealCmd 的 Linux 探测表里，gio/pcmanfm/xdg-open 三条腿**按设计只送父目录**
+// （P3 的排序是"能选中文件 > 只能打开目录"，只有前一类带完整路径）。所以
+// "完整文件路径必须出现在 argv 里"不是跨平台不变量，它是 darwin/windows 加
+// nautilus/dolphin/thunar/nemo 那一档的保证。跨平台只成立的是这两条：
+//   - 不下发给 shell 解释器；
+//   - 送出去的那一项（完整路径**或**父目录）整串落在恰好一个元素里，没被拆开。
+// 于是这里把父目录也埋进同名载荷，让"只送父目录"的那几条腿同样有东西可证。
+//
 // execRevealCmd 是注入缝（M155 卷型缝同族）：不桩掉的话，每个用例都会真的
 // 弹一个 Finder/文件管理器窗口——测试不许劫持用户的桌面。
 
@@ -80,7 +89,13 @@ func TestRevealPathFileOpensRevealCommand(t *testing.T) {
 	a, _ := newHistApp(t)
 	got, restore := stubRevealExec(t)
 	defer restore()
-	dir := t.TempDir()
+	// 父目录带同样的载荷：见文件头 ★——只把 hostile 放在文件名上时，Linux 那几条
+	// "只送父目录"的腿等于什么都没测。
+	root := t.TempDir()
+	dir := filepath.Join(root, "in dir; echo pwned")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	f := filepath.Join(dir, "a b; echo pwned.txt") // 空格 + shell 元字符都在名字里
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -94,36 +109,77 @@ func TestRevealPathFileOpensRevealCommand(t *testing.T) {
 	if len(*got) != 2 {
 		t.Fatalf("两次调用各该 exec 一次，得到 %d", len(*got))
 	}
-	argvs := strings.Split((*got)[0], "\x00")
-	// V5 的正面：整条路径恰好是一个 argv 元素（不过 shell 的直证）
-	found := false
-	for _, el := range argvs {
-		if el == f {
-			found = true
+	// 三平台共用的两条硬保证（V5 的正面与反面各一条）。
+	for i, rec := range *got {
+		label := "reveal"
+		if i == 1 {
+			label = "open"
+		}
+		argv := strings.Split(rec, "\x00")
+		switch filepath.Base(argv[0]) {
+		case "sh", "bash", "cmd", "powershell":
+			t.Errorf("%s 命令经 shell 解释器下发（注入面）：%q", label, argv)
+		}
+		whole := 0
+		for _, el := range argv {
+			if el == f || el == dir {
+				whole++
+			}
+		}
+		if whole != 1 {
+			t.Errorf("%s 应恰好有一个元素是完整路径或完整父目录（实得 %d）：%q", label, whole, argv)
+		}
+		for _, el := range argv {
+			if el == f || el == dir {
+				continue
+			}
+			if strings.Contains(el, "echo") || strings.Contains(el, "pwned") {
+				t.Errorf("%s 路径被拆开/改写后才下发，元素 %q 只剩片段：%q", label, el, argv)
+			}
 		}
 	}
-	if !found {
-		t.Errorf("reveal argv 里没有完整路径元素：%q", argvs)
-	}
-	for _, argv := range [2][]string{argvs, strings.Split((*got)[1], "\x00")} {
-		base := filepath.Base(argv[0])
-		if base == "sh" || base == "bash" || base == "cmd" || base == "powershell" {
-			t.Errorf("命令经 shell 解释器下发（注入面）：%q", argv)
-		}
-	}
+	reveal := strings.Split((*got)[0], "\x00")
+	fileOpen := strings.Split((*got)[1], "\x00")
 	switch runtime.GOOS {
 	case "darwin":
-		if argvs[0] != "open" {
-			t.Errorf("darwin reveal 应为 open -R：%q", argvs)
+		if reveal[0] != "open" || len(reveal) < 2 || reveal[1] != "-R" {
+			t.Errorf("darwin reveal 应为 open -R：%q", reveal)
 		}
-		if len(argvs) < 2 || argvs[1] != "-R" {
-			t.Errorf("文件行 reveal 漏了 -R（选中）参数：%q", argvs)
+		if len(reveal) != 3 || reveal[2] != f {
+			t.Errorf("darwin 文件行 reveal 应为 open -R <path>：%q", reveal)
 		}
-		fileOpen := strings.Split((*got)[1], "\x00")
 		if fileOpen[0] != "open" || len(fileOpen) != 2 || fileOpen[1] != f {
 			t.Errorf("darwin 打开文件应为 open <path>：%q", fileOpen)
 		}
+	case "windows":
+		if reveal[0] != "explorer" || len(reveal) != 3 || reveal[1] != "/select," || reveal[2] != f {
+			t.Errorf("windows 文件行 reveal 应为 explorer /select, <path>：%q", reveal)
+		}
+		if fileOpen[0] != "explorer" || len(fileOpen) != 2 || fileOpen[1] != f {
+			t.Errorf("windows 打开文件应为 explorer <path>：%q", fileOpen)
+		}
+	case "linux":
+		// Linux 只能断到"命中探测表"这一层：送完整路径还是送父目录，取决于装的
+		// 是哪个 DE 的工具先被 LookPath 命中，两种都算履行契约。真正跨平台的
+		// 注入保证在上面那两条通用断言里，不在这里。
+		if !inNames(reveal[0], "nautilus", "dolphin", "thunar", "nemo", "pcmanfm", "gio", "xdg-open") {
+			t.Errorf("linux reveal 命令不在 revealCmd 的探测表里：%q", reveal)
+		}
+		if !inNames(fileOpen[0], "xdg-open", "gio") {
+			t.Errorf("linux 打开文件命令不在 openCmd 的探测表里：%q", fileOpen)
+		}
 	}
+}
+
+// inNames 报告 exe 是否就是探测表里的某一条（比较 argv[0] 的基名，容忍绝对路径）。
+func inNames(argv0 string, names ...string) bool {
+	base := filepath.Base(argv0)
+	for _, n := range names {
+		if base == n {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRevealPathDirectoryOpensItself(t *testing.T) {
@@ -144,10 +200,18 @@ func TestRevealPathDirectoryOpensItself(t *testing.T) {
 		t.Fatalf("exec 次数 = %d", len(*got))
 	}
 	argvs := strings.Split((*got)[0], "\x00")
+	// 「目录不带选中参数」是这条用例的全部命题，三平台同真：darwin 的 -R、
+	// Linux/Windows 的 --select、/select, 一个都不该出现。此前只在 darwin 断言，
+	// 换到别的平台这条用例就退化成"exec 了一次"。
 	if runtime.GOOS == "darwin" {
 		// 与 OpenPath 同形：open <dir>，没有 -R
 		if argvs[0] != "open" || len(argvs) != 2 || argvs[1] != sub {
 			t.Errorf("目录行 reveal 不该带 -R：%q", argvs)
+		}
+	}
+	for _, el := range argvs {
+		if el == "-R" || el == "--select" || strings.HasPrefix(el, "/select,") {
+			t.Errorf("目录行走成了「到父目录里选中」而不是打开自身（%q）：%q", el, argvs)
 		}
 	}
 }
