@@ -50,6 +50,27 @@ row() {
   return $rc
 }
 
+# 0) 嵌入产物前置检查（R4-5，2026-09-23 第四轮全仓审查）
+# main.go:21 是 `//go:embed frontend/dist`，而 dist 属构建产物（.gitignore 排除）。本 harness 的
+# 第 2~8 行全是 go 命令、跑在第 10 行 frontend-build **之前** ⇒ fresh clone 上那七行会一起红在
+# `pattern frontend/dist: no matching files found`（本机实测：把 dist 移开即复现，见设计稿 §30.13），
+# 而有 stale dist 时那七行是在**旧嵌入产物**上跑的。ci.yml 头部把"必须先构建前端"写成了顺序约束
+# （:10-12），harness 不能是另一套口径。
+# ★ 为什么不干脆把 frontend-build 挪到第 2 行：npm 一失败，2~8 行根本没跑过，15 行读数表会留
+#   一片空行与级联红，比"一行都不齐且原因写在脸上"更难读。
+# ★ 不新增判定行：`rows=15` 这个口径被 docs/04 §3.2/§3.3 多处引用，加行等于制造新的文档错位。
+# ★ 判据只到"存在"为止：**旧不等于坏**，据"比 src 旧"判红是另一种谎 ⇒ 那一格只打 NOTE 不判红。
+if [[ ! -f frontend/dist/index.html ]]; then
+  echo "### 0 dist 前置检查"
+  echo "FAIL：frontend/dist/index.html 不存在 ⇒ 第 2~8 行的 go 命令会一起红在 go:embed，那不是产品的问题"
+  echo "  先产一次嵌入产物：cd frontend && npm ci && npm run build（或单独跑第 10 行 frontend-build）"
+  exit 1
+fi
+if [[ -n "$(find frontend/src frontend/package.json -newer frontend/dist/index.html -print -quit 2>/dev/null)" ]]; then
+  echo "### 0 dist 前置检查"
+  echo "NOTE：frontend/dist 比 frontend/src 里的源文件旧 ⇒ 第 2~8 行是在旧嵌入产物上跑的（不判红）"
+fi
+
 # 1) gofmt：rc 恒 0，判据必须是**列出的文件数**。
 # M124：但"文件数为 0"单独不成立——gofmt 自己崩了（rc≠0 且 stdout 空）也会数出 0，
 # 那一格改前读成 PASS。⇒ 判据两条：rc 必须为 0，且列出文件数必须为 0。

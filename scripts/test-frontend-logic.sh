@@ -81,6 +81,29 @@ wiring() { # $1=文件 $2=必须出现 $3=禁止出现（可空） $4=说明
 		printf '  ✓ %s\n' "$why"
 	fi
 }
+# wiring_count <文件> <串> <期望出现次数> <说明>
+# ★ R4-4（2026-09-23 第四轮全仓审查）补的第二把尺子：`wiring()` 只有"出现 / 不出现"两态，
+#   钉不住"**只此一处**"这一类判据。M80 那条例子就是活证据：锚从 `'head: true'` 换长成
+#   `'error', 12000, { head: true }` 之后，把 `head` 从摘要行**挪到**明细行仍然绿
+#   （明细行也含那段尾巴）——负控制实测过，见 §30.13 实施读数。计数判据才是"M80 只给摘要破例"
+#   这句话的直译。仍然按接线数计入自报合计，不留"看不见的断言"（M119 同一把尺子）。
+wiring_count() { # $1=文件 $2=串 $3=期望次数 $4=说明
+	wiring_total=$((wiring_total + 1))
+	local file="$1" needle="$2" want="$3" why="$4" n
+	if [ ! -f "$FE/$file" ]; then
+		printf '  \033[31m✗ 找不到 %s，接线断言无法执行\033[0m\n' "$file" >&2
+		wiring_fail=$((wiring_fail + 1))
+		return
+	fi
+	n=$(grep -cF -- "$needle" "$FE/$file")
+	if [ "$n" = "$want" ]; then
+		printf '  ✓ %s\n' "$why"
+	else
+		printf '  \033[31m✗ %s（%s 在 %s 里出现 %s 次，应为 %s 次）\033[0m\n' \
+			"$why" "$needle" "$file" "$n" "$want" >&2
+		wiring_fail=$((wiring_fail + 1))
+	fi
+}
 wiring 'src/components/GroupCard.vue' 'store.groupSelCount(group)' 'group.files.length - 1' \
 	'组内冗余项数取自 store.groupSelCount（M18：组件不得自算）'
 wiring 'src/components/ConfirmDialog.vue' 'reclaimLine(' 'humanBytes' \
@@ -108,8 +131,21 @@ wiring 'src/views/RecordsView.vue' 'store.histBusy' 'store.scanning || store.ops
 # node 用例与 vue-tsc 都照样绿。★ 只锚标识符/写法，不锚中文文案（改措辞是安全的）。
 wiring 'src/views/ResultView.vue' 'opFailedLabel(' '失败 {{ formatCount(store.opsResult.Failed.length) }}' \
 	'失败按钮措辞取自 opFailedLabel（M81：组件不得自拼"失败 N"，那是本次数与全量数不同源的成因）'
-wiring 'src/views/ResultView.vue' 'head: true' '' \
-	'Warnings 摘要行标了 head（M80：不标就会被自己投出的明细挤掉）'
+# ★ R4-4（2026-09-23 第四轮全仓审查）：下面 M80 那条原先只锚 `'head: true'` 六个字，而
+#   `wiring()` 是全文件 `grep -qF`（无行锚、无上下文）⇒ 只要这个文件里**任何**一处出现该串，
+#   锚就成立，摘要行上的 `head` 被删掉、或被挪到别的 `toast.push` 上，本探针都不会红——
+#   钉不住的正是要钉的那件事。★ 换成长锚 `'error', 12000, { head: true }` 也**不够**：明细行
+#   （`ResultView.vue:69`）本就是 `toast.push(w, 'error', 12000)`，把 `head` 挪过去之后那段
+#   尾巴照样在——本批真取到这个假绿（负控制读数见 §30.13 实施读数）。⇒ 三把尺子一起上：
+#   ① 四参形状必须在（want）、② 明细行不得带 options 对象（forbid）、
+#   ③ `{ head: true }` 全文件**恰一处**（wiring_count，直译"M80 只给摘要破例"那个"只"字）。
+#   ★ 已知残角（如实登记，不装作钉全了）：把 `head` 挪到**溢出行**（`:70`）三把尺子都读不出来，
+#     要钉它得锚那一行的中文模板，违反"不锚文案"这条规矩。
+wiring 'src/views/ResultView.vue' "'error', 12000, { head: true }" \
+	'toast.push(w, '"'"'error'"'"', 12000, {' \
+	'Warnings 摘要行标了 head、明细行没标（M80：不标就会被自己投出的明细挤掉）'
+wiring_count 'src/views/ResultView.vue' '{ head: true }' 1 \
+	'head 只给摘要行破例（M80 的"只"字；R4-4 补的计数尺子）'
 wiring 'src/components/FailedDrawer.vue' 'copyText(' 'navigator.clipboard?.writeText(' \
 	'复制全部走 utils/clipboard 的 copyText（M83：可选链短路时 .catch 从未挂上，无剪贴板环境完全静默）'
 # M116 / M118（第 2 轮 §23.5）：展示面两处「判据收在一份、组件只许引用」。

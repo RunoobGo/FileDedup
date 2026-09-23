@@ -6711,3 +6711,111 @@ GOOS=windows、GOOS=linux）全过 / `go test -race -count=2 ./...` **23 个包�
 - ⑥ **只登记不改行为**：`GetOpRecord` 在最坏情况（死挂载 / 拔走的 SMB）下仍可长时间不返回，本机不插网络卷 ⇒ 那一格没有任何真机读数。
 - 三处涉及 Windows/Linux 的注释更正（④ 的 fsid 句柄腿）依据是**源码读数**，两平台真机未跑。
 
+
+### 30.13 Task D2（R4-3/4/5）：门禁脚本的三处假绿残角——先分"能不能钉"再动手
+
+三条全部来自代理报告。**逐条开码重取后，Step 1 的修法与计划的预测不同**（计划以为改成
+按后缀区分就能补出 rc=0 成功路径，实读做不到，原因见下）；Step 2/3 成立。
+
+| # | 计划坐标 | 实读 | 计划的修法可兑现？ |
+|---|---|---|---|
+| R4-3 | `smoke-symlink-assert.sh:120-124` stat 桩的尾斜杠 elif 是死分支 | **成立**：桩只对 `stat -c %d <path>` 生效，两卷判定靠"参数带尾斜杠"给不同设备号；而被测脚本 `smoke-symlink.sh:114-115` 传的是 `$WORK` 与 `$MNT="$WORK/mnt"`（`:66`），**都不带尾斜杠** ⇒ `echo 7` 那一格恒不触发 | **部分**：换后缀判能救活 elif，但**救不出 rc=0 成功路径**（见下） |
+| R4-4 | `test-frontend-logic.sh:111` 锚 `'head: true'` 过泛 | **成立**：`wiring()` 用 `grep -qF`（`:74`，无行锚无上下文），ResultView 里任一 `toast.push(..., head: true)` 都算满足 | 是 |
+| R4-5 | `run-gates.sh:81-137` 行序违反 embed 约束 | **成立且实测**：`row "2 build" go build ./...` 在第 10 行 `frontend-build` **之前**；本机把 `frontend/dist` 移开 ⇒ `main.go:21:12: pattern frontend/dist: no matching files found`（`main.go:21` 就是 `//go:embed frontend/dist`）。ci.yml 头部注释已把这条写成"顺序约束（勿调换）"，harness 没跟 | 是 |
+
+**R4-3：为什么"补一条 rc=0 成功路径"在这台机器上不可能（这是本条的真结论）**
+
+桩只能改**它接管的那几件事**（`id`/`mount`/`umount`/`mkfs.ext4`/`losetup`/`stat -c %d`）。把设备号
+桩成 42/7 之后，被测脚本会越过设备号闸门继续往下，而紧接着的 ① 是**真系统调用**：
+
+- `smoke-symlink.sh:127` `ln "$KEEP" "$MNT/hardlink-try"` 期望失败（EXDEV）。桩环境下 `$MNT` 只是
+  `$WORK` 下的普通子目录，**同一真卷** ⇒ `ln` 成功 ⇒ `:128` 的 `fail "硬链接竟然跨卷成功了"` ⇒ rc=1。
+- 本机连"走到 ③"都到不了：`stat -c %s`（`:145-146`）会 fall through 到 `/usr/bin/stat`，BSD stat
+  实测 `stat: illegal option -- c`。另外 `mkfs.ext4` / `losetup` 本机 **MISSING**（桩给出去了，但
+  `command -v` 那一关在脚本里，桩目录里有同名文件才过得去）。
+
+⇒ 桩能钉住的**不是**"七条判据全成立"，而是"**设备号这道闸不恒红、也不恒绿**"这一格——它恰好是
+改前唯一没被驱动的分支走向。设计定为一个新组 **D0**：桩给出两个**不同**设备号 ⇒ 断言被测脚本
+(a) 打出 `卷 A dev=42 ｜ 卷 B dev=7` 这一行（闸门放行）、(b) 随后停在 ① 的真实跨卷语义上
+（输出含"硬链接竟然跨卷成功"或后续某条 FAIL），rc=1。★ 断言 (b) 的措辞必须写成"闸门之后仍在跑"，
+**不许**写成"七条判据通过"——那是本机取不到的读数。真 rc=0 只在 Linux runner 真挂载时可得（D3 那条腿，本批不动）。
+
+**改前红（本项有，且是白送的）**：新 D0 判据打在**未改的桩**上必红——旧桩对无尾斜杠的两个路径
+都回 42，脚本必然停在设备号闸门（`测试前提不成立`），拿不到 `卷 A dev=42 ｜ 卷 B dev=7`。
+⇒ 落笔顺序：先加 D0 判据（旧桩）取红 ⇒ 再把 elif 改成按 `${3##*/}` 是否为 `mnt` 判卷 B ⇒ 转绿。
+
+**R4-4：锚换成 M80 那行的独特片段**
+
+★ 这一节的修法**被自己的负控制证伪**（2026-09-23 落码时），最终改法与读数见 §30.13 实施读数的 R4-4 段；
+下面这段按原样保留，因为它正是"看着对、实际钉不住"的那类设计的活样本。
+
+现锚 `'head: true'`（`:111`）。目标行实测（`ResultView.vue:68`）：
+`toast.push(\`… ${ws.length} …\`, 'error', 12000, { head: true })`。
+候选片段 `'error', 12000, { head: true }` 在 ResultView.vue 内实测计数 = **1**（且 `head: true` 全仓
+也只此一处，所以换锚不会与别的 warn 撞）。★ 但"全仓只一处"是**今天的**事实，不能当判据写进注释：
+注释只说"锚到 M80 那行的调用签名片段，明细行（`:69`/`:70`）不带 `head`，因此挪不动这个锚"。
+
+**R4-5：前置检查的三条设计约束**
+
+1. **不许新增第 16 行**：`rows=15` 这个口径被 docs/04 §3.2/§3.3 多处引用，加行等于制造新的文档错位。
+   ⇒ 前置检查放在 gofmt 之前、**不 note 进 ROWS**，只做两件事：dist 缺 ⇒ 打印成因与修法后 `exit 1`；
+   dist 比 `frontend/src` 最新源旧 ⇒ 打 NOTE 明示"2~8 行是在旧嵌入产物上跑的"，**不判红**
+   （旧不等于坏，据它判红是另一种谎）。
+2. **为什么不改成"把 frontend-build 挪到第 2 行"**：那样 npm 一旦失败，2~8 行根本没跑过，
+   15 行读数表会留一堆空行/级联红，比现在更难读；前置检查把这一格变成"要么 15 行齐、
+   要么一行都不齐且原因写在脸上"。
+3. 陈旧判据用 `find frontend/src frontend/package.json -newer frontend/dist/index.html`，
+   GNU/BSD `-newer` 语义已核（都支持）；★ **未在 Linux runner 实跑过**，本机只验 darwin。
+
+**本项不碰的东西**：`.github/workflows/*`（D1/D3 等用户手改）、产品 Go 代码（⇒ 无 Go 侧回归，
+验证面 = 三个门禁脚本自身 rc + `run-gates.sh` 全量 15 行）、`MIN_CHECKS`（只设下限，加断言不必抬；
+本批实跑读数会记进实施读数）。
+
+**未兑现面 / 边界（落笔时就写死，别等收口）**
+- D0 钉的是**桩驱动的控制流**，不钉真跨卷文件系统语义；① ~ ⑦ 的 rc=0 全绿只能来自 Linux 腿。
+- R4-5 的陈旧 NOTE 在 CI 上永远不会打（CI 先跑前端构建），它只服务本机复跑。
+- 三条都是门禁/脚本面 ⇒ 没有"用户看得见的行为变化"，也不进 docs/09（用户手册）。
+
+**实施读数（2026-09-23，HEAD `92a0ca8` 之上，逐项实跑）**
+
+三条全部落地，改动面只有三个门禁脚本：`scripts/smoke-symlink-assert.sh`（R4-3）、
+`scripts/test-frontend-logic.sh`（R4-4）、`scripts/run-gates.sh`（R4-5）。产品 Go/TS 代码一行未动。
+
+**R4-3 的改前红拿到了，而且是白送的**（与 F1 那一格不同）：先写 D0 判据、打在**旧桩**上 ⇒
+`✗ 两卷设备号不同（42 / 7）时闸门没有放行 …… FAIL: 两个目录仍在同一设备（A=42 B=42）上`。
+把 elif 从"参数带尾斜杠"改成"末段目录名 = `mnt`"后转绿（`卷 A dev=42 ｜ 卷 B dev=7` 真被打出来了）。
+负控制另跑一发：把被测脚本**拷贝**（`SMOKE_TARGET` 本就是为这个准备的）里的
+`[ "$A_DEV" != "$B_DEV" ]` 取反成 `=` ⇒ D0 三条里两条转红，全套 18 条中失败 4 条。
+★ 本组断言的措辞按设计段收紧：只说"闸门放行 + 放行后仍在跑"，**没有**一条写作"七条判据通过"。
+
+**★ R4-4 的一条自我纠正，是本批最该记的一笔**：设计段（上面）写的修法是"锚换成唯一片段
+`'error', 12000, { head: true }`"。**这条修法被自己的负控制证伪了**——把 `head` 从摘要行
+（`ResultView.vue:68`）挪到明细行（`:69`）后，长锚照样绿，因为明细行原本的尾巴就是
+`'error', 12000`，接上第四参后同一段子串仍在。⇒ 现改成三把尺子：want（四参形状）+
+forbid（明细行不得带 options 对象）+ **wiring_count**（`{ head: true }` 全文件恰一处）。
+计数那把是新加的辅助函数（`wiring_count`），因为 `wiring()` 只有"出现/不出现"两态，
+表达不了 M80 句里那个"只"字；它同样累加进 `wiring_total`，不留看不见的断言（M119 口径）。
+负控制复跑：同一个"挪到明细行"的变异 ⇒ forbid 尺子转红（`✗ …（出现被禁写法：toast.push(w, 'error', 12000, {）`）。
+★ 两条如实边界：(1) 变异时 `frontend/tests/toast-head.test.ts` 三条**全绿**——它钉的是 store 的
+淘汰语义，钉不到调用点，这正是接线锚存在的理由，别把它当第二重覆盖；(2) 把 `head` 挪到
+**溢出行**（`:70`）三把尺子都读不出来，要钉它得锚那行的中文模板（违反"不锚文案"），已作为残角登记。
+
+**R4-5 的两条负控制**：(1) 把 `frontend/dist` 整个移开 ⇒ harness 在第 1 行之前就
+`### 0 dist 前置检查 / FAIL：frontend/dist/index.html 不存在 …` 并 `exit 1`（复现了设计段引的
+`main.go:21:12: pattern frontend/dist: no matching files found` 那一格），移回后 `go build ./...` 过；
+(2) `touch frontend/src/views/ResultView.vue` ⇒ 打 NOTE 且**不判红**，`git status` 无内容改动。
+★ 本机第一次跑前置检查时 NOTE 就响了（dist 确实比 src 旧）⇒ 先 `npm run build` 重建再收口，
+最终 15 行读数里没有那一行输出（dist 已新）。这条也算 R4-5 的实际收益：**它当场就抓到了一次旧嵌入产物**。
+
+**全量 15 行真读数（HEAD `92a0ca8` 之上，本机 darwin/arm64）**：
+`rows=15 PASS=14 SKIP=1 FAIL=0`，rc=0。SKIP 那行是 `15 smoke-symlink`
+（`SKIP（跳过，非通过）: 需要 root…当前 uid=501`，按 AS-K2 不算通过）。
+计数留证：`src_test=786`、`run=864`、`top_PASS=734 / top_SKIP=5 / top_FAIL=0`、`sub_PASS=125`、
+`ok_pkgs=23`、两行 race 的 `data_race=0`；`11 frontend-logic` 自报 `node 用例 78 项 + 接线断言 24 项 = 合计 102 项`
+（★ 接线数从 23 涨到 24 是本批加的 `wiring_count`）；`14 smoke-symlink-assert` 自报
+`走到断言 18 条（下限 15 条）`。⇒ 交 E2 的口径：Go **786 Test / 4 Benchmark**、前端 **78 + 24 = 102**、
+跨卷 harness **18 条**。
+
+**未兑现面**：D0 只钉桩驱动的控制流，① ~ ⑦ 的 rc=0 全绿**本机从未取到**（单真卷 + BSD stat 不认 `-c`）；
+`find -newer` 的陈旧判据只在 darwin 实跑过，Linux runner 上永远不会打那一行（CI 先构建前端）；
+`.github/workflows/*` 本批按裁定未动（D1/D3 等用户手改）。
