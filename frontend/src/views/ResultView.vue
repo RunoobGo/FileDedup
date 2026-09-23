@@ -121,6 +121,19 @@ const moreLabel = computed(() =>
     : `加载更多（${formatCount(store.groups.length)}/${formatCount(store.totalGroups)}）`,
 )
 
+// 功能 3（2026-09-23）：开着「隐藏非拟处理项」时，一行拟处理项都不剩的组
+// 整卡不渲染——留着只会得到一张点开的空卡，是噪音不是信息。
+// ★ 消费的是后端逐行 isPending 投影（GroupCard 同纪律），这里不按路径重算。
+// 统计条/分页口径不动：藏行是显示层的事，Total 若跟着投影浮动就成了
+// "部分当全部"（M4 教训；后端镜像断言 TestIsPendingDoesNotChangeAggregates）。
+const visibleGroups = computed(() =>
+  store.hideNonPending ? store.groups.filter(g => g.files.some(f => f.isPending)) : store.groups)
+// 开着开关、已加载行里一个拟处理项都没有：这是真的"策略把本页全滤掉了"，
+// 与"没有重复文件"是两件事，必须分开说——套用后者那句空态会把用户支去
+// 重扫，而该做的其实是回来关开关或调策略。
+const allHidden = computed(() =>
+  store.hideNonPending && store.groups.length > 0 && visibleGroups.value.length === 0)
+
 async function applyKeep() {
   await store.applyKeep(keepKind.value, store.keepDirs)
 }
@@ -315,6 +328,15 @@ function onConfirm(targetDir?: string) {
         <button v-if="store.selectedFiles.length" class="btn-ghost xs"
           title="执行前逐行核对哪些文件会被处理、哪些不会及原因"
           @click="store.openPendingDrawer()">查看清单</button>
+        <!-- 功能 3（2026-09-23）：显示层开关——把"不会被处理的行"从界面上藏起来。
+             刻意不受勾选数约束（它服务的是"看清还剩什么"，与选没选无关）。
+             开着时按钮自身说明当前处于隐藏态，不必等用户去数行数对不对。 -->
+        <button class="btn-ghost xs" :class="{ 'btn-emph': store.hideNonPending }"
+          :aria-pressed="store.hideNonPending ? 'true' : 'false'"
+          :title="store.hideNonPending
+            ? '当前正隐藏不会被处理的行（判据=后端拟处理投影）；点击恢复显示全部'
+            : '隐藏当前处理策略下不会被处理的行（保留项/目录外/黑名单）；开启会按当前策略重取本页'"
+            @click="store.toggleHideNonPending()">{{ store.hideNonPending ? '恢复显示全部行' : '隐藏非拟处理项' }}</button>
       </div>
       <!-- 多目录优先级列表：序号即优先级，命中多个目录时保留最靠前目录内的文件 -->
       <div v-if="keepKind === 'directory'" class="keepdirs">
@@ -553,7 +575,15 @@ function onConfirm(targetDir?: string) {
           </button>
         </div>
       </div>
-      <GroupCard v-for="g in store.groups" :key="g.groupID" :group="g" />
+      <div v-else-if="allHidden" class="empty panel">
+        <div class="empty-title">已加载的行里没有拟处理项</div>
+        <p class="empty-desc">它们都不会被本次策略处理（保留项 / 不在优先文件夹内 / 命中「不处理」黑名单），已按开关隐藏。
+          关闭隐藏或调整处理策略后可见；继续滚动加载仍会按当前策略投影。</p>
+        <div class="empty-actions">
+          <button class="btn-ghost" @click="store.toggleHideNonPending()">关闭「隐藏非拟处理项」</button>
+        </div>
+      </div>
+      <GroupCard v-for="g in visibleGroups" :key="g.groupID" :group="g" />
     </div>
 
     <!-- close/confirm 都只改 confirmKind，store.confirmOpen 由 watch 统一复位 -->

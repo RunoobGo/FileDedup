@@ -210,7 +210,7 @@ func TestGetResultGroupsExtFilter(t *testing.T) {
 
 func TestToGroupViewKeepShortest(t *testing.T) {
 	g := mkGroup(1, 42, "/very/long/path/deep/file.bin", "/a/b.bin", "/mid/file.bin")
-	v := toGroupView(g, nil)
+	v := toGroupView(g, nil, nil)
 	keep := -1
 	for i, f := range v.Files {
 		if f.IsKeep {

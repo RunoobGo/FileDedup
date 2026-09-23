@@ -117,6 +117,14 @@ export const useScanStore = defineStore('scan', () => {
   // 判据在后端与白名单同一内核（pendingIDsLocked），短路序
   // gone→keep→outside→excluded。
   const procExcludeDirs = ref<string[]>([])
+  // 功能 3（2026-09-23）：「隐藏非拟处理项」显示开关。
+  //
+  // 开着时：①每次结果页请求带上两把策略过滤器，让回包里逐行 isPending 是
+  // 当前策略的投影（判据在后端 pendingSetLocked，前端只消费布尔值）；
+  // ②策略变更后重取本页，藏/显行不读陈旧投影。
+  // 关着时：目录不上送——非空 dirs 会让后端预热卷语义（写探测文件），
+  // 翻页是高频路径，不该为显示层开关默认付这笔 I/O。
+  const hideNonPending = ref(false)
   // 最近一次执行的过滤结果，供结果页横幅说明「实际处理了几项」。
   // 不持久化——它描述的是一次已经发生的操作。
   const lastFilter = ref<{ matched: number; selected: number; unmatched: string[] } | null>(null)
@@ -296,6 +304,10 @@ export const useScanStore = defineStore('scan', () => {
         pageSize,
         sort: resultSort.value,
         ext: resultExt.value,
+        // 功能 3：开着「隐藏非拟处理项」才把策略目录随查询上送（见 hideNonPending 注释）。
+        ...(hideNonPending.value
+          ? { dirs: usableProcDirs(), excludeDirs: usableProcExcludeDirs() }
+          : {}),
       })
       if (gen !== resultGen) return // 结果集已被新扫描/新历史作废，回包不得盖回界面
       if (append) {
@@ -375,6 +387,9 @@ export const useScanStore = defineStore('scan', () => {
       currentFileID.value = null
       opsResult.value = null
       resetSelection()
+      // 先按"无结果"再清策略：clearProc* 挂着功能 3 的投影重取腿
+      // （refreshPendingProjection），不先落闸会在换代窗口里多问一次旧结果。
+      hasResult.value = false
       clearProcDirs() // 结果集已换，优先文件夹不再对应当前内容
       clearProcExcludeDirs()
       resultExt.value = '' // M17：同 clearStaleResult，过滤不跨结果集存活
@@ -709,18 +724,41 @@ export const useScanStore = defineStore('scan', () => {
     const d = (dir ?? '').trim()
     if (!d || procDirs.value.includes(d)) return
     procDirs.value.push(d)
+    refreshPendingProjection()
   }
-  function removeProcDir(i: number) { procDirs.value.splice(i, 1) }
-  function clearProcDirs() { procDirs.value = [] }
+  function removeProcDir(i: number) { procDirs.value.splice(i, 1); refreshPendingProjection() }
+  function clearProcDirs() { procDirs.value = []; refreshPendingProjection() }
 
   // 黑名单一侧同构（并集、无序、去重追加，不提供排序）。
   function addProcExcludeDir(dir: string) {
     const d = (dir ?? '').trim()
     if (!d || procExcludeDirs.value.includes(d)) return
     procExcludeDirs.value.push(d)
+    refreshPendingProjection()
   }
-  function removeProcExcludeDir(i: number) { procExcludeDirs.value.splice(i, 1) }
-  function clearProcExcludeDirs() { procExcludeDirs.value = [] }
+  function removeProcExcludeDir(i: number) { procExcludeDirs.value.splice(i, 1); refreshPendingProjection() }
+  function clearProcExcludeDirs() { procExcludeDirs.value = []; refreshPendingProjection() }
+
+  // refreshPendingProjection 在「隐藏非拟处理项」开着时重取本页（功能 3）：
+  // 行的藏/显读的是后端按**当前策略**算出的 isPending 投影，策略一变，
+  // 已加载行的投影即刻陈旧——多显示是把"不会动的"留在场上，少显示是把
+  // "会动的"藏起来，两个方向都是界面对处理范围说谎（AS-H6 同族）。
+  // hasResult 门槛：clearStaleResult（换代）也会经 clearProc* 走到这里，
+  // 那时重取会把**旧结果集**的行盖回刚清空的界面（新扫描正在途）。
+  function refreshPendingProjection() {
+    if (hideNonPending.value && hasResult.value) void loadResultPage(false)
+  }
+
+  // toggleHideNonPending 翻开关；只在**打开**时需要重取——打开前加载的行
+  // 是没带策略算的投影（只反映"非保留"），不重取就藏不全。
+  // 关闭不需要：isPending 不再被读，陈旧值无害。
+  // 重取的连带效果是勾选被重置（Y8 纪律：行集被替换 ⇒ 清空勾选），
+  // 与改排序/筛选同一形状——这里更该如此：被藏掉的行若还背着勾，
+  // "已选 N"就在替看不见的东西说话。
+  function toggleHideNonPending() {
+    hideNonPending.value = !hideNonPending.value
+    refreshPendingProjection()
+  }
 
   // ---------- 拟处理清单抽屉（2026-09-23，设计段 §4） ----------
   //
@@ -1073,6 +1111,8 @@ export const useScanStore = defineStore('scan', () => {
     procDirs, addProcDir, removeProcDir, clearProcDirs,
     // 黑名单一侧同构（功能 2），同样不提供排序
     procExcludeDirs, addProcExcludeDir, removeProcExcludeDir, clearProcExcludeDirs,
+    // 功能 3：「隐藏非拟处理项」开关（消费的是后端 isPending 投影，前端不自算）
+    hideNonPending, toggleHideNonPending,
     procExcludeActive,
     procActive, procFiltering, procExcluded, lastFilter,
     // AS-H6：命中数来自后端，UI 需要知道"还没到位"和"问失败了"

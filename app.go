@@ -71,6 +71,19 @@ type FileView struct {
 	// false 时不参与跨卷判定（保守按"同卷"处理，不显示按钮）：
 	// 与其猜错让用户点出一个注定失败的按钮，不如不显示。
 	VolumeResolved bool `json:"volumeResolved"`
+
+	// IsPending 表示"策略上这一项可被处理"（功能 3，2026-09-23「隐藏非拟处理项」）。
+	// 口径 = 拟处理内核（pendingIDsLocked）在**全量结果集**上的投影：
+	// 非保留 ∩（若启用）优先目录 −（若启用）黑名单目录，**与勾选无关**
+	// （GetResultGroups 看不到勾选上下文，勾选是显示层的另一层过滤）。
+	//
+	// ★ 为什么由后端填而不是前端自算：前端手里只有 isKeep 和路径，路径归属
+	// 判据（大小写折叠、Clean 归一、卷语义）全在后端——前端重算就是第二份
+	// 实现，AS-H6/I5 两类事故（界面对"不会动的文件"做承诺 / 藏错行）的温床。
+	// 前端只许消费这个布尔值。
+	// 注意 ResultQuery 不带 dirs/excludeDirs 时它只反映"非保留"——白/黑名单
+	// 没上送就没有那个维度的信息，界面若开着"隐藏"必须把它们一起上送。
+	IsPending bool `json:"isPending"`
 }
 
 // GroupView 重复组视图。
@@ -102,6 +115,14 @@ type ResultQuery struct {
 	PageSize int    `json:"pageSize"`
 	Sort     string `json:"sort"` // reclaimable(默认)/size/count
 	Ext      string `json:"ext"`  // 扩展名筛选（含点，空=全部）
+	// Dirs/ExcludeDirs 「优先处理的文件夹」白名单与「不处理的文件夹」黑名单（功能 3）。
+	// **只服务 FileView.IsPending 这一个投影**——不改分组、不改排序、不改聚合口径
+	// （TestIsPendingDoesNotChangeAggregates 钉死）。不送 = 投影只反映"非保留"。
+	// ★ 开着"隐藏非拟处理项"的每一次分页都必须带上，否则藏行用的是陈旧策略。
+	// 副作用提醒：非空时后端要预热卷语义（会写探测文件），所以前端只在开关
+	// 打开时才上送，别把它变成每次翻页的固定 I/O。
+	Dirs        []string `json:"dirs"`
+	ExcludeDirs []string `json:"excludeDirs"`
 }
 
 // PagedResult 分页结果（01 §7.2）。
@@ -900,7 +921,16 @@ func (a *App) GetStatus() string { return string(a.pipe.Status()) }
 // ---------- 结果查询 ----------
 
 // GetResultGroups 分页查询重复组（M2-T07 排序/筛选；Y3 排序缓存）。
+//
+// 功能 3（2026-09-23）：q.Dirs/q.ExcludeDirs 非空时逐行填 FileView.IsPending，
+// 投影与执行判据同收归 pendingIDsLocked（见 pendingSetLocked），这里只是把
+// 全量结果集的 ID 喂进内核。预热（写探测文件）必须保持在取锁**之前**（AS-R3），
+// 且仅在有策略目录时才发生——翻页是高频动作，无策略时零额外 I/O。
 func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
+	var resolve ops.SensResolver
+	if all := warmDirs(q.Dirs, q.ExcludeDirs); len(all) > 0 {
+		resolve = ops.WarmSensitivity(all)
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -951,8 +981,11 @@ func (a *App) GetResultGroups(q ResultQuery) (PagedResult, error) {
 		end = len(gs)
 	}
 	views := make([]GroupView, 0, end-start)
+	// IsPending 投影：只在这里算一次（本页所有组共用同一份集合）。
+	// 放在切片判空之后：空页不必为"没有行的结果"遍历整个 byID。
+	pending := a.pendingSetLocked(q.Dirs, q.ExcludeDirs, resolve)
 	for _, g := range gs[start:end] {
-		views = append(views, toGroupView(g, a.keepIDs))
+		views = append(views, toGroupView(g, a.keepIDs, pending))
 	}
 	return PagedResult{Total: total, Page: q.Page, TotalReclaimable: totalReclaim, TotalReclaimableActual: totalReclaimActual, Groups: views}, nil
 }
@@ -1039,7 +1072,10 @@ func groupHasExt(g *model.DuplicateGroup, ext string) bool {
 }
 
 // toGroupView 转换为 UI 视图：保留标记 = 当前决策（若有）否则路径最短建议（01 §9）。
-func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
+// pending 为拟处理投影集合（见 pendingSetLocked）；nil 表示本次不投影
+// （单元测试直调路径），届时 IsPending 一律 false——生产路径（GetResultGroups）
+// 永远传内核算出的集合，不存在"忘了传"这一态可被界面读到。
+func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool, pending map[uint64]bool) GroupView {
 	// 防御：空组没有成员可展示，`g.Files[0].Size` 会越界 panic。走到这里就说明
 	// 上游已经把畸形组放进了结果集（扫描流水线输出前有 len<2 过滤，故只可能来自
 	// history.LoadScan 读到被外部改写/损坏的历史库）。视图层不该因此崩掉整页
@@ -1079,6 +1115,7 @@ func toGroupView(g *model.DuplicateGroup, keepIDs map[uint64]bool) GroupView {
 			IsKeep:         i == keep,
 			Volume:         vol,
 			VolumeResolved: volOK,
+			IsPending:      pending[f.ID],
 		})
 	}
 	return v
@@ -1527,6 +1564,31 @@ func (a *App) pendingIDsLocked(dirs, excludeDirs []string, resolve ops.SensResol
 		ids = append(ids, id)
 	}
 	return ids, reason, unmatched
+}
+
+// pendingSetLocked 结果页投影用的「策略可处理」集合（功能 3）：把 byID 全量
+// 当候选集喂进 pendingIDsLocked，返回 ID 集合。
+//
+// ★ 为什么不另写一份"非保留 ∩ 白 − 黑"：那会是拟处理判据的第二实现——
+// AS-H6（前端自算命中）与 I5（视图自选保留者）两类事故都是同一个形状：
+// 第二份实现漂移后，界面对"不会动的文件"做承诺、或把该留的藏了。
+// 这里付出的 O(结果文件数) 每次翻页一遍，换"藏的行 == 引擎会动的行"这个不变式。
+//
+// gone 归类天然不会命中（候选集就是结果集全量）；勾选上下文不在口径里——
+// IsPending 说"策略上可处理"，"用户勾没勾"是显示层的另一层，见 FileView.IsPending。
+//
+// 须持 a.mu；resolve 由调用方在取锁前预热（AS-R3，与 pendingIDsLocked 同一约定）。
+func (a *App) pendingSetLocked(dirs, excludeDirs []string, resolve ops.SensResolver) map[uint64]bool {
+	all := make([]uint64, 0, len(a.byID))
+	for id := range a.byID {
+		all = append(all, id)
+	}
+	ids, _, _ := a.pendingIDsLocked(dirs, excludeDirs, resolve, all)
+	set := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
 }
 
 // PreviewProcessPolicy 在**不执行任何操作**的前提下，算出处理策略的实际生效范围。

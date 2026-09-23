@@ -100,6 +100,11 @@ export interface FileView {
   // Windows 盘符不等于卷（挂载点会把别的卷挂到某目录下），
   // 拿路径前缀猜会把用户引向注定失败的按钮。见 isGroupCrossVolume。
   volumeResolved: boolean
+  // 「策略上可处理」（功能 3，app.go FileView.IsPending）：拟处理内核在全量
+  // 结果集上的投影=非保留 ∩ 白名单 − 黑名单，与勾选无关。判据只在后端一份，
+  // 前端只许消费这个布尔值（AS-H6 纪律）；查询没带 dirs/excludeDirs 时它只
+  // 反映"非保留"——开着「隐藏非拟处理项」翻页必须把两把过滤器一起上送。
+  isPending: boolean
 }
 
 export interface GroupView {
@@ -120,6 +125,11 @@ export interface ResultQuery {
   pageSize: number
   sort: string
   ext: string
+  // 处理策略白/黑名单（功能 3）：**只喂 FileView.isPending 投影**，不改变
+  // 分组、排序与聚合。空/缺省=未启用该维度。只在「隐藏非拟处理项」开着时
+  // 上送——非空会让后端预热卷语义（写探测文件），翻页是高频路径。
+  dirs?: string[]
+  excludeDirs?: string[]
 }
 
 export interface PagedResult {

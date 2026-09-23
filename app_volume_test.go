@@ -88,7 +88,7 @@ func TestToGroupViewCarriesVolume(t *testing.T) {
 				Key: model.FileKey{VolumeID: 222, Resolved: true}},
 		},
 	}
-	v := toGroupView(g, nil)
+	v := toGroupView(g, nil, nil)
 	if len(v.Files) != 2 {
 		t.Fatalf("视图文件数错误: %d", len(v.Files))
 	}
@@ -114,7 +114,7 @@ func TestToGroupViewSameVolumeGroupDetectable(t *testing.T) {
 				Key: model.FileKey{VolumeID: 7, Resolved: true}},
 		},
 	}
-	v := toGroupView(g, nil)
+	v := toGroupView(g, nil, nil)
 	if v.Files[0].Volume != v.Files[1].Volume {
 		t.Fatalf("同卷组不应被识别为跨卷: %q vs %q",
 			v.Files[0].Volume, v.Files[1].Volume)
@@ -132,7 +132,7 @@ func TestGroupVolumeUnresolvedOnUnixLikePaths(t *testing.T) {
 			{ID: 31, Path: "/tmp/b/x.bin", Size: 10},
 		},
 	}
-	v := toGroupView(g, nil)
+	v := toGroupView(g, nil, nil)
 	if v.Files[0].Volume == "" {
 		t.Fatal("Volume 不应为真正的空串（会与 JSON 缺省值混淆）")
 	}

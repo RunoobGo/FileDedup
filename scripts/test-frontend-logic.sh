@@ -219,6 +219,17 @@ wiring 'src/stores/scan.ts' 'api.getPendingFiles(' '' \
 wiring 'src/components/PendingDrawer.vue' 'store.pendingData' '' \
 	'抽屉渲染消费 store.pendingData（常驻挂载+store 控显隐，FailedDrawer 同族形状）'
 
+# 功能 3（2026-09-23「隐藏非拟处理项」）：藏行的判据是后端逐行 isPending 投影，
+# 视图只许消费（请求上送链由 scan-hide-nonpending.test.ts 的 node 用例钉）。
+# .vue 打不进 node --test（M116/M118 同族限制），这里钉"有没有去用"这一刀。
+# ★ 只锚标识符，不锚中文文案（改措辞安全）。
+wiring 'src/components/GroupCard.vue' 'f.isPending' 'files.filter(f => f.isKeep' \
+	'GroupCard 藏行消费后端 isPending（功能 3：组件不得按 isKeep/路径重算拟处理集，AS-H6 同一纪律）'
+wiring 'src/views/ResultView.vue' 'g.files.some(f => f.isPending)' '' \
+	'整组无拟处理项才隐藏整卡，判据同样取自 isPending 投影（功能 3）'
+wiring 'src/views/ResultView.vue' 'store.toggleHideNonPending()' '' \
+	'开关走 store 动作（重取/上送链收在 store，视图不自拼请求，功能 3）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1
