@@ -288,7 +288,7 @@ func TestTSInterfaceFieldsParsesRealFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"Kind", "FileIDs", "TargetDir", "ConfirmDanger", "ProcessDirs"}
+		want := []string{"Kind", "FileIDs", "TargetDir", "ConfirmDanger", "ProcessDirs", "ExcludeDirs"}
 		assertSameOrder(t, "OpRequest", want, got)
 	})
 	t.Run("真文件：内联对象元素里的键不算本层字段", func(t *testing.T) {

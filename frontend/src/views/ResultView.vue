@@ -179,7 +179,7 @@ const procDirInput = ref('')
 const opDisabled = computed(() =>
   store.effectiveCount === 0 || store.procCountPending || store.busy)
 const opDisabledTip = computed(() => {
-  if (store.procCountPending) return '正在按后端判据核算优先文件夹内的命中数…'
+  if (store.procCountPending) return '正在按后端判据核算本次处理范围内的命中数…'
   if (store.procCountError) return `命中数计算失败：${store.procCountError}`
   return store.busyTip
 })
@@ -202,6 +202,33 @@ async function pickProcDir() {
 function addProcDirInput() {
   store.addProcDir(procDirInput.value)
   procDirInput.value = ''
+}
+
+// ---------- 「不处理的文件夹」黑名单（2026-09-23 功能 2） ----------
+//
+// 与白名单分开的独立开关，**不**挂在 procKind 下拉下：那个下拉表达的是
+// "处理谁"（全部 / 仅在优先目录内），黑名单回答的是"永不处理谁"，
+// 两者可以同时开、也可以只开黑名单。启用判据同样只有一个：
+// store.procExcludeDirs 里有非空白项（真值在后端 pendingIDsLocked，
+// 前端只做显示，见 stores/scan.ts 的 AS-H6 注释）。
+//
+// ★ 文案上必须与"扫描排除/保留目录"区分开：这里黑名单**不**影响保留判定，
+// 目录内文件仍可被选为保留锚点、仍出现在结果集，只是永远不会被动。
+const procExcludeInput = ref('')
+
+async function pickProcExcludeDir() {
+  const { api } = await import('../wails')
+  try {
+    const dir = await api.selectDirectory()
+    if (dir) store.addProcExcludeDir(dir)
+  } catch (e: any) {
+    toast.notifyError('选择目录失败', e)
+  }
+}
+
+function addProcExcludeInput() {
+  store.addProcExcludeDir(procExcludeInput.value)
+  procExcludeInput.value = ''
 }
 
 // 只改 confirmKind：store.confirmOpen 的复位由上方 watch 统一负责（不再手工赋值）
@@ -272,12 +299,12 @@ function onConfirm(targetDir?: string) {
                  只显示"已选 N"而操作按钮按 effectiveCount 禁用，
                  用户会看到"选了 40 项，按钮却是灰的"这种无从解释的状态。 -->
             <template v-if="store.procFiltering">
-              ，其中<b>{{ store.effectiveCount }}</b> 项在优先文件夹内 / <b>{{ humanBytes(store.effectiveBytes) }}</b>
+              ，其中<b>{{ store.effectiveCount }}</b> 项在处理范围内 / <b>{{ humanBytes(store.effectiveBytes) }}</b>
             </template>
             <!-- 命中数要问后端（判据不再前端自算），那一次往返期间显示"计算中"
                  而不是 0——0 是一句假话，它读起来像"你的优先文件夹没命中任何东西"。 -->
             <template v-else-if="store.procCountPending">
-              ，优先文件夹内的命中数<b>计算中…</b>
+              ，处理范围内的命中数<b>计算中…</b>
             </template>
           </template>
           <template v-else>未选择——点「全选」选中全部冗余项</template>
@@ -349,6 +376,36 @@ function onConfirm(targetDir?: string) {
           </span>
         </div>
       </div>
+      <!-- 「不处理的文件夹」黑名单（功能 2）：与上面的白名单并排独立生效。
+           范围 = 白名单命中 − 黑名单命中（后端同一内核，短路序白名单先拦）。
+           ★ 它不改保留判定：这里的目录内文件仍可当保留锚点、仍在结果集，
+           只是永不进拟处理集——文案必须说清这条边界，否则会被读成"屏蔽整个目录"。 -->
+      <div class="procrow exrow">
+        <div class="keep">
+          <span class="lbl" aria-hidden="true">不处理</span>
+          <span v-if="store.procExcludeActive" class="proc-hint">
+            黑名单生效中：列内目录（含子目录）的文件永不被处理，但仍可当保留锚点
+          </span>
+          <span v-else class="proc-hint">
+            添加"永不处理"的目录：里面的重复文件仍会被列出、仍可当保留锚点，只是不会被改动
+          </span>
+          <button v-if="store.procExcludeDirs.length" class="btn-ghost xs"
+            title="清空黑名单" @click="store.clearProcExcludeDirs()">清空</button>
+        </div>
+      </div>
+      <div class="procdirs exdirs">
+        <div v-for="(d, i) in store.procExcludeDirs" :key="d" class="kd-row">
+          <!-- 同样无序号无排序：并集语义，与白名单一侧同一个理由。 -->
+          <span class="kd-path" :title="d">{{ d }}</span>
+          <button class="btn-ghost xs" title="移除该目录" aria-label="移除不处理目录"
+            @click="store.removeProcExcludeDir(i)">✕</button>
+        </div>
+        <div class="kd-add">
+          <button class="btn-ghost" @click="pickProcExcludeDir">＋ 添加不处理目录</button>
+          <input v-model="procExcludeInput" type="text" aria-label="粘贴不处理的目录路径"
+            placeholder="粘贴目录后回车添加" @keyup.enter="addProcExcludeInput" />
+        </div>
+      </div>
       <div class="ops">
         <!-- M18：全选的范围是**整个结果集**，包含被折叠起来的组。这里刻意不改成
              "只选可见项"——折叠只是显示状态，静默少选会让用户以为整组都勾上了，
@@ -382,10 +439,10 @@ function onConfirm(targetDir?: string) {
       <p v-if="store.procFiltering" class="proc-note">
         <Icon name="filter" :size="13" />
         处理范围已收窄：已勾选 <b>{{ store.selectedFiles.length }}</b> 项，
-        其中 <b>{{ store.procExcluded }}</b> 项不在优先文件夹内，本次不会改动。
+        其中 <b>{{ store.procExcluded }}</b> 项不在本次处理范围内（未被优先文件夹放行，或被「不处理」目录拦下），本次不会改动。
         <template v-if="store.procExcluded === store.selectedFiles.length">
-          <b>当前没有任何勾选项在优先文件夹内，操作按钮已灰化。</b>
-          请调整优先文件夹或清除该设置。
+          <b>当前没有任何勾选项在处理范围内，操作按钮已灰化。</b>
+          请调整优先文件夹或「不处理」目录，或清除这些设置。
         </template>
       </p>
       <!-- 计数还没到位 / 问后端失败：这两态都必须显式说，且**不能**用 0 顶替。
@@ -393,7 +450,7 @@ function onConfirm(targetDir?: string) {
            失败态尤其重要——它是唯一能告诉用户"不是你的目录没命中，是没算出来"的地方。 -->
       <p v-else-if="store.procCountPending" class="proc-note">
         <Icon name="filter" :size="13" />
-        正在按后端判据核算优先文件夹内的命中数，操作按钮在算出结果前灰化。
+        正在按后端判据核算本次处理范围内的命中数，操作按钮在算出结果前灰化。
       </p>
       <p v-else-if="store.procCountError" class="proc-note warn">
         <Icon name="alert" :size="13" />
@@ -529,6 +586,8 @@ button.stat:hover b { text-decoration: underline; }
 /* 处理策略的目录列表。复用 keepdirs 的 .kd-* 样式（同一套视觉语言：
    路径 + 行内删除），但**不**含序号与 ↑↓ —— 见模板里的注释。 */
 .procdirs { display: flex; flex-direction: column; gap: 4px; }
+/* 黑名单块（功能 2）：与白名单块同款排布，只隔一层间距表明"另一把过滤器" */
+.exrow { margin-top: var(--sp-2); }
 /* 收窄说明。info 色：这是"告知范围"不是"出错"；warn 变体才用于
    "你加的目录里没有可处理的文件"那种需要用户动手修的情况。 */
 .proc-note {

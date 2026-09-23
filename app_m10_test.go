@@ -226,7 +226,7 @@ func TestPreviewNoDirsExcludesKeepAndStale(t *testing.T) {
 	const staleID = uint64(1 << 40) // 结果集外的 id（历史裁剪后/伪造入参）
 
 	sel := []uint64{keepID, redundantID, staleID}
-	pv, err := a.PreviewProcessPolicy(nil, sel)
+	pv, err := a.PreviewProcessPolicy(nil, nil, sel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestPreviewNoDirsExcludesKeepAndStale(t *testing.T) {
 
 	// 重复勾选只算一次：执行侧 planOpItems 用 seen 去重，预览必须同口径，
 	// 否则"将处理 N"会大于实际写入账本的条目数。
-	dup, err := a.PreviewProcessPolicy(nil, []uint64{redundantID, redundantID})
+	dup, err := a.PreviewProcessPolicy(nil, nil, []uint64{redundantID, redundantID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestPreviewNoDirsExcludesKeepAndStale(t *testing.T) {
 
 	// 启用策略的一路同样去重（保留项那一路由 ApplyProcessPolicyWith 剔除）
 	inside := idsInDir(t, a, insideDir)
-	both, err := a.PreviewProcessPolicy([]string{insideDir},
+	both, err := a.PreviewProcessPolicy([]string{insideDir}, nil,
 		[]uint64{inside.ids[0], inside.ids[0], keepID})
 	if err != nil {
 		t.Fatal(err)

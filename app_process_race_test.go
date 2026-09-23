@@ -62,7 +62,7 @@ func TestPreviewProcessPolicyConcurrentWithCleanupNoRace(t *testing.T) {
 	}()
 
 	for i := 0; i < 300; i++ {
-		if _, err := a.PreviewProcessPolicy([]string{insideDir}, ids); err != nil {
+		if _, err := a.PreviewProcessPolicy([]string{insideDir}, nil, ids); err != nil {
 			t.Fatalf("PreviewProcessPolicy 出错: %v", err)
 		}
 	}

@@ -65,6 +65,9 @@ const canConfirm = computed(() => {
 // 必须走下面的"计算中"分支，否则会落到 v-else 那条"将处理 40 个文件"上，又是一句假话。
 const narrowed = computed(() => store.procFiltering)
 const procDirsTip = computed(() => store.procDirs.filter(d => d.trim()).join('、'))
+// 功能 2：黑名单也要在确认框里点名——"落差是谁造成的"必须指名道姓，
+// 只报白名单会把黑名单造成的收窄错记到优先文件夹头上。
+const procExcludeTip = computed(() => store.procExcludeDirs.filter(d => d.trim()).join('、'))
 
 // M15（2026-09-21 全仓审计 §六 15）：这批字节数对用户意味着什么，要按操作类型分别措辞。
 // 原先两个分支都写死"空间可释放"：hardlink 场景下数据一点没少（只是不再重复存第二份，
@@ -138,10 +141,10 @@ useModal(dlgRef)
              结果页的操作按钮此时已经是灰的，走到这一步通常是 debounce 与弹窗
              竞速的极窄窗口；ensureProcCounts 会在挂载时立刻补一次，几毫秒后就换真数。 -->
         <template v-else-if="store.procCountPending">
-          <div>正在核算实际处理范围（优先文件夹内的命中数尚未返回）…</div>
+          <div>正在核算实际处理范围（本次处理范围内的命中数尚未返回）…</div>
         </template>
         <template v-else-if="narrowed">
-          <div>将处理 <b>{{ store.effectiveCount }}</b> 个文件（已勾选 {{ store.selectedFiles.length }} 项，其中 {{ store.procExcluded }} 项不在优先文件夹内，本次不改动）</div>
+          <div>将处理 <b>{{ store.effectiveCount }}</b> 个文件（已勾选 {{ store.selectedFiles.length }} 项，其中 {{ store.procExcluded }} 项不在本次处理范围内，本次不改动）</div>
           <div>{{ reclaim.lead }}<b>{{ reclaim.bytes }}</b>{{ reclaim.tail }}</div>
         </template>
         <template v-else>
@@ -150,8 +153,11 @@ useModal(dlgRef)
         </template>
       </div>
       <p v-if="narrowed" class="proctip">
-        处理范围受「优先处理的文件夹」限制（{{ procDirsTip }}）。
-        保留策略仍然优先：保留项在任何情况下都不会被处理。
+        处理范围受
+        <template v-if="procDirsTip">「优先处理的文件夹」限制（{{ procDirsTip }}）</template>
+        <template v-if="procDirsTip && procExcludeTip">与</template>
+        <template v-if="procExcludeTip">「不处理的文件夹」黑名单限制（{{ procExcludeTip }}）</template>
+        。保留策略仍然优先：保留项在任何情况下都不会被处理；黑名单不改变保留判定。
       </p>
       <div v-if="kind === 'move'" class="moverow">
         <button class="btn-ghost" :disabled="picking" @click="pickDir">选择目录</button>

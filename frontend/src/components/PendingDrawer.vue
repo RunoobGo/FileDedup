@@ -44,7 +44,7 @@ const excludedOnPage = computed(() =>
           <span id="pending-drawer-title">
             拟处理清单
             <template v-if="data">（将处理 <b>{{ formatCount(data.pendingCount) }}</b> 项
-              <template v-if="data.keepCount + data.outsideCount + data.goneCount">
+              <template v-if="data.total - data.pendingCount > 0">
                 / 不会处理 {{ formatCount(data.total - data.pendingCount) }} 项
               </template>）</template>
           </span>
@@ -83,6 +83,7 @@ const excludedOnPage = computed(() =>
                   <template v-if="r.pending">组 #{{ r.groupId }}</template>
                   <template v-else-if="r.reason === 'keep'">保留项 · 硬拒绝</template>
                   <template v-else-if="r.reason === 'outside'">不在优先文件夹内</template>
+                  <template v-else-if="r.reason === 'excluded'">「不处理」目录内</template>
                   <template v-else>已不在结果集</template>
                 </span>
               </div>

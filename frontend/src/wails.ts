@@ -207,6 +207,12 @@ export interface OpRequest {
   // 注意它**不会**改变用户的勾选状态：显式勾选是用户的明确表达，
   // 一个策略设置不该悄悄改写它——后端也只收窄本次操作，不回写 selection。
   ProcessDirs?: string[]
+  // ExcludeDirs 「不处理的文件夹」黑名单（2026-09-23 功能 2 新增）：
+  // 实际处理范围再减去位于这些目录下的文件。与 ProcessDirs 同一内核
+  // （pendingIDsLocked），短路序 gone→keep→outside→excluded。
+  // ★ 不影响保留判定：黑名单内文件仍可当保留锚点、仍在结果集，
+  // 唯一效果是永不进拟处理集。空/不传 = 未启用。
+  ExcludeDirs?: string[]
 }
 
 // OpsFiltered 处理策略收窄了实际执行范围（后端事件 ops:filtered）。
@@ -304,6 +310,7 @@ export interface ProcessPreview {
 export interface PendingQuery {
   selectedIds: number[]
   dirs: string[]
+  excludeDirs: string[] // 「不处理的文件夹」黑名单（功能 2）；空=未启用
   page: number
   pageSize: number
   sort: string // group(默认)/size/path
@@ -316,7 +323,7 @@ export interface PendingRow {
   size: number
   groupId: number
   pending: boolean
-  reason: string // ''/keep/outside/gone
+  reason: string // ''/keep/outside/gone/excluded，见 Go 侧 Pending* 常量
 }
 
 export interface PendingPage {
@@ -327,6 +334,7 @@ export interface PendingPage {
   keepCount: number
   outsideCount: number
   goneCount: number
+  excludedCount: number // 落在「不处理的文件夹」黑名单内的行数（功能 2）
   rows: PendingRow[]
 }
 
@@ -345,7 +353,7 @@ export interface BackendAPI {
   // PreviewProcessPolicy 只读预览"处理策略实际会命中哪些"（无副作用、不写账本、
   // 不动文件系统，因此不受 opsRunning 互斥限制）。声明在方法面钉子里（G5）：
   // 缺声明 = 后端有、前端按类型调不到。
-  PreviewProcessPolicy(dirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
+  PreviewProcessPolicy(dirs: string[], excludeDirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
   // GetPendingFiles 分页查询"执行前拟处理清单"明细（与上一绑定同一内核的两个投影：
   // 预览给计数、清单给逐行可读明细 + 被排除项的 reason）。同为只读，不受
   // opsRunning 互斥限制。

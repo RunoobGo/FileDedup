@@ -12,6 +12,7 @@ package main
 
 import (
 	"math"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -49,24 +50,30 @@ func TestPendingFilesMirrorsPreviewKernel(t *testing.T) {
 	inside := idsInDir(t, a, insideDir)
 
 	cases := []struct {
-		name string
-		dirs []string
-		sel  []uint64
+		name    string
+		dirs    []string
+		exclude []string // 功能 2 黑名单腿：恒 nil 时与新增本参数前逐格同行为
+		sel     []uint64
 	}{
-		{"未启用策略", nil, []uint64{keepID, redundantID, staleID}},
-		{"启用策略混合勾选", []string{insideDir}, []uint64{keepID, redundantID, staleID, inside.ids[0]}},
-		{"仅未命中目录", []string{outsideDir}, []uint64{redundantID, keepID}},
-		{"重复勾选", nil, []uint64{redundantID, redundantID, keepID}},
-		{"空勾选", nil, nil},
-		{"多目录并集", []string{insideDir, outsideDir}, []uint64{keepID, redundantID, staleID}},
+		{"未启用策略", nil, nil, []uint64{keepID, redundantID, staleID}},
+		{"启用策略混合勾选", []string{insideDir}, nil, []uint64{keepID, redundantID, staleID, inside.ids[0]}},
+		{"仅未命中目录", []string{outsideDir}, nil, []uint64{redundantID, keepID}},
+		{"重复勾选", nil, nil, []uint64{redundantID, redundantID, keepID}},
+		{"空勾选", nil, nil, nil},
+		{"多目录并集", []string{insideDir, outsideDir}, nil, []uint64{keepID, redundantID, staleID}},
+		{"仅黑名单", nil, []string{insideDir}, []uint64{keepID, redundantID, staleID, inside.ids[0]}},
+		{"白名单减黑名单", []string{insideDir}, []string{filepath.Join(insideDir, "sub")},
+			[]uint64{keepID, inside.ids[0], inside.ids[1]}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pv, err := a.PreviewProcessPolicy(tc.dirs, tc.sel)
+			pv, err := a.PreviewProcessPolicy(tc.dirs, tc.exclude, tc.sel)
 			if err != nil {
 				t.Fatal(err)
 			}
-			pg, err := a.GetPendingFiles(PendingQuery{Dirs: tc.dirs, SelectedIDs: tc.sel})
+			pg, err := a.GetPendingFiles(PendingQuery{
+				Dirs: tc.dirs, ExcludeDirs: tc.exclude, SelectedIDs: tc.sel,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}

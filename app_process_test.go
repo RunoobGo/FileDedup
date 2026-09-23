@@ -488,7 +488,7 @@ func TestPreviewProcessPolicy(t *testing.T) {
 	}
 	selected := append(append([]uint64{}, inside.ids...), outID)
 
-	pv, err := a.PreviewProcessPolicy([]string{insideDir}, selected)
+	pv, err := a.PreviewProcessPolicy([]string{insideDir}, nil, selected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestPreviewProcessPolicy(t *testing.T) {
 	}
 
 	// 未启用（dirs 为空）→ 生效范围 = 全部勾选，且不报未命中
-	pv2, err := a.PreviewProcessPolicy(nil, selected)
+	pv2, err := a.PreviewProcessPolicy(nil, nil, selected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,7 +546,7 @@ func TestPreviewProcessPolicy(t *testing.T) {
 	}
 
 	// 未命中的目录要被点名（用户加了目录但里面没有可处理的重复文件）
-	pv3, err := a.PreviewProcessPolicy([]string{insideDir, filepath.Join(t.TempDir(), "nope")},
+	pv3, err := a.PreviewProcessPolicy([]string{insideDir, filepath.Join(t.TempDir(), "nope")}, nil,
 		selected)
 	if err != nil {
 		t.Fatal(err)
@@ -557,7 +557,7 @@ func TestPreviewProcessPolicy(t *testing.T) {
 
 	// ★ 交集为空时预览不报错，而是如实给出 0：
 	// 预览是"给你看会发生什么"，不是"阻止你"。是否拒绝由 ExecuteOperation 决定。
-	pv4, err := a.PreviewProcessPolicy([]string{insideDir}, []uint64{outID})
+	pv4, err := a.PreviewProcessPolicy([]string{insideDir}, nil, []uint64{outID})
 	if err != nil {
 		t.Fatalf("预览在交集为空时不该报错（它只描述结果）: %v", err)
 	}
