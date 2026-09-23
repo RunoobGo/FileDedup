@@ -1,7 +1,7 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind, PendingPage } from '../wails'
 import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
 import { undoBlockedText } from '../utils/undoReason'
@@ -681,6 +681,75 @@ export const useScanStore = defineStore('scan', () => {
   function removeProcDir(i: number) { procDirs.value.splice(i, 1) }
   function clearProcDirs() { procDirs.value = [] }
 
+  // ---------- 拟处理清单抽屉（2026-09-23，设计段 §4） ----------
+  //
+  // 与 proc 命中数腿（filterInDirs + 150ms debounce）是**两个读者、一份判据**：
+  // 清单直接问 GetPendingFiles（后端同一内核 pendingIDsLocked 的明细投影）。
+  // 刻意不做订阅式刷新：清单的语义是"点开这一刻的快照"，勾选变化后重开即重取；
+  // 若也挂 debounce 跟命中数腿互相踩，就是 AS-H6 双判据事故的另一种复发形式。
+  // 代价如实告知：抽屉开着时改勾选，画面不会自己变——分节文案里明写"重新打开可刷新"。
+  const pendingOpen = ref(false)
+  const pendingPage = ref(0)
+  const pendingSort = ref('group')
+  const pendingData = ref<PendingPage | null>(null)
+  const pendingLoading = ref(false)
+  const pendingError = ref('')
+  const PENDING_PAGE_SIZE = 50
+  let pendingReqSeq = 0
+
+  // refreshPending 拉当前页。只认最后一次请求的回执（procReqSeq 同族手法）：
+  // 用户在途翻页/改排序时，旧回包不得覆盖新状态，也不得把 loading 按灭。
+  async function refreshPending(): Promise<void> {
+    const seq = ++pendingReqSeq
+    pendingLoading.value = true
+    pendingError.value = ''
+    try {
+      const pg = await api.getPendingFiles({
+        selectedIds: selectedFiles.value.map(f => f.id),
+        dirs: usableProcDirs(),
+        page: pendingPage.value,
+        pageSize: PENDING_PAGE_SIZE,
+        sort: pendingSort.value,
+      })
+      if (seq !== pendingReqSeq) return
+      pendingData.value = pg
+    } catch (e: any) {
+      if (seq !== pendingReqSeq) return
+      pendingData.value = null
+      pendingError.value = String(e?.message ?? e ?? '清单拉取失败')
+    } finally {
+      if (seq === pendingReqSeq) pendingLoading.value = false
+    }
+  }
+
+  function openPendingDrawer() {
+    pendingPage.value = 0
+    pendingOpen.value = true
+    void refreshPending()
+  }
+  function closePendingDrawer() {
+    pendingOpen.value = false
+    // 作废在途回执：否则一次慢回包会把"上一次打开"的清单塞进下一次打开的第一帧。
+    pendingReqSeq++
+    pendingLoading.value = false
+  }
+  function pendingGotoPage(p: number) {
+    if (p < 0 || p === pendingPage.value) return
+    pendingPage.value = p
+    void refreshPending()
+  }
+  function pendingSetSort(s: string) {
+    if (s === pendingSort.value) return
+    pendingSort.value = s
+    pendingPage.value = 0 // 换排序必须回第 0 页：停在旧页会读到一条没排过的尾巴
+    void refreshPending()
+  }
+  const pendingTotalPages = computed(() =>
+    pendingData.value && pendingData.value.total > 0
+      ? Math.ceil(pendingData.value.total / PENDING_PAGE_SIZE)
+      : 1,
+  )
+
   async function applyKeep(kind: string, dirs: string[] = []) {
     if (!guard('应用保留策略')) return
     try {
@@ -960,6 +1029,9 @@ export const useScanStore = defineStore('scan', () => {
     procActive, procFiltering, procExcluded, lastFilter,
     // AS-H6：命中数来自后端，UI 需要知道"还没到位"和"问失败了"
     procCountPending, procCountError, ensureProcCounts,
+    // 拟处理清单抽屉（快照式：open 时拉取，翻页/换排序重拉，close 作废在途回包）
+    pendingOpen, pendingPage, pendingSort, pendingData, pendingLoading, pendingError,
+    pendingTotalPages, openPendingDrawer, closePendingDrawer, pendingGotoPage, pendingSetSort,
     previewCurrent,
     resetSelection, toggleSelect, selectAll, clearSelection, selectedFiles, selectedBytes,
     effectiveFiles, effectiveBytes, effectiveCount,

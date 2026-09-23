@@ -282,6 +282,12 @@ function onConfirm(targetDir?: string) {
           </template>
           <template v-else>未选择——点「全选」选中全部冗余项</template>
         </span>
+        <!-- 拟处理清单（2026-09-23）：把"将处理 N 项"的计数翻成逐行可核对的明细。
+             清单自己问后端拿真值（GetPendingFiles 与预览同一内核），不依赖
+             debounce 命中数那条腿 ⇒ "计算中…"期间不灰化，点了就拉。 -->
+        <button v-if="store.selectedFiles.length" class="btn-ghost xs"
+          title="执行前逐行核对哪些文件会被处理、哪些不会及原因"
+          @click="store.openPendingDrawer()">查看清单</button>
       </div>
       <!-- 多目录优先级列表：序号即优先级，命中多个目录时保留最靠前目录内的文件 -->
       <div v-if="keepKind === 'directory'" class="keepdirs">

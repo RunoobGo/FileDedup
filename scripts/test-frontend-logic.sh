@@ -209,6 +209,16 @@ wiring 'src/views/RecordsView.vue' 'if (!accepted) undoingItem.value = null' '' 
 wiring 'src/views/SettingsView.vue' 'confirmClearCache' 'if (!confirm(' \
 	'清空缓存走两段式就地确认（R3-5：原生 confirm() 是全仓唯一残留，绕开 useModal 收口的那套）'
 
+# 拟处理清单（2026-09-23，设计段 specs/2026-09-23-pending-files-query-design.md §5）：
+# 抽屉与 store 状态机有 node 用例钉，但 .vue 打不进 node --test（M116/M118 同族限制）——
+# 视图接线只能走锚。三条都锚**标识符**，不锚中文文案（改措辞安全）。
+wiring 'src/views/ResultView.vue' 'store.openPendingDrawer()' '' \
+	'结果页入口问的是 store 的清单动作（判据归后端、清单腿不许视图自算，AS-H6 同一纪律）'
+wiring 'src/stores/scan.ts' 'api.getPendingFiles(' '' \
+	'清单数据来自后端 GetPendingFiles（与预览同一内核的两个投影，前端不重算拟处理集）'
+wiring 'src/components/PendingDrawer.vue' 'store.pendingData' '' \
+	'抽屉渲染消费 store.pendingData（常驻挂载+store 控显隐，FailedDrawer 同族形状）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1
