@@ -214,7 +214,7 @@ type App struct {
 	viewCache map[sortKey]viewCacheEntry
 
 	opsRunning   bool               // 清理操作执行中（互斥：拒绝并发操作/保留策略，与 goroutine 写结果集互斥）
-	scanInFlight bool               // 扫描 goroutine 在途（互斥新扫描：防旧任务收尾写结果集覆盖新任务）
+	scanInFlight bool               // 扫描"结果集尚未写回"的在途标志（互斥新扫描）。★ F1③：复位点在写回那一拍（本 goroutine 内），不是整条 goroutine 的生命周期；写回之后还剩"落历史 → 认领 → 发事件"三拍，那一段由 resultGen 判取代
 	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
 	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
@@ -588,6 +588,19 @@ func (a *App) resultSuperseded(myGen uint64) bool {
 	return myGen != a.resultGen.Load()
 }
 
+// scanAboutToSaveHook 是扫描收尾"即将落历史库"那一点的测试接缝
+// （F1②，2026-09-23）。**生产恒 nil**，调用点见 StartScan 的收尾 goroutine。
+//
+// 为什么需要它：②要证的性质是"被取代的那一轮不落历史行"，而这要求"在 A 的判代际
+// 与 SaveScan 之间插入一次 B 的 StartScan"。现有码在那一段没有任何卡点
+// （a.emit 在 SaveScan 之后，a.hist 是具体结构体、没有可换装的函数字段），
+// 光靠调度时序拿不到可复跑的读数。手法先例：fscase.fireProbeHook、
+// ops.beforeActContentRecheck。
+//
+// ★ 代价如实：钩子本身是新符号 ⇒ ②的"改前红"不存在（改前树 import 不到它），
+// 修对必红的证据由变异提供（把 superseded 早退挪回 SaveScan 之后 ⇒ 用例当场红）。
+var scanAboutToSaveHook func()
+
 // StartScan 创建扫描任务，返回 taskID；运行中重复调用返回错误。
 func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	if len(cfg.Roots) == 0 {
@@ -618,6 +631,11 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 	a.byID = make(map[uint64]*model.FileEntry)
 	a.keepIDs = nil
 	a.failed = nil
+	// ★ F1①（2026-09-23 第四轮全仓审查）：lastEvs 也在这里作废。它是进度回调的唯一写者，
+	//   不复位就等于：新扫描已把 groups 清空、GetScanProgress 却仍回吐上一轮的终值——
+	//   对本轮进度的一次**谎报**（注释自称的"断线重连语义"因此不成立）。零值是诚实答案：
+	//   本轮还没有任何进度。（前端目前无消费者，见 §30.11 的如实收窄。）
+	a.lastEvs = model.ProgressEvent{}
 	a.resultsReady = false // 旧结果集作废（历史恢复/上次扫描均不再可操作）
 	a.curHistID = 0
 	a.invalidateViewCacheLocked() // Y3：新任务清空旧视图
@@ -679,6 +697,18 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		}
 		a.scanInFlight = false
 		a.mu.Unlock()
+		// F1（②，2026-09-23 第四轮全仓审查）：判代际必须**早于**落库。改前的顺序是
+		// SaveScan（锁外，慢）→ 再判 superseded → 弃写，于是被取代的那一轮照样占一格
+		// history.MaxScanHistory，把最旧的**有效**记录挤掉（外键 CASCADE 连子行一起删）。
+		// ★ 前移只是把窗口从"SaveScan + 两拍"收窄到"本行到 SaveScan 起跑之间"，**不消除**：
+		//   SaveScan 依 App.hist 的既有约束必须在锁外，判代际与落库之间天然让一次锁。
+		if scanAboutToSaveHook != nil {
+			scanAboutToSaveHook()
+		}
+		if superseded() {
+			fmt.Fprintf(os.Stderr, "[scan] 第 %d 代扫描已被新任务取代，历史与结果集均弃写\n", myGen)
+			return
+		}
 		// v0.5.0 功能 3：扫描成功收尾自动写历史（锁外调用，见 App.hist 注释）。
 		// 保存失败不影响结果集可用，只失去本次记录的恢复/裁剪联动。
 		var histID int64
@@ -702,9 +732,11 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		a.curHistID = histID
 		// M6-P4 / M21 / M62+M85：五个"按轮计数"口径在与 superseded() 判定同一临界区内取。
 		// 为什么不能留到锁外的 emit 里现取：Run 一开始就把按轮计数器归零，
-		// 而 a.scanInFlight 在扫描体第一行就复位（新扫描因此可通过在途检查，
-		// 只靠 resultGen 判取代）。锁内取数等于把结论钉死成"未被取代 ⇒
+		// 而 a.scanInFlight 在"结果集写回"那一拍就复位（紧接其后的落库/认领这段全程为 false，
+		// 新扫描因此可通过在途检查，只靠 resultGen 判取代）。锁内取数等于把结论钉死成"未被取代 ⇒
 		// 没有新的 StartScan ⇒ 没有新一轮 Run ⇒ 这几个值仍是本轮的"。
+		// ★ F1③：这里原写的是"在扫描体第一行就复位"——那个位置没有复位语句，
+		//   真复位点在上面的 `a.scanInFlight = false`（与结果集写回同一个临界区）。
 		pDirs := a.pipe.ProtectedDirs()
 		pFiles := a.pipe.ProtectedFiles()
 		cloudSkipped := a.pipe.CloudSkipped()
@@ -2110,6 +2142,14 @@ type OpRecordItem struct {
 // 逐条标注链接状态（2026-09-20）：只对**已成功执行**的 done 条目做检测——
 // 其余状态（failed/skipped/cancelled）本就没在文件系统上动手，
 // 原位可能有意料之外的第三方文件，检测它们只会产出误导性的标红。
+//
+// ★ F1⑥（2026-09-23 登记，**不改行为**）：下面那个循环是**逐条同步 Lstat**，
+// 条目数没有上限（一笔大批量清理可上千条），且路径取自账本、可能是当初那个
+// 网络卷/外置盘。死挂载与拔走的 SMB 上 Lstat 可以长时间不返回 ⇒ 这条 RPC 会拖着
+// 记录页一起不返回，而界面上没有取消入口。这与 B2（R2-2）收的"探测听取消"同族，
+// 差别在这里要收的是**读侧的逐条 stat**：要么加"只检测前 N 条"、要么给整条 RPC 配
+// ctx 与超时（= 改 OpRecordItem 的检测时机/契约），两条都超出一行级小修的范围 ⇒
+// 本批只把风险写进注释，改法随批登记为欠账（J-6 取向）。
 func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 	hs := a.histSnapshot()
 	if hs == nil {

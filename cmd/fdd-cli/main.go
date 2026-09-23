@@ -115,13 +115,21 @@ func main() {
 	}
 
 	p := dedup.New()
+	// F1⑤（2026-09-23）：`defer cch.Close()` 救不了 `os.Exit` —— defer 只在函数返回时跑，
+	// 而 main() 里此后还有三条失败退出路径（扫描失败 / 创建输出失败 / 编码失败），
+	// 每一条都绕过它。SQLite 跑在 WAL 上，进程被带走不会丢已提交的数据，但会
+	// 跳过 Close() 这条明确的收口约定（应用侧 startup/shutdown 都走它，见 app.go 的 C5），
+	// 并把 -wal/-shm 的检查点推到下次开档。改法：Close 收进一个幂等闭包，
+	// 三条退出路径各显式调一次，正常路径仍由 defer 兜（database/sql 的 Close 幂等）。
+	var closeCache = func() {}
 	if *cachePath != "" {
 		cch, err := cache.Open(*cachePath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "缓存打开失败: %v\n", err)
 			os.Exit(1)
 		}
-		defer cch.Close()
+		closeCache = func() { _ = cch.Close() }
+		defer closeCache()
 		p = p.WithCache(cch)
 		cfg.UseCache = true
 	}
@@ -130,6 +138,7 @@ func main() {
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "扫描失败: %v\n", err)
+		closeCache()
 		os.Exit(1)
 	}
 
@@ -180,6 +189,7 @@ func main() {
 		f, err := os.Create(*out)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "创建输出失败: %v\n", err)
+			closeCache()
 			os.Exit(1)
 		}
 		defer f.Close()
@@ -189,6 +199,7 @@ func main() {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(&r); err != nil {
 		fmt.Fprintf(os.Stderr, "编码失败: %v\n", err)
+		closeCache()
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "完成: %d 组 / 可释放 %s（实占 %s）/ 失败 %d / 耗时 %s\n",

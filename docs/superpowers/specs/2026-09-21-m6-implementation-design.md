@@ -6641,3 +6641,73 @@ version-sync / 三个冒烟脚本）。
 （`scripts/test-frontend-logic.sh:187` 那行 `node 用例 %s 项 + 接线断言 %s 项 = 合计 %s 项全部通过`）才写的——
 指一个不存在的自报口径，等于用一个新的错位替掉旧的。同理 F1 没有把 linux 的 `vfat`/`msdosfs` 写进手册，
 因为 `fscase.go:86-89` 注明 `volumeTypeName` 真实现只在 darwin 有读数，另两平台恒 `""`。
+
+### 30.12 F1（J-6 一行级六条）实施读数：两条"锚咬自己注释"的自撞，是这一项真正的收获
+
+**落地清单（HEAD `c070000` 之上）**：六条全部改动，加一个新文件。
+
+| # | 落点 | 内容 |
+|---|---|---|
+| ① | `app.go:634-638`（StartScan 锁内段） | `a.failed = nil` 与 `a.resultsReady = false` 之间补 `a.lastEvs = model.ProgressEvent{}` |
+| ② | `app.go:700-711` | `superseded()` 早退前移到 `histSnapshot()/SaveScan` **之前**；钩子调用点紧挨其前 |
+| ③ | `app.go:217` + `app.go:738-740` | 字段注释改为"结果集尚未写回的在途标志 + 复位点在写回那一拍"；按轮计数段把"扫描体第一行就复位"改成真复位坐标 |
+| ④ | `internal/cache/cache.go:35-36` + `:273` + `:304-307` | Dev/Ino 注释按 fsid I7 重写（引 `fsid_unix.go:16` / `fsid_windows.go:201`）；比较条件注明 `!id.Resolved` **与平台无关** |
+| ⑤ | `cmd/fdd-cli/main.go:118-132` | Close 收进幂等闭包 `closeCache`，`defer` + 三条 `os.Exit(1)` 前各显式调一次（实测 4 处） |
+| ⑥ | `app.go:2146` | `GetOpRecord` 文档注释登记"逐条同步 Lstat、条数无上限、死挂载/拔走的 SMB 上可长时间不返回"，与 B2 同族，**不改行为** |
+| 测试 | `app_f1_test.go`（新建，3 条） | `TestStartScanClearsStaleProgress`（①，行为）、`TestSupersededScanWritesNoHistoryRow`（②，行为）、`TestF1StaticAnchors`（①③④⑤⑥ 静态钉） |
+
+**与设计段的一条命名偏离**：§30.11 写的钩子名是 `scanBeforeHistorySave func()`，实现落成
+**`scanAboutToSaveHook func()`**（`app.go` 内 `resultSuperseded` 之后声明，生产恒 nil）。改名理由：调用点
+的语义是"即将落库"而非"落库之前的一段"，与紧随其后的 `if superseded()` 读起来才连得上。位置与设计一致
+（Unlock 之后、`histSnapshot()` 之前，不持锁）。同批另一条小偏离：§30.11 回归配方里写的静态钉用例名
+`TestStaticAnchors_F1` 未采用，实际名 `TestF1StaticAnchors`（与全仓 `TestF0…`/`TestM…` 的前缀式命名一致）。
+
+**④ 的错处实际有三处，设计段只列了两处**：除了 `:35` 的字段注释和 `:304` 那段，`Lookup` 的**文档注释**
+（`:273`）也写着 `id 未解析（Windows）时身份比较平凡通过`——同一个把平台无关的格子缩成 Windows 专属的毛病。
+本批一并改；静态钉补 **④b**（禁 `id 未解析（Windows）`）。
+
+**★★ 本项最有价值的一条：静态锚的"禁止串"撞上了解释为什么禁止的那句注释，两处自撞红。**
+- ④ 的原锚禁 `"Windows 恒 0"`；而 ④ 的新注释为了说明"旧注释是 I7 之前的事实"，原文引用了那个串
+  ⇒ 锚红在自己钉的那次修复上（`app_f1_test.go:176` 实测红过一次）。
+- ⑤ 的原锚禁 `"defer cch.Close()"`；而 `main.go:118` 那句 "`defer cch.Close()` 救不了 `os.Exit`" 就是**改动说明本身**
+  ⇒ 同一形。
+- 修法两条不同，各自取小：④ 改**注释措辞**（引号内改成「该值恒为 0、比较平凡通过」，锚保持全文 Contains 的严）；
+  ⑤ 改**锚的粒度**（全文 Contains ⇒ 按行 `HasPrefix(TrimSpace(line), "defer cch.Close()")`，只钉代码行）。
+  ★ 这不是"为了让门禁变绿而放宽断言"：⑤ 改后仍然钉得住真实回归——变异 Fc 就是靠这条新形态取到红的（见下），
+  而全文 Contains 那种写法会连"写解释"一起判红，等于逼后来人删注释。这条要作为**静态钉家族的通用规矩**交 E2 登记：
+  **禁止串锚在钉"代码"时必须按行取代码上下文，钉"文档措辞"时才可全文匹配，二者不能混用。**
+
+**变异三发（§30.11 配方，逐发实跑，还原一律 `cp` + `cmp`）**
+- **Fa**（把 ② 的早退挪回 SaveScan 之后）⇒ `app_f1_test.go:142: 历史行数 = 2, want 1 …：[2, 1]` **红**，与预测一致。
+- **Fb**（删 ① 那句 `a.lastEvs = model.ProgressEvent{}`）⇒ `app_f1_test.go:91: 重扫后 GetScanProgress 仍回吐上一轮终值：
+  {Stage:hash FilesDone:4 FilesTotal:4 BytesDone:112 BytesTotal:112 …}` **红**，与预测一致。
+- **Fc**（⑤ 退成只剩裸 `defer cch.Close()`）⇒ `app_f1_test.go:191: ⑤：`defer cch.Close()` 退回来了` **红**，与预测一致。
+- 还原后取证：四个文件 `grep -c 'MUTATION-F'` 全 = **0**；`cmp` 与 `/tmp/f1mut/` 备份逐字节相同。
+
+**★ 一条工具层面的事故，必须记账**：① 那次 Edit 当时由工具回报"已成功"，但磁盘上 `grep -c 'a.lastEvs = model.ProgressEvent{}'`
+= **0**（`git status` 也未见该行），本段重落一次才真正生效。⇒ 本仓当前**只有 Bash 的 `grep -c` / `sed -n` 算权威取证**，
+Grep/Read 的返回在本会话内与该文件不符过两次。每次 Edit 之后已改为立刻 Bash 复核；这条与项目记忆里"并发第二会话"
+那条地雷并列，属同类风险的两种可能成因，**根因未定**（见下条）。
+
+**★ 一条未解释的历史红（如实保留，不写作已解决）**：`TestSupersededScanWritesNoHistoryRow` 在
+`-race -count=2 -run 'F1|Superseded'` 下曾报"用例前提不成立：A 没走到落库卡点"，当时 `-count=1 -v` 单跑 PASS。
+本段在同一命令下 `-count=2` 与 `-count=5` 连跑**均未复现**（5 次全 PASS，每次带
+`[scan] 第 1 代扫描已被新任务取代，历史与结果集均弃写`）。同批该命令里唯一的红换成了 `TestF1StaticAnchors` 的 ④（即上面
+那条自撞）。⇒ 结论限定为"本段未能复现，且当时那次与 ①/④ 未落盘的状态同窗口发生"；**根因未定**，按观察项交 E2 登记，
+不许划成"已修"。
+
+**回归配方实跑（本机 darwin/arm64）**：`gofmt -l .` 空 / `go build ./...` 过 / `go vet` 三平台（darwin、
+GOOS=windows、GOOS=linux）全过 / `go test -race -count=2 ./...` **23 个包全 ok**（根包 30.7s）/
+`go test -race -count=4 .` ok（58.3s）/ `check-version-sync.sh` rc=0（6 取值位仍全对齐 0.5.0）/
+`smoke-cli.sh` rc=0（三跑一致、205 组逐组对账、复扫命中 532）。**15 行全量门禁留到 E2 收口统一跑。**
+
+**计数影响（供 E2 第十次核对）**：全平台源码口径（§3.2 那条 `grep -rh '^func Test' … --exclude-dir=node_modules
+--exclude-dir=.workbuddy`）HEAD = **783**，工作树 = **786**（+3 全在根包）；Benchmark 仍 **4**。
+★ 不带那两个 `--exclude-dir` 的裸命令读数是 **803**——这正是 §3.2 记过的那个坑，别抄这个数。
+
+**未兑现面（不许写成已通过）**
+- ⑤ 的三条 `os.Exit` 路径**本机不可测**（CLI 单测跑不到 `main`）⇒ 只有静态钉 Fc 一条证据，没有"真取到进程带 Close 退出"的运行时证据。
+- ② 的残余让锁窗口**未消除**（前移只收窄），按 J-6 只登记；① 的前端**无消费者**，修的是绑定层契约，无界面可见变化。
+- ⑥ **只登记不改行为**：`GetOpRecord` 在最坏情况（死挂载 / 拔走的 SMB）下仍可长时间不返回，本机不插网络卷 ⇒ 那一格没有任何真机读数。
+- 三处涉及 Windows/Linux 的注释更正（④ 的 fsid 句柄腿）依据是**源码读数**，两平台真机未跑。
+

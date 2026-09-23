@@ -32,8 +32,8 @@ type Entry struct {
 	Tail    uint64 // xxHash64 尾部 64KiB（小文件=全文件）
 	Mid1    uint64 // xxHash64 size/2 处 64KiB（H1：中段采样）
 	Mid2    uint64 // xxHash64 3size/4 处 64KiB
-	Dev     uint64 // 物理身份（unix）；Windows 恒 0（fsid 未解析，比较平凡通过）
-	Ino     uint64
+	Dev     uint64 // 物理身份的卷号：unix 取 fstat 的 st_dev（fsid_unix.go:16），Windows 取句柄查询的卷序列号（fsid_windows.go:201，I7 起**不再恒 0**）
+	Ino     uint64 // 同上腿的 inode / 文件索引
 	CtimeNs int64
 	Full    []byte // BLAKE3-256；nil = 未算过全量（大文件预筛后被淘汰）
 }
@@ -270,7 +270,8 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 // Lookup 命中判定：path 存在且 size/mtime 与物理身份 (dev, ino, ctime_ns)
-// 完全一致。id 未解析（Windows）时身份比较平凡通过，兜底仍靠四点采样。
+// 完全一致。id 未解析时身份比较平凡通过（这一格与平台无关，见下方 F1④ 说明），
+// 兜底仍靠四点采样。
 // 返回条目与 full 是否有效（决定阶段 3 是否跳过）。
 func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Entry, bool, bool) {
 	if c.corrupt.Load() {
@@ -300,6 +301,11 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 	// H1：mtime 无法证明内容未变（粗粒度卷/原地改写保 mtime），ctime 与
 	// inode 身份提供第二重证据：写内容、rename、chmod 都会推进 ctime；
 	// 路径被换成另一文件则 dev/ino 必不同。不一致宁可当次未命中重算。
+	// ★ F1④：跳过这一道比较的条件是 `!id.Resolved`（身份没解析出来），**与平台无关**——
+	//   Windows 自 fsid I7 起走句柄查询，正常也有卷号+索引；只有查询失败或卷不提供
+	//   稳定索引（FAT/exFAT 等，见 fsid_windows.go:191 的 index==0 判定）才落到这一格。
+	//   旧注释把这一格写成 Windows 专属（「该值恒为 0、比较平凡通过」）——那是 I7 之前的
+	//   事实，别再照它推理。
 	if id.Resolved && (e.Dev != id.Dev || e.Ino != id.Ino || e.CtimeNs != id.CtimeNs) {
 		return Entry{}, false, false
 	}
