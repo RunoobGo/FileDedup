@@ -6343,3 +6343,73 @@ export function isGroupCrossVolume(files: { volume: string; volumeResolved: bool
   它是同一族里的另一条腿，需要 fake timers 或真等 150ms ⇒ 本批按最小面未做。
 - **O5 是不变式而不是修前红探针**：它钉的是"当前那一问失败必须看得见"，改前改后同形（本来就成立）。
   它的价值是让 O3 不至于靠"什么失败都不写"蒙过——写清楚，免得被读成一条取证。
+
+---
+
+### 30.9 R3-3 / R3-4 / R3-5（Task C3）：三处 UI 小修——状态卡住的两处 + 一处原生弹窗
+
+三条都是低危、坐标来自代理报告。**实施前逐条开码复核**，其中一条的修法与计划给的方向不同（见 ③）。
+
+**① R3-3 `ConfirmDialog`：命中数问失败后永久停在"正在核算…"，没有出口**
+
+复核结果（成立，且比报告写的更堵）：
+- `grep -n procCountError src/components/ConfirmDialog.vue` **零命中** ⇒ 全组件不读这个状态；
+- 失败腿 `procMatch.value = null`（`scan.ts:618`）⇒ `procCountPending` 恒真 ⇒
+  模板 `v-if="store.procCountPending"` 那条分支永久成立（"正在核算实际处理范围…"），
+  `canConfirm` 里第一句 `if (store.procCountPending) return false` 永久灰掉确认按钮；
+- 唯一的自动重问是 `watch(procSelKey)`，而失败**不改** key ⇒ 用户只能关窗、改一下勾选、再开。
+  界面上没有任何一处说明"是算失败了"而不是"还在算"——这是一句**说不清的假话**，
+  与 M15/M22 那一族同形（把"不知道"演成"正在做"）。
+
+修法（最小面，不改判据）：模板加一条 **error 分支放在 pending 之前**，
+显示 `store.procCountError` 原文 + 一颗「重新计算」按钮走 `store.ensureProcCounts()`。
+为什么这颗按钮真能重问：失败时 `procMatch` 已被置 null ⇒ `refreshProcCounts` 里
+`procMatch.value?.key === key` 那条短路不成立（这条不是新逻辑，是既有形状，本项只是把它接给用户）。
+`canConfirm` 与结果页按钮的灰态判据**一字不动**（仍由 `procCountPending` 说话）——
+真值没到位时依旧不许确认，改的只是"为什么不许"看得见。
+
+**② R3-4 `RecordsView.undoOne`：被 guard 拒绝时那一行永久挂着"执行中…"**
+
+复核结果（成立）：`undoOne` 先 `undoingItem.value = it.id` 再调 `store.undoItem(...)`；
+`undoItem` 第一句 `if (!guard('回撤')) return`（`scan.ts:460`）在拒绝时**不置** `opsRunning` ⇒
+视图靠 `watch(() => store.opsRunning)` 的下降沿清标记，这一路下降沿永远不会来 ⇒
+那一行的标签永久是"执行中…"（`:324`），而 `canUndoItem` 仍为真，看上去像一个卡死的进行中任务。
+
+修法：把"受理与否"变成返回值——`undoItem` / `undoRecord` 一律 `Promise<boolean>`
+（true = 已开始、由 `opsRunning` 的下降沿收尾；false = 被互斥挡下，什么都没发生）；
+`undoOne` 乐观置位后 `await` 该值，被拒就立即收回。
+★ 为什么不在视图里先问 `store.busy`：那是**同一判据的第二处引用点**，
+`guard` 的判据将来加一条（例如"历史回包在途"）视图就会漏——返回值契约把判据留在 store 一份。
+
+**③ R3-5 `SettingsView:21` 原生 `confirm()`：全仓唯一残留——但计划给的方不对**
+
+计划写"收进 `useModal`"。读 `src/composables/useModal.ts` 后更正这一条：
+`useModal(rootRef, isOpen?)` 是**焦点陷阱**（打开时移焦、Tab 环限制在浮层内、关闭时归还），
+它不产出确认框、也不产出任何"取消/确认"的语义——用它等于只做无障碍壳、原生弹窗还在。
+仓库里同类的既有形状是 `RecordsView.vue:145-149 + :197-203` 的**两段式就地确认**
+（`confirmClearOps`：第一下变成"确认清空 + 取消"，第二下才动手）。本项照该形状改
+`clearCache`，**不新起组件**（为单点建模态是本批反对的过度抽象，与 §30.7 同一条理由）。
+副作用一并写清楚：原生 `confirm()` 在 Wails 的 webview 里样式与键盘行为都不受本应用控制，
+且绕开了 `useModal` 收口过的那套 role/aria-modal/焦点归还（P2-3）。
+
+**钉子（三条各自的位置）**
+| 钉 | 位置 | 形态 | 修前面貌 |
+|---|---|---|---|
+| N-1 | 接线锚 `ConfirmDialog.vue` | 必须出现标识符 `store.procCountError` | 红（零引用） |
+| N-2 | node 用例 `scan-undo-accepted.test.ts` | `undoItem`/`undoRecord` 的 `Promise<boolean>` 契约（受理 true / 被拒 false 且不发 RPC） | 红在 `undefined !== true`（新契约 ⇒ 记为断言不符，不是"接口不存在"） |
+| N-3 | 接线锚 `RecordsView.vue` | 必须出现 `if (!accepted) undoingItem.value = null` | 红（旧代码无此行） |
+| N-4 | 接线锚 `SettingsView.vue` | 必须出现 `confirmClearCache`、禁止 `if (!confirm(` | 红（两侧同时命中） |
+
+**变异预测（绿后回砍）**
+- **M-a** 删掉 ConfirmDialog 的 error 分支 ⇒ N-1 红，其余全绿 ⇒ 证明这一格只有这一把钉。
+- **M-b** `undoItem` 的拒绝腿改回 `return`（不带 false）⇒ N-2 的被拒两条红、N-3 仍绿
+  ⇒ 视图那把锚挡不住 store 契约退化，**两层必须都在**。
+- **M-c** `undoOne` 退回"先置位、不等返回值"⇒ N-3 红、N-2 仍绿（store 契约没动）
+  ⇒ 反向互补。
+- **M-d** `clearCache` 里再塞回原生 `confirm(` ⇒ N-4 红（禁项命中）。
+
+**不做的边界**
+- 不动 `canConfirm` / 结果页灰态的判据（①只补"为什么"的呈现）。
+- 不把 `undoRecord` 的批量路径接上返回值消费：它的按钮在 `confirmUndoId` 两段式里，
+  标签由 `store.busy` 说话，没有"卡住的行"这一形。只统一签名，不改它的呈现。
+- 不引入通用 Confirm/Modal 组件（③）。
