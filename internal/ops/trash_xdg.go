@@ -71,6 +71,15 @@ func trashXDG(trashDir string, paths []string) (map[string]string, error) {
 // trashXDG 靠它决定 trashinfo 回滚与否：被顶替时副本与 info 必须成对留存。
 var errCopiedSrcSwapped = errors.New("源在复制期间被替换")
 
+// preRemoveRecheck 是上面那道删源前复核的包级接缝（测试直接换装，同 copyVerifyFile 惯例）。
+// 存在的理由不是"能换"，而是换入的顶替时序**必须发生在 src 读句柄关闭之后**：
+// Go 的 syscall.Open 在 Windows 的 sharemode 只有 READ|WRITE、不带
+// FILE_SHARE_DELETE（syscall/syscall_windows.go 的 openFile），
+// 句柄开着时 os.Rename(src) 必撞 sharing violation——首版把顶替钩在 copyAndSyncFile
+// 里（句柄还开着）在 CI windows 腿直接红（run 35931760089，§6.29 复批）。
+// 钩在本接缝上（moveIntoTrash 已 f.Close、未 identityStill）两平台都能构造同一时序。
+var preRemoveRecheck = identityStill
+
 // moveIntoTrash 同卷 rename；跨卷退化复制+删除（复制失败时清理半成品再返回错误）。
 //
 // 与 MoveFile 的跨卷路径不同：这里刻意不还原权限位与 mtime。
@@ -95,13 +104,13 @@ func moveIntoTrash(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	err = copyAndSyncFile(f, dst, st.Size())
+	err = copyAndSync(f, dst, st.Size())
 	f.Close()
 	if err != nil {
 		os.Remove(dst) // 清理半成品，避免"看起来进了回收站实为残片"
 		return err
 	}
-	if !identityStill(src, srcID) {
+	if !preRemoveRecheck(src, srcID) {
 		// 与 move.go 跨卷腿同取向：不删源、不算成功。副本（原件字节）留在 dst，
 		// trashinfo 由调用方豁免回滚 ⇒ 两份并存交给用户核对。
 		return fmt.Errorf("%w（inode 已变化）：为避免误删第三方文件**未删除源**，"+

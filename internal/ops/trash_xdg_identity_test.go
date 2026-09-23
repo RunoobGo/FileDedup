@@ -3,35 +3,52 @@ package ops
 // §31（2026-09-24 第五轮审查 P0）：XDG 回收站跨卷复制腿「复制完成后按路径
 // 盲删源」缺身份复核——AS-H4 在 move.go/undo.go 都已装过的那道守卫，此前
 // 唯独没装在这条腿上。判据形状照抄 move_crossvolume_identity_test.go：
-// 时序由包级接缝钉死（renameFile 稳定 EXDEV 进入复制腿；copyAndSyncFile 在
-// "复制完成、源未删"这一刻构造第三方 rename 顶位；removeSrc 记录是否真动手）。
+// 时序由包级接缝钉死（renameFile 稳定 EXDEV 进入复制腿；preRemoveRecheck 在
+// "复制与读句柄都已结束、删源复核尚未发生"这一刻构造第三方 rename 顶位；
+// removeSrc 记录是否真动手）。
+// ★ 顶替不许钩在复制进行中：Go 的 syscall.Open 在 Windows 的 sharemode 只有
+// READ|WRITE、不带 FILE_SHARE_DELETE（syscall/syscall_windows.go 的 openFile），
+// src 读句柄开着时 os.Rename(src) 必撞 sharing violation——首版钩 copyAndSyncFile
+// 在 CI windows 腿直接红（run 35931760089，§6.29 复批）。检测点本就是复核那一步，
+// 钩在复核前沿同样钉住守卫。
 // 本文件无 build tag：守卫行为在 CI 三腿与开发机同判据真跑（H6 惯例）。
 
 import (
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"filededup/internal/fsid"
 )
 
-// hijackAfterCopyXDG 与 hijackAfterCopy 同形，差别只在钩的是回收站腿的复制接缝。
-func hijackAfterCopyXDG(t *testing.T, srcPath, thirdPartyContent string) *hijackState {
+// xdgHijackState 承接钩子内才确定的信息；hijackErr 让"顶替本身没做成"
+// （比如又有人把句柄窗口钩错了位置）不会被误读成"守卫没触发"。
+type xdgHijackState struct {
+	parked    string // 被第三方挪走的原件所在路径
+	calls     int    // removeSrc 实际被调用的次数
+	hijackErr error  // 钩子内构造顶替自身的失败
+}
+
+// hijackAfterCopyXDG 在删源前复核的那一刻把 srcPath 顶替成第三方的新文件
+// （原子改名 + 落新内容），返回记录"删源是否真的发生"的状态。
+//
+// parked 里是**被第三方挪走的原件**，srcPath 里是第三方的新文件——
+// 两者都不是应用该删的东西，都必须在用例结束后仍然存在。
+func hijackAfterCopyXDG(t *testing.T, srcPath, thirdPartyContent string) *xdgHijackState {
 	t.Helper()
-	st := &hijackState{}
-	origCopy := copyAndSyncFile
-	copyAndSyncFile = func(sf io.Reader, dst string, size int64) error {
-		if err := origCopy(sf, dst, size); err != nil {
-			return err
-		}
+	st := &xdgHijackState{}
+	origCheck := preRemoveRecheck
+	preRemoveRecheck = func(p string, id fsid.ID) bool {
 		st.parked = srcPath + ".third-party-parked"
-		if err := os.Rename(srcPath, st.parked); err != nil {
-			return err
+		if st.hijackErr = os.Rename(srcPath, st.parked); st.hijackErr != nil {
+			return origCheck(p, id)
 		}
-		return os.WriteFile(srcPath, []byte(thirdPartyContent), 0o644)
+		st.hijackErr = os.WriteFile(srcPath, []byte(thirdPartyContent), 0o644)
+		return origCheck(p, id)
 	}
-	t.Cleanup(func() { copyAndSyncFile = origCopy })
+	t.Cleanup(func() { preRemoveRecheck = origCheck })
 
 	origRemove := removeSrc
 	removeSrc = func(p string) error {
@@ -56,6 +73,9 @@ func TestTrashXDGCrossVolumeDoesNotDeleteReplacedSource(t *testing.T) {
 	st := hijackAfterCopyXDG(t, src, thirdParty)
 
 	m, err := trashXDG(trashRoot, []string{src})
+	if st.hijackErr != nil {
+		t.Fatalf("顶替时序本身没构造成（Windows 上多为句柄未关撞 sharing violation，钩位错了）: %v", st.hijackErr)
+	}
 	if err == nil {
 		t.Fatal("复制期间源被第三方顶替，trashXDG 却报告成功：删掉的是第三方文件，账本还会记 done（§31/AS-H4）")
 	}
