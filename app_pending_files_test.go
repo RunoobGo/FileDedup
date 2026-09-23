@@ -176,7 +176,10 @@ func TestPendingFilesSortLegs(t *testing.T) {
 	shuffled := append([]uint64(nil), sel...)
 	sort.Slice(shuffled, func(i, j int) bool { return shuffled[i] > shuffled[j] })
 
-	// group 腿：组发放序是 7..1，组序键 (grpIdx) 即发放位序 ⇒ 输出组 7,6,...,1。
+	// group 腿：组发放序是 7..1，组序键 (grpIdx) 即发放位序 ⇒ 输出组 7,6,...,1，
+	// 且组内保持成员序（a.bin 在 b.bin 前）。★ 必须逐行钉完整 ID 序：勾选传入序是
+	// ID 降序，GroupID 单调就恰好成立——只判单调的话，"comparator 恒 false、整个
+	// 退化成勾选序"这一类变异会漏网（V-5 的正是这一格）。
 	gp, err := a.GetPendingFiles(PendingQuery{SelectedIDs: shuffled, Sort: "group", PageSize: 500})
 	if err != nil {
 		t.Fatal(err)
@@ -184,15 +187,19 @@ func TestPendingFilesSortLegs(t *testing.T) {
 	if gp.Total != 14 || gp.PendingCount != 14 {
 		t.Fatalf("全量计数 total=%d pending=%d，应为 14/14", gp.Total, gp.PendingCount)
 	}
-	lastGid := ^uint64(0)
-	for i, r := range gp.Rows {
+	wantGroup := make([]uint64, 0, 14)
+	for gid := uint64(7); gid >= 1; gid-- {
+		wantGroup = append(wantGroup, gid*100, gid*100+1)
+	}
+	gotGroup := make([]uint64, 0, len(gp.Rows))
+	for _, r := range gp.Rows {
 		if !r.Pending {
-			t.Fatalf("第 %d 行不该是排除行：%+v", i, r)
+			t.Fatalf("第 %d 行不该是排除行：%+v", len(gotGroup), r)
 		}
-		if r.GroupID > lastGid {
-			t.Fatalf("group 腿未按发放组序（7→1）输出：%+v", gp.Rows)
-		}
-		lastGid = r.GroupID
+		gotGroup = append(gotGroup, r.ID)
+	}
+	if !reflect.DeepEqual(gotGroup, wantGroup) {
+		t.Fatalf("group 腿失真：got=%v want=%v（组序=发放序 7→1、组内保持成员序；退化成勾选序也长这样吗？不——勾选传入是降序）", gotGroup, wantGroup)
 	}
 
 	// size 腿全平手 ⇒ GroupID 升序兜底 1..7；组内保持成员序 a.bin→b.bin。
