@@ -295,6 +295,37 @@ export interface ProcessPreview {
   unmatchedDirs: string[]
 }
 
+// ---------- 拟处理清单查询（2026-09-23，Go 侧 app.go 同名结构体逐字段镜像） ----------
+
+export interface PendingQuery {
+  selectedIds: number[]
+  dirs: string[]
+  page: number
+  pageSize: number
+  sort: string // group(默认)/size/path
+}
+
+export interface PendingRow {
+  id: number
+  path: string
+  name: string
+  size: number
+  groupId: number
+  pending: boolean
+  reason: string // ''/keep/outside/gone
+}
+
+export interface PendingPage {
+  total: number
+  page: number
+  pageSize: number
+  pendingCount: number
+  keepCount: number
+  outsideCount: number
+  goneCount: number
+  rows: PendingRow[]
+}
+
 // Wails 注入对象（最小接口约束，替代 any 边界；响应字段与 Go json tag 一致）
 export interface BackendAPI {
   SelectDirectory(): Promise<string>
@@ -311,6 +342,10 @@ export interface BackendAPI {
   // 不动文件系统，因此不受 opsRunning 互斥限制）。声明在方法面钉子里（G5）：
   // 缺声明 = 后端有、前端按类型调不到。
   PreviewProcessPolicy(dirs: string[], selectedIDs: number[]): Promise<ProcessPreview>
+  // GetPendingFiles 分页查询"执行前拟处理清单"明细（与上一绑定同一内核的两个投影：
+  // 预览给计数、清单给逐行可读明细 + 被排除项的 reason）。同为只读，不受
+  // opsRunning 互斥限制。
+  GetPendingFiles(q: PendingQuery): Promise<PendingPage>
   RevealInFolder(id: number): Promise<void>
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
@@ -412,6 +447,8 @@ export const api = {
   // dirs 全空白时返回空数组 = 未启用处理策略，调用方走"不过滤"的原路径。
   filterInDirs: (dirs: string[], paths: string[]): Promise<number[]> =>
     backend().FilterInDirs(dirs, paths).then(r => r ?? []),
+  // getPendingFiles 拟处理清单明细（与预览同一内核；见 BackendAPI 声明处注释）。
+  getPendingFiles: (q: PendingQuery): Promise<PendingPage> => backend().GetPendingFiles(q),
   cancelOperation: (): Promise<void> => backend().CancelOperation(),
   openTrash: (): Promise<void> => backend().OpenTrash(),
   listOpRecords: (): Promise<OpRecord[]> => backend().ListOpRecords(),
