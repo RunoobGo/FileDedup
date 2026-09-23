@@ -6294,3 +6294,52 @@ export function isGroupCrossVolume(files: { volume: string; volumeResolved: bool
 - 不动 `procReqSeq` 的实现：本项是**测试面**补齐（审查裁定 R3-2 = 中危·测试面），除非用例把
   另一条真实缺陷带出来；带来的一律按流程先写设计段再改码。
 - 不引入 vitest / jsdom：继续用仓库既有的 node 原生 TS 剥离 + `harness.mjs` 桩（零依赖决策未变）。
+
+**实施读数（HEAD `475db38` 之上新增，逐项实跑）**：
+
+- 新增两份测试文件、**实现零改动**：`frontend/tests/pathpolicy-crossvolume.test.ts`（9 条 U-1…U-9）
+  与 `frontend/tests/scan-proc-race.test.ts`（5 条 O1…O5）。
+  读数：`node 用例 74 项 + 接线断言 20 项 = 合计 94 项全部通过`（改前 60 + 20 = 80 ⇒ +14 条用例、锚数未动）；
+  `vue-tsc --noEmit` rc=0；`vite build` ✓；全套 `run-gates` **`rows=15 PASS=14 SKIP=1 FAIL=0`**
+  （唯一 SKIP 仍是需 root 的 `smoke-symlink`）。
+- ★ **落点偏离计划坐标（必须记）**：计划写 `frontend/src/utils/pathpolicy.test.ts` 与
+  `scan.test.ts 增例`。`scripts/test-frontend-logic.sh:43` 只 glob `tests/*.test.ts`
+  ⇒ 放在 `src/` 下的 `.test.ts` **永远不会被跑**（那是一枚看起来存在、实际空转的守卫）。
+  仓库既有 14 份探针全在 `frontend/tests/`，本项随同一组织落两份新文件。
+- ★ **设计段的 U-7 那一格比实际窄**：原文预测 M-a 只红在"U-7 的位 1、位 2"。
+  实测 U-7 **整条红**——改前那句 `some(f => !f.volumeResolved || …)` 对**首位**未解析同样命中
+  `!volumeResolved` 分支。⇒ M7 缺陷的准确表述不是"其他成员未解析时误判"，而是
+  "**任何**成员未解析都判成跨卷"（首位那格改前也错，只是 U-5 举的是非首位那一形）。
+  按实测改正，不改断言方向（方向本就是 M7 修后的现实现）。
+- ★ **O1 的期望第一版是我按记忆写的，实测把我纠正了**：原先断"旧回包先落地时界面显示旧数 1"，
+  真读数是 `0 !== 1`。守卫比的是**请求序号**（`seq !== procReqSeq`），`seq=1` 撞上
+  `procReqSeq=2` 时整个丢弃、**连一次临时显示都不写** ⇒ 正确断言是"此刻 effectiveCount 仍为 0、
+  procCountPending 仍为真"。这一格现由 O1 的第一条断言钉住。
+- **变异五刀（`cp` 备份 → `cp` 还原 → `cmp` 自证，未用 `git checkout`；
+  `MA/MB/MC/GA1/GA2-RESTORE cmp ok` 五次在册，`pathpolicy.ts` 与 `scan.ts` 各回到基线）**：
+  - **M-a**（改回 M7 改前原句）⇒ 红 U-5 / U-6 / U-7 / U-9，U-1…U-4、U-8 全绿
+    ⇒ 与设计段一致：**"未解析者在首位"从来不是这一格的判据**，四格都是"非首位或缺身份的整体降级"。
+  - **M-b**（删 `length < 2` 短路）⇒ 只红 U-1（`TypeError: Cannot read properties of undefined (reading 'volume')`），
+    U-2 仍绿 ⇒ 单成员那格靠的是 `some` 的空转而不是那条短路（设计段预言了这一点，标为"记录哪一格是空的"）。
+  - **M-c**（`some` → `every`）⇒ 红 U-4 与 U-8，U-3/U-5/U-9 不红 ⇒ 假阴性方向只有这两格抓得到。
+  - **G-a1**（删**成功腿**的 `seq` 守卫）⇒ 只红 O2（4 pass / 1 fail）。
+  - **G-a2**（删**失败腿**的 `seq` 守卫）⇒ 只红 O3（4 pass / 1 fail）。
+  ★ 两刀各自只被**一条**用例杀掉，且**不是同一条**：O1 两刀都杀不掉（它钉的是"没到位就说没到位"），
+  O4/O5 也杀不掉。⇒ 设计段"只有旧后到那一格能杀删守卫"这句成立，但准确形态是
+  **"成功腿与失败腿各需一条独立用例"**——少一条就少一腿无人挡。这正是本项要补的形状。
+- **零覆盖声明复核**（写读本前重跑）：`grep -rl isGroupCrossVolume frontend/tests/` 改前 0 命中；
+  `FilterInDirs` 在改前只出现在 `scan-execute-lock.test.ts`，且用的是**常量 responder**
+  （`FilterInDirs: () => counts.promise`，全程一次请求、一次 resolve）⇒ "同一缺陷族只测了两条腿"
+  这句话里的"两条腿"是 `resultGen`/`histGen`，本项补上第三条。
+
+**本项之后仍不成立的声明（未兑现面）**：
+- **`ResultView.vue:32-38` 的聚合没有用例**：`crossVolumeGroups` 只统计**已加载分页**里的组
+  （注释里写明这是刻意的），但"未加载组里有跨卷组 ⇒ 按钮不出现"这一格目前只有注释。
+  纯视图计算属性，node 层拿不到（无 JS 测试运行器、不引 jsdom）⇒ 记为未覆盖。
+- **卷标识本身不在前端测**：`vid:<id>` / `root:<VolumeName>` 是 `app.go:1001 fileVolume` 算的，
+  前端只比相等。U-6 钉的是"前端连盘符形状也不解释"，**不**是"盘符判得对"——后者归 Go 侧。
+- **`refreshProcCounts` 的 150ms 去抖那一层没有用例**：本项全部走 `ensureProcCounts()` 同步入口
+  （`procTimer` 被它 clear），所以"用户连改五次勾选只问最后一次"这一格仍未钉。
+  它是同一族里的另一条腿，需要 fake timers 或真等 150ms ⇒ 本批按最小面未做。
+- **O5 是不变式而不是修前红探针**：它钉的是"当前那一问失败必须看得见"，改前改后同形（本来就成立）。
+  它的价值是让 O3 不至于靠"什么失败都不写"蒙过——写清楚，免得被读成一条取证。
