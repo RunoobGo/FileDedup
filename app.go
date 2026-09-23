@@ -1340,6 +1340,93 @@ func startCmd(cmd *exec.Cmd, onExit func(error)) error {
 	return nil
 }
 
+// execRevealCmd 是路径类外部命令的执行缝（M155 卷型注入缝同族）。
+//
+// 抽出来只为一个理由：RevealPath/OpenPath 的用例不许真的弹出 Finder/文件管理器
+// 窗口——那是劫持用户的桌面。生产值恒为 startCmd，测试期整只替换成"只记录不启动"。
+// 卷型缝收在 mu 里面（M155 的教训：注入点必须自身线程安全），这里没有那个问题：
+// 缝只在绑定方法入口处读一次，读与用之间不跨锁、不跨 goroutine。
+var execRevealCmd = startCmd
+
+// checkRevealPath 校验前端回送的路径，返回规整后的绝对化入参与 stat 结果。
+//
+// 失败清单里的路径是"后端算出 → 前端展示 → 原样送回"的一圈往返，属于新的信任
+// 边界（ID 走不到它们：失败项压根没进 byID）。所以两条硬规则先于任何装配执行：
+//   - 空白路径拒掉：空的 open 调用在 darwin 上会打开"当前目录"的 Finder，
+//     属于用户没要求的跳转；
+//   - stat 不到的路径拒掉：失败清单里躺着的多半正是"访问不了"的东西，
+//     把 ENOENT 原样抛回去，比弹一个空窗或让外部工具静默失败有用。
+func checkRevealPath(raw string) (string, os.FileInfo, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", nil, fmt.Errorf("路径为空")
+	}
+	info, err := os.Lstat(p)
+	if err != nil {
+		return "", nil, fmt.Errorf("路径不存在或无法访问（%s）：%v", p, err)
+	}
+	return p, info, nil
+}
+
+// openCmd 组装"打开这个路径本身"的命令（文件交给默认应用，目录开窗口）。
+// 与 revealCmd 的区别只有一条：不带选中参数。Linux 同样要探测，否则
+// 命令不存在时报的是"exec 失败"，用户分不清是没装工具还是操作失败。
+func openCmd(path string) (*exec.Cmd, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path), nil
+	case "windows":
+		return exec.Command("explorer", path), nil
+	}
+	for _, c := range []struct {
+		exe  string
+		args []string
+	}{
+		{"xdg-open", []string{path}},
+		{"gio", []string{"open", path}},
+	} {
+		if _, err := exec.LookPath(c.exe); err == nil {
+			return exec.Command(c.exe, c.args...), nil
+		}
+	}
+	return nil, fmt.Errorf("未找到可用的打开命令（xdg-open/gio），无法打开 %s", path)
+}
+
+// RevealPath 按路径"打开所在文件夹并选中"（功能 4：失败清单逐行定位）。
+// 目录例外——直接打开自身：对目录做"到父目录里选中它"没有使用价值，用户想看的
+// 是里面有什么（权限错在哪个子项上）。
+func (a *App) RevealPath(path string) error {
+	p, info, err := checkRevealPath(path)
+	if err != nil {
+		return err
+	}
+	cmd, err := revealCmd(p)
+	if info.IsDir() {
+		cmd, err = openCmd(p)
+	}
+	if err != nil {
+		return err
+	}
+	return execRevealCmd(cmd, func(werr error) {
+		a.warnBackground("reveal", fmt.Sprintf("打开所在文件夹失败（%s）：%v", p, werr))
+	})
+}
+
+// OpenPath 按路径打开文件/目录本身（失败清单里"路径还能看，只是处理失败"的那些行）。
+func (a *App) OpenPath(path string) error {
+	p, _, err := checkRevealPath(path)
+	if err != nil {
+		return err
+	}
+	cmd, err := openCmd(p)
+	if err != nil {
+		return err
+	}
+	return execRevealCmd(cmd, func(werr error) {
+		a.warnBackground("open", fmt.Sprintf("打开失败（%s）：%v", p, werr))
+	})
+}
+
 // ---------- 设置（单一事实源，01 §7.3） ----------
 
 // settingsPath 给出 settings.json 的路径；配置目录不可用时以错误收口。

@@ -369,6 +369,13 @@ export interface BackendAPI {
   // opsRunning 互斥限制。
   GetPendingFiles(q: PendingQuery): Promise<PendingPage>
   RevealInFolder(id: number): Promise<void>
+  // RevealPath / OpenPath 是**路径版**定位与打开（功能 4：失败清单逐行）。
+  // 为什么不能复用上面的 RevealInFolder：它按结果集 ID 查，而失败项压根没进
+  // 结果集（扫描中途失败的条目没有 byID 记录），ID 到不了它们。
+  // 判据全在后端（AS-H6）：空路径、路径不存在、是文件还是目录，都由 Go 侧
+  // checkRevealPath 定，前端只负责把显示的那条路径原样送回去、把拒绝原样报出来。
+  RevealPath(path: string): Promise<void>
+  OpenPath(path: string): Promise<void>
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
@@ -445,6 +452,13 @@ export const api = {
   getFailedItems: (): Promise<FailedItem[]> => backend().GetFailedItems(),
   previewFile: (id: number): Promise<PreviewData> => backend().PreviewFile(id),
   revealInFolder: (id: number): Promise<void> => backend().RevealInFolder(id),
+  // revealPath / openPath：失败清单的逐行出口（功能 4）。
+  //
+  // 这一腿前端**只做交接**：路径逐字节原样送出，后端的拒绝原样抛回。
+  // 不在这里判"路径看着像不存在就不发了"——判据全在后端（AS-H6），前端拦下来
+  // 只会把失败变成 M83 那一族的"点了没反应"。
+  revealPath: (path: string): Promise<void> => backend().RevealPath(path),
+  openPath: (path: string): Promise<void> => backend().OpenPath(path),
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),

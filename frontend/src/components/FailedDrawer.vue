@@ -7,6 +7,8 @@ import { useToastStore } from '../stores/toast'
 import { formatCount } from '../utils/format'
 import { copyText } from '../utils/clipboard'
 import { useModal } from '../composables/useModal'
+import { api } from '../wails'
+import Icon from './Icon.vue'
 
 const store = useScanStore()
 const toast = useToastStore()
@@ -15,6 +17,25 @@ const toast = useToastStore()
 // 本组件由 App.vue 常驻挂载、靠 store.failedOpen 控制显隐，因此必须把「是否打开」传进去。
 const dlgRef = ref<HTMLElement | null>(null)
 useModal(dlgRef, () => store.failedOpen)
+
+// 功能 4（2026-09-23）：逐行「打开该项 / 打开所在文件夹」。
+//
+// 为什么走路径版而不是结果行那套 api.revealInFolder(id)：失败项压根没进结果集
+// （扫描中途失败的条目没有 byID 记录），ID 到不了它们。
+// 这里不做任何"这条路径能不能开"的预判（AS-H6）：判据全在 Go 侧 checkRevealPath，
+// 视图把按钮藏起来只会把「打不开并说明原因」变成「没点可点」——后者是 M83
+// 那一族"点了没反应"的镜像形态。两条失败腿都必须有回声：
+//   - 校验拒绝 / Start 失败 → 返回值 reject，这里 catch 后弹 toast；
+//   - 起得来但随即非零退出 → 后端 warnBackground 经 app:error 事件上屏（M58）。
+// 目录行上两个按钮会落到同一个动作（后端对目录的 reveal 就是打开自身），这是
+// **有意不区分**：前端要区分就得自己 stat 或猜路径形状，那正是判据搬家。
+function openFailed(p: string) {
+  api.openPath(p).catch((e: any) => toast.notifyError('打开失败', e))
+}
+
+function revealFailedDir(p: string) {
+  api.revealPath(p).catch((e: any) => toast.notifyError('打开所在文件夹失败', e))
+}
 
 async function copyAll() {
   const text = store.failed.map(f => `${f.Stage}\t${f.Path}\t${f.Err}`).join('\n')
@@ -53,12 +74,33 @@ async function copyAll() {
           <template v-else>
             <!-- P1-4：三列栅格 + 列头，路径列起点对齐 -->
             <div class="d-cols" aria-hidden="true">
-              <span>阶段</span><span>路径</span><span>错误原因</span>
+              <span>阶段</span><span>路径</span><span>错误原因</span><span>操作</span>
             </div>
             <div v-for="(f, i) in store.failed" :key="i" class="item">
               <span class="stage">{{ f.Stage }}</span>
               <span class="path" :title="f.Path">{{ f.Path }}</span>
               <span class="err" :title="f.Err">{{ f.Err }}</span>
+              <!-- 功能 4：两条出口都不问"这条路径看着能不能开"（判据在后端） -->
+              <span class="ops">
+                <button
+                  class="op"
+                  type="button"
+                  title="用系统默认应用打开该项（目录则进入该目录）"
+                  aria-label="打开该项"
+                  @click.stop="openFailed(f.Path)"
+                >
+                  <Icon name="external" :size="15" />
+                </button>
+                <button
+                  class="op"
+                  type="button"
+                  title="打开所在文件夹并选中"
+                  aria-label="在文件夹中打开该项"
+                  @click.stop="revealFailedDir(f.Path)"
+                >
+                  <Icon name="folder-open" :size="15" />
+                </button>
+              </span>
             </div>
           </template>
         </div>
@@ -83,8 +125,10 @@ async function copyAll() {
 .d-head > div { display: flex; gap: var(--sp-2); }
 .d-body {
   flex: 1; overflow-y: auto; padding: 8px;
-  /* P1-4：阶段 / 路径 / 错误 三列共用同一套轨道，保证三行起点一致 */
-  --fail-cols: 56px minmax(0, 1.2fr) minmax(0, 1fr);
+  /* P1-4：阶段 / 路径 / 错误 / 操作 四列共用同一套轨道，保证列头与各行起点对齐。
+     操作列给固定宽度而不是 auto：`.d-cols` 与 `.item` 是**两个**栅格容器，
+     auto 会各自按内容求解（列头是两个字、行内是两枚按钮），轨道宽度就漂了。 */
+  --fail-cols: 56px minmax(0, 1.2fr) minmax(0, 1fr) 62px;
 }
 .empty { color: var(--text-3); text-align: center; padding: 40px 0; }
 .d-cols {
@@ -102,4 +146,13 @@ async function copyAll() {
 /* 原先被 max-width:180px + nowrap 截成 49~167px，最关键的错误原因全被切掉。
    改为占满整列并允许换行 —— 抽屉的唯一用途就是排障，错误信息必须完整可读。 */
 .err { color: var(--danger-ink); overflow-wrap: anywhere; user-select: text; }
+/* 功能 4：逐行两枚图标按钮。尺寸沿用 GroupCard 的 .op（28×28，P1-5 的
+   图标按钮下限），两枚并排 28+28+6=62px，正是 --fail-cols 末列的宽度。 */
+.ops { display: flex; gap: 6px; }
+.op {
+  background: none; color: var(--text-3);
+  display: flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0; border-radius: var(--r-md); line-height: 1;
+}
+.op:hover { color: var(--primary); background: var(--bg-hover); }
 </style>

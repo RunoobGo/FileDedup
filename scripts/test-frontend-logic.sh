@@ -230,6 +230,19 @@ wiring 'src/views/ResultView.vue' 'g.files.some(f => f.isPending)' '' \
 wiring 'src/views/ResultView.vue' 'store.toggleHideNonPending()' '' \
 	'开关走 store 动作（重取/上送链收在 store，视图不自拼请求，功能 3）'
 
+# 功能 4（2026-09-23「失败清单逐行打开文件/所在目录」）：抽屉的按钮腿。
+# 交接与抛错这两件事由 frontend/tests/failed-reveal-path.test.ts 钉（那是 wails.ts
+# 的 api 包装，node 打得进）；这里钉的是"抽屉有没有真的去调这两个包装"。
+# ★ 只锚标识符，不锚中文文案（改措辞安全）。
+wiring 'src/components/FailedDrawer.vue' 'api.revealPath(' '' \
+	'失败清单逐行走后端路径绑定定位（功能 4：不得复用按 ID 的 revealInFolder，失败项没进结果集）'
+wiring 'src/components/FailedDrawer.vue' 'api.openPath(' '' \
+	'失败清单逐行走后端路径绑定打开（功能 4）'
+# 被禁写法正是"前端先替后端判这条路径能不能开"：判据全在 Go 侧 checkRevealPath，
+# 视图把按钮藏起来只会让用户以为功能坏了（M83 那一族"点了没反应"的镜像——这次是"没点可点"）。
+wiring 'src/components/FailedDrawer.vue' 'api.openPath(' 'v-if="f.Path"' \
+	'按钮不因路径看着为空就消失（功能 4：AS-H6，前端不重算判据）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1
