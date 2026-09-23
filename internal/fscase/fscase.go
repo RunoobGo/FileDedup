@@ -86,6 +86,7 @@ type Result struct {
 // volumeTypeName 卷型名读取的注入缝（H6 惯例，同 scanner.probeCaseVerdict、
 // ops.verifyFileFn）。真实现只在 darwin 有读数，另两平台恒 ""（media.probe_other.go）
 // ⇒ 那两条腿永远走"退默认"，与 M62 之前一字不差。测试换它扮演 FAT/远端卷。
+// ★ 它是可变包级状态 ⇒ 读要走 volumeTypeReader、写要持 mu（M155，见那里）。
 var volumeTypeName = media.FSTypeName
 
 // insensitiveVolumeTypes 天生不区分大小写的卷型名（statfs 的 f_fstypename，小写口径
@@ -108,9 +109,25 @@ var insensitiveVolumeTypes = map[string]bool{
 // defaulted 是"没问到任何证据"的结论：退平台默认，且如实记为未确证。
 func defaulted() Result { return Result{Sensitive: Default(), Proven: false} }
 
+// volumeTypeReader 取当前的卷型读数实现。**锁内只取函数值，调用留在锁外**。
+//
+// ★ M155（2026-09-23 CI 真红，run 35818865178，设计稿 §31）：R2-2 把 probe 搬进
+// VerdictCtx 起的 goroutine 之后，这一位就成了本包第二个"探测 goroutine 会读、
+// 测试会写"的包级可变状态（第一个是 hook）。调用方在 ctx.Done() 那一格**不等**它，
+// 于是一支早已松手的探测可以在任意后续时刻读到这里，与下一条用例的替换撞成 data race。
+// 同步口径照抄 hook：读方取值加锁、写方替换加锁。
+//
+// ★ statfs 必须在锁外跑（AS-R3）：死挂载上的一次 FSTypeName 可以永远不返回，
+// 让它握着 mu 等于把缓存、探测钩子、卷型替换一起卡死。
+func volumeTypeReader() func(string) string {
+	mu.Lock()
+	defer mu.Unlock()
+	return volumeTypeName
+}
+
 // fromVolumeType 探针不可用时先看卷型（M85）：天生不敏感 ⇒ 按卷型确证，否则退默认（M62）。
 func fromVolumeType(dir string) Result {
-	if insensitiveVolumeTypes[volumeTypeName(dir)] {
+	if insensitiveVolumeTypes[volumeTypeReader()(dir)] {
 		return Result{Sensitive: false, Proven: true}
 	}
 	return defaulted()

@@ -57,9 +57,18 @@ func missingProbeDir(t *testing.T) string {
 // ★ 返回旧值而不是 Cleanup 里写死 ""：嵌套替换时能一层层退回去。
 func useVolumeType(t *testing.T, name string) (restore func()) {
 	t.Helper()
+	// ★ 两端都要持 mu（M155）：读端在生产侧（fscase.go 的 volumeTypeReader），写端在这里。
+	//   只锁一头等于把 race detector 哄住——被 VerdictCtx 放弃的探测 goroutine 会在
+	//   本用例结束之后才走到那次读（CI run 35818865178 的红就是这个形状）。
+	mu.Lock()
 	prev := volumeTypeName
 	volumeTypeName = func(string) string { return name }
-	return func() { volumeTypeName = prev }
+	mu.Unlock()
+	return func() {
+		mu.Lock()
+		volumeTypeName = prev
+		mu.Unlock()
+	}
 }
 
 // TestVerdictOnWritableDirIsProven 钉 ①：能写进去的目录必须报"确证"。

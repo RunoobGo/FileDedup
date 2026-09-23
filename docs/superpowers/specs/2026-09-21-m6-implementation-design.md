@@ -6819,3 +6819,185 @@ forbid（明细行不得带 options 对象）+ **wiring_count**（`{ head: true 
 **未兑现面**：D0 只钉桩驱动的控制流，① ~ ⑦ 的 rc=0 全绿**本机从未取到**（单真卷 + BSD stat 不认 `-c`）；
 `find -newer` 的陈旧判据只在 darwin 实跑过，Linux runner 上永远不会打那一行（CI 先构建前端）；
 `.github/workflows/*` 本批按裁定未动（D1/D3 等用户手改）。
+
+---
+
+## 31. 第 6 批（第四轮修订推送后 CI 首红复批）：fscase 的卷型注入缝漏了同步（2026-09-23）
+
+### 31.0 取材：一次真实 CI 读数，不是推断
+
+`35b2d3c..d1203c2`（二十四提交：第四轮全仓审查修订批 A1→D2 的全部）推上 main 后，run
+**35818865178** `gh run view --json jobs` 真读数 **3 个 job**：
+
+| job id | job | 结论 |
+|---|---|---|
+| `107046201956` | `gofmt / vet x3 / test -race / frontend / smoke`（linux） | **failure** |
+| `107046202112` | `go test (macos)` | **failure** |
+| `107046202210` | `go test (windows)` | **success** |
+
+红全部落在步骤 `go test -race -count=2`。★ 该步骤之后的 `count=4 根包`、`CLI 冒烟`、
+`跨卷冒烟`、`冒烟判据自证` 四条在 linux 腿**没有跑**（日志里是 `-`）⇒ 本批能记的覆盖面只到
+"包级 -race"这一格，冒烟四条一律按"未取到"处理（AS-K2）。
+
+`--log-failed` 逐字（linux 腿；macos 腿同形，只差路径与 goroutine 编号）：整条 run 只有一行 FAIL。
+
+```text
+WARNING: DATA RACE
+Write at 0x000000828ab0 by goroutine 42:
+  filededup/internal/fscase.useVolumeType()
+      .../internal/fscase/verdict_result_test.go:61
+  filededup/internal/fscase.TestVerdictUnprovenWhenProbeFailsAndVolumeTypeUnknown()
+      .../internal/fscase/verdict_result_test.go:82
+Previous read at 0x000000828ab0 by goroutine 26:
+  filededup/internal/fscase.fromVolumeType()
+      .../internal/fscase/fscase.go:113
+  filededup/internal/fscase.probe()
+      .../internal/fscase/fscase.go:249
+  filededup/internal/fscase.VerdictCtx.func1()
+      .../internal/fscase/fscase.go:161
+Goroutine 26 (finished) created at:
+  filededup/internal/fscase.VerdictCtx()          .../fscase.go:161
+  filededup/internal/fscase.callVerdictCtx.func1() .../probe_ctx_test.go:66
+--- FAIL: TestVerdictUnprovenWhenProbeFailsAndVolumeTypeUnknown (0.00s)
+    testing.go:1865: race detected during execution of test
+FAIL    filededup/internal/fscase 0.126s
+```
+
+其余 22 个包 `ok`。★ 与 §25 / §29 两次复批同一形状（红在两条腿、整条 run 只有一格），
+但位置不同：那两次红在**夹具前提**，搬一下自检就收口；这次红在**并发**，
+夹具搬不动它，而 `t.Skip` 在这条路上一个都不许用（AS-K2）。
+
+### 31.1 复核：栈指到的是一对**裸读写**，读写方分属两条互不知情的用例
+
+同一个地址 `0x828ab0` 就是包级变量 `volumeTypeName`（`fscase.go:89`，M62+M85 的 H6 注入缝）。
+两端各自的成因，逐条现读：
+
+1. **写端**（`verdict_result_test.go:58-63`）：`useVolumeType` 裸写 `volumeTypeName`，
+   restore 时再裸写一次。替换的目的是让 `darwin` 之外的腿也能扮演 FAT/远端卷。
+2. **读端**（`fscase.go:113`）：`fromVolumeType` 裸读。它由 `probe` 的"创建失败"出口
+   （`:249`）到达，而 `probe` 跑在 `VerdictCtx` 起的探测 goroutine 里（`:161`）。
+   ★ 要害：`VerdictCtx` 的 `ctx.Done()` 分支**不等这个 goroutine**（`:166-169`，设计意图就是
+   "上层不再陪着等"），所以栈里那支读方是一支**调用方已经松手**的探测。
+3. **松手那支为什么会走到 `:249`（创建失败）**：`probe_ctx_test.go` 的两条 ctx 用例把
+   "卡在 syscall 里"的现场交给 `t.TempDir()` + `blockingProbeHook`。`t.Cleanup` 按 LIFO 跑 ⇒
+   `release()` **先**执行、`t.TempDir()` 的目录删除**后**执行 ⇒ 被放行的探测随后往一个
+   **正在被删的目录**里建探针文件 ⇒ ENOENT ⇒ 正好落在 `:249` → `:113` 那次裸读。
+   ⇒ 这不是"CI 环境怪异"，是 §30.4 自己写下的边界（"卡在内核态 syscall 里的这个 goroutine，
+   本包救不了"）第一次被真的走到。
+4. **为什么本机 `-count=2` 全绿、CI 两条腿红**：命中要"松手那支还活着"与"下一条用例已经开始
+   换卷型"两件事撞上，窗口微秒级；CI 满载把它拉开了。★ 本机加压复现读数
+   （`go test -race -count=60 -cpu=1 ./internal/fscase/`，**第一轮即红**）与 CI 逐字同形：
+   `Write at … verdict_result_test.go:61` / `Previous read at … fscase.go:113 ← fscase.go:161 ← probe_ctx_test.go:66`，
+   FAIL 的用例名也是同一条。⇒ 这就是本批的"改前红"，不是"看着像"。
+
+★ **这条红与最后两个提交（F1 `92a0ca8`、D2 `d1203c2`）无因果**：`git log --oneline 35b2d3c..d1203c2 --
+internal/fscase` 在本批范围内只有 `4c5cab9`（B2/R2-2）一条。红由 **B2**（把探测搬进 goroutine）
+与 **§28.2 的卷型腿**（`2f48619`，在 goroutine 里读包级变量）**首次同时在场**才成立——B2 之前
+`probe` 由调用方同步跑，"松手"这件事根本不存在，那次裸读也就没有并发对手。
+⇒ 记为 **B2 的残角**（登记 M155），不记成 F1/D2 的回归。
+
+### 31.2 修法判据：把这条缝补到与同包 `hook` 同一口径（锁内取值、锁外调用）
+
+生产侧不是无辜的，本包**同一个形状**的另一条缝早就锁好了：`hook`（AS-R3 立的观察点）由
+`SetProbeHook` 在 `mu` 下写、`fireProbeHook` 在 `mu` 下取值后**解锁再调用**。
+`volumeTypeName` 是本包第二个"probe goroutine 会读、测试会写"的包级可变状态，
+在 `:161` 之前它没有并发读者所以裸着无妨，B2 之后就有了 ⇒ 修法是把这条缝补到同一口径：
+
+- **读端在生产侧**：新增 `volumeTypeReader()`，`mu` 内**只取函数值**；`fromVolumeType` 先取值、
+  **在锁外**调用它。★ 锁里绝不许放 `media.FSTypeName` 那次 statfs——那正是 AS-R3 立的规矩，
+  也正是本批 B2/B3 两条在修的那类形状（死挂载上的 syscall 握着 `mu` = 缓存、钩子、
+  卷型替换一起卡死）。
+- **写端在测试侧**：`useVolumeType` 的替换与还原都收进 `mu`。生产永不写这一位，
+  所以写端不必新增导出接缝（约束 7：不给生产面加只有测试用的 API）。
+- ★ 但**读端必须在生产侧取锁**：只给测试加锁等于把 race detector 哄住——下一次任何非测试路径
+  （新的调用方、`Sensitive` 的另一条腿）读这一位仍然是裸的，而那时不会再有 CI 替我们说话。
+- **既有断言一条不减、一字不改**（硬约束）：`useVolumeType` 仍"返回旧值而不是写死 `""`，
+  嵌套替换能一层层退回去"；四条 Verdict 用例（①可写确证 / ②卷型确证 / ③退默认 / 远端负控制）
+  的断言集合原样在场。本批只**加**一条用例（见 31.3），不删不改任何一条既有的。
+
+### 31.3 新增回归用例的判据：钉"两端同步"，不钉删除时序
+
+CI 那一支红依赖 `t.TempDir()` 与 `t.Cleanup` 的相对顺序 ⇒ **本机不复现 == 门禁不复现**，
+把它留在 CI 里等下一次满载再撞（§30.12 刚欠过一条"未复现的历史红不许划成已修"的账）。
+所以另加一条不依赖删除时序的确定形状：读方 goroutine 反复直接问 `fromVolumeType`
+（就是栈里那一行 `:113`），主 goroutine 反复换卷型读数，`WaitGroup` 收拢后再断言。
+race detector 抓的是**访问对**，不需要撞上目录被删那一刻。
+
+★ 分工写清楚，别混成一条覆盖两件事：这条新用例钉得住的是"缝的两端同步"；
+"被放弃的探测不许污染按目录缓存"仍由 §30.4 的 `TestVerdictCtxAbortsBlockedProbe` 钉，
+本批不重复、也不许用它替新用例背书。
+
+### 31.4 不做的事
+
+- **不给"松手的 goroutine"造 join 接缝**。要真等它跑完，得让 `VerdictCtx` 交出那个 goroutine 的
+  完成信号 ⇒ 生产面新增接缝，超本批范围（约束 7）；而且"取消后它继续跑"本来就是 §30.4 写下的
+  设计意图，不是要修的 bug。
+- 不改 `probe_ctx_test.go` 的夹具形状（`t.TempDir()` / `blockingProbeHook`）：夹具没错，
+  错的是被它暴露的那位裸变量。
+- 不动 `insensitiveVolumeTypes` 那张表：只读、编译期常量集合，无同步需求。
+- 不把卷型注入改成环境变量之类"绕开共享状态"的写法：那会让这条缝不再是 H6 惯例的形状，
+  也让 darwin 真读数腿与注入腿的对应关系断掉。
+
+### 31.5 实施读数
+
+**三处落点（现读）**：
+
+| 落点 | 改动 |
+|---|---|
+| `internal/fscase/fscase.go:112-126` | 新增 `volumeTypeReader()`：`mu` 内**只取函数值**；`:130` 的读改为 `volumeTypeReader()(dir)`，`media.FSTypeName` 那次 statfs 留在锁外（AS-R3） |
+| `internal/fscase/fscase.go:89` | 变量注释加一句"读要走 `volumeTypeReader`、写要持 `mu`"，防止下一个写这一位的人再裸写 |
+| `internal/fscase/verdict_result_test.go:58-72` | `useVolumeType` 的替换与还原两次写都收进 `mu`；`prev` 语义（返回旧值、可嵌套回退）**一字未动** |
+| `internal/fscase/probe_ctx_test.go:199-240` | 新增 `TestVolumeTypeSwapRaceFreeAgainstLateProbeReads`（④），文件头注释的"三件事"改"四件事" |
+
+既有断言集合：①②③ + 远端负控制 + Abort/Deadline/ServesCache/Background 四条 ctx 用例，
+一条未删、一条未改（本批只**加**了一条用例与两处注释）。
+
+**改前红的取证（三层，全取到了）**：
+
+1. CI 真读数：run 35818865178 的 linux + macos 两条腿（31.0 全文引用）。
+2. 本机加压复现：`go test -race -count=60 -cpu=1 ./internal/fscase/` **第一轮即红**，
+   栈与 CI 逐字同形（`verdict_result_test.go:61` 写 ←→ `fscase.go:113` 读 ←161 ←
+   `probe_ctx_test.go:66`），FAIL 的用例名也是同一条。⇒ §31.1-4 那句"本机从未撞上、
+   加压才拉开"是真读数而不是推测。
+3. 变异取证（新用例非空转）：把 `:130` 退回裸读、其余原样 ⇒ `TestVolumeTypeSwapRaceFree…`
+   `-count=1` 首跑即红，且**两处写**都被指出来（`useVolumeType()` 那次替换与
+   `useVolumeType.func2()` 那次还原）⇒ 读端与写端各自都钉得住。
+   还原自证：`grep -c 'MUTATION-TMP'` = 0、`diff` 与变异版只差那一行、与改前原件差 19 行（= 本批修法）。
+
+★ **取证过程中的一次工具事故，记下来别再犯**：第一次想用 `cp 备份 && perl 原地改` 一条链做变异，
+被安全策略按"倒退修复"这个形状拦下 ⇒ 同一条链里的 `cp` 备份也没执行，随后 `cp` 还原时报
+`No such file or directory`。改用 Edit 反向还原 + 上面的 `diff`/`grep -c` 自证才闭合。
+⇒ 规矩：**变异之前的备份要单独一条命令、并确认它存在**，不要和变异写在同一条 `&&` 链里。
+
+★ **新用例首版自己是红的，这条比修法更值得记**：首版读方写成"自旋到 `stop` 关闭"，
+`-cpu=1` 加压下 8 个读方**一次都没跑到**（`reads` 读到 0），是同批刚立的"下限自证（M119）"
+把它自己抓出来的——没有那条精确值断言，它会以"0 次读 + 无 race"绿着进门禁，等于一条空转假绿。
+同一次跑里还夹了一条 `TestVerdictCtxHonorsDeadline` 的红，三次复跑未再现 ⇒ 归因指向首版
+不自愿让位的读方（GOMAXPROCS=1 下把带 50ms/3s 断言的那条饿到），改成有界 +
+`runtime.Gosched()` 后加压口径转绿。★ 那条 Deadline 红**没有第二次读数、根因未定**，
+与 §30.12 那条 F1 历史红同一格处理：不划成已修，留在台账里。
+
+**修后读数（本机 darwin/arm64）**：
+
+- `go test -race -count=2 ./...`（CI 同口径）：**23 个包全 `ok`**。
+- `go test -race -count=60 -cpu=1 ./internal/fscase/`（复现口径）：`ok`，5.753s。
+- `scripts/run-gates.sh` 全量 15 行：`rows=15 PASS=14 SKIP=1 FAIL=0`；SKIP 那行仍是
+  `15 smoke-symlink`（`rc=2`，需要 root，按 AS-K2 不算通过）。
+- 计数：Go **787 Test / 4 Benchmark**（★ 裸命令陷阱现在是 **804**，别抄：不带两个
+  `--exclude-dir` 会多读 17 条）；前端 `node 用例 78 + 接线断言 24 = 合计 102`（本批未动，
+  实测 `^wiring ` 调用数仍 23、加 `wiring_count` 一处）；跨卷 harness 自报 `走到断言 18 条（下限 15 条）`。
+
+### 31.6 兑现边界（本批之后仍然不成立的声明）
+
+- **CI 三条腿的下一次真读数未取到**：本批只在本地闭环。在上面那句"23 包全 ok"之外，
+  不许写"CI 已绿"——红本来就是 CI 满载才拉开的，本机加压只是它的等价替身。
+- **被放弃的探测 goroutine 仍然会迟到读**：本批消除的是"裸读写撞成 data race"，
+  不是"松手后还有人读"这件事本身（31.4 明写不给 join 缝）。那条迟到读数拿到的值
+  照旧被丢弃（`done` 带缓冲、无人读 ⇒ 不写缓存），这一点仍由 §30.4 的 Abort 用例钉，
+  本批没重复钉、也不能拿它替本批背书。
+- 新用例钉的是"缝的两端同步"，钉不到"迟到读方拿到的卷型值对不对"——那个值本来就进不了结论。
+- windows 腿本来就没红；而 fscase 的卷型读数在 windows/linux 恒 `""`（`§28.6` 明写本批不做那条腿），
+  所以那两条腿仍然只测"退默认"，测不到 ②档。
+- `TestVerdictCtxHonorsDeadline` 那一条未复现的红仍挂账（见 31.5 最后一★），不随本批划掉。
+
+
