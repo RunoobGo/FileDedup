@@ -440,6 +440,10 @@ var renameFile = os.Rename
 // 这一刻构造第三方以 rename 顶替源路径。
 var copyVerifyFile = copyVerify
 
+// copyAndSyncFile 默认等于 copyAndSync（§31）：回收站复制腿的同一时刻观察点，
+// 惯例同 copyVerifyFile——测试在"复制已完成、源尚未删除"处构造顶替。
+var copyAndSyncFile = copyAndSync
+
 // removeSrc 默认 os.Remove：测试据此断言「守卫生效时一次都不该删」。
 // 抽成 var 本身不改变行为，但把"是否真的动手"变成可观测的事实。
 var removeSrc = os.Remove

@@ -3,21 +3,12 @@
 package ops
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
-	"time"
 )
 
-// defaultTrash XDG Trash 规范自研实现（02 决策 7：零外部依赖）：
-// ~/.local/share/Trash/{files,info}；重名按 .2/.3 递增（规范要求）；trashinfo 记录原路径与时间。
-// trashXDGGuard 进程内互斥：uniqueXDG 是「先查后用」（TOCTOU），并发 trash 同名
-// 文件会同时选中同一 dst，导致后到者覆盖已入回收站的文件、源被删（数据丢失）。
-// 锁覆盖「选名 + 写 info + 移动」整段，保证同一回收站命名空间下串行化。
-var trashXDGGuard sync.Mutex
-
+// defaultTrash Linux 回收站 = XDG Trash 规范自研实现（判据本体在无 tag 的
+// trash_xdg.go，§31）：~/.local/share/Trash/{files,info}。
 func defaultTrash(paths []string) (map[string]string, error) {
 	if len(paths) == 0 {
 		return map[string]string{}, nil
@@ -31,154 +22,4 @@ func defaultTrash(paths []string) (map[string]string, error) {
 		root = filepath.Join(home, ".local", "share")
 	}
 	return trashXDG(filepath.Join(root, "Trash"), paths)
-}
-
-// trashXDG 规范实现（root 可注入：测试用）。
-// 返回 src→dst 映射，键为传入的原始路径（未 Abs 化），失败时返回已完成部分。
-func trashXDG(trashDir string, paths []string) (map[string]string, error) {
-	filesDir := filepath.Join(trashDir, "files")
-	infoDir := filepath.Join(trashDir, "info")
-	dstMap := make(map[string]string, len(paths))
-	if err := os.MkdirAll(filesDir, 0o700); err != nil {
-		return dstMap, err
-	}
-	if err := os.MkdirAll(infoDir, 0o700); err != nil {
-		return dstMap, err
-	}
-	for _, p := range paths {
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return dstMap, err
-		}
-		trashXDGGuard.Lock()
-		dst, err := uniqueXDG(filesDir, filepath.Base(abs))
-		if err != nil {
-			trashXDGGuard.Unlock()
-			return dstMap, err
-		}
-		// P2：trashinfo 必须先写。若顺序颠倒，moveIntoTrash 成功后写 info 失败
-		// 会留下无元数据的孤儿文件——回收站看不到原始路径，用户无法还原，
-		// 且此时"报错并继续下一个"会让前面的孤儿已无法回滚。先写 info 时，
-		// 移动失败只留下一个无害的空 info（回收站会忽略无对应文件的条目）。
-		if err := writeTrashInfo(infoDir, filepath.Base(dst), abs); err != nil {
-			trashXDGGuard.Unlock()
-			return dstMap, err
-		}
-		if err := moveIntoTrash(abs, dst); err != nil {
-			os.Remove(filepath.Join(infoDir, filepath.Base(dst)+".trashinfo"))
-			trashXDGGuard.Unlock()
-			return dstMap, err
-		}
-		trashXDGGuard.Unlock()
-		dstMap[p] = dst
-	}
-	return dstMap, nil
-}
-
-// moveIntoTrash 同卷 rename；跨卷退化复制+删除（复制失败时清理半成品再返回错误）。
-//
-// 与 MoveFile 的跨卷路径不同：这里刻意不还原权限位与 mtime。
-// 移入回收站后源 mtime 应保留在原处语义（恢复时由 DE 按 trashinfo 处理），
-// 权限还原对回收站条目无意义，恢复体验也以内容一致为优先。
-func moveIntoTrash(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	st, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	err = copyAndSync(f, dst, st.Size())
-	f.Close()
-	if err != nil {
-		os.Remove(dst) // 清理半成品，避免"看起来进了回收站实为残片"
-		return err
-	}
-	return os.Remove(src)
-}
-
-// nameFree 判定候选名可用：Lstat 报 NotExist 才算空位。
-// 悬空符号链接（目标不存在）Lstat 成功返回 → 视为占用：rename 会把它连同
-// 链接本身一起移走，若当作空位则目标端语义丢失。
-// 其他错误（EACCES、EIO…）无法判定，返回错误让调用方失败退出——修正前
-// 这类错误被当作"NotExist 为假 = 占用"继续递增，掩盖故障且可能永动。
-func nameFree(path string) (bool, error) {
-	_, err := os.Lstat(path)
-	if err == nil {
-		return false, nil
-	}
-	if os.IsNotExist(err) {
-		return true, nil
-	}
-	return false, err
-}
-
-// uniqueXDG XDG 规范重名：name → name.2 → name.3（不带扩展名拆分）。
-// 返回错误表示命名空间不可用或超出上限，调用方必须中止而非跳过硬用。
-//
-// 注：不用 O_EXCL 占位来消除 TOCTOU——占位文件会破坏目录移入：
-// rename(目录 → 已存在的普通文件) 在 Linux 上返回 ENOTDIR，
-// 而 trash 源完全可能是目录（见跨卷测试）。进程内竞态由
-// trashXDGGuard 互斥覆盖；跨进程竞态（两个实例同时 trash）在
-// 单实例桌面应用语境下属可接受残余风险。
-func uniqueXDG(dir, name string) (string, error) {
-	dst := filepath.Join(dir, name)
-	if free, err := nameFree(dst); err != nil {
-		return "", fmt.Errorf("回收站命名空间不可读: %w", err)
-	} else if free {
-		return dst, nil
-	}
-	for i := 2; i <= nameMaxTry+1; i++ {
-		dst = filepath.Join(dir, fmt.Sprintf("%s.%d", name, i))
-		free, err := nameFree(dst)
-		if err != nil {
-			return "", fmt.Errorf("回收站命名空间不可读: %w", err)
-		}
-		if free {
-			return dst, nil
-		}
-	}
-	return "", fmt.Errorf("回收站中 %s 的重名条目已达上限 %d，拒绝继续递增", name, nameMaxTry)
-}
-
-// writeTrashInfo 生成规范 .trashinfo。
-//
-// H4：Path= 必须是"绝对路径或相对路径"（freedesktop Trash Spec 1.0），
-// 修正前写 `file:///...`，会被按相对路径解析到 $XDG_DATA_HOME 下 → 回收站
-// 无法还原，文件事实上永久失联。换行符格式无法表达，直接拒绝。
-//
-// 按规范 Path 值需做 desktop-entry location 转义（glib/Nautilus 即如此）：
-// 空格与非 ASCII 字节写成原样会让 key-file 解析产生歧义，回收站按
-// %XX 解码后找不到原路径。此处仅保留 unreserved 字符与 '/'，其余字节
-// （含多字节 UTF-8）逐字节 percent 编码。
-func writeTrashInfo(infoDir, name, origAbs string) error {
-	if strings.ContainsAny(origAbs, "\n\r") {
-		return fmt.Errorf("路径含换行符，trashinfo 格式无法表达: %s", origAbs)
-	}
-	now := time.Now().Format("2006-01-02T15:04:05")
-	content := fmt.Sprintf("[Trash Info]\nPath=%s\nDeletionDate=%s\n", xdgEscapePath(origAbs), now)
-	return os.WriteFile(filepath.Join(infoDir, name+".trashinfo"), []byte(content), 0o600)
-}
-
-// xdgEscapePath 桌面入口 location 转义：A-Za-z0-9-._~/ 之外的字节 → %XX。
-func xdgEscapePath(p string) string {
-	var b strings.Builder
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		const upperhex = "0123456789ABCDEF"
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
-			c == '-', c == '.', c == '_', c == '~', c == '/':
-			b.WriteByte(c)
-		default:
-			b.WriteByte('%')
-			b.WriteByte(upperhex[c>>4])
-			b.WriteByte(upperhex[c&0x0f])
-		}
-	}
-	return b.String()
 }
