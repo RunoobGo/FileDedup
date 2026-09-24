@@ -992,6 +992,14 @@ export const useScanStore = defineStore('scan', () => {
       const msg = (e && typeof e === 'object' && e.message) ? e.message : String(e ?? '任务进行中')
       toast().push(msg, 'info')
     })
+    // M196（登记表 APP-23）：OS 级单实例。第二个实例由 Wails 自己带走，首实例收到这个事件
+    // 时已经把窗口前置到前台（raise 在 emit 之前，见 app_single_instance.go）。
+    // 不给提示的话，用户第二次双击图标看到的是"窗口跳了一下，什么也没发生"——
+    // 他会以为图标坏了，而真实情况是"另一个窗口被你合并掉了"。
+    bind('app:second-instance', (e: any) => {
+      const cwd = (e && typeof e === 'object' && typeof e.workingDirectory === 'string') ? e.workingDirectory : ''
+      toast().push(cwd ? `已合并另一个 FileDedup 实例（它的启动目录：${cwd}）` : '已合并另一个 FileDedup 实例', 'info')
+    })
     bind('scan:progress', (ev: ProgressEvent) => {
       progress.value = ev
     })
