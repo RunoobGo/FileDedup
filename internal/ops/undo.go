@@ -318,7 +318,13 @@ func undoHardlink(it UndoItem) (string, error) {
 	}
 
 	tmp := it.OrigPath + FddUndoSuffix
-	_ = os.Remove(tmp)
+	// M199（2026-09-24，登记 §6.29）：这一格此前是 `_ = os.Remove(tmp)` 无条件盲删——
+	// 全仓最后一处"先删后写不取证"（合并/软链腿四处槽位早已走 claimSlot 三档，M6）。
+	// 名字被占时按证据处置：内容逐字节等于本次记录 ⇒ 是我们上次运行的暂存，清掉重来；
+	// 证明不了（第三方文件、撕裂残留、目录）⇒ 显式失败点名路径，一个字节不碰。
+	if err := claimSlot(tmp, func() bool { return slotProvesUndoTemp(tmp, it.Size, it.Hash) }); err != nil {
+		return "", err
+	}
 	sf, err := os.Open(it.LinkSrc)
 	if err != nil {
 		return "", err

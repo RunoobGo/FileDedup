@@ -101,6 +101,31 @@ func slotProvesSymlink(keep, path string) bool {
 	return verifySymlinked(keep, path) == nil
 }
 
+// slotProvesUndoTemp 回撤暂存槽位（`原名.fdd-undo-tmp`）的归属取证：
+// 只有**逐字节等于本次记录内容**的普通文件才算我们上一次运行写好的暂存。
+//
+// M199（2026-09-24，登记 §6.29，设计稿 `2026-09-24-undo-tmp-claim-slot-m199-design`）：
+// undoHardlink 此前对该名字**无条件盲删**（`_ = os.Remove(tmp)`，错误被吞）——
+// 第三方的同名文件会被删掉且因 worktemp 忽略规则连扫描痕迹都没有。回撤 tmp 是
+// 新建副本而非硬链接，`slotProvesHardlink` 的"同 inode"证明在这里无从可用；
+// 而"内容 == 记录哈希"是本格子里充分的归属证据：这份字节本来就来自 LinkSrc，
+// 删掉重写不丢任何字节（源本尊还在）。
+//
+// 判据 fail-closed，与 `slotProvesHardlink` 的取向同理（证明不了 ⇒ 一个字节不碰，
+// 代价是撕裂残留会挡回撤直到用户处置——设计稿 §4-2 记为自觉边界）：
+// 记录哈希为零值（老记录无从复核）、尺寸不符、读不出/哈希不等，全部判"不是我们的"。
+func slotProvesUndoTemp(path string, size uint64, h [32]byte) bool {
+	if h == [32]byte{} {
+		return false
+	}
+	st, err := os.Lstat(path)
+	if err != nil || !st.Mode().IsRegular() || uint64(st.Size()) != size {
+		return false
+	}
+	got, herr := hashFile(path)
+	return herr == nil && got == h
+}
+
 // abandonForeignBackup 处理「窗口 A 被第三方顶替」：放弃本次合并，
 // 把第三方文件放回它能被找到的位置，清理我们的临时链接，返回错误。
 //

@@ -68,8 +68,14 @@
   - Vb `slotProvesUndoTemp` 恒假 ⇒ 杀 P-3（正当自愈被拦）；
   - Vc 删掉 `claimSlot` 调用回到裸 `os.Remove` ⇒ 杀 P-1、P-2。
   P-1 在 Va 下不红（第三方文件哈希必不等）——每条变异只许杀它该杀的格子。
+  - ★ **实测对账，预测有一格错**：Va 实测杀 **P-1+P-2** 两格，不是只杀 P-2。
+    原因：恒真替掉的是**整个取证**（含第三方那一半），claimSlot 于是把第三方文件
+    也"证明"成了我方残留删掉 ⇒ P-1 两格同倒。设计段那句"P-1 在 Va 下不红"把
+    Va 的替换面想窄了。Vb（实测只杀 P-3）、Vc（实测杀 P-1+P-2）与预测一致。
+    三条变异各自至少杀掉一格、无一漏杀；预测集≠实测集的差集（Va 多杀 P-1）
+    如实记这里，不改预测原文（M150 口径：读数对账不是记账面子）。
 
-## 4. 边界（本批不覆盖，如实写明）
+## 4. 边界（本修的自觉代价与不外推面）
 
 1. M152 的"已核验链接的改名窗口"原样留档——本批不动 `hardlinkRename(tmp, OrigPath)`
    一步的抢占形状（§27.6/§27.8 裁定在册）。
@@ -86,4 +92,11 @@
   （与三条 `slotProves*` 并列、同注释纪律）。
 - `internal/ops/undo.go`：`tmp := ...` 两行换成 `claimSlot` 调用 + 指针注释（M199）。
 - 探针/回归：新文件 `internal/ops/undo_tmp_claim_m199_test.go`（P-1/P-2/P-3）。
-- 真读数：〔实施后回填〕
+- 真读数（2026-09-24 本机 darwin/arm64 现跑）：
+  - **修前红**：P-1 两格（回撤误报成功 + `dup.bin.fdd-undo-tmp` 读取 no such file）、
+    P-2 两格（同形）——失败信息与 §3 预测逐格对齐；P-3 修前 PASS（护栏定位兑现）。
+  - **修后**：`go test -race -count=1 -run TestM199UndoHardlink -v ./internal/ops/`
+    三条全 PASS；整包 `-count=1` ok；全套 15 行门禁 `rows=15 PASS=14 SKIP=1 FAIL=0`
+    （SKIP 恒 `smoke-symlink` 需 root，AS-K2 不算通过），计数
+    top_PASS=769 / src_test=821（较本批前 +3＝本批三条用例）。
+  - **变异**：见 §3 实测对账（改前 `cp` 备份 → 逐条打补丁 → 还原 `cp`+`diff` 逐字一致）。
