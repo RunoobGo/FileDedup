@@ -22,6 +22,7 @@ package fscase
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -73,8 +74,42 @@ func callVerdictCtx(ctx context.Context, dir string) <-chan verdictCall {
 	return ch
 }
 
+// probeTempDir 是 t.TempDir() 的"耐受迟到探测"版（M208，设计稿 §2）。
+//
+// 为什么必须有它：`VerdictCtx` 在 ctx.Done() 那一格**有意不等**探测收尾（R2-2 的全部
+// 意义），于是 Abort/Deadline 两条用例松手后，被放弃的探测会在**用例结束之后**去交给
+// 它的目录里补做一轮 create+remove（`probe` 的内部动作，无 ctx 感知）。这一轮若撞进
+// `t.TempDir()` 框架清理的 readdir→rmdir 窗口，rmdir 报 ENOTEMPTY，框架记作用例失败——
+// 就是那条挂账红的原样（"TempDir RemoveAll cleanup: … directory not empty"；CI 两次
+// 读数 + 本机 6 路并发 -race 26 红/1200 次跑，签名逐字一致，设计稿 §1）。
+//
+// 清理用**有界重试**，这不是和稀泥：RemoveAll 成功一次 = 目录不复存在 ⇒ 迟到探测的
+// OpenFile 从此必 ENOENT、走"创建失败"出口返回，不可能再产生新条目 ⇒ "最终成功"就是
+// "该窗口已过"的机器证明。若目录是被别的东西占着，重试到顶照样 t.Errorf 报红。
+//
+// ★ 别为了"统一夹具"把它换回 t.TempDir()——断言语义与它一字不差，清理时序才是本助手
+// 的存在理由（设计稿 §5 的防回抹条款）。
+func probeTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", t.Name()+"-probe-")
+	if err != nil {
+		t.Fatalf("创建探测目录: %v", err)
+	}
+	t.Cleanup(func() {
+		var last error
+		for i := 0; i < 300; i++ { // 300 × 10ms = 3s 上限；探测腿最多 8 次 create+remove
+			if last = os.RemoveAll(dir); last == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Errorf("探测目录 3s 后仍删不掉（迟到探测之外另有占用？）: %v", last)
+	})
+	return dir
+}
+
 func TestVerdictCtxAbortsBlockedProbe(t *testing.T) {
-	dir := t.TempDir()
+	dir := probeTempDir(t) // 体内 release ⇒ 有迟到探测，不能用裸 t.TempDir()（M208）
 	entered, release := blockingProbeHook(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,7 +146,7 @@ func TestVerdictCtxAbortsBlockedProbe(t *testing.T) {
 }
 
 func TestVerdictCtxHonorsDeadline(t *testing.T) {
-	dir := t.TempDir()
+	dir := probeTempDir(t) // 末行 release ⇒ 同一暴露（M208），换回裸 t.TempDir() 即复发
 	entered, release := blockingProbeHook(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
