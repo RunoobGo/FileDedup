@@ -62,15 +62,19 @@ go run ./cmd/benchgen -dataset C -scale 0.02 -out ./benchdata   # 合成数据�
 .
 ├── main.go                 # 应用入口与窗口配置（go:embed frontend/dist）
 ├── app.go                  # Wails 应用生命周期与绑定（AppVersion 声明位）
-├── internal/               # Go 后端（scanner / dedup / hasher / cache / ops / history /
-│                           #   fsid / filter / media / progress / fscase / dbfile / model）
+├── internal/               # Go 后端 20 包（scanner / dedup / hasher / filter / cache / ops /
+│                           #   history / model / fsid / fscase / sysguard / realbytes /
+│                           #   cloudfile / ads / media / worktemp / progress / dbfile /
+│                           #   pathnorm / sqlconn）
 ├── cmd/                    # fdd-cli（JSON 报告冒烟工具）、benchgen（合成数据集生成器）
 ├── frontend/               # Vue 3 前端
 ├── scripts/                # 回归与门禁脚本（见下）
 ├── build/                  # 图标与打包资源（Info.plist / manifest 模板）
 └── docs/                   # 文档（索引见 docs/README.md）
     ├── 09-用户手册.md       # 活文档：功能与安全性口径真源
+    ├── 10-用户使用手册.md   # 活文档：09 的用户向派生本（三段结构，无源码坐标；两文出入以 09 为准）
     ├── 04-开发与测试计划.md # 活文档：V2.0 起为「现状与质量门禁」，§6 是唯一权威待办清单
+    ├── 05-真机实测清单.md   # 活文档：Windows / macOS / Linux **三腿**真机执行清单（M7 交付物；只写怎么测怎么判，读数回填 04）
     ├── 01/02/03-*.md        # 冻结设计/选型档案（正文不回填，偏差记页首日期化勘误表）
     ├── superpowers/         # 0.5.0 那批功能的设计 + 实施计划（历史产物，顶部有偏差说明）
     └── archive/             # 编年史：代码审查与修复 / UI 视觉与品牌 / 里程碑报告 /
