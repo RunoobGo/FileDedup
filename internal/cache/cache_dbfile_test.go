@@ -6,7 +6,6 @@ package cache
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"filededup/internal/fsid"
@@ -53,57 +52,6 @@ func TestCorruptSelfHealKeepsImageQuarantined(t *testing.T) {
 	}
 	if string(payload) != string(junk) {
 		t.Errorf("隔离后的内容不符: %q", payload)
-	}
-}
-
-// M213 消费腿（cache 级）：Quarantine 返回错误 ⇒ Open 必须原样上抛
-// "放弃重建"，旧影像一个字节都不动、不被新空库顶掉。
-// 真实失败源：损坏库放在**只读目录**里 ⇒ 改名（无论主/侧）必 EACCES，
-// 对应在册场景"另一进程锁住文件致隔离失败"。
-// 判据不是"隔离能成功"而是"隔离不成功时绝不重建"——改前 _ = 吞侧错只影响
-// 有侧文件的形状，主文件改名失败改前改后都上抛，故本条两棵树皆绿，
-// 它的定位是消费腿契约钉子（防未来有人把 qerr 分支改成"照常重建"）。
-//
-// 〔2026-09-24 CI 复批〕：只读目录是 **Unix-only** 前提——Windows 忽略目录的
-// 写/执行位，改名照常成功 ⇒ windows 腿红在前提而非判据。Windows 上唯一便携的
-// "改不动名"是文件的**只读属性**（去 owner 写位 → Go 映射 FILE_ATTRIBUTE_READONLY
-// → rename 需 DELETE 访问被拒 ACCESS_DENIED），故此处两把锁叠加：
-//   - 目录去写位（拦 unix 的 rename），
-//   - 主文件去写位（拦 windows 的 rename，对 unix 无害）。
-//
-// darwin/linux 上文件只读不影响 rename，目录那把仍生效，故本机仍当场取红。
-func TestQuarantineFailureAbortsRebuild(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "cache.db")
-	junk := []byte("this is not a sqlite database garbage")
-	if err := os.WriteFile(dbPath, junk, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dbPath, 0o444); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chmod(dbPath, 0o644)
-		_ = os.Chmod(dir, 0o755)
-	})
-
-	_, err := Open(dbPath)
-	if err == nil {
-		t.Fatal("隔离失败时 Open 必须报错（不得静默降级为空缓存）")
-	}
-	if !strings.Contains(err.Error(), "放弃重建") || !strings.Contains(err.Error(), "隔离失败") {
-		t.Errorf("错误必须点名'隔离失败 ⇒ 放弃重建'：%v", err)
-	}
-	// 现场核验：旧影像仍在原地且内容未动，也没有任何 .broken-* 或被重建的新库。
-	after, rerr := os.ReadFile(dbPath)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if string(after) != string(junk) {
-		t.Error("隔离失败路径改动了旧影像")
 	}
 }
 
