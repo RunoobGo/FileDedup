@@ -7,6 +7,7 @@
 import { ref, computed } from 'vue'
 import { useScanStore } from '../stores/scan'
 import { humanBytes, formatCount } from '../utils/format'
+import { firstExcludedIndex } from '../utils/pending'
 import { useModal } from '../composables/useModal'
 
 const store = useScanStore()
@@ -16,14 +17,10 @@ const dlgRef = ref<HTMLElement | null>(null)
 useModal(dlgRef, () => store.pendingOpen)
 
 const data = computed(() => store.pendingData)
-// 分界：当前页里第一段结束的位置（pending 段整体排在前面，跨页时可能页内没有交集）
-const firstExcluded = computed(() => {
-  const d = data.value
-  if (!d) return -1
-  const pageStart = d.page * d.pageSize
-  const idx = d.pendingCount - pageStart
-  return idx >= 0 && idx < d.rows.length ? idx : -1
-})
+// 分界：当前页里第一段结束的位置（pending 段整体排在前面，跨页时可能页内没有交集）。
+// C3 / R-前端-4：边界数学收进 utils/pending 的纯函数（.vue 打不进 node --test，
+// 内联时"整页都被排除"那格零覆盖且曾漏挂标题）。
+const firstExcluded = computed(() => firstExcludedIndex(data.value))
 const excludedOnPage = computed(() =>
   firstExcluded.value >= 0 ? data.value!.rows.length - firstExcluded.value : 0,
 )

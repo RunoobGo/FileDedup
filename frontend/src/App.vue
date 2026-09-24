@@ -29,7 +29,12 @@ function onKeydown(e: KeyboardEvent) {
     return
   }
   if (inInput) return
-  if (store.view === 'result' && !store.preview && !store.confirmOpen) {
+  // C2（R-前端-2）：模态门补 pendingOpen / failedOpen。抽屉开着时画面是快照、与全局
+  // 勾选脱钩，此时 Space 被劫持、Cmd+A 在模态背后改全局勾选、Delete 静默清空勾选——
+  // 与 confirmOpen 拦截的立项理由（防误删）同形，两抽屉此前漏网。Esc 关浮层在上面
+  // 已早退，不受本门影响。
+  if (store.view === 'result' && !store.preview && !store.confirmOpen
+    && !store.pendingOpen && !store.failedOpen) {
     if (e.code === 'Space') {
       e.preventDefault()
       store.previewCurrent()

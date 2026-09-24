@@ -251,6 +251,10 @@ wiring 'src/stores/scan.ts' 'api.getPendingFiles(' '' \
 	'清单数据来自后端 GetPendingFiles（与预览同一内核的两个投影，前端不重算拟处理集）'
 wiring 'src/components/PendingDrawer.vue' 'store.pendingData' '' \
 	'抽屉渲染消费 store.pendingData（常驻挂载+store 控显隐，FailedDrawer 同族形状）'
+# C3 / R-前端-4：分界数学抽进 utils/pending.ts（node 可测），抽屉只许消费——
+# 锚"有没有 import 并调用 firstExcludedIndex"，防止边界逻辑又被内联回 .vue（.vue 打不进 node）。
+wiring 'src/components/PendingDrawer.vue' 'firstExcludedIndex' '' \
+	'抽屉分界下标取自 utils/pending.ts 的纯函数（R-前端-4：整页排除段标题置顶的边界，node 可测）'
 
 # 功能 3（2026-09-23「隐藏非拟处理项」）：藏行的判据是后端逐行 isPending 投影，
 # 视图只许消费（请求上送链由 scan-hide-nonpending.test.ts 的 node 用例钉）。
@@ -281,6 +285,16 @@ wiring 'src/components/FailedDrawer.vue' 'api.openPath(' 'v-if="f.Path"' \
 # （别处本就有一堆 .catch），必须走行窗口。
 wiring_window 'src/stores/scan.ts' 'api.getStatus().then' 5 '.catch' \
 	'refreshStatus 的 getStatus promise 就地挂了 catch（M215：事件回调不得漏 rejection）'
+# C2（R-前端-2，2026-09-24 第五轮审查批）：全局快捷键（Space/Cmd+A/Delete）的模态门
+# 此前只判 preview/confirmOpen，漏了 pendingOpen/failedOpen——抽屉开着时画面是快照、
+# 与全局勾选脱钩，Cmd+A 会在模态背后改勾选、Delete 静默清空。判据是"门条件里同时
+# 挂了这两把锁"。.vue 打不进 node --test（M116/M118 同族限制），走行窗口锚：
+# 锚在 gate 独有的 `!store.preview && !store.confirmOpen` 片段（template 的
+# `store.view === 'result'` 不是 gate，不能当锚），下方 1 行内必须见两把新锁。
+wiring_window 'src/App.vue' '!store.preview && !store.confirmOpen' 1 '!store.pendingOpen' \
+	'快捷键模态门补 pendingOpen（C2：拟处理抽屉开着时不得在背后改全局勾选）'
+wiring_window 'src/App.vue' '!store.preview && !store.confirmOpen' 1 '!store.failedOpen' \
+	'快捷键模态门补 failedOpen（C2：失败抽屉开着时同上）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

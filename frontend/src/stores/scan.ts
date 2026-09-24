@@ -28,8 +28,13 @@ export const emptyFilters = (): Filters => ({
 })
 
 // 大小过滤单位换算：UI 输入框标注 KB（ScanView），后端 internal/filter/filter.go
-// 直接与字节比较 —— 差 1024 倍。store 内保持 KB 语义，换算只放在发往后端这一处，
-// 加载/保存设置（settings.filtersDefault）走的都是 KB 口径，因此不会重复换算。
+// 直接与字节比较 —— 差 1024 倍。store 内一律保持 KB 语义，换算只放两处、方向相反：
+// 发往后端时 KB→字节（startScan 的 payload，见下方 kbToBytes 调用点），从历史记录
+// 恢复过滤器时字节→KB（rescanHistory 的 `Math.round(.../1024)`）。
+// ★ R-前端-6 据实更正：旧注释这里宣称"加载/保存设置（settings.filtersDefault）走的
+// 都是 KB 口径，因此不会重复换算"——但 settings.filtersDefault 在 store 里**没有任何
+// 消费者**（设置页的 load/save 只整体存取 Settings，从不把它写回 filters），那条
+// "第三处换算路径"凭空多出来的、实际不存在。真实的换算面就是上面两处。
 const kbToBytes = (kb: number) => (Number.isFinite(+kb) ? +kb * 1024 : 0)
 
 export type ViewName = 'scan' | 'result' | 'settings' | 'records'
@@ -146,6 +151,14 @@ export const useScanStore = defineStore('scan', () => {
   function busyReason(): string | null {
     if (opsRunning.value) return '清理/回撤操作执行中，请等待完成'
     if (scanning.value) return '扫描进行中，请等待完成'
+    // R-前端-3：历史载入在途也算忙。openHistory 期间界面可能已被切走、用户转去点扫描
+    // 或对结果发起清理，而载入回包与新动作会同时写同一批结果态——resultGen 只能弃写
+    // **陈旧回包**，挡不住"新动作正在起跑"这一侧。并入这一道后，guard() 覆盖的全部入口
+    // （startScan/executeOp/undo/clearKeep/applyKeep/clearOpRecords）在载入窗口内一律被挡，
+    // busyTip 也如实给出原因；histBusy = busy || histLoading 语义不变（本就为真）。
+    // 不会自锁：openHistory 在 finally 里必然复位 histLoading，且其载入腿（loadResultPage/
+    // clearProcDirs）不走 guard()。
+    if (histLoading.value) return '历史结果载入中，请等待完成'
     return null
   }
   function guard(what: string): boolean {
@@ -948,8 +961,15 @@ export const useScanStore = defineStore('scan', () => {
         selected: f?.selected ?? 0,
         unmatched: f?.unmatched ?? [],
       }
-      const parts = [`已选 ${lastFilter.value.selected} 项，其中 ${lastFilter.value.matched} 项在优先文件夹内，本次只处理这些`]
+      // C1（R-前端-1）：命中数那句用**中性**措辞「在本次处理范围内」，不说「在优先文件夹内」。
+      // 后端 filtered = ProcessDirs>0 || ExcludeDirs>0——只配「不处理」目录（黑名单）时
+      // 也会发本事件，而界面上根本没有优先文件夹，旧文案是无中生有的假归因。
+      // 与 ResultView.vue 的「在处理范围内」字面对齐；不在前端重新推导是哪把过滤器生效
+      // （那是后端判据的第二份实现，会漂移——AS-H6 判据唯一性纪律）。
+      const parts = [`已选 ${lastFilter.value.selected} 项，其中 ${lastFilter.value.matched} 项在本次处理范围内，本次只处理这些`]
       if (lastFilter.value.unmatched.length > 0) {
+        // unmatched 仅由优先文件夹（ProcessDirs）产生，黑名单不产出未命中目录，
+        // 故这句非空即证明确有优先文件夹，措辞准确、保留。
         parts.push(`这些优先文件夹内没有可处理的重复文件：${lastFilter.value.unmatched.join('、')}`)
       }
       toast().push(parts.join('。'), 'info')
