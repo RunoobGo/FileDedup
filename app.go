@@ -737,7 +737,7 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 			} else {
 				resetInFlight()
 				if !superseded() {
-					a.emit(a.ctx, "scan:error", map[string]string{"error": err.Error()})
+					a.emit(a.ctx, "scan:error", errorEvent(err)) // M202：中文外壳，原文降级 detail
 				}
 			}
 			return
@@ -897,7 +897,8 @@ func (a *App) recoverGoroutine(kind string) {
 		if kind != "ops" {
 			a.pipe.Abort() // 状态机停在运行态 → 之后所有扫描都会被"任务进行中"拒绝
 		}
-		msg := map[string]string{"error": fmt.Sprintf("%s goroutine panic: %v", kind, r)}
+		// M202：原句（含 kind 与 panic 值）整串降级为 detail，外壳走 panic 专用档。
+		msg := errorEvent(fmt.Errorf("%s goroutine panic: %v", kind, r))
 		if a.emit != nil && a.ctx != nil {
 			if kind == "ops" {
 				a.emit(a.ctx, "ops:error", msg)
@@ -2449,7 +2450,7 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			// 此处把异常转成 ops:error 事件，使前端能复位 opsRunning（P2 死锁终防）。
 			OnPanic: func(err error) {
 				if a.emit != nil && a.ctx != nil {
-					a.emit(a.ctx, "ops:error", map[string]string{"error": err.Error()})
+					a.emit(a.ctx, "ops:error", errorEvent(err)) // M202：同上（C7 捕获的 worker panic）
 				}
 			},
 		}, op)

@@ -5,6 +5,7 @@ import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSumma
 import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
 import { undoBlockedText } from '../utils/undoReason'
+import { errWithDetail } from '../utils/errShell'
 // AS-H6（2026-09-20）：路径归属判据收回后端，这里不再 import 前端的 dirContains
 // 与大小写猜测——判据只有一份才不会再漂移。utils/pathpolicy.ts 只剩卷比较用的纯函数。
 
@@ -976,8 +977,9 @@ export const useScanStore = defineStore('scan', () => {
     // 此后所有清理/保留策略永久返回「操作执行中」，只能重启应用。
     bind('ops:error', (e: any) => {
       opsRunning.value = false
-      const msg = (e && typeof e === 'object' && e.error) ? e.error : String(e ?? '未知错误')
-      toast().notifyError('清理操作异常中断', msg)
+      // M202：载荷是 {error: 中文外壳, detail: 系统原文}，由 errWithDetail 拼成
+      // "中文在前、原文在后"的一行；裸字符串与 Error 实例同样走这里（兼容旧形状）。
+      toast().notifyError('清理操作异常中断', errWithDetail(e) || '未知错误')
     })
     // v0.5.0：后端非致命异常（如历史保存失败）→ toast 留痕，不影响当前功能
     bind('app:error', (e: any) => {
@@ -1012,7 +1014,9 @@ export const useScanStore = defineStore('scan', () => {
     bind('scan:error', (e: any) => {
       scanning.value = false
       status.value = 'Failed'
-      toast().notifyError('扫描失败', e)
+      // M202：改前把整个载荷对象裸传给 notifyError，靠 toast 的 errText 兜住 ⇒
+      // 英文 OS 错误直呈用户。现在外壳/原文的次序在这里定。
+      toast().notifyError('扫描失败', errWithDetail(e))
     })
     bind('app:ready', (v: string) => {
       appVersion.value = v
