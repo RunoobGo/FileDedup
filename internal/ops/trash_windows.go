@@ -234,7 +234,14 @@ func unsafeDriveReason(p string) string {
 //
 // 两道缺一不可：事前预检覆盖不了所有降级路径（例如配额在调用瞬间被
 // 其它进程占满），事后复核才是最后一道兜底——它把"静默"变成"响亮的错误"。
+// defaultTrash 把整次调用交给中性串行列（M197，见 `trash_serial.go` 的判据说明）：
+// 回收站条目数增量这一判据不接受并发腿，A 的增量可能全是 B 推进的。
+// 拆成 `defaultTrashLocked` 而非在函数中段插锁——一处 `defer` 覆盖全部 early-return。
 func defaultTrash(paths []string) (map[string]string, error) {
+	return withTrashSerial(defaultTrashLocked, paths)
+}
+
+func defaultTrashLocked(paths []string) (map[string]string, error) {
 	dst := map[string]string{}
 	if len(paths) == 0 {
 		return dst, nil

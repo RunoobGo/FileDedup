@@ -50,6 +50,7 @@
 | W1-7 | SHQueryRecycleBinW / 卷 GUID | 让带 `-v` 的 windows 腿（或本机 `go test ./internal/ops -run Recycle -v`，需 GTest 环境）真跑 `trash_windows_recycle_test.go` | 四组可 Skip 用例（`TestVolumeGUIDShape` / `TestRecycleBinCapBytesSystemDrive` / `TestQueryRecycleBinSystemDrive` / Nuke 三态两条：`TestWinNukeStatusOfDistinguishesAbsentFromUnreadable` + `TestRecycleBinVolumeNukeSystemDrive`）**逐条报 PASS 而非 SKIP**；`shQueryRBInfoSize==20` 布局钉在真 Shell 上语义正确 |
 | W1-8 | 长路径回收站 | >260 深度文件执行移入回收站 | `SHFileOperationW` 不接受 `\\?\`（`defaultTrash` 内注释原话"SHFileOperation 不支持 \\?\ 前缀，使用普通路径"）且不在 longPathAware 解除清单（04 §6.6.4"回收站路径（跨盘移入回收站）在超长路径上仍可能失败"段）→ 预期**显式失败并保留源文件**，不得静默永久删除 |
 | W1-9 | Shell 静默降级 | 沙箱/被安全软件接管 `$Recycle.Bin` 的环境（或第三方清理工具在场）执行 | Shell 返回 0 但未进站时，事后复核必须报「可能已被直接删除，请立即到回收站核实」——这条防线自身是本清单的被测对象 |
+| W1-10 | 并发腿的计数串扰（**M197 兑现格**） | 构造"一条腿会被 Shell 静默永久删除、另一条腿正常入站"的并发：把测试卷回收站容量压到刚好让 A 组超限（照 W1-2/W1-3 的配比），同批混入 B 组小文件，让执行器 C6 回退腿并发跑（`executor.go` 的 `runIndexed(…, opWorkers, …)`） | ① A 组逐条记 **Failed** 且源仍在原位（或被如实报出），**不得**因为 B 组推进了该卷条目数就被判成功——这就是 M197 的判据本体；② 观察调用是否真排队：`defaultTrash` 现经 `withTrashSerial`（`internal/ops/trash_serial.go`）串行，Process Monitor 里两条 `SHFileOperationW` 的时间窗**不应重叠**；③ 回退腿吞吐因串行而下降的幅度记录进账（本裁定的自觉代价）。★ 本机 darwin 只能证 `withTrashSerial` 的排队语义（`trash_serial_test.go` 真跑，摘锁即红），"windows 真接了这条列 + 判据不再被旁路"两格**只有这里有读数** |
 
 ---
 
