@@ -39,11 +39,34 @@ end repeat
 return out
 end run`
 
-// osascriptArgs 构造命令行：静态脚本 + 原样路径参数（argv 机制，无转义）。
-func osascriptArgs(paths []string) []string {
-	args := make([]string, 0, len(paths)+2)
-	args = append(args, "-e", trashScript)
+// osascriptArgsFor 构造命令行：静态脚本 + 原样路径参数（argv 机制，无转义）。
+//
+// M211（2026-09-24 第五轮审查批）：paths 前必须插 "--" 终止符。osascript 在 "--"
+// 之前把后续 token 按**自身选项**解析（本机实测三格）：
+//   - "-dash.txt" → `illegal option -- d` rc=2，整批失败；
+//   - 恰为 "-i"（osascript 唯一无参选项）→ rc=0 且零输出，run handler 根本没跑
+//     → 调用方见 err==nil 会把未移动的在盘文件整批记 done（虚账）。
+//
+// "--" 之后一切 token 原样进 argv，与路径形状无关。空批次不插（避免悬空终止符）。
+func osascriptArgsFor(script string, paths []string) []string {
+	args := make([]string, 0, len(paths)+3)
+	args = append(args, "-e", script)
+	if len(paths) > 0 {
+		args = append(args, "--")
+	}
 	return append(args, paths...)
+}
+
+// osascriptArgs 生产入口：trashScript + paths。
+func osascriptArgs(paths []string) []string {
+	return osascriptArgsFor(trashScript, paths)
+}
+
+// batchOutputGap 判定"脚本应执行却零配对"防线（M211）：本批有输入、
+// 却一行都没解析出来 ⇒ osascript 极可能根本没跑（rc=0 静默形状），
+// 不能按成功记账。纯函数，判据可单测。
+func batchOutputGap(parsed, batchLen int) bool {
+	return batchLen > 0 && parsed == 0
 }
 
 // osascript 批量与超时参数（D6）：
@@ -100,8 +123,14 @@ func defaultTrash(paths []string) (map[string]string, error) {
 			return dst, fmt.Errorf("osascript（第 %d/%d 批 %d 个文件；此前批次可能已移入回收站）: %v: %s",
 				bi+1, len(batches), len(batch), err, stderr)
 		}
-		for k, v := range parseTrashOutput(string(out), batch) {
+		parsed := parseTrashOutput(string(out), batch)
+		for k, v := range parsed {
 			dst[k] = v
+		}
+		if batchOutputGap(len(parsed), len(batch)) {
+			// C2 契约保持：此前批次已确认的落点不丢，随错误一起返回。
+			return dst, fmt.Errorf("osascript（第 %d/%d 批 %d 个文件）返回成功但零条成对输出——脚本未执行（路径以 - 开头撞选项通道的形状已由 -- 终止符封死，这里防整族静默）",
+				bi+1, len(batches), len(batch))
 		}
 	}
 	return dst, nil

@@ -20,14 +20,16 @@ func TestTrashScriptIsStatic(t *testing.T) {
 	tricky := `/a"b\c
 d` + "\x80\xe4\xb8\xad"
 	args := osascriptArgs([]string{tricky, "/normal/path"})
-	if len(args) != 4 {
-		t.Fatalf("args 长度 = %d, want 4", len(args))
+	// M211 契约改写（修前红由 TestOsascriptArgsDashTerminator 提供）：
+	// [-e, script, --, paths...]，路径必须在 -- 之后原样出现。
+	if len(args) != 5 {
+		t.Fatalf("args 长度 = %d, want 5（-e + script + -- + 2 paths）", len(args))
 	}
-	if args[0] != "-e" || args[1] != trashScript {
-		t.Fatalf("前两个参数应为 -e + 静态脚本，got %q %q", args[0], args[1])
+	if args[0] != "-e" || args[1] != trashScript || args[2] != "--" {
+		t.Fatalf("前三个参数应为 -e + 静态脚本 + -- 终止符，got %q %q %q", args[0], args[1], args[2])
 	}
-	if args[2] != tricky || args[3] != "/normal/path" {
-		t.Fatalf("路径必须原样进 argv（无转义），got %q %q", args[2], args[3])
+	if args[3] != tricky || args[4] != "/normal/path" {
+		t.Fatalf("路径必须原样进 argv（无转义），got %q %q", args[3], args[4])
 	}
 	if strings.Contains(trashScript, `POSIX file %q`) || strings.Contains(trashScript, "%q") {
 		t.Error("脚本不得内插路径")
@@ -178,5 +180,67 @@ func TestParseTrashOutputDropsBadLines(t *testing.T) {
 	// 空输出 → 空映射（非 nil），调用方按「去向未知」逐项处理
 	if m3 := parseTrashOutput("", nil); m3 == nil || len(m3) != 0 {
 		t.Errorf("空输出应为空映射, got %+v", m3)
+	}
+}
+
+// M211（2026-09-24 第五轮审查批）：paths 前必须有 "--" 终止符。
+// 取证（本机实测）：osascript 在 `--` 之前按自身选项解析后续 token——
+// 文件名 "-dash.txt" → `illegal option -- d` rc=2（整批失败）；
+// 文件名恰 "-i" → rc=0 且零输出（handler 根本没跑）→ executor 记整批 done 虚账。
+// 本条是**修前红探针**：改前 osascriptArgs 无 "--"，必须红。
+func TestOsascriptArgsDashTerminator(t *testing.T) {
+	paths := []string{"-dash.txt", "/normal/path"}
+	args := osascriptArgs(paths)
+	term := -1
+	for i, a := range args {
+		if a == "--" {
+			term = i
+			break
+		}
+	}
+	if term < 0 {
+		t.Fatalf("args 必须在 paths 之前含 -- 终止符，got %#v", args)
+	}
+	if len(args) != term+1+len(paths) {
+		t.Fatalf("-- 之后必须恰是全部 paths（原样，无转义），got %#v", args)
+	}
+	for i, p := range paths {
+		if args[term+1+i] != p {
+			t.Errorf("paths[%d] = %q, want %q", i, args[term+1+i], p)
+		}
+	}
+	// 空批次不得悬空 "--"
+	if got := osascriptArgs(nil); len(got) != 2 || got[0] != "-e" {
+		t.Errorf("空 paths 应只有 [-e script]，got %#v", got)
+	}
+}
+
+// M211 P-211-b（行为级，安全：count 脚本不触 Finder、不碰文件）：
+// 以生产同一条构造路径（osascriptArgsFor）把 "-i"/"-dash.txt" 交给真 osascript，
+// 必须原样数回 3 个 argv。若哪天 "--" 被删（变异 M-211-2），本条当场红：
+// "-i" 吞掉后续 token → 计数失真或 rc≠0。
+func TestOsascriptDashArgFidelity(t *testing.T) {
+	const countScript = "on run argv\nreturn (count of argv) as string\nend run"
+	paths := []string{"-i", "-dash.txt", "n.txt"}
+	cmd := exec.Command("osascript", osascriptArgsFor(countScript, paths)...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("osascript 真跑失败（- 开头路径被当选项？）: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "3" {
+		t.Fatalf("argv 计数 = %q, want 3（-- 之后 3 条路径须原样进 handler）", got)
+	}
+}
+
+// M211 P-211-c：零配对防线的三格判据。
+func TestBatchOutputGap(t *testing.T) {
+	if !batchOutputGap(0, 5) {
+		t.Error("5 输入零配对必须判缺口（-i 静默形状）")
+	}
+	if batchOutputGap(5, 5) {
+		t.Error("全配对不得判缺口")
+	}
+	if batchOutputGap(0, 0) {
+		t.Error("空批次平凡通过（defaultTrash 已在入口拦 len==0，这里双保险）")
 	}
 }
