@@ -20,8 +20,12 @@ import (
 //
 // 返回目标完整路径。需要知道"数据是否真的离开源卷"的调用方用 moveFileDetailed
 // （M40：执行器的 Reclaimed 只认跨卷那一格）。
+//
+// 本入口**不带落点复审**（M204 那一格只在有授权依据的调用方那里成立——
+// 只有 app 层知道自己是被用户经对话框授权了哪些根）。清理执行器走
+// moveFileDetailed 并传 `Options.MoveLandingAllowed`。
 func MoveFile(src, targetDir string) (string, error) {
-	dst, _, err := moveFileDetailed(src, targetDir)
+	dst, _, err := moveFileDetailed(src, targetDir, nil)
 	return dst, err
 }
 
@@ -31,7 +35,11 @@ func MoveFile(src, targetDir string) (string, error) {
 //
 // 为什么这条判据只能从这里出（M40，§24.3.2）：EXDEV 只有 rename 那一刻知道，
 // 上层要分辨就得自己再问一遍卷，两处实现必然漂移（I5）。
-func moveFileDetailed(src, targetDir string) (string, bool, error) {
+//
+// checkLanding 是 M204（2026-09-24 裁定）的落点复审：在名字已经定下来、
+// **数据还没动一步**的这一点，把实际落点交回调用方问一次"还在授权树里吗"。
+// nil ⇒ 不复审（回撤腿与 fdd-cli 没有授权集可问）。
+func moveFileDetailed(src, targetDir string, checkLanding func(landingPath string) error) (string, bool, error) {
 	if targetDir == "" {
 		return "", false, fmt.Errorf("未指定目标目录")
 	}
@@ -41,6 +49,18 @@ func moveFileDetailed(src, targetDir string) (string, bool, error) {
 	dst, err := claimDst(targetDir, filepath.Base(src))
 	if err != nil {
 		return "", false, err
+	}
+
+	// M204：复审必须在 claimDst **之后**——裁定句"按实际落点"里的"实际"就是
+	// 递增改名之后的那个名字；也必须严格早于 rename/复制，否则复审就只是记账。
+	// ★ 自觉代价（设计稿 §2-4）：claimDst 的 O_EXCL 创建早于这一点，所以目标树
+	// 若已被换成外部链接，外部会先多出一个**零字节**占位，随即由 release 按
+	// 身份证明清掉；数据一个字节都不出去。
+	if checkLanding != nil {
+		if err := checkLanding(dst.path); err != nil {
+			dst.release()
+			return "", false, err
+		}
 	}
 
 	if err := renameFile(src, dst.path); err == nil {

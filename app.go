@@ -604,6 +604,40 @@ func (a *App) moveTargetAllowed(dir string) bool {
 	return false
 }
 
+// authSnapshotLocked 取授权目录集合的不可变拷贝。**调用方须持 a.mu**。
+func (a *App) authSnapshotLocked() []string {
+	roots := make([]string, 0, len(a.authDirs))
+	for dir := range a.authDirs {
+		roots = append(roots, dir)
+	}
+	return roots
+}
+
+// landingGuard 生成 move 腿的**落点复审**（M204）：给实际落点全路径（含 `name_1.ext`
+// 递增后的那个名字），解析成真实物理位置后问一次"还在授权树里吗"。
+//
+// 判据与入口那次 `moveTargetAllowed` **同一份**（`resolveTargetPath` + `withinDir`
+// 都只有一处实现——AS-H6 一族点名的形状是"两处实现必然漂移"），差别只在问的对象：
+// 入口问的是用户填的名义目录，这里问的是即将写入的那个具体位置。
+//
+// ★ fail-closed：解析不动即拒绝（"解析不了就先放行"正是 AS-H3 那笔修掉的形状）。
+// 返回的闭包不触碰 `a` 的任何字段，只捕获 `roots` 切片 ⇒ 执行器在锁外调用安全。
+func (a *App) landingGuard(roots []string) func(string) error {
+	return func(landing string) error {
+		resolved, err := resolveTargetPath(landing)
+		if err != nil {
+			return fmt.Errorf("移动目标在操作期间已不可解析，已拒绝移动（源文件未改动）：%s", landing)
+		}
+		for _, auth := range roots {
+			if withinDir(resolved, auth) {
+				return nil
+			}
+		}
+		return fmt.Errorf("移动目标在操作期间被替换（链接或改名），实际落点已不在授权目录内，"+
+			"已拒绝移动且未改动源文件：%s", landing)
+	}
+}
+
 // resolveTargetPath 返回 path 的真实物理位置：对**最近的已存在祖先**求
 // EvalSymlinks，再把尚不存在的那段尾段原样接回（不存在的段谈不上链接）。
 //
@@ -2319,9 +2353,19 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 	}
 	// H5：move 的目标是前端传入的字符串——只允许落在本会话经原生对话框
 	// 选择过的目录（或其子目录）内，堵住"绑定层写任意路径"的越权面。
-	if op.Kind == "move" && !a.moveTargetAllowed(op.TargetDir) {
-		a.mu.Unlock()
-		return "", fmt.Errorf("移动目标无效或未经选择目录对话框授权，请重新选择目标目录")
+	//
+	// M204（2026-09-24 裁定）：这一次校验管不到派发窗口——放行之后才是逐文件校验
+	// 与串行搬移，窗口内目标被换成指向别处的链接就会写越界。故在**同一把锁内**
+	// 取授权集快照，交给执行器逐条目复审（见 ops.Options.MoveLandingAllowed）。
+	// 取快照而不是让执行器读 a.authDirs：① 执行器在另一条 goroutine 上，读活表是
+	// 数据竞争；② 用户中途又能选目录会让授权集漂，"这一批凭什么被放行"必须有唯一时刻。
+	var moveLanding func(string) error
+	if op.Kind == "move" {
+		if !a.moveTargetAllowed(op.TargetDir) {
+			a.mu.Unlock()
+			return "", fmt.Errorf("移动目标无效或未经选择目录对话框授权，请重新选择目标目录")
+		}
+		moveLanding = a.landingGuard(a.authSnapshotLocked())
 	}
 	// M61（04 §6.11 APP-13）：S4「永久删除须显式确认」原先只在执行器里
 	//（internal/ops/executor.go 的 delete 分支），而本函数的写前账本 beginJournal
@@ -2433,6 +2477,8 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			// 平台能力声明：Windows 的回收站实现会独立复核落位，
 			// 故"源消失但无落点"必须按失败上报（见 ops.TrashVerifiesRecycle）。
 			TrashVerifiesRecycle: ops.TrashVerifiesRecycle(),
+			// M204：move 腿每个条目在实际落点上复审一次授权（非 move 操作恒 nil）。
+			MoveLandingAllowed: moveLanding,
 			OnProgress: func(done, total int, current string) {
 				a.emit(a.ctx, "ops:progress", model.OpsProgress{Done: done, Total: total, Current: current})
 			},

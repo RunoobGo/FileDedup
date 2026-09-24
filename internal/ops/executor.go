@@ -144,6 +144,24 @@ type Options struct {
 	//
 	// 默认 false 以保持既有平台行为不变；Windows 由 app 层显式置为 true。
 	TrashVerifiesRecycle bool
+
+	// MoveLandingAllowed 是 move 腿的**落点复审**（M204，2026-09-24 裁定
+	// 「rename 前按实际落点复审 withinDir」，设计稿 `2026-09-24-move-landing-recheck-m204`）。
+	//
+	// 为什么需要它：入口那次 `moveTargetAllowed` 与真正的 rename 之间隔着整个派发窗口
+	// （逐文件校验 + 串行搬移），窗口内目标目录被第三方换成指向别处的链接时，
+	// MkdirAll + claimDst + rename 会顺着链接写到用户从未授权的位置，而执行器
+	// 原本只复核**被搬的文件**的身份、从不复问落点归属。
+	//
+	// 调用时机与契约：每个条目恰好一次，落在 `claimDst` 定下名字之后、
+	// rename/跨卷复制**之前**；参数是**实际落点全路径**（含 `name_1.ext` 递增）。
+	// 返回非 nil 即判这一项失败：数据不动一步、占位由本包 release 清掉、源文件保留。
+	//
+	// ★ 为什么走 Options 而不是 `model.OpRequest`：后者是前端序列化来的值对象，
+	// 授权依据放进请求体等于让请求方自己填。判据本身留在 app 层
+	// （`resolveTargetPath` + `withinDir` 只有一份，见 AS-H6 一族）。
+	// nil ⇒ 不复审，行为与改前完全一致（回撤腿、fdd-cli、既有测试都走这一档）。
+	MoveLandingAllowed func(landingPath string) error
 }
 
 // adsCheck NTFS 备用数据流判据（M6-P3）。抽成包级变量供测试注入假判据：
@@ -705,7 +723,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			// 文件整体搬走、内容不丢，扫到的哈希对不上也不会销毁任何东西。把它们纳进来
 			// 就是拿两倍的读盘换零收益。（delete/hardlink/symlink 三条腿会销毁 dup 原内容，
 			// 那边才接。别"顺手补一致"。）
-			dst, crossVol, err := moveFileDetailed(e.Path, op.TargetDir)
+			dst, crossVol, err := moveFileDetailed(e.Path, op.TargetDir, opts.MoveLandingAllowed)
 			switch {
 			case err != nil:
 				// M89（§24.3.1）：部分成功（MoveFile 已复制出副本、只是没删成源）
