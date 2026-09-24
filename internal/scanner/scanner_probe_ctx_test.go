@@ -106,7 +106,7 @@ func TestDedupeRootsPropagatesProbeError(t *testing.T) {
 	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
 		return fscase.Result{}, want
 	}
-	kept, _, _, verdicts, err := dedupeRoots(context.Background(), roots, false)
+	kept, _, _, verdicts, _, err := dedupeRoots(context.Background(), roots, false)
 	if !errors.Is(err, want) {
 		t.Fatalf("dedupeRoots 把探测的错误吞了：err=%v want=%v", err, want)
 	}

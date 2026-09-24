@@ -234,7 +234,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	// M105（设计稿 §28.3 补记二）：单根是否探测取决于**有没有排除模式**。判重（≥2 根）
 	// 那条消费方一直在；排除模式这条是这批新接上的，没有它时探测结果无人可读，
 	// C1 的"别往用户目录写探测文件"原口径继续成立。
-	cleaned, all, unproven, rootVerdicts, err := dedupeRoots(ctx, roots, len(f.ExcludePaths) > 0)
+	cleaned, all, unproven, rootVerdicts, covered, err := dedupeRoots(ctx, roots, len(f.ExcludePaths) > 0)
 	if err != nil {
 		// R2-2：卷语义探测被中断 ⇒ 折叠判据没问全，**绝不**带着没问全的根集合继续扫
 		// （darwin/windows 的默认值是"不敏感"，在这里退默认等于把两棵真不同的树折成一棵，
@@ -244,6 +244,17 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		return res
 	}
 	res.CaseProbeUnproven = unproven
+	// M212（2026-09-24 第五轮审查批）：遍历根集 = cleaned ∪ covered（联合语义）。
+	// 被宽根丢弃的具名子根必须自己作为根提交：宽根的下降走不进它的隐藏祖先
+	// （:隐藏剪枝）——"用户明明点名了，整棵子树零留痕漏扫"就是改前形状。
+	// visited 预登记让"根提交"与"父下降"互斥（出队处 seen 判定），防双扫双计。
+	// ★ 刻意**不**扩 prefixes/rootVerdicts（covered 文件 relativeTo 落宽根前缀，
+	//   同卷同 verdict）与 startUnprot（其警示由遍历期 :428 逃逸分支给，
+	//   扩了会双记——偏差已在 §6.40 留痕）。
+	walkRoots := cleaned
+	if len(covered) > 0 {
+		walkRoots = append(append(make([]string, 0, len(cleaned)+len(covered)), cleaned...), covered...)
+	}
 	// G2：根前缀预计算一次，供每个文件的 relativeTo 复用
 	prefixes := rootPrefixes(cleaned)
 	// G3：过滤器预编译一次（扩展名集合建 map），供全部 worker 只读复用
@@ -264,8 +275,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 	// M6-P4：盘根伪文件的锚点。**原样字符串**比对即可，不必折叠：遍历期的 dir
 	// 只有两种来源——用户给的根（就是这份字符串本身）或 filepath.Join(父, 名字)，
 	// 后者永远不等于任何根。做折叠反而会引入"根的两种拼写谁赢"的无谓分支。
-	scanRoots := make(map[string]bool, len(cleaned))
-	for _, r := range cleaned {
+	scanRoots := make(map[string]bool, len(walkRoots))
+	for _, r := range walkRoots {
 		scanRoots[r] = true
 	}
 	// M6-P4 逃逸判据要用**用户原始指定的全部根**（含被宽根覆盖而丢弃的子根）：
@@ -311,8 +322,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 		pend    sync.WaitGroup // 在途目录计数（队列中 + 处理中）
 	)
 
-	for i := range cleaned {
-		visited[visitKey(cleaned[i])] = struct{}{}
+	for i := range walkRoots {
+		visited[visitKey(walkRoots[i])] = struct{}{}
 	}
 
 	// submit 投递目录：先计数再入队（保证 closer 的 Wait 不早于 Add）。
@@ -545,7 +556,8 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 
 	// 先投递根目录（完成全部 Add），再启动 closer：
 	// 在途计数归零 → 关闭队列 → worker 逐个退出。
-	for _, r := range cleaned {
+	for _, r := range walkRoots {
+		// M212：covered 根在此一并提交（先经 visited 预登记，与父下降互斥）。
 		submit(r)
 	}
 	go func() {
@@ -644,6 +656,9 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 // 那一格（04 §6.11 FLT-3）在最常见形态上原样留着；无排除模式时探测结果没有任何消费方，
 // C1 的原口径继续成立。
 //
+// 第五个返回值 covered 是 M212 的"被宽根严格覆盖的具名根"（联合语义要另行作根提交）；
+// 第六个才是 error。
+//
 // 第四个返回值 keepVerdicts 与 kept **同序**（不是与 all 同序）：调用点拿 relativeTo 的
 // 根下标去取，错位比不放宽更糟（把 A 卷的语义按到 B 卷的根上）。
 //
@@ -652,7 +667,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 // 死挂载上可以永远不返回 ⇒ 扫描停在 Scanning、Cancel 无效。错误**不**折成"退默认继续"：
 // darwin/windows 的默认值是"不敏感"（fscase/default_insensitive.go），在这里退默认就是把两棵
 // 真不同的树折成一棵（fscase 包注释 :5-8 写过两遍的那格静默漏扫）。
-func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]string, []string, int, []fscase.Result, error) {
+func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]string, []string, int, []fscase.Result, []string, error) {
 	var out []string
 	for _, r := range roots {
 		if r == "" {
@@ -665,7 +680,7 @@ func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]s
 		out = append(out, filepath.Clean(abs))
 	}
 	if len(out) == 0 || (len(out) == 1 && !probeSingleRoot) {
-		return out, out, 0, nil, nil
+		return out, out, 0, nil, nil, nil
 	}
 	// M66（04 §6.11 SCN-4）：卷读数必须在排序**之前**算——排序键要用它。探测与顺序无关，
 	// 所以上移本身不改任何结论；单根只在 `probeSingleRoot` 为真时才走到这里（C1 的
@@ -678,7 +693,7 @@ func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]s
 		v, err := probeCaseVerdict(ctx, r)
 		if err != nil {
 			// 根集合已规范化（下面调用点仍拿得到它），但折叠判据没问全 ⇒ 不猜，直接交回错误。
-			return out, out, unproven, nil, err
+			return out, out, unproven, nil, nil, err
 		}
 		verdicts[i] = v
 		if !verdicts[i].Proven {
@@ -717,8 +732,17 @@ func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]s
 	out, verdicts = sortedPaths, sortedVerdicts
 	var kept []string
 	var keepVerdicts []fscase.Result
+	// M212（2026-09-24 第五轮审查批）：被丢弃的根分两类——"同树另一拼写"
+	// （折叠键相等，M66 防双扫的正身，**不得**另行提交）与"用户点名的严格子根"
+	// （折叠键严格长于某 kept ⇒ 宽根走不进它的隐藏/保护祖先目录，丢弃即整棵
+	// 静默漏扫）。后者必须原样交回调用方另作根提交（联合语义，见 Scan）。
+	// coveredFkeys 供嵌套具名根互斥：inner 与其后代 inner/deep 同被点名时只提交
+	// 先到的祖先（out 已按折叠键排序，祖先必在前，其遍历本就覆盖后代）。
+	var covered []string
+	var coveredFkeys []string
 	for i, r := range out {
 		dup := false
+		var coverFk string
 		// M26：比较键的归一在 fscase.Fold 的替换腿里完成，前缀判定走 pathnorm.Under，
 		// 两者都在 "/" 空间里，
 		// 与平台分隔符无关。修前这里写的是 fk+string(filepath.Separator)，
@@ -735,15 +759,30 @@ func dedupeRoots(ctx context.Context, roots []string, probeSingleRoot bool) ([]s
 			fk := fscase.Fold(k, keepVerdicts[j].Sensitive)
 			if pathnorm.Under(fr, fk) {
 				dup = true
+				coverFk = fk
 				break
 			}
 		}
 		if !dup {
 			kept = append(kept, r)
 			keepVerdicts = append(keepVerdicts, verdicts[i])
+			continue
+		}
+		if strings.HasPrefix(fr, coverFk+"/") {
+			shadowed := false
+			for _, cf := range coveredFkeys {
+				if pathnorm.Under(fr, cf) {
+					shadowed = true
+					break
+				}
+			}
+			if !shadowed {
+				covered = append(covered, r)
+				coveredFkeys = append(coveredFkeys, fr)
+			}
 		}
 	}
-	return kept, out, unproven, keepVerdicts, nil
+	return kept, out, unproven, keepVerdicts, covered, nil
 }
 
 // rootPrefixes 预计算「根 + 分隔符」前缀（G2）。

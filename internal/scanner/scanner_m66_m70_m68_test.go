@@ -49,7 +49,7 @@ func TestDedupeRootsSortsByFoldKey(t *testing.T) {
 	} // 扮演"两个根都在不敏感卷上"
 
 	// 原样串里 'B'(0x42) < 'b'(0x62) ⇒ 子根先排序在前；折叠后 "/data/b" 才是父根。
-	kept, all, _, _, _ := dedupeRoots(context.Background(), []string{"/data/B/A", "/data/b"}, false)
+	kept, all, _, _, _, _ := dedupeRoots(context.Background(), []string{"/data/B/A", "/data/b"}, false)
 	if len(all) != 2 {
 		t.Fatalf("去重前的全部根 = %v, want 2 条", all)
 	}
@@ -65,7 +65,7 @@ func TestDedupeRootsKeepsUnrelatedRootsAfterSortFix(t *testing.T) {
 	probeCaseVerdict = func(context.Context, string) (fscase.Result, error) {
 		return fscase.Result{Sensitive: false, Proven: true}, nil
 	}
-	kept, _, _, _, _ := dedupeRoots(context.Background(), []string{"/data/zz/sub", "/data/b"}, false)
+	kept, _, _, _, _, _ := dedupeRoots(context.Background(), []string{"/data/zz/sub", "/data/b"}, false)
 	want := []string{rootWant(t, "/data/b"), rootWant(t, "/data/zz/sub")}
 	if !reflect.DeepEqual(kept, want) {
 		t.Fatalf("kept = %v, want %v（无父子关系的两根都要留）", kept, want)

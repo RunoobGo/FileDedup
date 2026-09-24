@@ -122,7 +122,7 @@ func TestKeepVerdictsAlignedWithKeptRoots(t *testing.T) {
 		"zeta": {Sensitive: true, Proven: true},
 	}
 	stubVerdict(t, want)
-	kept, _, _, verdicts, _ := dedupeRoots(context.Background(), []string{wide, sub, sibling}, false)
+	kept, _, _, verdicts, _, _ := dedupeRoots(context.Background(), []string{wide, sub, sibling}, false)
 	if len(kept) != 2 || len(verdicts) != 2 {
 		t.Fatalf("夹具应为 wide+zeta 两根（sub 被覆盖丢弃）、读数两份，实得 kept=%d verdicts=%d",
 			len(kept), len(verdicts))
