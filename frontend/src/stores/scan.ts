@@ -182,10 +182,13 @@ export const useScanStore = defineStore('scan', () => {
 
   function refreshStatus() {
     if (!isBackendAvailable()) return
+    // M215：本函数从 scan:stage/app:ready 等事件回调里调用，getStatus 无 error 返回，
+    // 传输层 reject 时裸 .then 会漏出 unhandled rejection——与下方 getStartupNotice/
+    // getSettings 两处同构补 .catch（状态下一拍事件自然刷回，不必在这里再发事件）。
     api.getStatus().then((s: string) => {
       status.value = s
       scanning.value = ['Scanning', 'Prefiltering', 'Hashing', 'Paused'].includes(s)
-    })
+    }).catch(() => {})
   }
 
   // M16：为"done 早于 startScan 回包"这条竞速留的记账——收到几次 scan:done、

@@ -246,4 +246,3 @@ func TestQuarantineNoSideFilesUnchanged(t *testing.T) {
 		t.Errorf("隔离名不合约定：%s", filepath.Base(got))
 	}
 }
-

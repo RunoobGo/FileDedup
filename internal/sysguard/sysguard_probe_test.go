@@ -16,6 +16,8 @@ package sysguard
 import (
 	"strings"
 	"testing"
+
+	"filededup/internal/pathnorm"
 )
 
 func TestReservedNameCLOCKIsReservedOnWindows(t *testing.T) {
@@ -172,5 +174,51 @@ func TestAbsPathEntryReliesOnConstantBackslashSwap(t *testing.T) {
 	// 见 table 注释"大小写精确、只认绝对根"）。
 	if d := g.Dir(`C:\windows\system32`, "system32"); d.Skip {
 		t.Error("absPath 变成大小写不敏感：/System 与镜像根目录里的同名目录会互相误伤")
+	}
+}
+
+// M216（2026-09-24 第五轮审查批）：包尾注释声称"条目侧统一走 Slash+TrimTailKeepRoot"，
+// 改前 New() 只对 prefix/suffix 折小写、eAbsPath.name 原样入桶，归一只发生在查询侧。
+// 现读内置 13 条 absPath 全是干净 POSIX 形 ⇒ 今日无实害，但下一条按注释形状登记的
+// "/dev/"（尾斜杠）或反斜杠形条目会静默失配 —— latent fail-open：保护清单不命中且
+// 毫无征兆，正是这包最怕的那一类缺陷。
+//
+// ★ 故意改全局 table 再装配（同 APP-9 / 反斜杠恒换探针的写法）；本包无 t.Parallel。
+func TestM216AbsPathEntryNormalizedAtAssembly(t *testing.T) {
+	// P-216-a（修前真红）：登记"看着最自然"的尾斜杠形，后代必须照样被挡。
+	defer func(orig []entry) { table = orig }(table)
+	table = append(append([]entry{}, table...), entry{
+		kind: eAbsPath, plat: pAll, name: "/audit-probe-dir/", // ★ 故意带尾斜杠
+		why: "M216 探针：条目侧尾斜杠必须被 New() 归一",
+	})
+
+	g := New(PlatformLinux)
+	if d := g.Dir("/audit-probe-dir/sub", base("/audit-probe-dir/sub")); !d.Skip {
+		t.Errorf("尾斜杠条目 /audit-probe-dir/ 未挡住其后代（Kind=%v）：条目侧未归一 ⇒ Under 落在不同键空间（改前红）", d.Kind)
+	}
+	// 归一不能把匹配放宽：只差一个分隔符的邻居不得被误伤（Under 的分隔符边界）。
+	if d := g.Dir("/audit-probe-dirX/sub", base("/audit-probe-dirX/sub")); d.Skip {
+		t.Error("/audit-probe-dirX 被误挡：归一只去尾斜杠，不放宽匹配语义")
+	}
+}
+
+// P-216-b（自检锚）：遍历内置表，断言每条 absPath 名**已等于**其归一值——
+// 防"注释又跑回实现前面"。现读内置 absPath 13 条全为干净 POSIX 形，本条对现状恒绿，
+// 它拦的是"未来有人登记了未归一形状、却又没像 M216 探针那样显式改表"的漂移。
+func TestM216BuiltinAbsPathEntriesAreAlreadyNormalized(t *testing.T) {
+	var checked int
+	for _, e := range table {
+		if e.kind != eAbsPath {
+			continue
+		}
+		checked++
+		want := pathnorm.TrimTailKeepRoot(pathnorm.Slash(e.name, "\\"))
+		if e.name != want {
+			t.Errorf("内置 absPath 条目 %q 非归一形（应为 %q）：装配期归一与登记形不符", e.name, want)
+		}
+	}
+	// M146 下界：清单被删空 ⇒ 本条循环 0 次照样绿，等于没跑。现读 13 条，下界 12。
+	if checked < 12 {
+		t.Fatalf("absPath 条目数 = %d，下界 12：判据清单被删空 ⇒ 本条等于没跑（M146）", checked)
 	}
 }

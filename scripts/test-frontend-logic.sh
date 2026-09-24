@@ -104,6 +104,39 @@ wiring_count() { # $1=文件 $2=串 $3=期望次数 $4=说明
 		wiring_fail=$((wiring_fail + 1))
 	fi
 }
+# wiring_window <文件> <锚串> <下方行数> <须见串> <说明>
+# ★ M215（2026-09-24 第五轮审查批）补的第三把尺子：wiring() 全文件 grep 钉不住
+#   "**这一处**挂了 .catch"——scan.ts 里别处本就有十几条 .catch，把 refreshStatus 的
+#    promise 退回裸 .then，全文件 grep 仍假绿（R4-4 同族缺口的行窗口版）。
+#   语义：每一处锚串命中行的"本行起下方 N 行"窗口内都必须见须见串（多处锚 = 多处都要过）。
+wiring_window() { # $1=文件 $2=锚串 $3=窗口行数 $4=须见串 $5=说明
+	wiring_total=$((wiring_total + 1))
+	local file="$1" anchor="$2" span="$3" want="$4" why="$5"
+	local lines n missing=0
+	if [ ! -f "$FE/$file" ]; then
+		printf '  \033[31m✗ 找不到 %s，接线断言无法执行\033[0m\n' "$file" >&2
+		wiring_fail=$((wiring_fail + 1))
+		return
+	fi
+	lines=$(grep -nF -- "$anchor" "$FE/$file" | cut -d: -f1)
+	if [ -z "$lines" ]; then
+		printf '  \033[31m✗ %s（锚 %s 已不在文件中）\033[0m\n' "$why" "$anchor" >&2
+		wiring_fail=$((wiring_fail + 1))
+		return
+	fi
+	for n in $lines; do
+		if ! sed -n "$((n)),$((n + span))p" "$FE/$file" | grep -qF -- "$want"; then
+			missing=$((missing + 1))
+		fi
+	done
+	if [ "$missing" = "0" ]; then
+		printf '  ✓ %s\n' "$why"
+	else
+		printf '  \033[31m✗ %s（%s 处锚点下方 %s 行窗口内未见 %s）\033[0m\n' \
+			"$why" "$missing" "$span" "$want" >&2
+		wiring_fail=$((wiring_fail + 1))
+	fi
+}
 wiring 'src/components/GroupCard.vue' 'store.groupSelCount(group)' 'group.files.length - 1' \
 	'组内冗余项数取自 store.groupSelCount（M18：组件不得自算）'
 wiring 'src/components/ConfirmDialog.vue' 'reclaimLine(' 'humanBytes' \
@@ -242,6 +275,12 @@ wiring 'src/components/FailedDrawer.vue' 'api.openPath(' '' \
 # 视图把按钮藏起来只会让用户以为功能坏了（M83 那一族"点了没反应"的镜像——这次是"没点可点"）。
 wiring 'src/components/FailedDrawer.vue' 'api.openPath(' 'v-if="f.Path"' \
 	'按钮不因路径看着为空就消失（功能 4：AS-H6，前端不重算判据）'
+# M215（2026-09-24 第五轮审查批）：refreshStatus 的 getStatus 挂在事件回调路径上
+# （scan:stage / app:ready），GetStatus 无 error 返回 ⇒ 传输层 reject 时裸 .then
+# 漏出 unhandled rejection。判据是"该 .then 就地挂了 .catch"——全文件 grep 挡不住
+# （别处本就有一堆 .catch），必须走行窗口。
+wiring_window 'src/stores/scan.ts' 'api.getStatus().then' 5 '.catch' \
+	'refreshStatus 的 getStatus promise 就地挂了 catch（M215：事件回调不得漏 rejection）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

@@ -416,6 +416,9 @@ func (c *Cache) Touch(paths []string) (err error) {
 
 // LastHit 读取条目 last_hit（诊断/测试用：验证命中续期语义）。
 func (c *Cache) LastHit(path string) (int64, bool) {
+	if c.corrupt.Load() {
+		return 0, false // M214：停用后不再发 SQL，与 Lookup 同档
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var ts int64
@@ -461,6 +464,12 @@ func (c *Cache) evictLocked() error {
 // 重算，因此常态下零全表扫描；仅在 Clear 之后的首查走一次 COUNT（不回写，
 // 避免持读锁写共享字段与并发 GetStats 竞争）。
 func (c *Cache) GetStats() (Stats, error) {
+	if c.corrupt.Load() {
+		// M214：停用期不再发 SQL。返回的是**说谎的零**（不代表空库），
+		// 真状态由调用方经 Corrupted() 单独问——停用后继续拉统计只会每轮
+		// 拿一条英文 SQL 错，不如安静给零并靠 Corrupted 兜住语义。
+		return Stats{}, nil
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var s Stats
@@ -482,6 +491,9 @@ func (c *Cache) GetStats() (Stats, error) {
 
 // Clear 清空缓存。
 func (c *Cache) Clear() error {
+	if c.corrupt.Load() {
+		return ErrCorruptDisabled // M214：停用后不再发 SQL，与 Lookup/Store/Touch 同档
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.db.Exec(`DELETE FROM hash_cache`)

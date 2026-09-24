@@ -14,6 +14,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,5 +137,55 @@ func TestM202NilErrorYieldsEmptyPayload(t *testing.T) {
 	}
 	if got := errorEvent(nil); got["error"] != "" {
 		t.Errorf("nil 错误不该有外壳：%q", got)
+	}
+}
+
+// M214（第五轮审查批）：RPC **返回腿**同壳。shellRPCError 是新函数 ⇒
+// 无改前红，判据由变异顶（M-214-1：恒 `return err` 不包裹 ⇒ 下面 P-1/P-3 格红）。
+func TestM214RPCErrorGetsSameShell(t *testing.T) {
+	// P-214-c（设计段登记的换路形状）：真 OS 错误 → "中文壳（系统原文：裸串）"两段俱在。
+	missing := filepath.Join(t.TempDir(), "definitely-not-here")
+	_, oerr := os.Open(missing)
+	if oerr == nil {
+		t.Fatal("前提：打开不存在的路径必须失败")
+	}
+	got := shellRPCError(oerr)
+	if got == nil {
+		t.Fatal("RPC 错误不该被吞成 nil")
+	}
+	msg := got.Error()
+	if !strings.Contains(msg, "（系统原文：") || !strings.Contains(msg, oerr.Error()) {
+		t.Errorf("必须保留可排查的系统原文段：%q", msg)
+	}
+	shellPart := strings.SplitN(msg, "（系统原文：", 2)[0]
+	if shellPart == "" || strings.ContainsAny(shellPart, "abcdefghijklmnopqrstuvwxyz") ||
+		strings.ContainsAny(shellPart, `/\`) {
+		t.Errorf("外壳段应是中文且不含路径（裸 OS 串不许顶格出现）：%q", shellPart)
+	}
+	if shellPart == "操作未能完成（未分类的系统错误）" {
+		t.Errorf("真实 errno 落进未分类档 ⇒ 签名表漏档：原文 %q", oerr)
+	}
+
+	// B 档护栏：应用自撰中文必须**原样返回同一个错误值**——
+	// CacheClear 透传的 ErrCorruptDisabled 等哨兵靠这条保住 errors.Is 身份。
+	sentinel := errors.New("哈希缓存库在运行期确证损坏，已停用：不影响去重结果")
+	if shellRPCError(sentinel) != sentinel {
+		t.Error("自撰中文被重新包裹 ⇒ 哨兵身份丢失（errors.Is 将失真）")
+	}
+	wrapped := fmt.Errorf("外层: %w", sentinel)
+	if got := shellRPCError(wrapped); got != wrapped {
+		t.Error("含 CJK 的包装错误也应原样穿过（不降级已有信息）")
+	}
+
+	// C 档：认不出的英文 → 未分类壳 + 原文保留。
+	weird := errors.New("weird internal thing 42 happened")
+	if got := shellRPCError(weird); !strings.HasPrefix(got.Error(), "操作未能完成（未分类的系统错误）") ||
+		!strings.Contains(got.Error(), "weird internal thing 42 happened") {
+		t.Errorf("未分类档形状不对：%v", got)
+	}
+
+	// nil 必须穿过 nil（六处调用点都在 err!=nil 分支之外还有 CacheStats 的 nil 腿）。
+	if shellRPCError(nil) != nil {
+		t.Error("nil 必须返回 nil")
 	}
 }

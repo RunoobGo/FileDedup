@@ -18,7 +18,10 @@
 // （用户可见口径写在 docs/09 §6.5「错误提示的两段式」与 docs/10 §3.9）。
 package main
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // errorShellRule 的 needle 一律小写，匹配前把错误串 ToLower。
 type errorShellRule struct {
@@ -111,4 +114,26 @@ func errorEvent(err error) map[string]string {
 		out["detail"] = detail
 	}
 	return out
+}
+
+// shellRPCError 给 RPC **返回腿**套同一套中文外壳（M214）。
+//
+// 改前 event 通道已被 errorEvent 收编，但方法直接 return 的 err 仍是英文 OS 原句
+// （`open /Users/…: permission denied`）——前端 toast 的 `errText` 把它原样转字符串上屏。
+// 本函数把裸 err 转成「中文外壳（系统原文：裸串）」，与 09 §"错误文案"已立的"系统原文"话术同形。
+//
+// 判据（不能一律套）：errorShell 得 (shell, raw)；
+//   - shell==raw（B 档应用自撰中文，含 ErrCorruptDisabled / ErrEvictFailed 这些哨兵）
+//     ⇒ **原样返回 err**（不是新错误值），保留 errors.Is/errors.As 的身份与包装链，
+//     ★ 绝不给已可读的中文句再包一层壳（信息降级 + 破坏哨兵比对）；
+//   - shell!=raw（A 档英文 errno 命中签名 / C 档未分类 / D 档 panic）⇒ 合成"外壳（系统原文：裸串）"。
+func shellRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+	shell, raw := errorShell(err)
+	if shell == raw {
+		return err
+	}
+	return fmt.Errorf("%s（系统原文：%s）", shell, raw)
 }

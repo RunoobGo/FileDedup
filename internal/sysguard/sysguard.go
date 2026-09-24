@@ -204,6 +204,13 @@ func New(p Platform) *Guard {
 		case eDirName:
 			g.dirNames = append(g.dirNames, e)
 		case eAbsPath:
+			// M216（2026-09-24 第五轮审查批）：absPath 条目侧也要归一，与查询侧
+			// （Dir 里对 dirAbs 走 Slash+TrimTailKeepRoot）同键空间。包尾注释本就
+			// 声称"条目侧统一走 Slash+TrimTailKeepRoot"，改前只对 prefix/suffix 折
+			// 小写、eAbsPath.name 原样入桶——登记成 "/dev/" 或反斜杠形即与查询侧
+			// 不同键、Under 恒假、保护静默失效（latent fail-open）。现读内置 13 条
+			// absPath 全为干净 POSIX 形 ⇒ 今日零行为变化；归一只拦未来的错误登记。
+			e.name = pathnorm.TrimTailKeepRoot(pathnorm.Slash(e.name, "\\"))
 			g.absPaths = append(g.absPaths, e)
 		case ePseudoFile:
 			g.pseudoFiles = append(g.pseudoFiles, e)

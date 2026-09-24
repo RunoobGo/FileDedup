@@ -121,4 +121,3 @@ func rollbackSide(path, quarantined string, moved []string) []string {
 	}
 	return fails
 }
-

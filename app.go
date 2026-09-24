@@ -1216,7 +1216,7 @@ func (a *App) PreviewFile(id uint64) (PreviewData, error) {
 	}
 	f, err := os.Open(e.Path)
 	if err != nil {
-		return PreviewData{}, err
+		return PreviewData{}, shellRPCError(err) // M214：RPC 返回腿不再直通英文 OS 错误
 	}
 	defer f.Close()
 
@@ -1230,7 +1230,7 @@ func (a *App) PreviewFile(id uint64) (PreviewData, error) {
 		}
 		b := make([]byte, e.Size)
 		if _, err := io.ReadFull(f, b); err != nil {
-			return PreviewData{}, err
+			return PreviewData{}, shellRPCError(err)
 		}
 		thumb, err := thumbnail(b, 512)
 		if err != nil {
@@ -1243,7 +1243,7 @@ func (a *App) PreviewFile(id uint64) (PreviewData, error) {
 	buf := make([]byte, min64(e.Size, textLimit))
 	n, err := io.ReadFull(f, buf)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return PreviewData{}, err // 文件短于记录 size：用已读部分
+		return PreviewData{}, shellRPCError(err) // 文件短于记录 size：用已读部分（M214：此腿同壳）
 	}
 	b := buf[:n]
 	if isLikelyText(b) {
@@ -1529,7 +1529,7 @@ func (a *App) SaveSettings(s Settings) (Settings, error) {
 		return s, perr
 	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
-		return s, err
+		return s, shellRPCError(err) // M214：SaveSettings 写文件失败不再直通英文 OS 错误
 	}
 	return s, nil
 }
@@ -2934,7 +2934,8 @@ func (a *App) CacheStats() (cache.Stats, error) {
 	if cch == nil {
 		return cache.Stats{}, fmt.Errorf("缓存不可用")
 	}
-	return cch.GetStats()
+	st, err := cch.GetStats()
+	return st, shellRPCError(err) // M214：透传的 SQL 腿错误套壳（nil 原样穿过）
 }
 
 // CacheClear 清空缓存（M4-T01）。同上（APP-2）。
@@ -2943,7 +2944,7 @@ func (a *App) CacheClear() error {
 	if cch == nil {
 		return fmt.Errorf("缓存不可用")
 	}
-	return cch.Clear()
+	return shellRPCError(cch.Clear()) // M214：DELETE 原始错误套壳；中文哨兵（ErrCorruptDisabled）原样保身份
 }
 
 // thumbnail 生成缩略图（M4-T04）：解码（jpeg/png/gif 首帧）→ 最近邻缩放 → JPEG。
