@@ -126,3 +126,124 @@ func TestQuarantineFailsOnMissingMain(t *testing.T) {
 		t.Fatal("主文件不存在时应返回错误")
 	}
 }
+
+// hasBrokenResidue 报告目录下是否残留任何 .broken-* 隔离名（含主/侧）。
+func hasBrokenResidue(t *testing.T, dir string) (bool, []string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".broken-") {
+			names = append(names, e.Name())
+		}
+	}
+	return len(names) > 0, names
+}
+
+// P-213-a（修前真红 · M213）：-wal 改名成功、-shm 改名失败时，必须
+// ① 返回点名 -shm 的错误（改前 `_ =` 吞掉 ⇒ err==nil ⇒ 首格红）；
+// ② 把已隔离的主文件与已改名的 -wal 全部回滚到原路径（改前不滚 ⇒ 回原位格红）；
+// ③ 不留任何 .broken-* 残留。
+func TestQuarantineSideFailureRollsBackAndErrors(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "cache.db")
+	for _, f := range []string{p, p + "-wal", p + "-shm"} {
+		if err := os.WriteFile(f, []byte("img"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	origRename := renameFile
+	t.Cleanup(func() { renameFile = origRename })
+	// 注入：仅 -shm 的前向改名失败（src 恰为原路径 -shm）。回滚调用 src 是隔离名，不受影响。
+	renameFile = func(src, dst string) error {
+		if src == p+"-shm" {
+			return errors.New("injected: EPERM on -shm")
+		}
+		return origRename(src, dst)
+	}
+
+	_, err := Quarantine(p)
+	if err == nil {
+		t.Fatal("侧文件改名失败必须返回错误（改前静默吞 ⇒ 此格红）")
+	}
+	if !strings.Contains(err.Error(), "-shm") {
+		t.Errorf("错误未点名失败的侧文件 -shm：%v", err)
+	}
+	// 主影像与已改名的 -wal 都应回到原路径。
+	if !Exists(p) {
+		t.Error("主影像未回滚到原路径")
+	}
+	if !Exists(p + "-wal") {
+		t.Error("-wal 未随主影像一起回滚到原路径")
+	}
+	// -shm 从未被挪走，理应仍在原地。
+	if !Exists(p + "-shm") {
+		t.Error("-shm 应仍在原路径（其改名被注入为失败）")
+	}
+	if residue, names := hasBrokenResidue(t, d); residue {
+		t.Errorf("回滚后仍残留 .broken-* 隔离名：%v", names)
+	}
+}
+
+// P-213-c（回滚本身失败 ⇒ 绝不静默）：-wal 改名失败触发回滚，
+// 而主影像回滚也被注入为失败 ⇒ 必须返回点名"勿在原路径重建"的错误，
+// 且主影像确实留在隔离名处（不假装回到原位）。
+func TestQuarantineRollbackFailureIsLoud(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "ledger.db")
+	if err := os.WriteFile(p, []byte("img"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p+"-wal", []byte("wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origRename := renameFile
+	t.Cleanup(func() { renameFile = origRename })
+	renameFile = func(src, dst string) error {
+		if src == p+"-wal" {
+			return errors.New("injected: side -wal rename fails") // 触发回滚
+		}
+		if dst == p {
+			return errors.New("injected: main rollback fails") // 主影像挪不回原位
+		}
+		return origRename(src, dst)
+	}
+
+	_, err := Quarantine(p)
+	if err == nil {
+		t.Fatal("回滚失败仍须返回错误")
+	}
+	if !strings.Contains(err.Error(), "勿在原路径重建") {
+		t.Errorf("回滚失败的错误必须点名'勿在原路径重建'：%v", err)
+	}
+	// 主影像回滚失败 ⇒ 它留在隔离名处（不在原路径）。
+	if Exists(p) {
+		t.Error("主影像回滚被注入为失败，不应出现在原路径")
+	}
+	if residue, _ := hasBrokenResidue(t, d); !residue {
+		t.Error("主影像回滚失败 ⇒ 应能在隔离名处看到 .broken-*（证明它确被挪走且未假装回来）")
+	}
+}
+
+// P-213-b（负控制）：无侧文件时行为与改前一致——err==nil、主文件隔离、原名消失。
+func TestQuarantineNoSideFilesUnchanged(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "solo.db")
+	if err := os.WriteFile(p, []byte("img"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Quarantine(p)
+	if err != nil {
+		t.Fatalf("无侧文件时不应报错：%v", err)
+	}
+	if Exists(p) {
+		t.Error("主文件应已隔离，原路径不该存在")
+	}
+	if !strings.HasPrefix(filepath.Base(got), "solo.db.broken-") {
+		t.Errorf("隔离名不合约定：%s", filepath.Base(got))
+	}
+}
+
