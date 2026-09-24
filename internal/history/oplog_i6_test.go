@@ -8,9 +8,11 @@ import (
 )
 
 // seedExecutedOp 落一条「三项都执行成功」的账（planned→done→Finalize）。
+// 用 delete 类型：它是真正释放磁盘的操作，执行器算出的 reclaimed = 三项之和 6000，
+// 与本 helper 传给 FinalizeOp 的值一致（B6 后 reclaimed 由调用方传入、库内不重算）。
 func seedExecutedOp(t *testing.T, s *Store) int64 {
 	t.Helper()
-	opID, err := s.BeginOp("trash", "", 0, true, opPlans())
+	opID, err := s.BeginOp("delete", "", 0, true, opPlans())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,7 +21,7 @@ func seedExecutedOp(t *testing.T, s *Store) int64 {
 			t.Fatal(err)
 		}
 	}
-	if err := s.FinalizeOp(opID); err != nil {
+	if err := s.FinalizeOp(opID, 6000); err != nil {
 		t.Fatal(err)
 	}
 	return opID

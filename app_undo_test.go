@@ -121,8 +121,11 @@ func TestOpJournalHardlinkRecordsLinkSrc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Kind != "hardlink" || meta.Done != 1 || meta.Reclaimable == 0 {
-		t.Fatalf("meta = %+v", meta)
+	// B6（R-操作-3）：硬链接合并当期不释放磁盘（数据块转为共享），执行器把字节
+	// 记入 LinkedBytes 而非 Reclaimed，历史「回收空间」因此为 0 —— 这是修正后的
+	// 真话；修正前此处按 SUM(size) 记出非零假账，故断言从「!=0」翻正为「==0」。
+	if meta.Kind != "hardlink" || meta.Done != 1 || meta.Reclaimable != 0 {
+		t.Fatalf("meta = %+v（硬链接回收空间应为 0）", meta)
 	}
 	if len(items) != 1 || items[0].State != "done" || items[0].LinkSrc == "" {
 		t.Fatalf("items = %+v，期望 done 且记录 link_src", items)
@@ -304,7 +307,7 @@ func seedDoneOp(t *testing.T, a *App, kind string, undoable bool,
 			t.Fatal(err)
 		}
 	}
-	if err := a.hist.FinalizeOp(opID); err != nil {
+	if err := a.hist.FinalizeOp(opID, 0); err != nil {
 		t.Fatal(err)
 	}
 	return opID

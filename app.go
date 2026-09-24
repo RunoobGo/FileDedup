@@ -2501,8 +2501,10 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 			},
 		}, op)
 		if journalID != 0 {
-			// 残留 planned（取消未派发等）→ cancelled，并冻结 done 计数/回收字节
-			if err := hs.FinalizeOp(journalID); err != nil {
+			// 残留 planned（取消未派发等）→ cancelled，冻结 done 计数；
+			// 回收字节直接落执行器已按 kind 算好的 res.Reclaimed（B6 / R-操作-3：
+			// 库内不再 SUM(size) 重算，避免 trash/链接类/同卷 move 记成假账）。
+			if err := hs.FinalizeOp(journalID, res.Reclaimed); err != nil {
 				a.warnLedger(fmt.Sprintf("操作账本收尾失败：%v，残留的「计划中」条目未归位，回撤范围以历史记录为准", err))
 			}
 		}

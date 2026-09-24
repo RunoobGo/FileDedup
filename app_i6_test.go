@@ -53,7 +53,7 @@ func seedExecutedOp(t *testing.T, a *App, kind string, origs, dests []string,
 			t.Fatal(err)
 		}
 	}
-	if err := a.hist.FinalizeOp(opID); err != nil {
+	if err := a.hist.FinalizeOp(opID, 0); err != nil {
 		t.Fatal(err)
 	}
 	return opID

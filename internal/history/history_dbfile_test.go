@@ -28,7 +28,7 @@ func seedLedger(t *testing.T, p string) {
 	if err := s.FinishItem(jid, "/root/a/0.bin", "/Trash/a.bin", "", StateDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinalizeOp(jid); err != nil {
+	if err := s.FinalizeOp(jid, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

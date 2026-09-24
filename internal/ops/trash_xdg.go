@@ -117,7 +117,19 @@ func moveIntoTrash(src, dst string) error {
 			"复制好的副本留在回收站 %s，源路径现为顶替者 %s，请核对后自行处理其一",
 			errCopiedSrcSwapped, dst, src)
 	}
-	return removeSrc(src)
+	// B4（R-操作-2）：删源失败 ⇒ 源仍在原处、字节未动（复核已通过，不是被顶替）。
+	// 此时 dst 副本是纯多余：调用方 trashXDG 因这不是 errCopiedSrcSwapped 会回滚
+	// trashinfo，副本将退化成**回收站孤儿**（无元数据、DE 看不到、用户无从还原），
+	// executor C6 逐文件重试还会再复制一份、占用翻倍。与上面「复制失败清半成品」同形，
+	// 清掉 dst——归属可证明（本函数刚创建），零数据损失。
+	// ★ 与紧邻的 preRemoveRecheck 失败分支取向**相反**（那支留 dst）：区别在源的身份——
+	// 被顶替时 dst 装的是原件字节、是唯一可还原的留存，必须保；删源失败时原件好端端
+	// 在 src，dst 只是冗余。
+	if err := removeSrc(src); err != nil {
+		os.Remove(dst)
+		return fmt.Errorf("跨卷入回收站时删源失败（源未动、回收站无残留副本，原件仍在 %s）: %w", src, err)
+	}
+	return nil
 }
 
 // nameFree 判定候选名可用：Lstat 报 NotExist 才算空位。

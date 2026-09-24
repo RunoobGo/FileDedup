@@ -54,7 +54,7 @@ func TestBeginOpAllPlanned(t *testing.T) {
 	}
 }
 
-// FinishItem 逐条收口；FinalizeOp 汇总 done 计数与 reclaimed 字节。
+// FinishItem 逐条收口；FinalizeOp 冻结 done 计数，并落调用方（执行器）传入的 reclaimed。
 func TestFinishAndFinalize(t *testing.T) {
 	s := testDB(t)
 	opID, err := s.BeginOp("move", "/dst", 0, true, opPlans())
@@ -67,8 +67,9 @@ func TestFinishAndFinalize(t *testing.T) {
 	if err := s.FinishItem(opID, "/op/b.bin", "", "", StateFailed, "permission denied"); err != nil {
 		t.Fatal(err)
 	}
-	// c.bin 未处理，Finalize 时应转 cancelled
-	if err := s.FinalizeOp(opID); err != nil {
+	// c.bin 未处理，Finalize 时应转 cancelled。
+	// reclaimed 由调用方传入（模拟执行器对跨卷 move 算出的 a.bin=1000）。
+	if err := s.FinalizeOp(opID, 1000); err != nil {
 		t.Fatal(err)
 	}
 	meta, items, err := s.GetOp(opID)
@@ -88,7 +89,7 @@ func TestFinishAndFinalize(t *testing.T) {
 		t.Fatalf("聚合计数 = %+v", meta)
 	}
 	if meta.Reclaimable != 1000 {
-		t.Fatalf("Reclaimable = %d, 期望 1000（仅 done 计）", meta.Reclaimable)
+		t.Fatalf("Reclaimable = %d, 期望 1000（原样落调用方传入值）", meta.Reclaimable)
 	}
 }
 
@@ -107,7 +108,7 @@ func TestMarkItemUndo(t *testing.T) {
 	if err := s.FinishItem(opID, "/op/a.bin", "/Trash/a.bin", "", StateDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FinalizeOp(opID); err != nil {
+	if err := s.FinalizeOp(opID, 0); err != nil {
 		t.Fatal(err)
 	}
 	_, items, _ := s.GetOp(opID)
@@ -176,7 +177,7 @@ func TestListOpsAndClear(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.FinalizeOp(opID); err != nil {
+		if err := s.FinalizeOp(opID, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

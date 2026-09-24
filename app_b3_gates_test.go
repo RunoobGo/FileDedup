@@ -33,7 +33,7 @@ func appWithLedger(t *testing.T) (*App, int64) {
 	if err := hs.FinishItem(opID, "/ledger/a.bin", "/ledger/.trash/a.bin", "", history.StateDone, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := hs.FinalizeOp(opID); err != nil {
+	if err := hs.FinalizeOp(opID, 0); err != nil {
 		t.Fatal(err)
 	}
 	return a, opID

@@ -163,6 +163,13 @@ var cloudCheck = cloudfile.Of
 // 缝多出来的那个 error 由 dedupeRoots 逐根检查，测试注入桩据此扮演"卡住后被松手的探测"。
 var probeCaseVerdict = fscase.VerdictCtx
 
+// readDirFn 默认 os.ReadDir。抽成包级变量的唯一理由是测试可换装它，造出
+// 「DirEntry.Type() 返回 0（DT_UNKNOWN）、而 Info() 仍能报出真实目录 mode」的项：
+// FUSE/SMB/部分网络挂载不回填 d_type，此时目录会错走文件腿、被 !IsRegular 静默
+// 丢弃（整棵子树漏扫且不计数）。本机与 CI 的真实卷都填 d_type，造不出这个形状，
+// 不能注入就等于这条兜底分支永远没有断言机会（B5 / R-扫描-1，同 guard/cloudCheck 手法）。
+var readDirFn = os.ReadDir
+
 // visitKey 遍历期的比较键（M36，设计稿 §10.1）：**只归一分隔符，不做大小写折叠**。
 //
 // 遍历期没有可并之物：队列只投用户的原样根，其后每个路径都由
@@ -357,6 +364,63 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 			local := make([]*model.FileEntry, 0, 1024)
 			// M67：本 worker 真正 ReadDir 成功的目录数（Visited 的唯一来源）。
 			var myAccessed int
+			// enterDir 对「遍历中发现的子目录」执行门禁并在通过时提交遍历。
+			//
+			// B5（R-扫描-1）：抽成闭包是为了让**两条来路共用同一份判据**——
+			//   ① 正常目录腿（de.Type().IsDir() 为真）；
+			//   ② DT_UNKNOWN 兜底腿（Type() 返回 0、Info() 才报出 IsDir 的目录，
+			//      见下面文件腿里的 info.IsDir() 分支）。
+			// guard.Dir/隐藏/ExcludeDir/ExcludeDirPath/去重/submit 的口径必须逐字一致，
+			// 两处各写一遍是漂移的开始（同 05「同一判据三处各写一遍」的戒律）。
+			// 调用方一律在其后 continue：本函数每条路径都意味着"这一项已按目录处置完毕"。
+			enterDir := func(full string, de fs.DirEntry) {
+				// M6-P4（04 §6.7 C 组 4）：系统保护清单**排在隐藏规则之前**。
+				// 既属"系统保护"又属"隐藏"的条目（.Spotlight-V100 一类）若先被
+				// 隐藏规则拦下，"已保护跳过 N" 会随用户勾选"包含隐藏文件"而变小，
+				// 读起来像保护失效；两类计数也就此分不清谁挡的。
+				//
+				// 命中后唯一的放行通道是"用户显式把该目录（或其内部）设为扫描根"：
+				// 保护是为了挡住误伤，不是为了否决专家的指名请求。放行时把涉及的
+				// 根记进 UnprotectedRoots，界面必须警示"这一片已脱离系统保护"。
+				if d := guard.Dir(full, de.Name()); d.Skip {
+					if esc := rootsUnder(rawKeys, all, visitKey(full)); len(esc) > 0 {
+						escapedRoots[idx] = append(escapedRoots[idx], esc...)
+					} else {
+						protDirs[idx]++
+						return
+					}
+				}
+				if !f.IncludeHidden && strings.HasPrefix(de.Name(), ".") {
+					return
+				}
+				// P2：目录级剪枝。修正前 ExcludePaths 只作用于文件，
+				// 排除 node_modules/.git 时仍会把整棵树走完再逐个过滤，
+				// 大目录场景下"排除"只省结果不省时间（实测遍历量不变）。
+				// 目录不参与扩展名/大小判定，故走 matchPath-only 的裁剪入口。
+				// M105：卷语义按**该目录所属根**给（与下面的文件级同一条读数），
+				// 否则不敏感卷上整棵剪枝腿跟不上文件腿，症状只解一半。
+				drel, dridx := relativeTo(prefixes, full)
+				if matcher.ExcludeDir(drel, de.Name(), verdictFor(rootVerdicts, dridx)) {
+					return
+				}
+				// 功能1（2026-09-23）：ExcludeDirs 精确目录剪枝。与上面的 glob
+				// 剪枝分属两条通道：这里比**绝对路径**的段边界前缀，命中即整棵
+				// 子树不遍历。剪枝只发生在"遍历中发现的子目录"上——显式指定的
+				// 扫描根不查此表（指名优先，同保护清单的放行裁定）。
+				if matcher.ExcludeDirPath(full) {
+					return
+				}
+				key := visitKey(full)
+				mu.Lock()
+				_, seen := visited[key]
+				if !seen {
+					visited[key] = struct{}{}
+				}
+				mu.Unlock()
+				if !seen {
+					submit(full)
+				}
+			}
 			// handle 处理单个目录。I3（2026-09-18 审查）：逐目录 recover——
 			// 修正前 worker 无任何兜底，阶段 0 一个 panic（异常 DirEntry 的 Info、
 			// 底层 FS 返回的畸形项等）就把整个进程带走，与手册 §7「panic 转 Failed、
@@ -382,7 +446,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					// 修正前取消后仍会把队列里剩余全部目录逐个读一遍才退出。
 					return
 				}
-				entries, err := os.ReadDir(dir)
+				entries, err := readDirFn(dir)
 				if err != nil {
 					fails[idx] = append(fails[idx], model.FailedItem{Path: dir, Stage: "scan", Err: err.Error()})
 					return
@@ -427,52 +491,7 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 						continue
 					}
 					if typ.IsDir() {
-						// M6-P4（04 §6.7 C 组 4）：系统保护清单**排在隐藏规则之前**。
-						// 既属"系统保护"又属"隐藏"的条目（.Spotlight-V100 一类）若先被
-						// 隐藏规则拦下，"已保护跳过 N" 会随用户勾选"包含隐藏文件"而变小，
-						// 读起来像保护失效；两类计数也就此分不清谁挡的。
-						//
-						// 命中后唯一的放行通道是"用户显式把该目录（或其内部）设为扫描根"：
-						// 保护是为了挡住误伤，不是为了否决专家的指名请求。放行时把涉及的
-						// 根记进 UnprotectedRoots，界面必须警示"这一片已脱离系统保护"。
-						if d := guard.Dir(full, de.Name()); d.Skip {
-							if esc := rootsUnder(rawKeys, all, visitKey(full)); len(esc) > 0 {
-								escapedRoots[idx] = append(escapedRoots[idx], esc...)
-							} else {
-								protDirs[idx]++
-								continue
-							}
-						}
-						if !f.IncludeHidden && strings.HasPrefix(de.Name(), ".") {
-							continue
-						}
-						// P2：目录级剪枝。修正前 ExcludePaths 只作用于文件，
-						// 排除 node_modules/.git 时仍会把整棵树走完再逐个过滤，
-						// 大目录场景下"排除"只省结果不省时间（实测遍历量不变）。
-						// 目录不参与扩展名/大小判定，故走 matchPath-only 的裁剪入口。
-						// M105：卷语义按**该目录所属根**给（与下面的文件级同一条读数），
-						// 否则不敏感卷上整棵剪枝腿跟不上文件腿，症状只解一半。
-						drel, dridx := relativeTo(prefixes, full)
-						if matcher.ExcludeDir(drel, de.Name(), verdictFor(rootVerdicts, dridx)) {
-							continue
-						}
-						// 功能1（2026-09-23）：ExcludeDirs 精确目录剪枝。与上面的 glob
-						// 剪枝分属两条通道：这里比**绝对路径**的段边界前缀，命中即整棵
-						// 子树不遍历。剪枝只发生在"遍历中发现的子目录"上——显式指定的
-						// 扫描根不查此表（指名优先，同保护清单的放行裁定）。
-						if matcher.ExcludeDirPath(full) {
-							continue
-						}
-						key := visitKey(full)
-						mu.Lock()
-						_, seen := visited[key]
-						if !seen {
-							visited[key] = struct{}{}
-						}
-						mu.Unlock()
-						if !seen {
-							submit(full)
-						}
+						enterDir(full, de)
 						continue
 					}
 					// 普通文件（Type 未知时用 Info 兜底）
@@ -487,6 +506,17 @@ func WalkWithGate(ctx context.Context, roots []string, f *model.Filters, workers
 					info, err := de.Info()
 					if err != nil {
 						fails[idx] = append(fails[idx], model.FailedItem{Path: full, Stage: "scan", Err: err.Error()})
+						continue
+					}
+					// B5（R-扫描-1）：DT_UNKNOWN 兜底。de.Type() 对「常规文件」与
+					// 「d_type 未知项」都返回 0（FileMode.Type() 对常规文件也是 0），
+					// 派发前无从区分；FUSE/SMB/部分网络挂载不回填 d_type，目录因此错走
+					// 文件腿。若不在这里认回它，下面的 !IsRegular 会把整棵子树静默丢弃
+					// （不记 Failed、不计数，违背 M21「跳过必留痕」）。Info() 已一次 stat
+					// 报出真实 mode：确为目录则走与正常目录腿**完全一致**的门禁（enterDir），
+					// 且必须排在 cloudCheck / IsRegular 这些文件级判据**之前**。
+					if info.IsDir() {
+						enterDir(full, de)
 						continue
 					}
 					// M6-P1 云端占位：必须排在 IsRegular / 0 字节 / matcher.Apply

@@ -24,6 +24,11 @@ import (
 	"filededup/internal/scanner"
 )
 
+// phase3IdentityFn 是阶段 3「重取句柄身份」的包级接缝，生产恒为 fsid.FromFile，
+// 仅供测试注入"阶段 2 与阶段 3 两次 open 之间文件被顶替"的情形（与 ops 的
+// fsidFromPathFn 同族，见 internal/ops/verify.go:103）。
+var phase3IdentityFn = fsid.FromFile
+
 // Pipeline 一次扫描任务。
 type Pipeline struct {
 	mu          sync.Mutex
@@ -690,6 +695,26 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				hashTargets[i] = nil // 失败剔除，不参与最终分组（防零哈希假组）
 				continue
 			}
+			ci := hashSlot[i]
+			// B2（R-算法-2）：阶段 3 是**第二次** open（阶段 2 已 open 取采样与身份
+			// ids[ci]）。两次 open 之间文件可能被顶替（同步盘落新版、下载器原子改名
+			// 进来）：此时 full 算的是新内容，而 ids[ci]/采样仍是旧文件的，写回缓存就
+			// 存下"旧身份 + 新内容"——日后旧文件回位且 size/mtime 未变，Lookup 四点采样
+			// 全过 → 返回新内容的 full → 旧文件被并进新内容的组（假重复组）。故 open
+			// 成功后立刻重取句柄身份与 ids[ci] 比对：不一致即判"扫描期间被替换"，不写
+			// 回、剔除分组、记 failed。SameIdentity 任一侧未解析时返回 true（fail-open）
+			// ——这正是此处要的方向：FAT/exFAT 等无稳定索引的卷无从判断替换，强行判否
+			// 会把这些卷上的大文件全部误剔（漏报）；身份可解析的卷（NTFS/ext4/APFS）
+			// 才真正生效。接缝 phase3IdentityFn 仅供测试注入顶替。
+			if cur := phase3IdentityFn(f); !cur.SameIdentity(ids[ci]) {
+				f.Close()
+				preMu.Lock()
+				failed = append(failed, model.FailedItem{Path: e.Path, Stage: "hash",
+					Err: "文件在扫描期间被替换（身份已变化），已跳过"})
+				preMu.Unlock()
+				hashTargets[i] = nil
+				continue
+			}
 			var full [32]byte
 			if e.Size > 512<<20 {
 				// 大文件：分段预取流水线。段缓冲由环形池自管理（Y2），
@@ -708,7 +733,6 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				hashTargets[i] = nil
 				continue
 			}
-			ci := hashSlot[i]
 			// 全量哈希只写进独立的 fulls 槽位：pre[ci].sample 不得改动，
 			// 它仍是本阶段分桶与写回缓存的依据。
 			preMu.Lock()
@@ -748,6 +772,8 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 
 	// ---------- 最终分组：按全量哈希聚合 ----------
 	// fulls[] 是阶段 3 的产物，与 candidates 下标平行；pre[ci].full 覆盖缓存/小文件来源。
+	// 先按全量哈希聚合候选下标，再据阶段 2 句柄身份折并同物理文件（B1）。
+	finalIdx := make(map[finalKey][]int)
 	for _, idxs := range sampleGroups {
 		if len(idxs) < 2 {
 			continue
@@ -761,8 +787,21 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 				full = fulls[i]
 			}
 			k := finalKey{size: candidates[i].Size, full: full}
-			finalGroups[k] = append(finalGroups[k], candidates[i])
+			finalIdx[k] = append(finalIdx[k], i)
 		}
+	}
+	// B1（R-算法-1）：每个全量哈希桶内据 ids[]（阶段 2 fsid.FromFile 句柄身份）折并
+	// 确信同一物理文件的条目——硬链接 / 同 inode 多路径。这是阶段 1.5 ResolveKey 的
+	// 权威兜底：Windows 独占锁等致 ResolveKey 未解析时，同 inode 两路径会双双入桶成
+	// 假重复组；此处折并即消除。仅两侧均解析且同 Dev+Ino 才并（见 collapseSameIdentity）。
+	for k, idxs := range finalIdx {
+		entries := make([]*model.FileEntry, len(idxs))
+		bucketIDs := make([]fsid.ID, len(idxs))
+		for j, i := range idxs {
+			entries[j] = candidates[i]
+			bucketIDs[j] = ids[i]
+		}
+		finalGroups[k] = collapseSameIdentity(entries, bucketIDs)
 	}
 	// 采样唯一（桶内仅 1 个）的文件不可能与任何文件重复，无需进入最终分组。
 
@@ -997,6 +1036,43 @@ func refilterUnique(candidates []*model.FileEntry) []*model.FileEntry {
 		if bySize[e.Size] >= 2 {
 			out = append(out, e)
 		}
+	}
+	return out
+}
+
+// collapseSameIdentity 折并确信指向同一物理文件的条目（硬链接 / 同 inode 多路径），
+// 保留路径较短者，与阶段 1.5（候选 FileKey 去重）同口径：仅替换路径派生字段
+// Path/Ext，ID/Key 不被丢弃项覆盖（下游按 ID 关联选中态/保留决策/预览，覆盖会让
+// ID 与结果集错位——见阶段 1.5 的 C3 注释）。
+//
+// 仅当两侧 ids 均 Resolved 且 Dev+Ino 相同才折并；判据不含 ctime（chmod/xattr 会
+// 推进 ctime 但文件未被替换）。任一侧未解析时无从判断 ⇒ 保持独立（**不**折并）：
+// 避免在 FAT/exFAT 等不提供稳定文件索引的卷上把内容相同但物理独立的文件误并为一条
+// （漏报，对删除工具比 reclaimable 虚高更危险）。因此这里用确信判据而非 fsid 的
+// SameIdentity（后者任一侧未解析即返回 true，用于操作前复核的"存疑从同"方向，
+// 拿来分组折并会制造漏报）。
+//
+// 这是阶段 1.5 ResolveKey 的权威兜底：Windows 独占锁 / 删除挂起等致 ResolveKey
+// 标准 open 与 C4 兜底全失败、返回未解析 FileKey 时，同 inode 两路径会双双留在候选
+// 并因内容逐字节相同落入同一全量哈希桶，形成假重复组（R-算法-1）。阶段 2 的句柄
+// 身份 ids[]（fsid.FromFile）此时仍能确认同 Dev+Ino，据此折并即消除假组。
+func collapseSameIdentity(entries []*model.FileEntry, ids []fsid.ID) []*model.FileEntry {
+	seen := make(map[model.FileKey]*model.FileEntry, len(entries))
+	out := entries[:0] // 原地压缩（写索引 ≤ 读索引），与阶段 1.5 / refilterUnique 同款
+	for j, e := range entries {
+		id := ids[j]
+		if id.Resolved {
+			k := model.FileKey{VolumeID: id.Dev, FileIndex: id.Ino, Resolved: true}
+			if rep, dup := seen[k]; dup {
+				if len(e.Path) < len(rep.Path) {
+					rep.Path = e.Path
+					rep.Ext = e.Ext
+				}
+				continue // 折并：不新增组成员
+			}
+			seen[k] = e
+		}
+		out = append(out, e)
 	}
 	return out
 }

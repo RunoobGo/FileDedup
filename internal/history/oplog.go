@@ -96,22 +96,20 @@ func (s *Store) FinishItem(opID int64, origPath, destPath, linkSrc, state, errMs
 }
 
 // FinalizeOp 正常收尾：残留 planned（未派发，多为取消）置 cancelled，
-// 并冻结 done 计数与回收字节汇总。
+// 冻结 done 计数，并把执行器算好的 reclaimed 原样落库。
 //
-// reclaimed 的统计范围（**不要按"释放空间"直觉去改**）：
+// reclaimed 一律**由调用方传入**，库内不再用 SUM(size) 重算（B6 / R-操作-3）。
+// 旧实现在此重算 `SUM(size) WHERE state=done`，是 kind-blind 的：它对
+// hardlink / symlink / trash / 同卷 move 这些"源字节并未真正从磁盘移除"的操作
+// 也按条目 size 累加，历史页于是显示一笔**假账**。执行器早已按 kind 精确算出
+// res.Reclaimed（仅 delete + 跨卷 move；链接类归 LinkedBytes/SymlinkedBytes，
+// 回收站归 TrashedBytes，见 internal/model.OpsResult 与 executor.go），
+// FinalizeOp 的职责只是忠实地把这个数落库，与执行器同口径。
 //
-//	reclaimed = SUM(size) WHERE state=done
-//
-// 这个口径对 trash/delete/move 成立（数据确实离开原位置），对 hardlink /
-// symlink 则**天然为零**收益——它们不改变任何条目的 size，却也不该被算成
-// "没省空间"。这是刻意的：链接类合并省下的是"文件不再重复存一份"，
-// 而活文档 09 的字段口径把它单列为 LinkedBytes / SymlinkedBytes
-// （见 internal/model.OpsResult），历史记录页的 reclaimed 只表达
-// "真正从磁盘上移除的数据量"。两处口径不同是设计如此，不是遗漏。
-//
-// 若将来要给历史页补上链接类统计，请**新增列**而不是改这里的 SUM——
-// 历史的账目一旦重算，旧记录的数字会随新代码变化，审计链就断了。
-func (s *Store) FinalizeOp(opID int64) error {
+// 因此 trash / hardlink / symlink / 同卷 move 的历史记录「回收空间」显示 0 是
+// **正确**的：那些字节没有从磁盘上消失。要补链接类统计请新增列，不要动这里。
+// done_count 仍由库内 COUNT 得出——它是执行事实的汇总，无口径歧义。
+func (s *Store) FinalizeOp(opID int64, reclaimed uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -127,9 +125,9 @@ func (s *Store) FinalizeOp(opID int64) error {
 	}
 	res, err := tx.Exec(`UPDATE op_records SET
 		done_count = (SELECT COUNT(*) FROM op_items WHERE op_id = ? AND state = ?),
-		reclaimed  = (SELECT COALESCE(SUM(size), 0) FROM op_items WHERE op_id = ? AND state = ?)
+		reclaimed  = ?
 		WHERE id = ?`,
-		opID, StateDone, opID, StateDone, opID)
+		opID, StateDone, reclaimed, opID)
 	if err != nil {
 		return err
 	}
