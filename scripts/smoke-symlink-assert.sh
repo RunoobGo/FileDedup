@@ -313,7 +313,14 @@ else
 fi
 scanned=0
 m134_bad=''
-for f in $scan_list; do
+# R-门禁-8：scan_list 是**换行分隔**的路径清单（见上面 printf '%s\n'）。旧写法
+# `for f in $scan_list` 靠不加引号的词分割、按任意空白拆——REPO_ROOT 含空格时
+# （用户把仓库克隆到 "My Projects/…" 这类路径）每条路径会被撕成多段，逐段都命中
+# `[ ! -f ]` ⇒ m134_bad 塞满 "(读不到)" 垃圾、门禁假红，反而盖住真正要抓的 M134 形态。
+# 改用 IFS=换行 + read -r 逐行读，路径含空格安全。M134_SCAN_FILES（负控制入口）
+# 同此契约：一行一个路径。
+while IFS= read -r f; do
+	[ -n "$f" ] || continue
 	if [ ! -f "$f" ]; then
 		m134_bad="$m134_bad ${f}(读不到)"
 		continue
@@ -324,7 +331,7 @@ for f in $scan_list; do
 	if [ -n "$hit" ]; then
 		m134_bad="$m134_bad ${f##*/}:$(printf '%s' "$hit" | tr '\n' ' ')"
 	fi
-done
+done <<< "$scan_list"
 # 下界：清单为空 / glob 没展开时，"没有命中"是假的通过（M119 同一个坑）。
 if [ "$scanned" -lt 8 ]; then
 	bad "只扫到 ${scanned} 个文件（7 个 scripts/*.sh + ci.yml = 8）⇒ 扫描面本身没成立，不读作通过"

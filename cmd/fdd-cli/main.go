@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"filededup/internal/cache"
 	"filededup/internal/dedup"
 	"filededup/internal/model"
+	"filededup/internal/pathnorm"
 )
 
 type fileJSON struct {
@@ -93,6 +95,19 @@ func main() {
 	roots := flag.Args()
 	if len(roots) == 0 {
 		flag.Usage()
+		os.Exit(2)
+	}
+
+	// D2（R-门禁-4）：自指污染守卫。-cache / -o 若落在任一扫描根内，则
+	// cache.db(-wal/-shm) 或报告 JSON 会被下一跑当语料扫进 files_total、甚至配成"重复组"，
+	// 让 smoke 的三跑对账失真；-o 还会 os.Create **静默截断**根内既有文件。必须在
+	// cache.Open（建库文件）与 p.Run（读目录）**之前**拦下——晚一步就已污染。
+	if r := enclosingRoot(*cachePath, roots); r != "" {
+		fmt.Fprintf(os.Stderr, "拒绝执行：-cache 路径 %q 位于扫描根 %q 内——缓存库文件会被当语料扫入，污染计数与对账。\n", *cachePath, r)
+		os.Exit(2)
+	}
+	if r := enclosingRoot(*out, roots); r != "" {
+		fmt.Fprintf(os.Stderr, "拒绝执行：-o 路径 %q 位于扫描根 %q 内——报告会截断根内既有文件并成为下一跑的语料。\n", *out, r)
 		os.Exit(2)
 	}
 
@@ -185,6 +200,8 @@ func main() {
 	r.Stats.CaseProbeUnproven = int(p.CaseProbeUnproven()) // M62+M85
 
 	var w io.Writer = os.Stdout
+	// closeOut：os.Exit 跳过 defer，exit 3 前要显式收口输出文件（同 closeCache 的 F1⑤ 纪律）。
+	closeOut := func() {}
 	if *out != "" {
 		f, err := os.Create(*out)
 		if err != nil {
@@ -193,6 +210,7 @@ func main() {
 			os.Exit(1)
 		}
 		defer f.Close()
+		closeOut = func() { _ = f.Close() }
 		w = f
 	}
 	enc := json.NewEncoder(w)
@@ -205,6 +223,16 @@ func main() {
 	fmt.Fprintf(os.Stderr, "完成: %d 组 / 可释放 %s（实占 %s）/ 失败 %d / 耗时 %s\n",
 		r.Stats.Groups, humanBytes(r.Stats.ReclaimableSum),
 		humanBytes(r.Stats.ReclaimableActualSum), r.Stats.FilesFailed, elapsed)
+
+	// R-门禁-5（J-6=(a)）：扫描完成但**有失败项** → exit 3，与全成(0)/运行崩溃(1)/用法错误(2)
+	// 区分。门禁语料是干净树、failed 恒应为 0；非 0 即扫描器/流水线在吃错误，必须让 smoke/CI
+	// 检测得到，不能藏在 exit 0 背后。报告 JSON 已在上面完整编码，这里先收口输出文件与缓存
+	// （os.Exit 跳过 defer），再以 3 退出。
+	if r.Stats.FilesFailed > 0 {
+		closeOut()
+		closeCache()
+		os.Exit(3)
+	}
 }
 
 func humanBytes(n uint64) string {
@@ -218,4 +246,36 @@ func humanBytes(n uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// enclosingRoot 返回**第一个**把 target 含在其中的扫描根（原样返回调用方传入的根串，
+// 供错误消息用），一个都不含时返回空串。target 为空（未传该 flag）直接返回空。
+//
+// 判据走 pathnorm——abs+Clean 后按平台分隔符归一成键，再用 pathnorm.Under 做边界比较，
+// 避免"/tmp/bench" 误命中 "/tmp/benchmark" 这类纯前缀重叠（Under 按 "/" 边界比）。
+// 与全仓"把路径变成可比较键"的唯一实现处同一口径（pathnorm 包注释，M64/I5-1）。
+func enclosingRoot(target string, roots []string) string {
+	if target == "" {
+		return ""
+	}
+	keyTarget := absKey(target)
+	for _, r := range roots {
+		keyR := absKey(r)
+		if keyR == "" {
+			continue
+		}
+		if pathnorm.Under(keyTarget, keyR) {
+			return r
+		}
+	}
+	return ""
+}
+
+// absKey 把一个路径变成可做 pathnorm.Under 比较的键：绝对化 + Clean + 分隔符归一。
+func absKey(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = p
+	}
+	return pathnorm.Slash(filepath.Clean(abs), string(filepath.Separator))
 }

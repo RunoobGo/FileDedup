@@ -32,7 +32,19 @@ cd "$ROOT"
 DATASET="${SMOKE_DATASET:-C}"
 SCALE="${SMOKE_SCALE:-0.02}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fdd-smoke.XXXXXX")"
-cleanup() { chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"; }
+# D1（R-门禁-3）：失败时**保留**现场供检。旧版无条件 rm -rf，把 fdd-cli 的
+# 整段 stderr（.err）连同三跑的 .json 一起销毁——门禁报红时只看到"退出码非 0"，
+# 拿不到任何可定位的现场。改成按退出码分流：rc=0 才清理，rc≠0 保留并打印路径。
+cleanup() {
+	local rc=$?
+	chmod -R u+rwX "$WORK" 2>/dev/null
+	if [ "$rc" -ne 0 ]; then
+		printf '\n\033[1;31m==> 冒烟失败（rc=%s），现场已保留供检：%s\033[0m\n' "$rc" "$WORK" >&2
+		ls -la "$WORK" >&2 2>/dev/null || true
+	else
+		rm -rf "$WORK"
+	fi
+}
 trap cleanup EXIT
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -47,7 +59,20 @@ say "生成数据集 ${DATASET}×${SCALE}"
 say "扫描三跑（冷扫 / 缓存首扫 / 缓存复扫，均 -paranoid）"
 run() { # $1=标签 $2..=额外参数
 	local tag="$1"; shift
-	"$WORK/fdd-cli" -paranoid -o "$WORK/$tag.json" "$@" "$WORK/bench" 2>"$WORK/$tag.err"
+	# D1（R-门禁-3）：不让 set -e 在 fdd-cli 非零退出时直接掀桌——先接住退出码，
+	# 失败则把**整段** stderr 打出来（旧版只 sed 第 1 行，且那行在失败时根本轮不到执行）。
+	# D3（R-门禁-5）：rc=3 = "扫描完成但有失败项"，报告 JSON 仍有效——放行到下面的比对块，
+	# 由 python 侧 `failed != 0` 断言判红（保留三跑互比与逐组对账的诊断价值）；
+	# rc=1/2（崩溃/用法错）才就地停下。绿路径 failed=0 → rc=0，本分支都不触发。
+	local rc=0
+	"$WORK/fdd-cli" -paranoid -o "$WORK/$tag.json" "$@" "$WORK/bench" 2>"$WORK/$tag.err" || rc=$?
+	if [ "$rc" -eq 3 ]; then
+		printf '    %s: fdd-cli rc=3（有失败项），报告有效，交由比对块裁决\n' "$tag"
+	elif [ "$rc" -ne 0 ]; then
+		printf '\n\033[1;31m==> %s：fdd-cli 退出码 %s，完整 stderr：\033[0m\n' "$tag" "$rc" >&2
+		cat "$WORK/$tag.err" >&2 2>/dev/null || true
+		exit "$rc"
+	fi
 	sed -n '1p' "$WORK/$tag.err" | sed "s/^/    $tag: /"
 }
 run cold

@@ -15,8 +15,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -134,6 +136,57 @@ func TestSeedActuallyDrivesContent(t *testing.T) {
 	if corpusDigest(t, dirA) == corpusDigest(t, dirB) {
 		t.Fatal("不同 seed 生成的语料内容完全相同：seed 没有进入内容")
 	}
+}
+
+// R-门禁-7（2026-09-24 第五轮审查）：同 seed 两次生成的 **manifest JSON 必须逐字节相等**。
+//
+// 既有 TestSameSeedProducesIdenticalCorpus 只钉到「语料内容摘要 + TotalFiles/len(Groups)」
+// 这两格——每组的 Size、组内相对路径集合、Shapes 任一处漂移它都不报。本条补上对整份
+// manifest 的**字节级**钉：谁引入 map 迭代序 / rng 消耗顺序变化 / 时间或绝对路径混入这类
+// 非确定性，冒烟的「分组路径集合摘要」基线就无法跨运行复算，而旧断言照样绿。
+// manifest 全程用相对路径（rel(out,…)）、无时间戳，故与输出目录无关，可跨 t.TempDir() 比。
+func TestSameSeedProducesByteIdenticalManifest(t *testing.T) {
+	_, m1 := buildCorpus(t, "A", testScale, 42)
+	_, m2 := buildCorpus(t, "A", testScale, 42)
+	b1, err := json.MarshalIndent(&m1, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := json.MarshalIndent(&m2, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 非空守卫：确认比的是实打实由 seed 派生的内容，不是两个空 blob 的假绿。
+	// （"换 seed 内容必须变"这一侧的敏感性由 TestSeedActuallyDrivesContent 在语料级钉。）
+	if !bytes.Contains(b1, []byte(`"seed": 42`)) || len(m1.Groups) == 0 {
+		t.Fatalf("前置不成立：manifest 应含 seed=42 且至少一个重复组，实得 %d 字节 / %d 组", len(b1), len(m1.Groups))
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Fatalf("同 seed 两次生成的 manifest 非逐字节相等（%d vs %d 字节）——生成器进了非确定性"+
+			"（map 迭代序 / rng 消耗顺序 / 时间或绝对路径混入），冒烟的分组摘要基线无法跨运行复算。\n%s",
+			len(b1), len(b2), firstManifestDiff(b1, b2))
+	}
+}
+
+// firstManifestDiff 定位两份 manifest 的第一处字节差异，便于非确定性回归的快速排查。
+func firstManifestDiff(a, b []byte) string {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			lo, hi := i-40, i+40
+			if lo < 0 {
+				lo = 0
+			}
+			if hi > n {
+				hi = n
+			}
+			return fmt.Sprintf("首处差异在偏移 %d：\n  run1: %q\n  run2: %q", i, a[lo:hi], b[lo:hi])
+		}
+	}
+	return fmt.Sprintf("前 %d 字节相同，仅长度不同（%d vs %d）", n, len(a), len(b))
 }
 
 // ---- 2. 边界形态真的存在 ----

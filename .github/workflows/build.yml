@@ -7,9 +7,51 @@ on:
   workflow_dispatch:   # 允许在 GitHub 网页端手动点击触发
 
 jobs:
+  # ================= 0. 发布门槛：tag 必须指向已过 CI 的提交（J-2=(b)，R-门禁-2） =================
+  # 背景：ci.yml 的触发是 `push.branches:[main]` + `pull_request`，**tag push 不触发
+  # ci.yml**。因此本发布流水线（on.push.tags:v*）过去对「这个提交到底过没过 CI」一无
+  # 所知——可以给任意一个从没跑过 CI 的提交打 v* tag，四腿照样出包并（改前）直接发公开
+  # Release。J-2=(b) 的裁定是把发布门槛**收紧到与 CI 等价**：tag 指向的提交必须有一次
+  # name=="CI" 且 conclusion=="success" 的 run，否则拒绝构建。
+  #
+  # 只在 tag 触发时真正判定：非 tag 触发（workflow_dispatch）下 `if:` 为 false → 该 step
+  # 跳过 → 本 job 仍 success → 下游 build 的 `needs` 满足，手动演练不受影响。
+  verify-ci:
+    name: Verify Tag Commit Passed CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5   # 只做一次 API 查询，5 分钟已是极宽上限
+    permissions:
+      actions: read      # 查 workflow runs 所需的最小权限
+      contents: read
+    steps:
+      - name: Check CI status for tag commit
+        if: startsWith(github.ref, 'refs/tags/v')
+        # AS-K4 同款纪律：不把事件字段插值进 shell（run 块内只用 env 暴露的变量），
+        # 避免 tag/ref 名里若含特殊字符造成 shell 注入。
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Tag push detected. Verifying commit ${SHA} in ${REPO} passed CI before building a release."
+          RUNS_JSON=$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100")
+          CONCLUSION=$(printf '%s' "$RUNS_JSON" | jq -r '[.workflow_runs[] | select(.name=="CI")] | sort_by(.created_at) | last | .conclusion // empty')
+          if [ -z "$CONCLUSION" ]; then
+            echo "::error::No CI workflow run found for commit ${SHA}. A release tag must point to a commit that passed CI on main."
+            exit 1
+          fi
+          echo "Latest CI run conclusion for ${SHA}: ${CONCLUSION}"
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error::CI for commit ${SHA} concluded '${CONCLUSION}' (need 'success'). Refusing to build/publish a release from a commit that did not pass CI."
+            exit 1
+          fi
+          echo "OK: commit ${SHA} passed CI. Release gate satisfied."
+
   build:
     name: Build - ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
+    needs: verify-ci
     # M120（04 §6.11 GATE-4）：AS-K5 那条纪律在 ci.yml:37-42 写死了理由——没有
     # timeout-minutes 的作业一旦某步卡住就烧满 6 小时平台默认上限，还把已产出的
     # 日志一起废掉。那条只套了 CI，发布流水线改前是零处。四平台矩阵含 Wails 打包，
@@ -159,13 +201,21 @@ jobs:
             [ -d "build/bin/FileDedup.app" ] || { echo "❌ build/bin/FileDedup.app not found"; exit 1; }
             zip -ry "$ARCHIVE_NAME" build/bin/FileDedup.app
           else
-            # 自动查找 build/bin 下的可执行文件
-            BINARY=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \) | head -1)
-
-            if [ -z "$BINARY" ]; then
+            # 自动查找 build/bin 下的可执行文件。
+            # R-门禁-6：旧写法 `find ... | head -1` 在命中多个时**静默取第一个**（find 顺序不保证），
+            # 可能打包到错误的产物（如残留的旧二进制）。改成显式断言"恰好一个"——0 个或 >1 个都 fail。
+            MATCHES=$(find build/bin -type f \( -name "FileDedup*" -o -name "filededup*" \))
+            COUNT=$(printf '%s\n' "$MATCHES" | grep -c . || true)
+            if [ "$COUNT" -eq 0 ]; then
               echo "❌ Binary not found in build/bin/"
               exit 1
             fi
+            if [ "$COUNT" -gt 1 ]; then
+              echo "❌ Expected exactly 1 binary in build/bin/, found $COUNT:"
+              printf '%s\n' "$MATCHES"
+              exit 1
+            fi
+            BINARY="$MATCHES"
 
             if [ "$PLATFORM" == "windows" ]; then
               powershell -Command "Compress-Archive -Path '$BINARY' -DestinationPath '$ARCHIVE_NAME'"
@@ -200,13 +250,37 @@ jobs:
 
       # 04 附录 A「SHA-256 checksum 文件」：随 Release 一并发布，用户可比对下载完整性
       - name: Generate SHA-256 checksums
+        shell: bash
         run: |
+          set -euo pipefail
           cd artifacts
-          sha256sum FileDedup-* > SHA256SUMS.txt
+          # R-门禁-6：checksum 点数必须**等于矩阵腿数**。download-artifact 的 merge-multiple
+          # 少收一条腿的产物时，旧写法 `sha256sum FileDedup-*` 会照少数几个文件生成 checksums、
+          # release 照发——缺腿被静默吞掉。这里显式点数，对不上即 fail。
+          shopt -s nullglob
+          files=(FileDedup-*)
+          shopt -u nullglob
+          expected=4   # 矩阵腿数（build.yml 四平台 include）；增删平台时同步改这里
+          if [ "${#files[@]}" -ne "$expected" ]; then
+            echo "::error::Expected $expected release artifacts (matrix legs), got ${#files[@]}: ${files[*]:-<none>} — some build leg's artifact did not make it into the release set"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          lines=$(wc -l < SHA256SUMS.txt | tr -d ' ')
+          if [ "$lines" -ne "$expected" ]; then
+            echo "::error::SHA256SUMS.txt has $lines lines, expected $expected (one per leg) — checksum set does not match artifact set"
+            exit 1
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*
           generate_release_notes: true
+          # J-1=(a)（R-门禁-1）：release 腿是全仓唯一不可逆的对外动作。改前 v* tag
+          # 一推就直接建**公开** Release，无任何人工闸——打错 tag、产物损坏、checksum
+          # 对不上都已对外可见且难撤。加 draft: true 后，tag 触发只建**草稿** Release：
+          # 四腿产物与 SHA256SUMS.txt 齐了，但需人在 GitHub 上核对无误后手点 Publish
+          # 才公开。演练/回退都在草稿态完成，不外泄。
+          draft: true
