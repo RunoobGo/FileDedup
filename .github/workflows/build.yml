@@ -54,18 +54,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v7
 
-      # B3-5 发布门禁第一道：6 个取值位版本号必须对齐，且 **tag 触发时 tag 必须
-      # 等于 v<AppVersion>**。不把事件字段插值进 shell——脚本自行读
-      # GITHUB_REF_TYPE / GITHUB_REF_NAME / GITHUB_REF。
-      #
-      # ★ AS-K4：上面的 `on.push.tags: v*` 是**故意放宽**的。收窄成 v[0-9]* 只会
-      # 让 vBeta 这类标签静默不跑流水线（没人收到红），而门禁的作用是让打错标签
-      # 的人**看见**自己打错了。判定改看触发类型而非标签拼写，因此 v* 触发的
-      # 任何标签都会在此被比对，对不上即 fail。
-      - name: Version Sync Check
-        shell: bash
-        run: bash scripts/check-version-sync.sh
-
       # ================= 1. Linux 系统依赖 (修复 Exit Code 1) =================
       - name: Install Linux Dependencies
         if: matrix.platform == 'linux'
@@ -95,6 +83,28 @@ jobs:
         with:
           go-version-file: go.mod   # 与 go.mod 保持一致，勿硬编码版本
           cache: true
+
+      # B3-5 发布门禁第一道：6 个取值位版本号必须对齐，且 **tag 触发时 tag 必须
+      # 等于 v<AppVersion>**。不把事件字段插值进 shell——脚本自行读
+      # GITHUB_REF_TYPE / GITHUB_REF_NAME / GITHUB_REF。
+      #
+      # ★ AS-K4：上面的 `on.push.tags: v*` 是**故意放宽**的。收窄成 v[0-9]* 只会
+      # 让 vBeta 这类标签静默不跑流水线（没人收到红），而门禁的作用是让打错标签
+      # 的人**看见**自己打错了。判定改看触发类型而非标签拼写，因此 v* 触发的
+      # 任何标签都会在此被比对，对不上即 fail。
+      #
+      # ★ 位置与腿数（2026-09-24，run 36013091891 三腿红的复盘）：本步原来排在
+      #   Setup Go **之前**且四腿都跑，但脚本 B3/§7 的真值通道要 `go list`——
+      #   macOS runner 无预装 go（`command not found`）、windows 腿 Git Bash 下
+      #   go list 取空，只有 linux 腿靠 runner 预装 go 侥幸绿。该检查是平台无关
+      #   的「文档 vs 源码」对账，无需四腿重复。现移到 Setup Go 之后（用 go.mod
+      #   指定的 go，不再赌 runner 预装版本），并与 CLI Smoke 同款只在 linux 一腿
+      #   跑一次（口径对齐 ci.yml:72-73 的 ubuntu 单跑）。linux 是发布产物腿之一，
+      #   tag 触发时此门照样拦，门禁语义不减。
+      - name: Version Sync Check
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: bash scripts/check-version-sync.sh
 
       - name: Install Wails CLI
         # 固定与 go.mod 相同的 wails 版本，避免 @latest 与项目版本漂移
