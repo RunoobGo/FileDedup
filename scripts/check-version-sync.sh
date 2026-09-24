@@ -274,13 +274,14 @@ fi
 r_node=$(grep -h '^test(' frontend/tests/*.test.ts 2>/dev/null | wc -l | tr -d '[:space:]') || r_node=''
 r_wir1=$(grep -c '^wiring ' scripts/test-frontend-logic.sh) || r_wir1=''
 r_wir2=$(grep -c '^wiring_count ' scripts/test-frontend-logic.sh) || r_wir2=''
-if [ -n "$r_wir1" ] && [ -n "$r_wir2" ]; then
-	r_wir=$((r_wir1 + r_wir2))
+r_wir3=$(grep -c '^wiring_window ' scripts/test-frontend-logic.sh) || r_wir3=''
+if [ -n "$r_wir1" ] && [ -n "$r_wir2" ] && [ -n "$r_wir3" ]; then
+	r_wir=$((r_wir1 + r_wir2 + r_wir3))
 else
 	r_wir=''
 fi
 cmpv '  前端 node 用例数' "$d_node" "$r_node"
-cmpv '  前端接线断言数（wiring + wiring_count）' "$d_wir" "$r_wir"
+cmpv '  前端接线断言数（wiring + wiring_count + wiring_window）' "$d_wir" "$r_wir"
 cmpv '  前端合计自洽式（node + 接线 = 合计）' "$d_sum" "$([ -n "$d_node" ] && [ -n "$d_wir" ] && printf '%s' "$((d_node + d_wir))")"
 
 # ---- B5 §4.3 的接线断言条数（与 B4 同源：防"两格分叉"） ----
