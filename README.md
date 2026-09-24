@@ -133,6 +133,12 @@ CI 门禁：`ci.yml`（PR 与 main push）三条腿——ubuntu 跑上述全套�
 （被 .gitignore 排除）。因此全新克隆后须先 `cd frontend && npm ci && npm run build`，
 否则 `go build` / `go vet` / `go test` 会因 embed 找不到目录而失败（CI 已按此顺序编排）。
 
+`frontend/wailsjs/`（Wails 生成的绑定）同样被 .gitignore 排除，`wails dev` / `wails build`
+每次重生成。★ 本仓库的前端**不 import 它**：调用面统一走手写的 `frontend/src/wails.ts`，
+运行时按 `window.go.main.App` 直连后端（现读 grep：`wailsjs` 在 `frontend/src` 里只有
+一处注释命中）。所以绑定过期既不会让 `npm run typecheck` 变红，也不影响运行时，
+只影响"直接读 `App.d.ts` 当契约看"这类工具——要拿它当参考前，先跑一次 `wails dev` 重生成。
+
 ## 许可证
 
 本项目采用 **MIT License**，详见仓库根目录 [LICENSE](LICENSE) 文件。
