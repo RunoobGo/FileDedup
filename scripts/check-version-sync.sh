@@ -246,7 +246,10 @@ plat_tests() {
 		printf ''
 		return 1
 	fi
-	out=$(printf '%s\n' "$paths" | xargs grep -h "$B_TST" 2>/dev/null | wc -l | tr -d '[:space:]') || out=''
+	# 不用 xargs：Git Bash 的 xargs 会把反斜杠当转义符吃掉（`F:\Dev\...` 变 `F:Dev...`），
+	# grep 以 rc=123 失败、管道在 pipefail 下整体红 ⇒ 通道取空、三格假报"活文档漂移"。
+	# while read 逐文件喂给 grep，路径里的反斜杠原样保留，两侧平台同一条判据。
+	out=$(while IFS= read -r f; do grep -h "$B_TST" "$f" 2>/dev/null || true; done <<< "$paths" | wc -l | tr -d '[:space:]') || out=''
 	printf '%s' "$out"
 	return 0
 }

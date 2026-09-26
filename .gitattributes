@@ -1,0 +1,19 @@
+# 行尾与文件模式策略（2026-09-26 登记 M264 / 划账 §6.43）
+#
+# 本项目在 macOS 与 Windows 11 两台机器上交替开发和测试。加本文件之前，仓库里
+# 没有任何行尾口径（全仓 grep `gitattributes` / `autocrlf` 零命中），检出成什么样
+# 完全由各机器的局部 git 配置决定：Windows 侧惯例 `core.autocrlf=true` ⇒ 一次全新
+# 克隆把 410 个文本文件全部落成 CRLF（实测：`git checkout-index -a` 模拟，
+# run-gates.sh 208/208 行、ci.yml 292/292 行、main.go 66/66 行带 CR）。
+#
+# 后果里唯一硬的一条落在本地门禁上：`gofmt -l` 在 CRLF 工作树上报 **292 个文件全红**
+# （LF 工作树 0 个），而 gofmt 判据只存在于 `scripts/run-gates.sh`（CI 不调用它）
+# ⇒ Windows 上刚克隆完、一行代码没改就是红的，CI 永远看不到这个红。
+# 其余判据实测对行尾不敏感（含 check-version-sync.sh 的 B 组与两个 harness 补丁）。
+#
+# 本文件把两侧拉到同一串字节：文本一律以 LF 落地，二进制不参与转换。
+* text=auto eol=lf
+
+# Wails 的图标资产：转换会损坏文件。
+*.png binary
+*.ico binary

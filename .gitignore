@@ -19,6 +19,12 @@ frontend/package.json.md5
 # ---------- macOS ----------
 .DS_Store
 
+# ---------- Windows ----------
+# 与上面的 .DS_Store 同一件事：本机浏览/扫描目录时系统自己写下的元数据。
+# 本项目在 macOS 与 Windows 11 两侧交替开发（2026-09-26 §6.43），原先只防了 mac 那一侧。
+Thumbs.db
+desktop.ini
+
 # ---------- 本地 Agent 会话状态 ----------
 # .workbuddy/ 存放项目工作日志/记忆，属本机运行状态而非项目源码，不入库。
 .workbuddy

@@ -86,6 +86,13 @@ import hashlib, json, sys, pathlib
 work = pathlib.Path(sys.argv[1])
 tags = ["cold", "cache1", "cache2"]
 
+def norm(p):
+    # 只做分隔符归一：**两侧都要过这道**（sig 的报告侧与下面 manifest 侧）。报告里的 path 是
+    # 扫描器给的绝对路径（Windows 上是反斜杠），manifest 的 rel 由 Go 的 filepath.Rel 产出。
+    # 只归一单侧 ⇒ 逐组对账在 Windows 上全红，而 reclaimable/dup_files/digest 照样一致（假失败）。
+    # 比对的是"组成员集合"，不是拼写口径。
+    return str(p).replace("\\", "/")
+
 def sig(tag):
     r = json.loads((work / f"{tag}.json").read_text())
     s = r["stats"]
@@ -100,7 +107,7 @@ def sig(tag):
             sys.exit(1)
     groups = []
     for g in r["groups"]:
-        paths = sorted(f["path"] for f in g["files"])
+        paths = sorted(norm(f["path"]) for f in g["files"])
         groups.append((int(g["reclaimable"]), "\n".join(paths)))
     groups.sort(key=lambda x: x[1])
     blob = "\x1e".join(f"{c}\x1f{p}" for c, p in groups).encode()
@@ -181,11 +188,7 @@ if base["files_total"] != want_total:
 # 组内成员被一致性剔除一个而组仍 ≥2 成员时：组数不变、files_total 不变、三跑照样一致
 # ⇒ 上面四条断言全绿。这里按 manifest 逐组重建期望的 (可释放字节, 组内路径集合)，
 # 与报告交出的那一串**整表**比对，并顺手把两个聚合量也钉住（红的时候一眼看得出是哪一维）。
-def norm(p):
-    # 只做分隔符归一：manifest 的 rel 由 Go 的 filepath.Rel 产出（Windows 上是反斜杠），
-    # 报告里的 path 由扫描器产出。比对的是"组成员集合"，不是拼写口径。
-    return str(p).replace("\\", "/")
-
+# （norm 定义在文件开头：报告侧 sig() 也要用它，两侧共用同一道归一。）
 root = norm(work / "bench")
 exp = []
 exp_reclaimable = 0
