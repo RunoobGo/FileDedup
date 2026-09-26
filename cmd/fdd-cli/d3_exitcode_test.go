@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,11 @@ import (
 func TestCLIExitThreeOnFailedItems(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fdd-cli")
+	if runtime.GOOS == "windows" {
+		// go build -o 在 Windows 上落 fdd-cli.exe；exec 目标须同名，否则报
+		// "executable file not found in %PATH%"（CI windows 腿曾因此假红）。
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
