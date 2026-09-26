@@ -269,7 +269,17 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	// 各执行分支在破坏性动作前用 identityStill 复核路径未被换成另一 inode。
 	var toProcess []*model.FileEntry
 	var procIDs []fsid.ID
+	// R-操作-4：按 fid 去重（与 planOpItems/选择集去重同源）。重复 id 会让同一文件
+	// 进 toProcess 两次，执行阶段第二次动作命中 ENOENT，把一条已成功的腿覆写成
+	// failed，并重复计账。进度分母仍是 len(op.FileIDs)，故跳过时 report("") 推一格，
+	// 与下面"不在结果集"分支同款，保证 n 走到 total。
+	seen := make(map[uint64]bool, len(op.FileIDs))
 	for _, fid := range op.FileIDs {
+		if seen[fid] {
+			report("")
+			continue
+		}
+		seen[fid] = true
 		e, ok := byID[fid]
 		if !ok {
 			res.Failed = append(res.Failed, model.FailedItem{Stage: "ops", Err: fmt.Sprintf("文件不在当前结果集（id=%d）", fid)})

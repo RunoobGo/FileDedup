@@ -577,13 +577,19 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 					p.cacheHits.Add(1) // AS-K1：正向信号，"查到记录"即计一次
 					var full [32]byte
 					fullValidNow := false
-					// 四点采样全一致 → 内容极可能未变，信任缓存 full；否则内容已变，full 须重算。
+					// 四点采样全一致 → 内容极可能未变，信任缓存 full；否则内容已变。
 					if r.Partial.Head == ent.Head && r.Partial.Tail == ent.Tail &&
 						r.Partial.Mid1 == ent.Mid1 && r.Partial.Mid2 == ent.Mid2 {
 						if fullValid {
 							copy(full[:], ent.Full)
 						}
 						fullValidNow = fullValid
+					} else if r.Small {
+						// R-算法-6：采样不符 → 缓存 full 已过时（弃用）；但小文件本轮一趟
+						// 已算出真 full（r.Full），直接采用，免去阶段 3 对同一文件的全量重算
+						// （结果等价，纯省一次全量读；方向安全）。
+						full = r.Full
+						fullValidNow = true
 					}
 					pre[i] = preEntry{
 						sample: sampleKey{

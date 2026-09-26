@@ -348,7 +348,7 @@ func NewApp() *App {
 
 // startup Wails 生命周期。
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
+	a.setCtx(ctx)
 	if dir, err := os.UserConfigDir(); err == nil {
 		a.cfgDir = filepath.Join(dir, "FileDedup")
 	} else if home, herr := os.UserHomeDir(); herr == nil {
@@ -363,6 +363,14 @@ func (a *App) startup(ctx context.Context) {
 	// v0.5.0：扫描历史/清理账本（独立 history.db，确证损坏时隔离重建）
 	a.openLedger()
 	a.emit(a.ctx, "app:ready", AppVersion)
+}
+
+// setCtx 保存 Wails 注入的运行时 context。经 a.mu：linux 腿第二实例回调可能
+// 早于/并发于本赋值到达（R-根包-1），裸字段读写会被 race detector 判为数据竞争。
+func (a *App) setCtx(ctx context.Context) {
+	a.mu.Lock()
+	a.ctx = ctx
+	a.mu.Unlock()
 }
 
 // openCache 打开哈希缓存；失败时除 stderr 外**还必须留一条界面提示**（M25）。

@@ -349,7 +349,8 @@ func (c *Cache) Store(entries []Entry) (err error) {
 		ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
 			partial=CASE WHEN excluded.partial = x'0000000000000000000000000000000000000000000000000000000000000000'
 				THEN hash_cache.partial ELSE excluded.partial END,
-			full=excluded.full, last_hit=excluded.last_hit,
+			full=CASE WHEN excluded.full IS NULL THEN hash_cache.full ELSE excluded.full END,
+			last_hit=excluded.last_hit,
 			dev=excluded.dev, ino=excluded.ino, ctime_ns=excluded.ctime_ns`)
 	if err != nil {
 		return err

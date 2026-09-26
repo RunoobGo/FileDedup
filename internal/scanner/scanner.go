@@ -56,6 +56,9 @@ func (q *dirQueue) pop() (string, bool) {
 		return "", false
 	}
 	d := q.items[0]
+	// R-扫描-2：置空再 reslice——否则底层数组第 0 格仍引用已弹出的字符串，
+	// 百万目录级扫描时这些路径无法 GC，内存峰值随访问过的目录数单调上涨。
+	q.items[0] = ""
 	q.items = q.items[1:]
 	return d, true
 }

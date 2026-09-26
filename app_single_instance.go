@@ -63,14 +63,19 @@ func raiseMainWindow(ctx context.Context) {
 // 顺序是刻意的：**先 raise 后 emit**——提示要落在已经被带到前面的那个窗口上。
 // 载荷原样交回（不加工、不丢）：前端只拿它做展示，不参与任何判据。
 func (a *App) onSecondInstance(data options.SecondInstanceData) {
-	if a.ctx == nil {
+	// R-根包-1：a.ctx 由 startup 在另一条协程上写入（linux 腿回调可能早于赋值），
+	// 裸读会与写竞争。持 a.mu 快照一次，随后放锁再用——不与 raise/emit 嵌套持锁。
+	a.mu.Lock()
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx == nil {
 		// 启动尚未完成（linux 腿的那一格）。这里**不能**碰 wruntime。
 		fmt.Fprintf(os.Stderr, "FileDedup: 启动未完成时收到第二实例信号，已忽略（args=%q cwd=%q）\n",
 			data.Args, data.WorkingDirectory)
 		return
 	}
-	raiseMainWindow(a.ctx)
-	a.emit(a.ctx, "app:second-instance", map[string]any{
+	raiseMainWindow(ctx)
+	a.emit(ctx, "app:second-instance", map[string]any{
 		"args":             data.Args,
 		"workingDirectory": data.WorkingDirectory,
 	})
