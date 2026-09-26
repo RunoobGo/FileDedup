@@ -127,6 +127,7 @@ func dirContains(dir, path string) bool {
 
 // 处理策略生效：勾选三项（两内一外），限定 inside → 只处理 inside 的两项。
 func TestExecuteOperationWithProcessDirsFilters(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, outsideDir := procFixture(t)
 
 	inside := idsInDir(t, a, insideDir)
@@ -158,6 +159,7 @@ func TestExecuteOperationWithProcessDirsFilters(t *testing.T) {
 // 目录归属是递归的：inside/sub/b.bin 属于 inside。
 // 这条单独拎出来，因为「只比直接父目录」是个很容易犯、且只在子目录场景暴露的错。
 func TestExecuteOperationProcessDirsRecursesIntoSubdirs(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, _ := procFixture(t)
 
 	sub := filepath.Join(insideDir, "sub")
@@ -183,6 +185,7 @@ func TestExecuteOperationProcessDirsRecursesIntoSubdirs(t *testing.T) {
 //
 // 这条是硬要求——不启用时**必须**走原来的代码路径，否则所有老用户的行为都会变。
 func TestExecuteOperationProcessDirsEmptyIsBackwardCompatible(t *testing.T) {
+	requireRealTrash(t)
 	for _, name := range []string{"nil", "空 slice"} {
 		t.Run(name, func(t *testing.T) {
 			a, rec, _, insideDir, outsideDir := procFixture(t)
@@ -219,6 +222,7 @@ func TestExecuteOperationProcessDirsEmptyIsBackwardCompatible(t *testing.T) {
 //   - opsRunning 已复位（否则应用永久卡在"操作执行中"）
 //   - 没有任何文件被改动
 func TestExecuteOperationRejectsEmptyIntersection(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, outsideDir := procFixture(t)
 
 	outID, outPath := idInDir(t, a, outsideDir)
@@ -405,6 +409,7 @@ func TestExecuteOperationProcessDirsEmitsFiltered(t *testing.T) {
 // 这条是本需求的核心断言。若哪天有人在过滤器里图省事、忘掉 keepIDs 排除，
 // 或者把"保留项硬拒绝"这层去掉，这条测试必须失败。
 func TestProcessPolicyNeverOverridesKeepPolicy(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, root, _, _ := procFixture(t)
 
 	// 全部文件（含保留者）都在 root 下 → 处理策略的命中集合 = 所有勾选项

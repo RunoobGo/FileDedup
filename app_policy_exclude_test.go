@@ -190,6 +190,7 @@ func TestPendingFilesExcludedReason(t *testing.T) {
 
 // 执行腿：黑名单收窄真实处理范围，账本与实际执行同范围，ops:filtered 报数。
 func TestExecuteOperationExcludeDirsFilters(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, outsideDir := procFixture(t)
 	insideSub := filepath.Join(insideDir, "sub")
 	inside := idsInDir(t, a, insideDir)
@@ -252,6 +253,7 @@ func TestExecuteOperationExcludeDirsFilters(t *testing.T) {
 
 // 白名单 + 黑名单同时生效：a 被两侧放行、b 被黑名单拦、c 被白名单拦。
 func TestExecuteOperationExcludeWithProcessDirs(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, outsideDir := procFixture(t)
 	insideSub := filepath.Join(insideDir, "sub")
 	inside := idsInDir(t, a, insideDir)

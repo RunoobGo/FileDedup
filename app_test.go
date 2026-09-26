@@ -11,11 +11,48 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"filededup/internal/model"
+	"filededup/internal/ops"
 )
+
+// requireRealTrash 要求本机**真的能**把文件移入回收站，不能则 Skip。
+//
+// 为什么要有这道门：darwin 的回收站实现是 osascript 调 Finder（internal/ops/trash_darwin.go），
+// 依赖 macOS 的「自动化」授权（系统设置 → 隐私与安全性 → 自动化）。未授权、无桌面会话
+// 或被沙箱拦截时 Finder 报 -10004 权限违例，文件**原地不动**；执行器把它记成逐项失败，
+// 而 ExecuteOperation 本身仍返回 nil ⇒ 这种环境下测试以「范围内的文件应被处理」转红，
+// 根因却不是产品逻辑。
+// 环境差异必须和产品缺陷分开，否则每一次"环境没给能力"都在教人去动没坏的代码。
+//
+// 判据是**真挪一次**，不是查某个权限位：TCC 授权可以随时被撤销，也没有可靠的查询面；
+// 而且判断要与真实链路同源，所以走 ops.Trash 而不是在测试里另写一个 osascript。
+//
+// 两条判定缺一不可：err 非 nil 是"调用被拒"；err 为 nil 但文件还在，是那条「脚本应执行
+// 却零配对」防线（trash_darwin.go 的 batchOutputGap）兜住的形状——两者都不是通过。
+func requireRealTrash(t *testing.T) {
+	t.Helper()
+	// windows 走 SHFileOperationW、linux 走自研 XDG Trash，都不依赖 GUI 会话授权。
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	probe := filepath.Join(t.TempDir(), "TrashCapabilityProbe.bin")
+	if err := os.WriteFile(probe, []byte("probe"), 0o644); err != nil {
+		t.Fatalf("构造回收站能力探针失败: %v", err)
+	}
+	if _, err := ops.Trash([]string{probe}); err != nil {
+		t.Skipf("本机无法真实移入回收站（%v）：darwin 回收站经 osascript 调 Finder，需要 macOS"+
+			"「自动化」授权；未授权/无桌面会话/被沙箱拦截一律如此。这是环境缺能力，不是产品缺陷，"+
+			"按 SKIP 处理（SKIP 不读作通过）", err)
+	}
+	if _, err := os.Stat(probe); err == nil {
+		t.Skipf("本机 osascript 返回成功但探针文件仍未被移走（Finder 零配对，" +
+			"回收站实际没动作）。同上，按 SKIP 处理")
+	}
+}
 
 func newTestApp(t *testing.T) *App {
 	t.Helper()

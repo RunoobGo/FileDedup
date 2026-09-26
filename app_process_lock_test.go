@@ -111,6 +111,7 @@ func TestWarmSensitivityIsCacheHitAfterWarm(t *testing.T) {
 // TestExecuteOperationProbesBeforeOpsRunning 钉"探测发生在占互斥位之前"。
 // 判据取的是探测那一刻的 `a.opsRunning`，不是任何时序巧合。
 func TestExecuteOperationProbesBeforeOpsRunning(t *testing.T) {
+	requireRealTrash(t)
 	a, rec, _, insideDir, _ := procFixture(t)
 	ids := idsInDir(t, a, insideDir)
 	if len(ids.ids) == 0 {
