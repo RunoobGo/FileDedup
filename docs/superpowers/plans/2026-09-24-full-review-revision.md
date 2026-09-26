@@ -177,9 +177,11 @@
 - [x] 04 台账：本轮全部 M 编号登记（M223~M255 三十三行落 §6.8.9 表尾），§6.41 划账（六节：红从哪来/修前红与变异/门禁读数 E2 回填/活文档平移第十四次核对/偏差清单/兑现边界/CI 收口 E2 回填）；§3.2 测试计数第十四次核对 852→876 四处同步（§3.2 表 + 合计 + 平台三格 + §3.2 追记，gate cells 前序已落、check-version-sync.sh EXIT=0）；§7 包数/脚本数 gate 绿。
 - [x] 05 真机清单：A1 tag 演练（W10-4 发布腿人工闸+门槛对齐+点数断言 M223/M224/M239）、C 批 UI 现读（W9-10 前端中危四格浏览器内现读 M231~M235/M248）、B4 linux trash 实测（LNX-2 第二条可选加测，前序已落）。
 
-### Task E2: 全量回归 + 汇报
+### Task E2: 全量回归 + 汇报 — 已完成（2026-09-26）
 
-- [ ] Global Constraints 回归口径全跑；报告声明本机已知缺口（linux-only ops 测试仅编译核证、GUI 手测项）。
+- [x] Global Constraints 回归口径全跑：`scripts/run-gates.sh` **15 行 → PASS=14 / SKIP=1（smoke-symlink 需 root，预期）/ FAIL=0**；`src_test=876`、smoke-cli 205 组/failed=0/命中 532、smoke-symlink-assert 18 断言 0 失败。报告已声明本机已知缺口（linux-only ops 测试仅 GOOS=linux vet 编译核证、GUI 手测项无组件级测试面挂 05）。
+- [x] 提交推送：F 批 `30dd127` + E1 文档 `dd39df7` 推上 origin。
+- [x] 跟踪两项 run + 报红修复 + 复跟（用户指令）：首推 CI `36211862969` / Build `36211904251` **windows 腿同因报红**（D 批 `TestCLIExitThreeOnFailedItems`：`go build -o` 在 Windows 落 `.exe`、exec 目标无后缀）→ 修复 `6148d8a`（按 `runtime.GOOS` 补 `.exe`）→ 复推 CI `36212309756` `completed/success`（三腿全绿）+ Build `36212315563` `completed/success`（四 build 腿全绿、verify-ci success、Release 因 dispatch 非 tag 正确 skipped）。逐格读数落 04 §6.41 二/五/六。
 
 ## F 批：低危清单（J-4=(b) 挑选随批修；每条实施前先现读复核坐标）
 
