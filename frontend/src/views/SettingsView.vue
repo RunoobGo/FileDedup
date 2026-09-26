@@ -134,7 +134,7 @@ async function save() {
 <style scoped>
 .settings-view { flex: 1; overflow-y: auto; padding: var(--sp-5) var(--page-gutter); }
 .box { max-width: 640px; margin-inline: auto; padding: var(--sp-5) var(--page-gutter); }
-.sec { font-weight: 600; margin: var(--sp-4) 0 var(--sp-3); padding-top: 12px; border-top: 1px solid var(--border); }
+.sec { font-weight: 600; margin: var(--sp-4) 0 var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--border); }
 .sec:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 .row { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-3); }
 .row label { width: 110px; color: var(--text-2); }
@@ -142,5 +142,5 @@ async function save() {
 .row.disabled { opacity: 0.55; }
 .about div { color: var(--text-2); }
 .foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4); }
-.ok { color: var(--success-ink); display: inline-flex; align-items: center; gap: 4px; }
+.ok { color: var(--success-ink); display: inline-flex; align-items: center; gap: var(--sp-1); }
 </style>

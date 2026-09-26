@@ -160,7 +160,7 @@ function close() {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .acts { display: flex; align-items: center; gap: var(--sp-2); flex: none; }
-.acts .btn-ghost { padding: 4px 10px; font-size: var(--fs-sm); }
+.acts .btn-ghost { padding: var(--sp-1) 10px; font-size: var(--fs-sm); }
 
 /* P2-7：元信息行。与标题行用同一条分隔线体系，但底色下沉一档，
    让「标题 = 主体信息 / 元信息 = 辅助信息」在视觉层次上直接读得出来。 */
@@ -187,7 +187,7 @@ function close() {
    --text 在该底色上两套主题都远超 4.5:1。保留琥珀底色作为「注意」的信号。 */
 .chip-note { background: var(--warn-weak); border-color: transparent; color: var(--text); }
 
-.p-body { overflow: auto; padding: 12px; }
+.p-body { overflow: auto; padding: var(--sp-3); }
 .p-body img { max-width: 100%; max-height: 60vh; display: block; margin: 0 auto; }
 pre { font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.55; white-space: pre-wrap; user-select: text; }
 pre.hex { white-space: pre; font-size: var(--fs-sm); }

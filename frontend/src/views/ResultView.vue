@@ -594,9 +594,9 @@ function onConfirm(targetDir?: string) {
 <style scoped>
 .result-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .statbar, .toolbar { margin: var(--sp-3) var(--page-gutter) 0; padding: 10px 14px; display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
-.hist-banner { flex: none; margin: var(--sp-3) var(--page-gutter) 0; padding: 8px 14px; font-size: var(--fs-sm); color: var(--text-2); }
+.hist-banner { flex: none; margin: var(--sp-3) var(--page-gutter) 0; padding: var(--sp-2) 14px; font-size: var(--fs-sm); color: var(--text-2); }
 .stat { font-size: var(--fs-sm); color: var(--text-2); white-space: nowrap; }
-.stat b { font-size: var(--fs-lg); color: var(--text); margin-right: 4px; font-variant-numeric: tabular-nums; }
+.stat b { font-size: var(--fs-lg); color: var(--text); margin-right: var(--sp-1); font-variant-numeric: tabular-nums; }
 .stat.warn, .stat.warn b { color: var(--danger-ink); }
 /* P2-3：失败项入口现在是 <button>，抹掉原生按钮的底与内边距，使其与其它 .stat 视觉一致 */
 button.stat { background: none; padding: 0; font-family: inherit; }
@@ -604,7 +604,7 @@ button.stat:hover b { text-decoration: underline; }
 .spacer { flex: 1; }
 /* P0-4：纵向两行固定结构，不再依赖 flex 换行 —— 任何窗口宽度下都是 2 行，
    破坏性按钮永远与其它操作同处一行（原先 920px 下会孤立成第三行）。 */
-.toolbar { margin-top: 8px; flex-direction: column; align-items: stretch; gap: var(--sp-3); }
+.toolbar { margin-top: var(--sp-2); flex-direction: column; align-items: stretch; gap: var(--sp-3); }
 .trow { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
 .keep, .ops { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: nowrap; }
 .keep { min-width: 0; }
@@ -615,14 +615,14 @@ button.stat:hover b { text-decoration: underline; }
 .proc-hint { color: var(--text-3); font-size: var(--fs-sm); min-width: 0; }
 /* 处理策略的目录列表。复用 keepdirs 的 .kd-* 样式（同一套视觉语言：
    路径 + 行内删除），但**不**含序号与 ↑↓ —— 见模板里的注释。 */
-.procdirs { display: flex; flex-direction: column; gap: 4px; }
+.procdirs { display: flex; flex-direction: column; gap: var(--sp-1); }
 /* 黑名单块（功能 2）：与白名单块同款排布，只隔一层间距表明"另一把过滤器" */
 .exrow { margin-top: var(--sp-2); }
 /* 收窄说明。info 色：这是"告知范围"不是"出错"；warn 变体才用于
    "你加的目录里没有可处理的文件"那种需要用户动手修的情况。 */
 .proc-note {
   display: flex; align-items: flex-start; gap: 6px;
-  margin: 0; padding: 8px 10px; border-radius: var(--r-sm);
+  margin: 0; padding: var(--sp-2) 10px; border-radius: var(--r-sm);
   background: var(--bg-hover); color: var(--text-2);
   font-size: var(--fs-sm); line-height: 1.6; user-select: text;
 }
@@ -636,7 +636,7 @@ button.stat:hover b { text-decoration: underline; }
    行高放宽便于阅读。 */
 .symlink-risk {
   display: flex; align-items: flex-start; gap: 6px;
-  margin: 0; padding: 8px 10px; border-radius: var(--r-sm);
+  margin: 0; padding: var(--sp-2) 10px; border-radius: var(--r-sm);
   background: var(--primary-weak); color: var(--text-2);
   font-size: var(--fs-sm); line-height: 1.6; user-select: text;
 }
@@ -645,12 +645,12 @@ button.stat:hover b { text-decoration: underline; }
 .lbl { color: var(--text-2); font-size: var(--fs-sm); }
 .sel-info { font-size: var(--fs-sm); color: var(--text-2); flex: none; }
 .sel-info b { color: var(--primary-ink); }
-.opsbar { margin: 8px 16px 0; padding: 10px 14px; display: flex; align-items: center; gap: var(--sp-4); font-size: var(--fs-sm); }
+.opsbar { margin: var(--sp-2) var(--sp-4) 0; padding: 10px 14px; display: flex; align-items: center; gap: var(--sp-4); font-size: var(--fs-sm); }
 .opsbar .bar { flex: 1; height: 6px; background: var(--bg-hover); border-radius: var(--r-sm); overflow: hidden; }
 .opsbar .fill { height: 100%; background: var(--primary); transition: width 0.2s; }
 /* P2-1：结果条三种态各自带一个线性图标；用 inline-flex + gap 保证图标与文字间距确定，
    不再依赖模板里那个易被压缩掉的空白字符。 */
-.done .ok, .done .skip, .done .fail { display: inline-flex; align-items: center; gap: 4px; }
+.done .ok, .done .skip, .done .fail { display: inline-flex; align-items: center; gap: var(--sp-1); }
 .done .ok { color: var(--success-ink); }
 .done .skip { color: var(--text-3); }
 .done .fail { color: var(--danger-ink); background: none; padding: 0; font-family: inherit; }
@@ -658,23 +658,22 @@ button.stat:hover b { text-decoration: underline; }
 .done .x { margin-left: auto; background: none; color: var(--text-3); padding: 2px 6px; display: inline-flex; align-items: center; }
 .list { flex: 1; overflow-y: auto; padding: var(--sp-2) var(--page-gutter) var(--sp-5); }
 /* P1-2：空态 = 标题 + 说明 + 行动按钮 */
-.empty { text-align: center; color: var(--text-2); padding: 56px 24px; }
+.empty { text-align: center; color: var(--text-2); padding: 56px var(--sp-5); }
 /* P2-1：原 「🎉」 换成统一的线性图标（check-circle，成功色），随主题变色、无 emoji 固有彩色 */
 .empty-ico { color: var(--success-ink); display: block; margin: 0 auto 10px; }
 .empty-title { font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
-.empty-desc { margin-top: 8px; font-size: var(--fs-sm); color: var(--text-3); }
+.empty-desc { margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
 .empty-actions { margin-top: var(--sp-4); display: flex; gap: var(--sp-3); justify-content: center; }
 /* Y7：达到放量上限时以警示色提示需显式继续加载（边框属图形，需 ≥3:1） */
 .btn-ghost.capped { color: var(--warn-ink); border-color: var(--warn-ink); }
 /* Y8：未勾选时弱强调「全选」，引导用户显式选择（不再默认全选） */
 .btn-ghost.btn-emph { border-color: var(--primary); color: var(--primary-ink); }
 /* 多目录优先级列表 */
-.keepdirs { margin-top: 2px; display: flex; flex-direction: column; gap: 4px; }
+.keepdirs { margin-top: 2px; display: flex; flex-direction: column; gap: var(--sp-1); }
 .kd-row { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); }
 .kd-idx { flex: none; width: 18px; height: 18px; border-radius: 50%; background: var(--primary);
-  color: #fff; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
+  color: var(--on-primary); font-size: var(--fs-xs); display: inline-flex; align-items: center; justify-content: center; }
 .kd-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.btn-ghost.xs { padding: 1px 6px; font-size: 12px; line-height: 1.5; }
 .kd-add { display: flex; align-items: center; gap: var(--sp-2); }
 .kd-add input { flex: 1; min-width: 160px; }
 .kd-hint { color: var(--text-3); font-size: var(--fs-sm); }

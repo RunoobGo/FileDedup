@@ -346,13 +346,13 @@ function danglingTitle(it: OpRecordItem): string {
   margin: var(--sp-3) var(--page-gutter) 0; padding: 6px 10px;
   display: flex; align-items: center; gap: var(--sp-2);
 }
-.tabs button { background: none; color: var(--text-2); padding: 6px 12px; border-radius: var(--r-md); font: inherit; }
+.tabs button { background: none; color: var(--text-2); padding: 6px var(--sp-3); border-radius: var(--r-md); font: inherit; }
 .tabs button.on { background: var(--primary-weak); color: var(--primary-ink); font-weight: 600; }
 .spacer { flex: 1; }
 .confirm-tip { font-size: var(--fs-sm); color: var(--danger-ink); }
 .body { flex: 1; overflow-y: auto; padding: var(--sp-3) var(--page-gutter) var(--sp-5); }
 .hist-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
-.hist-table th, .hist-table td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.hist-table th, .hist-table td { padding: 9px var(--sp-3); text-align: left; border-bottom: 1px solid var(--border); }
 .hist-table th { color: var(--text-3); font-weight: 500; white-space: nowrap; }
 .hist-table tr:last-child td { border-bottom: none; }
 .hist-table tr.current td { background: var(--primary-weak); }
@@ -367,14 +367,14 @@ function danglingTitle(it: OpRecordItem): string {
 .undo-hint { font-size: var(--fs-sm); color: var(--text-3); }
 .hist-table tr.expanded td { background: var(--primary-weak); }
 .kind-badge {
-  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  display: inline-block; padding: 1px var(--sp-2); border-radius: 999px;
   font-size: var(--fs-xs, 12px); border: 1px solid var(--border); color: var(--text-2);
 }
 .kind-badge.k-delete { color: var(--danger-ink); border-color: var(--danger-ink); }
 .kind-badge.k-trash { color: var(--primary-ink); border-color: var(--primary-ink); }
 .no-undo { margin-left: 6px; font-size: var(--fs-xs, 12px); color: var(--text-3); }
-.detail-row > td { background: var(--bg-2, rgba(127, 127, 127, 0.05)); padding: 4px 12px 12px; }
-.detail-loading { padding: 12px; color: var(--text-3); font-size: var(--fs-sm); }
+.detail-row > td { background: var(--bg-2, rgba(127, 127, 127, 0.05)); padding: var(--sp-1) var(--sp-3) var(--sp-3); }
+.detail-loading { padding: var(--sp-3); color: var(--text-3); font-size: var(--fs-sm); }
 .item-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs, 12px); }
 .item-table th, .item-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
 .item-table th { color: var(--text-3); font-weight: 500; white-space: nowrap; }
@@ -382,25 +382,27 @@ function danglingTitle(it: OpRecordItem): string {
 .st { display: inline-block; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
 .st-ok { color: var(--primary-ink); background: var(--primary-weak); }
 .st-done { color: var(--text-2); background: rgba(127, 127, 127, 0.14); }
-.st-bad { color: var(--danger-ink); background: rgba(220, 80, 80, 0.12); }
+/* 状态胶囊：底色弱红一律走 --danger-weak。原先三处各自写成 rgba(220,80,80,·)
+   的 α 变体——那是**亮色谱**的红：暗色主题里 --danger 已换成 #f87171 一系，
+   写死的 RGB 不跟随，浅红底配深色 bg-panel 会变成脏红。 */
+.st-bad { color: var(--danger-ink); background: var(--danger-weak); }
 .st-mute { color: var(--text-3); background: rgba(127, 127, 127, 0.1); }
 .err-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-ink); }
 /* 悬空链接行：整行淡红底 + 行内红标。
    为什么要整行着色而不是只标一个图标：明细表可能有几十行，
    悬空项是需要用户**动手处理**的（回撤或重新放回保留文件），
    只标图标在长表里会被扫过去。底色把视线拉住，图标说明原因。 */
-.row-dangling > td { background: rgba(220, 80, 80, 0.08); }
+.row-dangling > td { background: var(--danger-weak); }
 .dangling-tag {
   display: inline-flex; align-items: center; gap: 3px;
   margin-left: 6px; padding: 0 6px; border-radius: 999px;
-  font-size: 11px; white-space: nowrap;
-  color: var(--danger-ink); background: rgba(220, 80, 80, 0.14);
+  font-size: var(--fs-xs); white-space: nowrap;
+  color: var(--danger-ink); background: var(--danger-weak);
 }
-.btn-ghost.xs { padding: 1px 6px; font-size: 12px; line-height: 1.5; }
 /* 空态样式与 ResultView 空态同节奏 */
-.empty { text-align: center; color: var(--text-2); padding: 56px 24px; }
+.empty { text-align: center; color: var(--text-2); padding: 56px var(--sp-5); }
 .empty-ico { color: var(--text-3); display: block; margin: 0 auto 10px; }
 .empty-title { font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
-.empty-desc { margin-top: 8px; font-size: var(--fs-sm); color: var(--text-3); }
+.empty-desc { margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
 .empty-actions { margin-top: var(--sp-4); display: flex; gap: var(--sp-3); justify-content: center; }
 </style>

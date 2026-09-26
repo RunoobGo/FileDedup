@@ -110,7 +110,7 @@ const navs: { key: 'scan' | 'result' | 'records' | 'settings'; label: string; ic
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 12px 0;
+  padding: var(--sp-3) 0;
   gap: var(--sp-2);
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
@@ -131,7 +131,7 @@ nav {
 .nav-btn {
   position: relative;
   width: 52px;
-  padding: 8px 0 6px;
+  padding: var(--sp-2) 0 6px;
   display: flex;
   flex-direction: column;
   align-items: center;

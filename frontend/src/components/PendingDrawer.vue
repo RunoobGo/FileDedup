@@ -114,24 +114,24 @@ const excludedOnPage = computed(() =>
   padding: var(--sp-4); font-weight: 600; border-bottom: 1px solid var(--border);
 }
 .d-head > div { display: flex; gap: var(--sp-2); align-items: center; }
-.d-err { padding: 8px var(--sp-4); color: var(--danger-ink); font-size: var(--fs-sm); }
+.d-err { padding: var(--sp-2) var(--sp-4); color: var(--danger-ink); font-size: var(--fs-sm); }
 .d-body {
-  flex: 1; overflow-y: auto; padding: 8px;
+  flex: 1; overflow-y: auto; padding: var(--sp-2);
   --pend-cols: minmax(0, 1.6fr) 72px minmax(0, 0.9fr);
 }
 .empty { color: var(--text-3); text-align: center; padding: 40px 0; }
 .d-cols {
   display: grid; grid-template-columns: var(--pend-cols); gap: var(--sp-2);
-  padding: 0 8px 6px; font-size: var(--fs-sm); color: var(--text-3);
-  border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  padding: 0 var(--sp-2) 6px; font-size: var(--fs-sm); color: var(--text-3);
+  border-bottom: 1px solid var(--border); margin-bottom: var(--sp-1);
 }
 .sec-head {
-  padding: 10px 8px 4px; font-size: var(--fs-sm); color: var(--text-3);
+  padding: 10px var(--sp-2) var(--sp-1); font-size: var(--fs-sm); color: var(--text-3);
   border-top: 1px dashed var(--border); margin-top: 6px;
 }
 .item {
   display: grid; grid-template-columns: var(--pend-cols); gap: var(--sp-2);
-  align-items: start; padding: 6px 8px; border-radius: var(--r-md); font-size: var(--fs-sm);
+  align-items: start; padding: 6px var(--sp-2); border-radius: var(--r-md); font-size: var(--fs-sm);
 }
 .item:hover { background: var(--bg-hover); }
 .item.excl { color: var(--text-3); }
@@ -140,7 +140,7 @@ const excludedOnPage = computed(() =>
 .why { overflow-wrap: anywhere; }
 .d-foot {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 8px var(--sp-4); border-top: 1px solid var(--border); font-size: var(--fs-sm);
+  padding: var(--sp-2) var(--sp-4); border-top: 1px solid var(--border); font-size: var(--fs-sm);
 }
-.d-note { padding: 4px var(--sp-4) 10px; font-size: var(--fs-sm); color: var(--text-3); }
+.d-note { padding: var(--sp-1) var(--sp-4) 10px; font-size: var(--fs-sm); color: var(--text-3); }
 </style>

@@ -51,7 +51,7 @@ const toast = useToastStore()
   display: flex;
   align-items: flex-start;
   gap: var(--sp-2);
-  padding: 9px 12px;
+  padding: 9px var(--sp-3);
   border-radius: var(--r-md);
   background: var(--bg-panel);
   border: 1px solid var(--border);

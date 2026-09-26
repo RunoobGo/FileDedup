@@ -271,7 +271,7 @@ const progressPercent = computed(() => {
 .actions { display: flex; gap: var(--sp-3); justify-content: center; }
 
 /* 历史横幅（v0.5.0 功能 3） */
-.hist-banner { display: flex; align-items: center; gap: 8px; padding: 9px 14px; margin-bottom: var(--sp-4); font-size: var(--fs-sm); }
+.hist-banner { display: flex; align-items: center; gap: var(--sp-2); padding: 9px 14px; margin-bottom: var(--sp-4); font-size: var(--fs-sm); }
 .hb-ico { color: var(--text-3); flex: none; }
 .hb-text { flex: 1; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hb-roots { font-family: var(--mono); }
@@ -297,7 +297,7 @@ const progressPercent = computed(() => {
 .x {
   background: none; color: var(--text-3);
   display: flex; align-items: center; justify-content: center;
-  min-width: 28px; min-height: 28px; margin: -4px 0;
+  min-width: 28px; min-height: 28px; margin: -var(--sp-1) 0;
   padding: 0; border-radius: var(--r-md); line-height: 1;
 }
 .x:hover { color: var(--danger-ink); background: var(--danger-weak); }
@@ -323,9 +323,9 @@ const progressPercent = computed(() => {
   gap: var(--sp-1);
   padding-top: calc(17.5px + var(--sp-1));
 }
-.toggle { background: none; color: var(--primary-ink); padding: 8px 0 4px; text-align: left; }
+.toggle { background: none; color: var(--primary-ink); padding: var(--sp-2) 0 var(--sp-1); text-align: left; }
 /* P2-1：折叠指示由文字字符 ▾ 改为线性图标，展开态用旋转表达（原先只靠 ▾/▸ 两种字形） */
-.toggle .chev { margin-left: 4px; transition: transform 0.18s ease; }
+.toggle .chev { margin-left: var(--sp-1); transition: transform 0.18s ease; }
 .toggle .chev.open { transform: rotate(180deg); }
 .adv { border-top: 1px dashed var(--border); padding-top: 10px; }
 /* 功能1：排除目录清单。列表行复用 .path/.x（与扫描目录同一控件语言），
@@ -335,7 +335,7 @@ const progressPercent = computed(() => {
 .exc-empty { color: var(--text-3); }
 .exc-item {
   display: flex; align-items: center; gap: var(--sp-2);
-  padding: 4px 8px; border-radius: var(--r-md);
+  padding: var(--sp-1) var(--sp-2); border-radius: var(--r-md);
   background: var(--bg-hover); user-select: text;
 }
 .exc-add { align-self: flex-start; margin-top: var(--sp-1); }

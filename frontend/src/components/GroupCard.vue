@@ -127,10 +127,10 @@ const hiddenCount = computed(() => props.group.files.length - visibleFiles.value
 .sep { width: 1px; height: 10px; background: var(--border); }
 .count { color: var(--text-3); }
 .reclaim { margin-left: auto; color: var(--primary-ink); font-weight: 600; }
-.files { padding: 4px 8px 8px; }
+.files { padding: var(--sp-1) var(--sp-2) var(--sp-2); }
 .file {
   display: flex; align-items: center; gap: var(--sp-2);
-  padding: 5px 8px; border-radius: var(--r-md);
+  padding: 5px var(--sp-2); border-radius: var(--r-md);
 }
 .file:hover { background: var(--bg-hover); }
 .file.keep { background: var(--success-weak); }
@@ -141,7 +141,7 @@ const hiddenCount = computed(() => props.group.files.length - visibleFiles.value
    因此行高维持 28px 不变（仅行内留白从 5px 视觉上收窄到 1px）。 */
 .check-wrap {
   flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px; margin: -4px 0; border-radius: var(--r-sm); cursor: pointer;
+  width: 26px; height: 26px; margin: -var(--sp-1) 0; border-radius: var(--r-sm); cursor: pointer;
 }
 .check-wrap.off { cursor: default; }
 .check-wrap:hover:not(.off) { background: var(--bg-hover); }
@@ -157,7 +157,7 @@ const hiddenCount = computed(() => props.group.files.length - visibleFiles.value
    弱标记的对比度：--text-3 对 --bg-panel 5.30:1、对 --bg-hover 4.73:1，均达 AA。 */
 .keep-tag {
   display: inline-flex; align-items: center; gap: 3px;
-  font-size: var(--fs-xs); padding: 1px 8px; border-radius: var(--r-sm); cursor: default;
+  font-size: var(--fs-xs); padding: 1px var(--sp-2); border-radius: var(--r-sm); cursor: default;
   background: none; color: var(--text-3);
 }
 .keep-tag.on { background: var(--success-weak); color: var(--success-ink); }

@@ -62,6 +62,23 @@
   --r-md: 8px; /* 面板、卡片、按钮、输入框、列表行（合并原 6 / 7 / 8） */
   --r-lg: 12px; /* 模态与浮层，与页内控件拉开层级 */
 
+  /* ---------- 亚档白名单（第六轮审查，2026-09-26） ----------
+     上面的六档不等于"页面上只允许出现这六个像素值"。复核现读时仍有四类取值落在档外：
+
+       ① 紧凑控件的连接量   1 / 2 / 3 / 6 / 7 / 9 / 10px —— 小表格里的翻页按钮（.btn-ghost.xs）、
+                             表格 cell 的内边距、列表行的相邻间隔。它们的共同点是要**贴着**边框或
+                             下一个控件排，取最近一档 4px 会明显撑开整张表。
+       ② 大块留白与中间态   空态的 40 / 56px、以及零星出现在表格/折叠区的 14 / 18 / 22 / 30px。
+       ③ 非间距语义的取值   border-radius: 999px（胶囊走到圆头，不是"半径阶梯"那一族）。
+       ④ 图形而非间距       图标 14 / 15 / 18px、Logo 44px —— 这些是**尺寸**，本来就该绕过 --sp-*。
+
+     纪律是两条，不是"全部改成六档"：
+       a. **新增**样式一律先问六档，取得到就取；用亚档必须在旁边写明"为什么 4px 不够/太多"。
+       b. **现值里恰好等于令牌值**的（4/8/12px、11/12px）必须写成 var(...)——
+          这是本轮一次性收口掉的那 65 处：数值没变，但从此调整令牌它们会真的跟着动。
+     亚档本身是**承认的现状**，不是待清缴的债；把它们批量塞回六档会带来大面积视觉位移，
+     收益却只是"数字好看"，不划算。 */
+
   /* ---------- P2-2：字号阶梯 ----------
      修复前全站出现 10 个不同字号（9 / 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 14 / 15），
      其中 9px 与 10px 出现在可读内容上、11.5px 与 12.5px 是只此一处的孤立取值。
@@ -144,19 +161,27 @@ button {
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .btn-primary {
-  background: var(--primary); color: var(--on-primary); padding: 8px 18px;
+  background: var(--primary); color: var(--on-primary); padding: var(--sp-2) 18px;
   font-weight: 500;
 }
 .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
 
 .btn-ghost {
-  background: transparent; color: var(--text-2); padding: 6px 12px;
+  background: transparent; color: var(--text-2); padding: 6px var(--sp-3);
   border: 1px solid var(--border);
 }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 
+/* xs 是 .btn-ghost 的紧凑变体（小表格里的翻页、行内小额动作）。
+   原先它**逐字重复**在 ResultView 与 RecordsView 各自的 <style> 里：改一处另一处就漂，
+   而这正是小型 / 工具按钮最容易被逐个微调的形状 ⇒ 收到这里一处定义。
+   垂直 1px / 水平 6px 属按钮系列的**亚档**（比 --sp-1=4px 还细的连接量），
+   见尺度令牌区那条「亚档白名单」注释：它不进 --sp-1..6 那六档，但也不是无来历的取值。
+   字号必走 --fs-sm（12px）——同类次级文字全站都是这一档。 */
+.btn-ghost.xs { padding: 1px 6px; font-size: var(--fs-sm); line-height: 1.5; }
+
 .btn-danger {
-  background: var(--danger); color: var(--on-danger); padding: 8px 18px;
+  background: var(--danger); color: var(--on-danger); padding: var(--sp-2) 18px;
 }
 
 input[type='text'], input[type='number'], select {
@@ -215,7 +240,7 @@ input[type='checkbox'], input[type='radio'] {
 }
 
 .tag {
-  display: inline-block; padding: 1px 8px; border-radius: var(--r-sm);
+  display: inline-block; padding: 1px var(--sp-2); border-radius: var(--r-sm);
   font-size: var(--fs-xs); line-height: 18px;
   background: var(--bg-hover); color: var(--text-2);
 }

@@ -124,7 +124,7 @@ async function copyAll() {
 }
 .d-head > div { display: flex; gap: var(--sp-2); }
 .d-body {
-  flex: 1; overflow-y: auto; padding: 8px;
+  flex: 1; overflow-y: auto; padding: var(--sp-2);
   /* P1-4：阶段 / 路径 / 错误 / 操作 四列共用同一套轨道，保证列头与各行起点对齐。
      操作列给固定宽度而不是 auto：`.d-cols` 与 `.item` 是**两个**栅格容器，
      auto 会各自按内容求解（列头是两个字、行内是两枚按钮），轨道宽度就漂了。 */
@@ -133,12 +133,12 @@ async function copyAll() {
 .empty { color: var(--text-3); text-align: center; padding: 40px 0; }
 .d-cols {
   display: grid; grid-template-columns: var(--fail-cols); gap: var(--sp-2);
-  padding: 0 8px 6px; font-size: var(--fs-sm); color: var(--text-3);
-  border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  padding: 0 var(--sp-2) 6px; font-size: var(--fs-sm); color: var(--text-3);
+  border-bottom: 1px solid var(--border); margin-bottom: var(--sp-1);
 }
 .item {
   display: grid; grid-template-columns: var(--fail-cols); gap: var(--sp-2);
-  align-items: start; padding: 6px 8px; border-radius: var(--r-md); font-size: var(--fs-sm);
+  align-items: start; padding: 6px var(--sp-2); border-radius: var(--r-md); font-size: var(--fs-sm);
 }
 .item:hover { background: var(--bg-hover); }
 .stage { color: var(--warn-ink); white-space: nowrap; }
