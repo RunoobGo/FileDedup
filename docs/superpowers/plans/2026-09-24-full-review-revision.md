@@ -99,7 +99,7 @@
 
 - [x] **Step 1（RED）:** `TestScannerDirUnknownTypeNotSilentlySkipped`——注入 Type() 返回未知（fs.FileMode(0) DirEntry）的目录项，断言子树被遍历（或至少留痕计数）。✅ `internal/scanner/scanner_dtunknown_b5_test.go`；新增 `readDirFn` 接缝（同 guard/cloudCheck 手法）注入 `unknownTypeEntry{fs.DirEntry}`（Type()→0、Info() 委托真实项）。RED 已证（修前 `files=[]`，整棵 sub 子树无声消失）。断言：①inner.txt 被收到 ②sub 不记 Failed（漏扫是静默的，修后也不该凭空记失败）。
 - [x] **Step 2:** 文件腿兜底处补 `info.IsDir()` 分支：按目录路径过门禁（guard/符号链接口径与正常目录腿一致）后 submit。✅ 关键发现：`de.Type()` 对**常规文件**也返回 0（`FileMode.Type()` 只留类型位），派发前无法区分 DT_UNKNOWN 与常规文件 ⇒ 兜底只能落在文件腿 `de.Info()` 之后（计划坐标正确）。为保「与正常目录腿**完全一致**」，把目录门禁（guard.Dir/escapedRoots/隐藏/ExcludeDir/ExcludeDirPath/去重/submit）抽成 worker 内闭包 `enterDir(full, de)`，正常腿与 DT_UNKNOWN 兜底腿共用（杜绝两处漂移）。兜底分支排在 cloudCheck/IsRegular **之前**。变异负控制（保留 IsDir 检测但摘掉 enterDir 路由）已证红。gofmt/build/vet×3 全绿，scanner 全套 `-race` 绿（enterDir 抽取未回归任何既有目录门禁测试）。
-- [ ] **Step 3:** 补 09 手册"网络卷/FUSE 扫描"一句（若 J-5 同批则合并改）。⏸ **顺延 E 批**：计划本句即标注"若 J-5 同批则合并改"，而 J-5=(b) 的 09 补明文正在 E 批（docs sync）。为避免 09 编辑碎片化、与 E 批合并一次改。B 批只交付代码修复（用户指令"处理 B1–B6 的修复"）。
+- [x] **Step 3:** 补 09 手册"网络卷/FUSE 扫描"一句。✅ E1 落 §3.1 新 bullet「网络卷的目录类型兜底」（DT_UNKNOWN → 补 stat 认回真实 mode → 目录走 enterDir，不再整棵子树静默丢弃）。
 
 ### Task B6: 历史页 reclaimed 口径（R-操作-3，已开码核实 planOpItems 全 kind 记 e.Size、oplog 注释与执行器实现互斥）——J-3=(a)
 
@@ -111,7 +111,7 @@
 - [x] **Step 2（对齐执行器）:** `FinalizeOp(opID int64)` → `FinalizeOp(opID int64, reclaimed uint64)`；SQL 由 `reclaimed = (SELECT SUM(size)...)` 改为 `reclaimed = ?`（done_count 仍库内 COUNT，无口径歧义）。`app.go:2505` 收尾改传 `hs.FinalizeOp(journalID, res.Reclaimed)`。8 处测试调用同步补参；`oplog_i6_test.go` seedExecutedOp 由 trash 改 delete（6000 与执行器口径自洽）、`app_undo_test.go:124` hardlink 断言由「Reclaimable!=0」翻正为「==0」。
 - [x] **Step 3:** 重写 oplog.go:98-118 注释——删掉「hardlink/symlink 天然为零/两处口径不同是设计如此」的假前提，如实描述「reclaimed 由调用方传入、与执行器同口径；trash/链接类/同卷 move 显示 0 是真话」；保留「补链接类统计请新增列、勿动此处」的告诫。
 - [x] **Step 4（负控制）:** 把 SQL 退回 `SUM(size)` 并 `_ = reclaimed` 忽略入参 → 两条 B6 测试均红（trash 得 1000、delete 得 6000），确证防线生效；随后还原。
-- [ ] **Step 5:** 09:672「回收空间」措辞现读复核是否需补口径说明（trash/链接类/同卷 move 记 0）—— ⏸ **顺延 E 批**（docs sync），与 J-5=(b) 的 09 补明文、B5 顺延的网络卷/FUSE 句合并一次改，避免 09 编辑碎片化。旧记录 reclaimed 不自动迁移（FinalizeOp 是收尾写死快照，非读取时动态算）：历史记录一经 Finalize 即冻结，旧假账数字留存于既有记录、新操作起记真值——E1 划账说明。
+- [x] **Step 5:** 09「回收空间」措辞补口径说明。✅ E1 落 §6.7 清理记录段新 bullet「"回收空间"只记真正腾出磁盘的操作」（仅永久删除 + 跨卷移动计入；回收站/硬链接/软链接合并/同卷移动记 0＝修正后的真话；改前库内 `SUM(条目大小)` kind-blind 假账）。旧记录 reclaimed 不自动迁移（FinalizeOp 收尾写死快照、一经 Finalize 即冻结）——已在 §6.41 划账与 M230 行说明。
 
 ## C 批：前端中危
 
@@ -172,10 +172,10 @@
 
 ### Task E1: 文档同步
 
-- [ ] 09 手册：B5（网络卷 DT_UNKNOWN 行为）、J-5 裁定结果、J-3 裁定的 reclaimed 口径句、D2 的 CLI 守卫行为。
-- [ ] README：CLI 段如 J-6 改退出码则同步。
-- [ ] 04 台账：本轮全部 M 编号登记（M223 起），§6.41 划账；§3.2 测试计数如变动四处同步（04 §3.1/§3.2/§3.3/§7 + README）。
-- [ ] 05 真机清单：A1 tag 演练、B4 linux trash 实测、C 批 UI 现读。
+- [x] 09 手册：B5（网络卷 DT_UNKNOWN 行为 §3.1 新 bullet）、J-5 裁定结果（§7 取消行补明文"取消路径不回写失败项"）、J-3 裁定的 reclaimed 口径句（§6.7"回收空间只记真正腾出磁盘的操作"）、D2 的 CLI 守卫行为 + R-门禁-5 退出码表（§8，前序已落）、R-前端-5 复核（§2.2 拖入文件→失败项留痕）。
+- [x] README：CLI 段补退出码四值（0/1/2/3）+ 自指守卫一句（J-6=(a)）。
+- [x] 04 台账：本轮全部 M 编号登记（M223~M255 三十三行落 §6.8.9 表尾），§6.41 划账（六节：红从哪来/修前红与变异/门禁读数 E2 回填/活文档平移第十四次核对/偏差清单/兑现边界/CI 收口 E2 回填）；§3.2 测试计数第十四次核对 852→876 四处同步（§3.2 表 + 合计 + 平台三格 + §3.2 追记，gate cells 前序已落、check-version-sync.sh EXIT=0）；§7 包数/脚本数 gate 绿。
+- [x] 05 真机清单：A1 tag 演练（W10-4 发布腿人工闸+门槛对齐+点数断言 M223/M224/M239）、C 批 UI 现读（W9-10 前端中危四格浏览器内现读 M231~M235/M248）、B4 linux trash 实测（LNX-2 第二条可选加测，前序已落）。
 
 ### Task E2: 全量回归 + 汇报
 
@@ -183,17 +183,20 @@
 
 ## F 批：低危清单（J-4=(b) 挑选随批修；每条实施前先现读复核坐标）
 
-**随批修（一行级/无行为争议）** —— 各配 RED 或断言，批末并入回归：
+**随批修（一行级/无行为争议）** —— 各配 RED 或断言，批末并入回归：**5 条代码项全部完成（2026-09-25）**
 
-| # | 坐标 | 一句话 |
-|---|---|---|
-| R-算法-6 | pipeline.go:576-590 | 缓存命中采样不符时丢弃本轮已算 full 重算：直接采用 |
-| R-操作-4 | executor.go:272 | Execute 不按 fid 去重，重复 id 使已成功腿被 last-wins 覆写为 failed：入口去重（对齐 planOpItems 的 seen） |
-| R-扫描-2 | scanner.go:59 | 出队不释放底层数组，百万目录级内存峰值：置零或环形队列 |
-| R-根包-1 | app_single_instance.go:66 vs app.go:351 | onSecondInstance 无同步读 a.ctx（linux 腿可早于 OnStartup）：atomic.Pointer 或经 a.mu |
-| R-缓存-1 | cache.go:347-353 | UPSERT 无条件 `full=excluded.full` 可把有效 full 抹 NULL：比照 partial 加 CASE（性能向，方向安全） |
-| R-前端-3/4/6 | 见 C3 | busyReason 并 histLoading / PendingDrawer 整页排除标题 / scan.ts:32 注释如实化（在 C3 内实施） |
-| R-门禁-7/8 | 见 D3 | benchgen 同 seed 逐字节钉测 / smoke-symlink-assert.sh:316 引号分词（在 D3 内实施） |
+| # | 坐标 | 一句话 | 状态 |
+|---|---|---|---|
+| R-算法-6 | pipeline.go:576-590 | 缓存命中采样不符时丢弃本轮已算 full 重算：直接采用 | ✅ `else if r.Small` 采用 r.Full + fullValidNow=true；源码锚 pipeline_cachefull_r6_test.go（纯效率/输出等价，命中+采样不符在 ctime 门禁下难确定性构造，与 D2/D3 同源用锚）；变异去分支→红→复原 |
+| R-操作-4 | executor.go:272 | Execute 不按 fid 去重，重复 id 使已成功腿被 last-wins 覆写为 failed：入口去重（对齐 planOpItems 的 seen） | ✅ seen 去重 + 跳过重复项 report("") 保进度满；executor_dedup_fid_r4_test.go 两用例（折叠成一次成功+不重复计账 / 进度走到 total）；RED（ok 出现两次）→修→GREEN→变异去 report→进度红→复原 |
+| R-扫描-2 | scanner.go:59 | 出队不释放底层数组，百万目录级内存峰值：置零或环形队列 | ✅ pop 出队前置 `q.items[0]=""` 再 reslice；dirqueue_release_r2_test.go（共享底层数组断言 backing[0]=="" + FIFO 不回归）；RED→修→GREEN |
+| R-根包-1 | app_single_instance.go:66 vs app.go:351 | onSecondInstance 无同步读 a.ctx（linux 腿可早于 OnStartup）：atomic.Pointer 或经 a.mu | ✅ 抽出 setCtx（a.mu 保护写）+ startup 改走 setCtx + onSecondInstance 持 a.mu 快照后放锁再用；app_ctx_race_r1_test.go 500×并发；`-race` RED（DATA RACE on setCtx/onSecondInstance）→修→GREEN，M196 四例不回归 |
+| R-缓存-1 | cache.go:347-353 | UPSERT 无条件 `full=excluded.full` 可把有效 full 抹 NULL：比照 partial 加 CASE（性能向，方向安全） | ✅ `full=CASE WHEN excluded.full IS NULL THEN hash_cache.full ELSE excluded.full END`；cache_preserve_full_r1_test.go（二轮无 full 保留旧值 / 二轮带新 full 覆盖）；RED→修→GREEN + cache 全包不回归 |
+| R-前端-3/4/6 | 见 C3 | busyReason 并 histLoading / PendingDrawer 整页排除标题 / scan.ts:32 注释如实化（在 C3 内实施） | ✅ 已在 C3 完成 |
+| R-门禁-7/8 | 见 D3 | benchgen 同 seed 逐字节钉测 / smoke-symlink-assert.sh:316 引号分词（在 D3 内实施） | ✅ 已在 D3 完成 |
+
+**F 批代码侧收口证据（2026-09-25）**：gofmt -l 空 / go build ./... rc=0 / go vet GOOS=linux·windows·darwin 三腿 rc=0 / ops·cache·scanner·dedup 四包 + 根包 `-race` 全绿。文档划账（M 编号登记 + 测试计数同步）并入 E1。
+
 
 **仅台账登记（动操作腿 or 需设计决策，本轮不改）**：
 
