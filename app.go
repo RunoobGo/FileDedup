@@ -1214,7 +1214,15 @@ func (a *App) GetFailedItems() []model.FailedItem {
 	if a.failed == nil {
 		return []model.FailedItem{}
 	}
-	return a.failed
+	// M322（APP-36）：交副本，不交内部切片的头。绑定调用方在锁**外**序列化，
+	// 拿到的数组若与 a.failed 同底层，任何一次写回（今天的 `a.failed = ...`、
+	// 将来最自然的 `a.failed = append(a.failed, ...)`）都会与它共享内存：
+	// 轻则调用方一笔写就改到 App 状态（本批的判据用例钉这一格），
+	// 重则读侧与在途写并发（race 门禁第 7/8 行）。同文件其余交出点都在锁内做了
+	// 投影/拷贝，这一处是唯一漏网的。
+	out := make([]model.FailedItem, len(a.failed))
+	copy(out, a.failed)
+	return out
 }
 
 // ---------- 预览与定位 ----------
@@ -2625,7 +2633,11 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 				a.warnLedger(fmt.Sprintf("操作账本收尾失败：%v，残留的「计划中」条目未归位，回撤范围以历史记录为准", err))
 			}
 		}
-		// 失败/跳过并入统一失败清单
+		// 失败并入统一失败清单；跳过按 S8 裁定（docs/04:569：计 Skipped、不算失败、
+		// 不计空间）**只作"从结果集移除"**，不入清单——清单是"本该处理却没处理"的集合，
+		// 跳过是"按规则本就不处理"。
+		// ★M323（APP-37）：这行注释原先写的是"失败/跳过并入统一失败清单"，
+		//   代码从来只并 res.Failed（下面那行），是注释说错了。
 		a.mu.Lock()
 		a.failed = append(append([]model.FailedItem{}, failed...), res.Failed...)
 		// 结果集清理：OK/Skipped 的文件移出组，组 <2 则移除组

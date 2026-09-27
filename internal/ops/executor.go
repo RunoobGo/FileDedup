@@ -662,6 +662,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 					// 是全仓唯一"复核不紧贴动作"的时序（delete/hardlink/symlink/move
 					// 都在动手前一行复核）。批量失败到逐个重试这段延迟不是零，
 					// 窗口内第三方顶替后，我们照旧把顶替者派进回收站。
+					// ★ M316（OPS-44，2026-09-28）复核这半句时的现读更正：move 的
+					// "动手前一行"当时只在**跨卷腿**成立，同卷快路径的复核点离 rename
+					// 隔着 MkdirAll + claimDst；同批已在 moveFileDetailed 里补上紧贴
+					// renameFile 的源复核（接缝 preRenameRecheck），这半句至此全对得上。
 					if guardIdentity(i, p) { // OPS-7：紧贴动作再复核一次
 						return
 					}

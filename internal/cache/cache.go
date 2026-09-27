@@ -64,7 +64,12 @@ const MaxEntries = 500_000
 //
 // v3（H1）：partial 从 2 点扩到 4 点（+size/2、+3size/4），并新增
 // dev/ino/ctime_ns 身份列。旧行既缺中段采样又缺身份，一律作废。
-const AlgoVersion = "blake3-256+xxh64-4pt+id-v3"
+//
+// v4（M315）：Store 的 full 分支加"同代际才保留"守卫。**已经写进用户库的
+// 跨代混排行**（新 size/mtime/partial + 旧 full）无法靠新判据回收——守卫只在
+// 写入时起作用 ⇒ 只能整表作废重扫一次。代价是一次全量重算，换掉的是
+// "假重复组"这一类数据丢失形状（缓存只是加速手段，不是等价证明）。
+const AlgoVersion = "blake3-256+xxh64-4pt+id-v4"
 
 // metaKey 元信息表主键。
 const metaKey = "algo_version"
@@ -392,12 +397,22 @@ func (c *Cache) Store(entries []Entry) (err error) {
 		return err
 	}
 	defer tx.Rollback()
+	// M315（CACHE-12）：full 的 CASE 只在"来行确实描述同一代文件"时才保留库存值。
+	// R-缓存-1 当初为"同代不误清"加的 CASE 是无条件的，于是等长原地改写后那次
+	// Full=NULL 的写回会把**上一代**的 full 留在新代际的 size/mtime/partial 旁边，
+	// 命中腿照单全收 ⇒ 缓存里出现跨代混排行（后果与判据见 04 登记行 M315）。
 	stmt, err := tx.Prepare(`INSERT INTO hash_cache (path, size, mtime_ns, partial, full, last_hit, dev, ino, ctime_ns)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
 			partial=CASE WHEN excluded.partial = x'0000000000000000000000000000000000000000000000000000000000000000'
 				THEN hash_cache.partial ELSE excluded.partial END,
-			full=CASE WHEN excluded.full IS NULL THEN hash_cache.full ELSE excluded.full END,
+			full=CASE WHEN excluded.full IS NOT NULL THEN excluded.full
+				WHEN excluded.size = hash_cache.size
+				 AND excluded.mtime_ns = hash_cache.mtime_ns
+				 AND (excluded.partial = hash_cache.partial
+				      OR excluded.partial = x'0000000000000000000000000000000000000000000000000000000000000000')
+				THEN hash_cache.full
+				ELSE NULL END,
 			last_hit=excluded.last_hit,
 			dev=excluded.dev, ino=excluded.ino, ctime_ns=excluded.ctime_ns`)
 	if err != nil {

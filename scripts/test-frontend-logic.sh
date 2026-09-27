@@ -57,6 +57,26 @@ if [ -z "$count" ] || [ "$count" -lt 1 ]; then
 	printf 'test-frontend-logic: 未能确认有测试被执行（计数行：[%s]）\n' "$tests_line" >&2
 	exit 1
 fi
+# ★ M318（GATE-27，2026-09-28 第六轮全量审查）：只有 `tests ≥ 1` 挡不住"全绿其实是全跳过"。
+#   node --test 里全部用例被 skip 时 fail=0 ⇒ rc=0、tests 行照样计数 ⇒ 这一行此前会打 PASS。
+#   AS-K2 的在册规矩是"SKIP 不作通过"（第 15 行 smoke-symlink 就照这条写的），第 11 行没有同等判据。
+#   口径：pass 行必须解析得出且 ≥1，解析不出直接红（沿用上面那条自己立的 fail-closed 规矩）；
+#   skipped 只打印不判红——本仓 node 腿确有合法的环境性 skip 先例，一刀切判红会把门禁
+#   训练成"大家都忽略的那一行"。
+pass_line="$(printf '%s\n' "$out" | grep -E '^[^ ]* *pass [0-9]+' | head -1)"
+passed="$(printf '%s' "$pass_line" | grep -oE '[0-9]+' | tail -1)"
+if [ -z "$passed" ]; then
+	printf 'test-frontend-logic: 未能读到 pass 计数行（[%s]）——全跳过与"换了 reporter 文案"都长这样，不得读作通过\n' "$pass_line" >&2
+	exit 1
+fi
+if [ "$passed" -lt 1 ]; then
+	printf 'test-frontend-logic: pass=%s 而 tests=%s ⇒ 一条都没真跑，SKIP 不作通过（AS-K2/M318）\n' "$passed" "$count" >&2
+	exit 1
+fi
+skipped_line="$(printf '%s\n' "$out" | grep -E '^[^ ]* *skipped [0-9]+' | head -1)"
+skipped="$(printf '%s' "$skipped_line" | grep -oE '[0-9]+' | tail -1)"
+printf 'test-frontend-logic: tests=%s pass=%s skipped=%s（skipped 只报数、不判红）\n' \
+	"$count" "$passed" "${skipped:-未读到}"
 # ---- 静态接线断言（M15 / M18）----
 # 探针钉得住"判据本身对不对"，钉不住"组件有没有去用这个判据"：模板退回自己拼
 # 字符串时，node 用例与 vue-tsc 都照样绿。这里补一刀最小必要的文本锚点。

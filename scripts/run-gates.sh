@@ -32,7 +32,6 @@ FAST=0
 [[ "${1:-}" == "--fast" ]] && FAST=1
 
 LOGDIR="$(mktemp -d)"
-trap 'rm -rf "$LOGDIR"' EXIT
 
 # 判定累加器：三态 PASS / SKIP / FAIL，最后逐行打印。
 ROWS=()
@@ -40,6 +39,22 @@ VERDICTS=()
 note() { ROWS+=("$1"); VERDICTS+=("$2"); }
 FAILS=0
 fail() { FAILS=$((FAILS + 1)); }
+
+# ★M325（GATE-29，2026-09-28 第六轮全量审查）：这一行原先是
+# `trap 'rm -rf "$LOGDIR"' EXIT`——**无论成败都把现场删了**。
+# 而本仓的交付纪律是"逐行读数落进 04 划账"，第 16 行的明细（DRIFT/MISSING/OOR）
+# 就在那份日志里（第 16 行那段的自述写着"明细整份留在本行日志里"）：只要有一行红，
+# 想抄明细就只能重跑一遍全量。现在改成"有 FAIL 就保留并打出路径，全绿照旧清"。
+# 判定、行序、`--fast` 语义一字未动——本条只改"红的时候东西还在不在"。
+gates_cleanup() {
+	if [[ $FAILS -gt 0 ]]; then
+		printf '日志保留在 %s（有 %s 行 FAIL：逐行 .log 还在，划账直接抄明细，不必重跑）\n' \
+			"$LOGDIR" "$FAILS"
+		return
+	fi
+	rm -rf "$LOGDIR"
+}
+trap gates_cleanup EXIT
 
 # run <行号名> <命令...>：把命令的 stdout+stderr 收进该行的日志，回显 rc 与摘要。
 row() {
@@ -204,11 +219,19 @@ sh_row "15 smoke-symlink" 1 bash scripts/smoke-symlink.sh
 #   都会让 `anchors=` 一行都打不出来——读空当通过是 AS-K2 反复点名的形状（判据同 B1）。
 # ★ 明细（DRIFT/MISSING/OOR）整份留在本行日志里，划账时按 `anchors=` 那行抄总数。
 echo "### 16 anchor-hit-rate（只报数）"
-ANCH_SRCLIST="$LOGDIR/16.srclist"
-find . \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .workbuddy \) -prune -o \
-  -type f \( -name '*.go' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' -o -name '*.js' \
-             -o -name '*.mjs' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.md' \) -print \
-  | sed 's|^\./||' | sort > "$ANCH_SRCLIST"
+# 负控制入口（同 smoke-symlink-assert.sh 的 M134_SCAN_FILES 惯例，M324-a 用）：
+# 调用方**预设** ANCH_SRCLIST 就按那份清单扫、不再自己 find——"扫描面塌成空"这一格
+# 只有能把清单换成空的才造得出来。（★ 不做成"预设路径但仍重写它"：那样入口只是换了个
+# 临时文件名，负控制永远打不出来，M324 的判据也就永远没人验证过。）
+if [[ -n "${ANCH_SRCLIST:-}" ]]; then
+  : # 沿用调用方给的清单（可以是不存在的文件，那就是空扫描面）
+else
+  ANCH_SRCLIST="$LOGDIR/16.srclist"
+  find . \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .workbuddy \) -prune -o \
+    -type f \( -name '*.go' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' -o -name '*.js' \
+               -o -name '*.mjs' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.md' \) -print \
+    | sed 's|^\./||' | sort > "$ANCH_SRCLIST"
+fi
 awk -v SRCLIST="$ANCH_SRCLIST" -f scripts/anchor-hits.awk docs/*.md > "$LOGDIR/16.anchor-hit-rate.log" 2>&1
 ANCH_RC=$?
 tail -n 4 "$LOGDIR/16.anchor-hit-rate.log"
@@ -216,7 +239,20 @@ if [[ $ANCH_RC -ne 0 ]] || ! grep -q '^anchors=' "$LOGDIR/16.anchor-hit-rate.log
   echo "rc=$ANCH_RC 且日志里没有 anchors= 那行 ⇒ 扫描面本身没成立，按 FAIL 记（不是命中率红，是这条通道坏了）"
   fail; note "16 anchor-hit-rate" FAIL
 else
-  note "16 anchor-hit-rate" REPORT   # 只报数：不进 PASS 数、不进 FAIL 数
+  # ★M324（GATE-28，2026-09-28 第六轮全量审查）：上面那段自述的"清单为空必须红"从未成立——
+  #   `anchor-hits.awk` 的 END 块是**无条件**打印 `anchors=… src_files=…` 的，扫描面塌成空时
+  #   打出来的是 `anchors=0 src_files=0`，`grep -q '^anchors='` 照样命中 ⇒ 记的是 REPORT。
+  #   触发场景是真的：上面 find 的 -prune 列表里某个目录名被改、或仓根换布局，
+  #   整块扫描面可以静默塌空，这一行仍报"看过"。补的是"扫描面本身"这一格，
+  #   **不是**命中率：两个数任意为 0 就 FAIL，其余照旧只报数不参与总判定。
+  ANCH_N="$(sed -n 's/^anchors=\([0-9][0-9]*\).*/\1/p' "$LOGDIR/16.anchor-hit-rate.log" | head -1)"
+  SRC_N="$(sed -n 's/^anchors=[0-9][0-9]* src_files=\([0-9][0-9]*\).*/\1/p' "$LOGDIR/16.anchor-hit-rate.log" | head -1)"
+  if [[ -z "$ANCH_N" || -z "$SRC_N" || "$ANCH_N" -eq 0 || "$SRC_N" -eq 0 ]]; then
+    echo "anchors=[${ANCH_N}] src_files=[${SRC_N}] ⇒ 扫描面塌空（锚或源清单一个都没有），这条通道没在扫东西，按 FAIL 记（M324）"
+    fail; note "16 anchor-hit-rate" FAIL
+  else
+    note "16 anchor-hit-rate" REPORT   # 只报数：不进 PASS 数、不进 FAIL 数
+  fi
 fi
 
 echo

@@ -28,19 +28,41 @@ type ScanMeta struct {
 	KeepPaths   []string           `json:"keepPaths"`
 }
 
-func mustJSON(v any) []byte {
-	b, err := json.Marshal(v)
+// marshalJSON 是序列化的包级接缝：本包全部入参都是普通结构体，真实值造不出
+// "marshal 必失败"那一格（chan/func 进不了 model 类型），测试靠它注入（同
+// ops 的 renameFile、scanner 的 readDirFn 惯例）。生产路径就是 json.Marshal。
+var marshalJSON = json.Marshal
+
+// encodeJSON 序列化一个历史记录的 JSON 列。
+//
+// ★M321（HIS-3，2026-09-28 第六轮全量审查）：原名 mustJSON，失败时返回 `"[]"`——
+// 那不叫 must，那叫"把一次序列化失败降级成空数组写进账本"：SaveScan 照样记成功、
+// UpdateKeepPaths 照样报已保存，而那一列的真数据已经没了。现在失败上抛，调用方在
+// **落账之前**拒绝（M61 的在册取向：未确认的写入要在落账前拒绝，不允许
+// "清完才发现无从恢复"那类静默降级）。
+func encodeJSON(field string, v any) ([]byte, error) {
+	b, err := marshalJSON(v)
 	if err != nil {
-		return []byte("[]")
+		return nil, fmt.Errorf("历史记录的 %s 无法序列化（账本写入已停止）: %w", field, err)
 	}
-	return b
+	return b, nil
 }
 
-func decodeJSON(b []byte, v any) {
+// decodeJSON 解析一个历史记录的 JSON 列。
+//
+// ★M321：此前是 `_ = json.Unmarshal(b, v)`——坏行只报"解析成功 + 空集"。
+// 症状形状：历史页点开某条记录说"这次扫描没有重复"，而同一条的文件数、
+// 可释放字节都是非零，两格互相矛盾，用户无从判断该不该相信这条记录。
+// 空列（len==0）仍是"没有数据"而不是错误；真解析不动就点名是哪一列上抛。
+func decodeJSON(histID int64, field string, b []byte, v any) error {
 	if len(b) == 0 {
-		return
+		return nil
 	}
-	_ = json.Unmarshal(b, v)
+	if err := json.Unmarshal(b, v); err != nil {
+		return fmt.Errorf("历史记录 #%d 的 %s 无法解析（账本可能损坏），已停止读取该条: %w",
+			histID, field, err)
+	}
+	return nil
 }
 
 // SaveScan 保存一次扫描结果（同一事务写入组/文件行），并淘汰超出
@@ -57,6 +79,21 @@ func (s *Store) SaveScan(cfg model.ScanConfig, groups []*model.DuplicateGroup, f
 		reclaim += g.Reclaimable
 	}
 
+	// M321：三段 JSON 在**开事务之前**编好——编不动就一行都不写。
+	// 改前是"边写边降级"：mustJSON 失败交回 "[]"，INSERT 照样成功、histID 照样返回。
+	rootsJS, err := encodeJSON("roots", cfg.Roots)
+	if err != nil {
+		return 0, err
+	}
+	filtersJS, err := encodeJSON("filters", cfg.Filters)
+	if err != nil {
+		return 0, err
+	}
+	failedJS, err := encodeJSON("failed_json", failed)
+	if err != nil {
+		return 0, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -67,9 +104,9 @@ func (s *Store) SaveScan(cfg model.ScanConfig, groups []*model.DuplicateGroup, f
 		(saved_at, roots, filters, threads, paranoid,
 		 groups_count, files_count, orig_files, reclaimable, failed_json, keep_paths)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')`,
-		time.Now().Unix(), mustJSON(cfg.Roots), mustJSON(cfg.Filters),
+		time.Now().Unix(), rootsJS, filtersJS,
 		cfg.Threads, cfg.Paranoid, len(groups), files, files, reclaim,
-		mustJSON(failed))
+		failedJS)
 	if err != nil {
 		return 0, err
 	}
@@ -126,10 +163,20 @@ func scanMeta(scan interface{ Scan(...any) error }) (ScanMeta, error) {
 		return m, err
 	}
 	m.Reclaimable = uint64(reclaim)
-	decodeJSON(rootsJS, &m.Roots)
-	decodeJSON(filtersJS, &m.Filters)
-	decodeJSON(failedJS, &m.Failed)
-	decodeJSON(keepJS, &m.KeepPaths)
+	// M321：四列逐个解码，任一列读不动就整条不上报——"组为空"与"文件数非零"
+	// 同时出现的那格是谎，不是"这次扫描真没有重复"。
+	if err := decodeJSON(m.ID, "roots", rootsJS, &m.Roots); err != nil {
+		return m, err
+	}
+	if err := decodeJSON(m.ID, "filters", filtersJS, &m.Filters); err != nil {
+		return m, err
+	}
+	if err := decodeJSON(m.ID, "failed_json", failedJS, &m.Failed); err != nil {
+		return m, err
+	}
+	if err := decodeJSON(m.ID, "keep_paths", keepJS, &m.KeepPaths); err != nil {
+		return m, err
+	}
 	return m, nil
 }
 
@@ -258,8 +305,12 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 func (s *Store) UpdateKeepPaths(histID int64, paths []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	keepJS, err := encodeJSON("keep_paths", paths)
+	if err != nil {
+		return err
+	}
 	res, err := s.db.Exec(`UPDATE scan_history SET keep_paths = ? WHERE id = ?`,
-		mustJSON(paths), histID)
+		keepJS, histID)
 	if err != nil {
 		return err
 	}
@@ -327,7 +378,9 @@ func (s *Store) PruneScanFiles(histID int64, gone map[string]bool) error {
 		return err
 	}
 	var keep []string
-	decodeJSON(keepJS, &keep)
+	if err := decodeJSON(histID, "keep_paths", keepJS, &keep); err != nil {
+		return err
+	}
 	if len(keep) > 0 {
 		out := keep[:0]
 		for _, p := range keep {
@@ -335,8 +388,12 @@ func (s *Store) PruneScanFiles(histID int64, gone map[string]bool) error {
 				out = append(out, p)
 			}
 		}
+		outJS, err := encodeJSON("keep_paths", out)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`UPDATE scan_history SET keep_paths = ? WHERE id = ?`,
-			mustJSON(out), histID); err != nil {
+			outJS, histID); err != nil {
 			return err
 		}
 	}

@@ -80,7 +80,8 @@ var errCopiedSrcSwapped = errors.New("源在复制期间被替换")
 // 钩在本接缝上（moveIntoTrash 已 f.Close、未 identityStill）两平台都能构造同一时序。
 var preRemoveRecheck = identityStill
 
-// moveIntoTrash 同卷 rename；跨卷退化复制+删除（复制失败时清理半成品再返回错误）。
+// moveIntoTrash 同卷 rename；仅当改名失败于**跨卷**时才退化为复制+删除
+// （复制失败时清理半成品再返回错误）。
 //
 // 与 MoveFile 的跨卷路径不同：这里刻意不还原权限位与 mtime。
 // 移入回收站后源 mtime 应保留在原处语义（恢复时由 DE 按 trashinfo 处理），
@@ -88,6 +89,15 @@ var preRemoveRecheck = identityStill
 func moveIntoTrash(src, dst string) error {
 	if err := renameFile(src, dst); err == nil {
 		return nil
+	} else if !isCrossDevice(err) {
+		// M320（OPS-46，2026-09-28 第六轮全量审查）：此处此前**丢弃 err 本身**、
+		// 无条件进入复制腿，等于把"权限不足 / 只读文件系统 / 配额满 / 回收站属主不对"
+		// 这类改名失败全当成跨卷处理。move.go 的同形位置一直有这条分岔（I5 同源判据：
+		// 只有 EXDEV 允许退化成复制）。后果不是丢数据（M207 之后删源前有身份复核），
+		// 而是**用户以为进了回收站、实际发生的是一次复制**：失败原因被吞掉，
+		// 且删源若失败还会报"跨卷入回收站时删源失败"——那句在此刻根本不是跨卷。
+		// 改名原子失败 ⇒ 现场一步未动，直接上抛（调用方按常规回滚 trashinfo）。
+		return fmt.Errorf("移入回收站失败（改名未因跨卷失败，未做任何改动）: %w", err)
 	}
 	st, err := os.Stat(src)
 	if err != nil {
@@ -125,6 +135,8 @@ func moveIntoTrash(src, dst string) error {
 	// ★ 与紧邻的 preRemoveRecheck 失败分支取向**相反**（那支留 dst）：区别在源的身份——
 	// 被顶替时 dst 装的是原件字节、是唯一可还原的留存，必须保；删源失败时原件好端端
 	// 在 src，dst 只是冗余。
+	// ★ 这句文案里的"跨卷"到 M320 才是真话：改名失败若非 EXDEV 已在函数入口拦掉，
+	//   能走到复制腿的只剩跨卷一种来路（修前它也在，只是归因常常是错的）。
 	if err := removeSrc(src); err != nil {
 		os.Remove(dst)
 		return fmt.Errorf("跨卷入回收站时删源失败（源未动、回收站无残留副本，原件仍在 %s）: %w", src, err)

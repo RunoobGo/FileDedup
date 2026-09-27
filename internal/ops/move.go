@@ -43,6 +43,13 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 	if targetDir == "" {
 		return "", false, fmt.Errorf("未指定目标目录")
 	}
+	// M316（OPS-44）：源身份底片在**入口**取，复核紧贴下面的 renameFile——
+	// 两者之间隔着 MkdirAll 与 claimDst（最坏一万次 O_EXCL 占名），那才是这条腿
+	// 真正的窗口宽度（执行器的 guardIdentity 在更外面一层，覆盖不到这段）。
+	// pathIdentity 失败按"未解析"处理（identityStill 对未解析一律放行）：
+	// FAT/exFAT 不提供稳定索引、句柄被独占锁占住的场合无从比对，强行判否会让
+	// 这些卷上完全无法操作（在册口径，见 verify.go 的 identityStill 注释）。
+	srcID, _ := pathIdentity(src)
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return "", false, err
 	}
@@ -63,6 +70,14 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 		}
 	}
 
+	// M316（OPS-44）：动手前一行紧贴复核源。同卷快路径没有"删源"这一步，
+	// 但 rename 会原子地把落点上已有的对象顶掉、并把**当时挂在 src 这个名字上的
+	// 那个对象**搬走——窗口内第三方顶替源时，搬走的是它的文件（不销毁数据，
+	// 却是替用户做了一次他没点过的移动）。跨卷腿在复制前后本来就有同款复核（AS-H4）。
+	if !preRenameRecheck(src, srcID) {
+		dst.release()
+		return "", false, fmt.Errorf("移动前复核未通过（源路径已不可比对或已指向另一个对象），未做任何改动: %s", src)
+	}
 	if err := renameFile(src, dst.path); err == nil {
 		return dst.path, false, nil // 同卷快路径：一次改名，没腾出任何空间
 	} else if !isCrossDevice(err) {
@@ -80,7 +95,10 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 	// **窗口最大**的一个，而删源用的是按路径的 os.Remove——窗口内第三方以 rename
 	// 顶替 src（同步盘、下载器的原子写入正是这个时序）时，删掉的是别人的新文件，
 	// 账本还记 done。因此复制前经已开句柄取身份，删源前复核路径仍指向同一文件。
-	srcID, err := pathIdentity(src)
+	// 跨卷腿另有自己的一份底片 copyID：它必须在**入口之后**再取一次，因为
+	// AS-H4 的判据是"复制期间"是否被顶替，用入口那份会把 AS-H4 的窗口
+	// 无谓地撑大到 MkdirAll+claimDst 那一段（M316 只补缝，不改 AS-H4 语义）。
+	copyID, err := pathIdentity(src)
 	if err != nil {
 		dst.release()
 		return "", false, err
@@ -89,7 +107,7 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 		dst.release() // 清理半成品（仅当占位仍属于我们）
 		return "", false, err
 	}
-	if !identityStill(src, srcID) {
+	if !identityStill(src, copyID) {
 		// 不删源，也不把这次算成功：两份并存交给用户核对，
 		// 代价远小于替用户删掉一个他没打算删的第三方文件。
 		// ★ 返回值里的 dst.path 不是冗余：M113（undoMove）与 M89（执行器记账）
@@ -455,6 +473,12 @@ var workTempRemove = cleanupWorkTemp
 // renameFile 默认 os.Rename：测试用它让首次改名稳定失败于 EXDEV，
 // 从而确定性地进入跨卷分支（本机造不出第二个真实挂载卷）。
 var renameFile = os.Rename
+
+// preRenameRecheck 是同卷快路径动手前一行的源复核（M316/OPS-44）。
+// 默认就是 identityStill；做成包级 var 是为了让测试能在"底片已取、改名未发"
+// 这一点上稳定构造顶替（与 trash_xdg.go 的 preRemoveRecheck 同形，M207 先例）：
+// 真文件系统上这个窗口只有几条指令宽，靠 sleep 赌时序会把用例训练成 flaky。
+var preRenameRecheck = identityStill
 
 // copyVerifyFile 默认等于 copyVerify：测试用它在「复制已完成、源尚未删除」
 // 这一刻构造第三方以 rename 顶替源路径。

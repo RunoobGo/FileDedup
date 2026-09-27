@@ -262,6 +262,7 @@ func undoMove(it UndoItem) (string, error) {
 // （用户已把 dup 换成别的文件时拦截，避免覆盖第三方）；
 // ② 从 LinkSrc 复制到临时文件后全量 BLAKE3 必须等于记录哈希
 // （源被篡改时拦截——此时恢复出的将是错误内容）；
+// 记录哈希为零值（旧账本无内容证据）时这一条按"无从比对"跳过，不拦死（M317）；
 // ③ 只有 ①②全过才 rename 替换，任何失败都不动 OrigPath 现状。
 func undoHardlink(it UndoItem) (string, error) {
 	lst, err := os.Lstat(it.OrigPath)
@@ -335,12 +336,20 @@ func undoHardlink(it UndoItem) (string, error) {
 		os.Remove(tmp)
 		return "", fmt.Errorf("读取保留源失败: %w", err)
 	}
-	if h, herr := hashFile(tmp); herr != nil {
-		os.Remove(tmp)
-		return "", herr
-	} else if h != it.Hash {
-		os.Remove(tmp)
-		return "", fmt.Errorf("保留源内容与扫描记录不一致（已被修改），已拦截（S1）")
+	// M317（OPS-45）：零值 Hash（升级前写入的旧账本没有内容证据）时**跳过而不是拦死**，
+	// 与 undoSourceCheck、undoSymlink 备份腿②b 同判据（那两条的注释一直写着"三条回撤
+	// 路径的判据必须一致"，唯独这一条漏做了）：旧账本的硬链接条目因此永久撤不回，
+	// 还被报成"内容已被修改"（假归因）。
+	// 让渡范围要说清：跳过的只是这一处**自校验**（对刚由我们自己写出的 tmp 复算哈希），
+	// 防线①（句柄身份 SameIdentity）与 default 分支的大小校验一条没动。
+	if it.Hash != ([32]byte{}) {
+		if h, herr := hashFile(tmp); herr != nil {
+			os.Remove(tmp)
+			return "", herr
+		} else if h != it.Hash {
+			os.Remove(tmp)
+			return "", fmt.Errorf("保留源内容与扫描记录不一致（已被修改），已拦截（S1）")
+		}
 	}
 	// M48 第三处（2026-09-22 裁定「只写明窗口」，设计稿 §27.6，登记 M152）：
 	// 上面的身份复核（①）与这次改名之间存在**本批不消除**的窗口——第三方若专门

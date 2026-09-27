@@ -268,6 +268,32 @@ full=CASE WHEN excluded.full IS NULL THEN
   划账不得写成"零值账本回撤现在安全"，成立的表述是"与另三条回撤路径同判据"。
 - Windows/Linux 上 `identityByHandle` 的可用性差异 ⇒ 该腿真机格未兑现（04 约束 (2) 同族：报"代码已改、验证未兑现"）。
 
+### 3.5 实施批落笔后的更正（只增不删）
+
+- §3.1 把"跳过而非拦死"的第二处在册口径写成"`:470-476`（`undoTrash` 备份腿）"——现读该段在
+  **`undoSymlink`** 的备份腿②b 里（`undo.go` 的 `func` 表：undoTrash 在 :135、undoSymlink 在 :402）。
+  三处显式零值守卫实为 `undoSourceCheck`、`undoHardlink`（本批新增）、`undoSymlink`；
+  `alreadyRestored`（:45）与 undoHardlink 的崩溃残留自检是另外两种形状（前者反向、后者是"要主张已还原才需要证据"）。
+  结论不变：undoHardlink 的②号防线仍是唯一漏做的那条。
+- §3.3 预测 `M317-b` 的红来自"`:327` 大小腿用例"——现读**没有这样一条既有用例**：default 分支要
+  `identityByHandle` 取不动才进得去，改前的任何断言都没构造过那个现场（首次实跑 M317-b 全绿印证了这点）。
+  实施批补了第二条用例 `TestM317ZeroHashStillChecksSize`（合并后 chmod 000 造"身份取不动"+ Size 故意不符），
+  M317-b 复跑红在该条。root 与 Windows（`os.Geteuid()` 恒 0）跳过 ⇒ §3.4 那句"该腿真机格未兑现"仍成立。
+- §8.1 把 M322 的成因写成"锁内交出内部切片 ⇒ 与并发写点有数据竞态"——现读**成因不成立**：
+  `a.failed` 的五处写点（app.go 内）全部是**整表替换** `a.failed = ...`，没有一处原位 `append`，
+  因此持锁读到的底层数组不会被并发改写，`-race` 也抓不到。真实缺陷是另一半：调用方拿到的
+  **就是内部那张表**，App 层外任何一次 `append`/元素改写都会写穿进内部清单。
+  ⇒ M322 的判据相应改成"写穿快照后内部清单必须不变"（`app_m322_test.go`），
+  而不是设计稿原先设想的"并发读改写红在 -race"。修仍然该修，只是红点换了地方。
+- §10.2 设想的 M324-a 触发法（"把 `SRCLIST` 指到空文件"）在改前脚本上**没有入口**：改前那 6 行
+  是无条件 `find … > "$LOGDIR/16.srclist"`。且第一版改法把 `ANCH_SRCLIST` 写成
+  `${ANCH_SRCLIST:-$LOGDIR/16.srclist}` 也仍然是个**假入口**——find 照样把调用方给的那份重写掉，
+  负控制永远打不出来。⇒ 按 `M134_SCAN_FILES` 的既有做法改成"预设即用、不再 self-find"。
+  另记一条：探针若改用"把 `docs/` 整个挪走"制造塌空，**打不到 M324 这一格**——awk 读不到
+  `docs/*.md` 会以 rc=2 退出，先被改前就有的 `ANCH_RC -ne 0` 守卫接住（实测 R1：16 行 FAIL）。
+  真能打到这一格的塌空是**源清单侧为空**（`anchors=929 src_files=0`、rc=0），
+  改前读数即因此取为 REPORT/总判定 rc=0（见划账 §6.57 的 M324 行）。
+
 ---
 
 # 第二部分 批 B：代码与门禁 8 条
