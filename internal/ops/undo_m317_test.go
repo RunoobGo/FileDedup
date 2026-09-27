@@ -21,6 +21,8 @@ package ops
 // 红在第二条——设计稿 §3.3 原本以为有一条现成的大小腿用例可当红靶，现读**没有**
 // （default 分支要"句柄身份取不动"才进得去，改前的断言里无人构造过），故本文件补了第二条。
 // 无 build tag：判据与平台无关（身份①在 unix 走 (dev,ino)、Windows 走句柄查询）。
+// ★ 但第二条用例的**夹具**（chmod 000 造"打不开"）只在认权限位的卷上成立 ⇒ 那一格
+// 按 M335 走"问卷不问系统名"的前置自检，造不出来时 Skip 并写明未验证，不是 Fail。
 
 import (
 	"os"
@@ -84,9 +86,20 @@ func TestM317LegacyLedgerWithoutHashStillUnlinksHardlink(t *testing.T) {
 //
 // 造 default 分支：合并后 chmod 000。dup 与 keep 是同一 inode，一次 chmod 两条路径
 // 同时不可读，identityByHandle 的 os.Open 必撞 EACCES ⇒ 落 default；
-// 而 Lstat 不需要读权限，大小腿照常可比对。root 忽略权限位 ⇒ 跳过（同
-// trash_linux_test.go 的既有口径）；Windows 上 os.Geteuid() 恒为 0，这一格也在
-// windows 腿跳过——**该腿真机格未兑现**，划账按约束 (2) 记"代码已改、验证未兑现"。
+// 而 Lstat 不需要读权限，大小腿照常可比对。root 忽略权限位 ⇒ 跳过。
+//
+// ★ 这条夹具的前提是"**本卷认 POSIX 权限位**"，而它比原设想窄得多（M335，2026-09-28
+// CI run 36340988848 的 windows 腿唯一一条红就出在这里）。两条读数把旧注释推翻：
+//   - Windows 上 `os.Geteuid()` **返回 -1 而不是 0**（GOROOT 的 syscall_windows.go 里
+//     `func Geteuid() (euid int) { return -1 }`）⇒ 上一版注释"Windows 上恒为 0、这一格
+//     会跳过"不成立，那条 Skip 从未在 windows 腿生效过；
+//   - Windows 的 chmod 只翻 `FILE_ATTRIBUTE_READONLY`、不拒绝读 ⇒ "身份取不动"根本造不出来。
+//
+// 处置沿用同包两条先例的口径（M52 的 TestVerifyUnopenableIsUnverifiable、M91 的
+// TestM91UnreadableDupIsUnverifiableNotModified）：**问卷而不问系统名**——先探一次
+// `os.Open`，打得开就 Skip 并写明原因。★ 探针句柄**必须关掉**：CI 那次跟着报的第二条错
+// （TempDir RemoveAll：dup.bin "被另一进程占用"）正是没关的探针挡住清理，不是判据红。
+// 按 04 §6.8.0 约束 5，这一格在 Windows 侧记"未验证"，不许拿 unix 的绿冒充。
 func TestM317ZeroHashStillChecksSize(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root 忽略文件权限位，造不出\"身份取不动\"的现场")
@@ -111,8 +124,10 @@ func TestM317ZeroHashStillChecksSize(t *testing.T) {
 	if err := os.Chmod(keep, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Open(dup); err == nil {
-		t.Fatal("夹具没造出来：000 之后 dup 仍可读，权限位未生效")
+	if f, err := os.Open(dup); err == nil {
+		_ = f.Close()
+		t.Skipf("本平台 chmod 不拒绝读（Windows 只翻只读位，exFAT/FAT 上权限位整个不存在）：" +
+			"\"身份取不动\"这一前提造不出来 ⇒ default 分支的大小腿在本卷未验证（M335）")
 	}
 
 	// Size 故意与现场不符：只有大小腿能识破，内容自校验此时本就无从比对。
