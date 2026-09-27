@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -304,7 +303,7 @@ func cacheWriteBackErrText(op string, e error) string {
 		consequence = "条目本身还在库里，只是 LRU 的「最近用过」没刷新，它可能被提前淘汰"
 	}
 	cause := ""
-	if s := e.Error(); strings.Contains(s, "database is locked") || strings.Contains(s, "SQLITE_BUSY") {
+	if cache.IsBusy(e) {
 		cause = "缓存库正被其他程序占用（另一个窗口或命令行版同时打开同一个库最常见），稍后重试即可"
 	}
 	tail := "系统原文：" + e.Error()
