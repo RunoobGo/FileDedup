@@ -7,6 +7,7 @@ import { useScanStore } from '../stores/scan'
 import { useToastStore } from '../stores/toast'
 import { api, type OpKind } from '../wails'
 import { reclaimLine } from '../utils/opdisplay'
+import { TRASH_MODAL_DESC } from '../utils/undoReason'
 import { useModal } from '../composables/useModal'
 
 const props = defineProps<{
@@ -22,7 +23,7 @@ const picking = ref(false)
 
 const meta = computed(() => {
   switch (props.kind) {
-    case 'trash': return { title: '移入回收站', danger: false, desc: '文件将移入系统回收站，可随时还原。' }
+    case 'trash': return { title: '移入回收站', danger: false, desc: TRASH_MODAL_DESC }
     case 'delete': return { title: '永久删除', danger: true, desc: '文件将被永久删除，此操作不可恢复！' }
     case 'move': return { title: '移动到指定目录', danger: false, desc: '文件将移动到目标目录（跨盘自动复制并校验）。' }
     case 'symlink': return {

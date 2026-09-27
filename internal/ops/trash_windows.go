@@ -268,7 +268,7 @@ func recycledVolumeRoots(paths []string) []string {
 
 func defaultTrashLocked(paths []string) (map[string]string, error) {
 	dst := map[string]string{}
-	// ★ M279：`dst` 建完就走是这条缺陷的本体——它让执行器回退分支里那条
+	// ★ M279：`dst` 从建完就走是这条缺陷的本体——它让执行器回退分支里那条
 	// `known[p]` 命中路径在 Windows 上**永不可达**，于是批量部分成功
 	// （真机读数：80 项混批里 15 个被占用 ⇒ SHFileOperation 返错误码 32，
 	// 其余 65 项其实已进站）时，源已消失的项全被记成
@@ -280,7 +280,12 @@ func defaultTrashLocked(paths []string) (map[string]string, error) {
 	// 见 recycle_index.go 头部），且只在解出自洽证据时才落键 ⇒ 配不到证据时交回的
 	// 仍是空表，2026-09-20 那道"静默永久删除"的 strict Failed 防线一寸未松。
 	started := time.Now()
-	defer func() { fillRecycledDst(dst, recycledVolumeRoots(paths), paths, started) }()
+	roots := recycledVolumeRoots(paths)
+	// ★ M270：一趟枚举、两处消费。`ev` 在 Shell 那一腿结束后填一次，
+	// defer 拿它填 dst，`verifyRecycled` 拿它做降级复核——两趟枚举会因中间被
+	// 别的进程清理而给出互相矛盾的读数（一边说有证据、一边说没进站）。
+	ev := recycleEvidence{}
+	defer func() { fillRecycledDst(dst, ev.found) }()
 	if len(paths) == 0 {
 		return dst, nil
 	}
@@ -311,18 +316,39 @@ func defaultTrashLocked(paths []string) (map[string]string, error) {
 		fFlags: fofAllowUndo | fofNoConfirmation | fofSilent | fofNoErrorUI,
 	}
 	r0, _, _ := procSHFileOperation.Call(uintptr(unsafe.Pointer(&op)))
+
+	// Shell 那一腿到此结束（成功、部分成功、被中止都一样）：**只扫这一次**。
+	// 放在 r0 判断**之前**是必须的——M279 的真机形状正是 `r0=32` 的错误出口，
+	// 那一批里已经进站的 65 项全靠这份读数才没被记成数据丢失。
+	ev.found, ev.scanned = scanRecycleBin(roots, paths, started)
+
 	if r0 != 0 {
-		return dst, fmt.Errorf("SHFileOperation 错误码 %d", r0)
+		// ★ M280：译文表在 shfileop.go（无 tag，Linux CI 主门禁跑那张表），这里只交码。
+		// 修前这里把错误码原样拼成一句"某码 + 数字"直达用户，而 32 恰是本机最常见的一档
+		// （占用），用户看不出该关什么、该不该重试。表的兜底臂刻意"未收录就不猜原因"：
+		// FO_E_* 与 Win32 码数值重叠，猜错归因会让用户照着假原因排查（M279 的教训反过来一样成立）。
+		return dst, shFileOperationError(int64(r0))
 	}
 	if op.fAnyOperationsAborted != 0 {
 		return dst, fmt.Errorf("操作被系统中止")
 	}
 	// ★ 关键：r0==0 **不足以**判定文件进了回收站。复核，否则可能是静默永久删除。
 	// 同时比对"每卷预期入站数"，否则同卷内**部分**文件被静默删除会被漏检。
-	if err := verifyRecycled(paths, expected, before); err != nil {
+	if err := verifyRecycled(paths, expected, before, ev); err != nil {
 		return dst, err
 	}
 	return dst, nil
+}
+
+// recycleEvidence 是**一趟** `$Recycle.Bin` 枚举的两份读数（见 scanRecycleBin）。
+//
+// 为什么要单列一个类型而不是两个裸参数往上传：这两份读数必须**同源**。拆成两个参数
+// 之后，调用方完全可以只传其中一份（另一份留空），症状是"复核说有 3 条没进站、
+// dst 里却有 3 条落点"这种自相矛盾的账。装在一个结构体里由一次赋值填满，
+// 漏一份就成了编译期错误。
+type recycleEvidence struct {
+	found   map[string]string // 原路径 → `$R…` 落点（M279）
+	scanned map[string]bool   // 卷根 → 这一趟真读到过该卷回收站的内容（M270）
 }
 
 // recyclableReason 判定单个路径能否**保证**进入系统回收站。
@@ -334,6 +360,15 @@ func defaultTrashLocked(paths []string) (map[string]string, error) {
 // 补成"全局 + 该卷"）。
 func recyclableReason(p string) string {
 	if why := unsafeDriveReason(p); why != "" {
+		return why
+	}
+	// ★ M265：路径长度层。`SHFileOperationW` 这一腿在 **260 个 UTF-16 码元**处
+	// 静默丢文件（真机九档同读数，且与 `LongPathsEnabled` 无关——开了照样丢），
+	// 而它**返回 0**、进站痕迹一条都没有 ⇒ 事后复核只能报"复核不可用"，
+	// 用户看到的是"已移入回收站"。这种失效必须在交给 Shell 之前拦下。
+	// 判据本体在 recycle_policy.go（无 tag，Linux CI 主门禁跑它）；尺子是码元，
+	// 不是字节也不是 rune（M269 立的正是这条量纲错）。
+	if why := longPathDropReasonFor(p); why != "" {
 		return why
 	}
 	// 策略层：全局或该卷的 NukeOnDelete=1 时删除都不进回收站。
@@ -480,10 +515,21 @@ func snapshotRecycleBinCounts(paths []string) RBState {
 
 // verifyRecycled SHFileOperation 返回 0 之后的独立复核（第二道防线）。
 //
-// 本函数只负责**采集平台数据**（哪些源还在、各卷回收站条目数），
-// 判定逻辑全部委托给 recycle_policy.go 的 checkRecycled——那里是纯函数，
-// 可在 Linux 上跑测试，确保这道防线进入 CI 主门禁。
-func verifyRecycled(paths []string, expected, before RBState) error {
+// 本函数只负责**采集平台数据**（哪些源还在、各卷回收站条目数、本轮进站痕迹），
+// 判定逻辑全部委托给 recycle_policy.go——那里是纯函数，可在 Linux 上跑测试，
+// 确保这道防线进入 CI 主门禁。
+//
+// ★ M270（2026-09-27）：`checkRecycled` 的判据 2 在"该卷没有快照基准"时**必须跳过**
+// （两条 `continue`），而本机 `SHQueryRecycleBinW` 四卷恒 `ok=false` ⇒ 判据 2
+// **每一卷都被旁路**，整条复核从未真正跑过（真机读数：`err=<nil>`、
+// `before=map[]`、`after=map[]`、`expected=map[F:\:3]`）。旁路的卷不能一跳了之，
+// 这里把它们交给降级腿 `checkRecycledByEvidence`：拿同一趟 `$Recycle.Bin` 枚举的
+// 逐条痕迹对账。
+//
+// 两腿的分工刻意不重叠：有基准的卷仍走计数判据（M197 那一套一字未动），
+// 无基准的卷才走逐条对账。否则同一批文件会被报两次，
+// 而两次读数之间还可能被清理工具改掉。
+func verifyRecycled(paths []string, expected, before RBState, ev recycleEvidence) error {
 	// 判据 1 的数据：源是否还在。
 	var still []string
 	for _, p := range paths {
@@ -493,7 +539,29 @@ func verifyRecycled(paths []string, expected, before RBState) error {
 	}
 	// 判据 2 的数据：操作后各卷回收站条目数。
 	after := snapshotRecycleBinCounts(paths)
-	return checkRecycled(still, expected, before, after)
+	if err := checkRecycled(still, expected, before, after); err != nil {
+		return err
+	}
+	bypassed := bypassedVolumes(expected, before, after)
+	if len(bypassed) == 0 {
+		return nil
+	}
+	return checkRecycledByEvidence(expected, bypassed, provenPerVolume(ev.found), ev.scanned)
+}
+
+// provenPerVolume 把逐条进站证据按卷计数，作为降级腿的"实际入站数"。
+//
+// 口径必须与 `expectedRecycledPerVolume` 完全一致：**每个源路径按其所处卷各计 1**，
+// 且卷根同样经 `toWinRoot` 规范化。两处口径错开（一边算条目一边算路径、
+// 或一边 `F:\` 一边 `f:\`）会让对账恒不等 ⇒ 每次都报"缺 N 条"的假警报。
+func provenPerVolume(found map[string]string) RBState {
+	out := RBState{}
+	for p := range found {
+		if root := toWinRoot(p); root != "" {
+			out[root]++
+		}
+	}
+	return out
 }
 
 // driveRoot 从路径提取卷根（`F:\`）；无法识别时返回 ""。

@@ -13,6 +13,7 @@ import {
   danglingKeepTitle,
   keepSourceTitle,
   offersInAppUndo,
+  recordedDest,
   revealKeepTitle,
 } from '../utils/keepsource'
 import Icon from '../components/Icon.vue'
@@ -176,16 +177,17 @@ async function clearAllOps() {
   await store.clearOps()
 }
 
-// 明细表「去向」列：trash/move 看 destPath，hardlink 看 linkSrc
+// 明细表「去向」列：trash/move 看 destPath，链接类（hardlink/symlink）看 linkSrc
 // destSummary 条目「去向」列的文案。
 //
-// 链接类条目（hardlink/symlink）的去向是"指向哪个保留源"，而非某个路径，
-// 故这里统一渲染成「→ 目标路径」。软链接额外标注「软链接」字样：
-// 后端的 isSymlink 标记来自 Lstat，能区分"当时建的链接"与"同栏但其实是
-// 硬链接的记录"——不靠 OP_KIND_LABEL 猜，避免旧记录/异常记录被误标。
+// 链接类条目的"去向"是**记账那一刻**写下的 linkSrc，不是现读的链接指向 ⇒ 文案必须自带
+// 这个口径（M291：真机上把链接改指到第三方文件后，这一行仍显示 `软链接 → …\keep.bin`，
+// 台账看起来完全健康，而执行侧的 verifySymlinked 当场就拦了——两句口径不一致）。
+// 造句住在 utils/keepsource.ts，视图只引用（M79 同一纪律）。
+// 两档仍按后端 isSymlink 分开标：那个标记来自 Lstat，比按 OP_KIND_LABEL 猜可靠（M290）。
 function destSummary(it: OpRecordItem): string {
   if (it.destPath) return it.destPath
-  if (it.linkSrc) return it.isSymlink ? `软链接 → ${it.linkSrc}` : `链接到 ${it.linkSrc}`
+  if (it.linkSrc) return recordedDest(it.linkSrc, !!it.isSymlink)
   return '—'
 }
 

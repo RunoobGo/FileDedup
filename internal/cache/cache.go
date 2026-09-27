@@ -109,6 +109,13 @@ func (c *Cache) DBErrors() int64 { return c.dbErrs.Load() }
 // 措辞约束：置位只代表"不再用它"，不代表"已隔离/已重建"——那一步没有做（§18.6 → M87）。
 func (c *Cache) Corrupted() bool { return c.corrupt.Load() }
 
+// DBPath 返回本库当前正在使用的文件路径。
+//
+// M281：缓存这一档的失败项此前 `Path` 恒空，在失败抽屉里就是"一行没有路径的失败"，
+// 与真正的文件操作失败混在同一个计数里。这个访问器唯一的用途是让那条 Item 指回
+// 用户能找到的那个文件（隔离重建后 `path` 仍是原路径，所以报出去的就是在用的那个）。
+func (c *Cache) DBPath() string { return c.path }
+
 // ErrCorruptDisabled 库被确证损坏后的自我停用（M74）。句子是完整的，调用方原样上报即可。
 var ErrCorruptDisabled = errors.New("哈希缓存库在运行期确证损坏，已停用：不影响去重结果，只是每次扫描都要重算")
 
@@ -323,6 +330,12 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 	//   稳定索引（FAT/exFAT 等，见 fsid_windows.go:191 的 index==0 判定）才落到这一格。
 	//   旧注释把这一格写成 Windows 专属（「该值恒为 0、比较平凡通过」）——那是 I7 之前的
 	//   事实，别再照它推理。
+	//   〔2026-09-27 M271 追加〕上面那句"normal 也有"对 dev/ino 成立，对 **ctime 那一腿不成立**：
+	//   `fileBasicInfoClass` 曾是错常数（1=FILE_STANDARD_INFO），Windows 上 CtimeNs 恒 0，
+	//   于是 H1 宣称的第二重证据在 Windows 上实际只剩 inode 一重——不是"该卷不维护 change
+	//   time"，是读错了结构。常数已修，判据见 `fsid_ctime_m271_test.go`。
+	//   ★ 一次性的后果要如实说：修前落盘的行 `ctime_ns=0`，修后现读得到真值 ⇒ 三腿比较
+	//   不命中 → **老缓存条目全量失效一次**（表现为一次重算，不是数据错误；方向是 fail-closed）。
 	if id.Resolved && (e.Dev != id.Dev || e.Ino != id.Ino || e.CtimeNs != id.CtimeNs) {
 		return Entry{}, false, false
 	}

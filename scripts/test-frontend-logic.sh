@@ -218,6 +218,12 @@ wiring 'src/views/RecordsView.vue' 'undoBlockedTitle(' '不支持应用内回撤
 	'记录页的不可回撤说明取自 utils/undoReason（M79：不得在视图里内联整句）'
 wiring 'src/stores/scan.ts' 'undoBlockedText(' "notifyError('回撤失败', e)" \
 	'回撤失败的 toast 正文经 utils/undoReason 翻译（M79：后端串不得原样上屏）'
+# M282（2026-09-27 实施批）：动手**之前**那句预告与动手**之后**那条徽标，必须是同一家的两半。
+# 改前模态里写的是内联句「文件将移入系统回收站，可随时还原。」，而记录页给同一批文件
+# 盖「不可回撤」——真机两张截图（b5_modal2 / b5_detail）。被禁写法就是那句原话：
+# 只要它在视图里回来，用户就又拿到一条自相矛盾的承诺，而 node 用例抓不到（它测的是 utils）。
+wiring 'src/components/ConfirmDialog.vue' 'TRASH_MODAL_DESC' '可随时还原' \
+	'回收站模态正文取自 utils/undoReason（M282：不得在视图里内联"可随时还原"）'
 # R3-1（2026-09-23 第四轮全仓审查，设计段 §30.7）：三处"唯一判据/唯一文案方"的漏网入口。
 # ★ 三条都锚**标识符**、禁的是**被取代的旧写法** ⇒ 日后改措辞不会误报。
 wiring 'src/components/GroupCard.vue' 'selectionWording(' '标记为删除' \

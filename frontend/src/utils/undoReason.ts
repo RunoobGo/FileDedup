@@ -71,3 +71,24 @@ export function undoBlockedTitle(code: string): string {
 export function undoTitleCodeForKind(kind: string): string {
   return kind === 'trash' ? UNDO_CODE_WINDOWS_TRASH : UNDO_CODE_PERMANENT_DELETE
 }
+
+/**
+ * 「移入回收站」确认模态的正文（M282，2026-09-27）。
+ *
+ * ★ 为什么这句也住在本文件：改动前它是 `ConfirmDialog.vue` 里内联的一句
+ * 「文件将移入系统回收站，可随时还原。」，而同一批文件在「记录」页拿到的徽标是
+ * 「不可回撤」——真机读数把这两句各拍了一张（`b5_modal2.png` / `b5_detail.png`）。
+ * 两句**各说一件事**（能还原的是 OS 回收站，做不到的是应用内一键回撤），但用户先读
+ * 前者、后读后者，就得到一条自相矛盾的承诺。M79 已经把"这条记录为什么不可回撤"收进
+ * 本文件当唯一文案方，M282 是同一族的另一半：**动手之前**那句预告。
+ *
+ * ★ 措辞必须平台中立：前端拿不到 GOOS（`wails.ts` 没有平台字段），所以这里不能写
+ * "本应用不提供回撤"——macOS/Linux 的回收站去向**是**可回撤的，那样写在那些平台上
+ * 是假话。写法改成"以记录页该条操作的徽标为准"，把准绳交给后端的判据（`undoable`）。
+ */
+export const TRASH_MODAL_DESC =
+  '文件将移入系统回收站（不是永久删除，数据还在回收站里）。' +
+  '要取回它们，请打开系统回收站后右键「还原」。' +
+  '本应用是否提供一键回撤，以「记录」页该条操作的徽标为准：' +
+  '标着「不可回撤」时（Windows 的回收站操作即如此），只能到系统回收站里手动还原。'
+

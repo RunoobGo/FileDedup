@@ -179,7 +179,9 @@ func TestVerifyRecycledDetectsExtantSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 文件存在 + 空快照（无卷信息可查）
-	err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{})
+	// 〔2026-09-27 M270〕签名多出 `ev`：事后复核现在还要吃"这一趟 `$Recycle.Bin`
+	// 枚举的两份读数"。本例传空表（什么都没读到），判据 1 应当先于降级腿报出"源仍在"。
+	err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{}, recycleEvidence{})
 	if err == nil {
 		t.Fatalf("源仍存在却未报错——「返回成功但没删掉」会被漏过")
 	}
@@ -188,13 +190,31 @@ func TestVerifyRecycledDetectsExtantSource(t *testing.T) {
 	}
 }
 
-// TestVerifyRecycledGoneSourceNoSnapshotOK 源已消失且无卷快照可查时，
-// 判据 2 跳过 → 不报错（保守：宁缺勿错判）。
+// TestVerifyRecycledGoneSourceNoSnapshotOK 源已消失且无卷快照可查时的行为。
+//
+// 〔2026-09-27 M270 更正〕本条原先断言"不报错（判据 2 应跳过，宁缺勿错判）"，
+// 而那条期望**就是 M270 的事故本体**：本机 `SHQueryRecycleBinW` 四卷恒 `ok=false`
+// ⇒ "无快照"不是边缘情形而是**每卷常态**，"跳过即通过"等于事后复核从未运行
+// （真机读数 `err=<nil>` + `before=map[]` + `after=map[]` + `expected=map[F:\:3]`）。
+// 期望因此翻转为"必须报错"。报错的措辞必须是「复核不可用」而不是「永久删除」——
+// 我们只是拿不到证据，没有证据说文件没了（把两者混同就是 M279 那类假警报）。
 func TestVerifyRecycledGoneSourceNoSnapshotOK(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "already-gone.bin") // 从未创建
-	if err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{}); err != nil {
-		t.Fatalf("无快照时不应报错（判据 2 应跳过），got %v", err)
+	err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{}, recycleEvidence{})
+	if err == nil {
+		t.Fatalf("无快照 + 无进站痕迹却判通过 ⇒ 复核仍是静默旁路（M270）")
+	}
+	if !strings.Contains(err.Error(), "复核不可用") {
+		t.Fatalf("报错措辞错：%v", err)
+	}
+	// 反向钉：痕迹齐备时同一批必须判通过（旁路的解药是证据，不是报错本身）。
+	ev := recycleEvidence{
+		found:   map[string]string{p: `C:\$Recycle.Bin\S-1-5-21-1\$Rx.bin`},
+		scanned: map[string]bool{toWinRoot(p): true},
+	}
+	if err := verifyRecycled([]string{p}, expectedRecycledPerVolume([]string{p}), RBState{}, ev); err != nil {
+		t.Fatalf("有逐条证据却仍报错：%v", err)
 	}
 }
 

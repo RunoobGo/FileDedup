@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -268,17 +269,62 @@ func (p *Pipeline) claimRunLocked(cancel context.CancelFunc) error {
 // cacheOpErrText 把 cache.Store/Touch 的错误分诊成一句**符合事实**的话（M75a / M74）。
 // 判据用哨兵错误而不是重新解释 SQLite 文本（I5：分类只在 cache 侧做一次）。
 // ok=false 表示这件事已由轮末那条停用说明统一交代，再报一条"失败"反倒成假话。
+//
+// 〔2026-09-27 M281〕造句本体搬到 cacheWriteBackErrText：这里只留"停用态不造句"这一半，
+// 因为 M74 那条边界（ok=false）被两处消费（Run 的 defer 与测试），不该和文案混在一起。
 func cacheOpErrText(op string, e error) (string, bool) {
-	switch {
-	case errors.Is(e, cache.ErrCorruptDisabled):
+	if errors.Is(e, cache.ErrCorruptDisabled) {
 		return "", false
-	case errors.Is(e, cache.ErrEvictFailed):
-		// 哨兵自带"哈希条目已写回，仅 LRU 淘汰未完成"——改前这里一律写成
-		// "缓存写回失败"，而 Commit 早就成功了（§18.0 取证 #8）。
-		return e.Error(), true
-	default:
-		return op + "失败: " + e.Error(), true
 	}
+	return cacheWriteBackErrText(op, e), true
+}
+
+// cacheWriteBackErrText 是缓存降级那两档的**唯一造句点**（M281）。
+//
+// 修前的形状（真机读数 W9-7）：`缓存写回失败: database is locked (5) (SQLITE_BUSY)`
+// ——SQLite 的英文内部串当主语直达用户，而且句子里读不出"这跟我的文件有没有关系"。
+// 三条边界：
+//  1. 先讲**降级**（不影响本次去重结果）再讲原因：缓存写回失败在语义上不是"文件没处理成"；
+//  2. 系统原文只能待在尾注里（本仓真机读数按原文归档，译文会随版本改，取证要对表）；
+//  3. 归因表只收**有读数**的一档（占用），认不出来的错误一律交回原文、不配猜来的原因
+//     ——与 M280 的 shFileOperationReason 同一纪律。
+//
+// op 分岔是因为两档的**后果不同**，共用一句就成了假话：写回失败 ⇒ 这批哈希没进库、
+// 下次要重算；续期失败 ⇒ 条目早已在库里（哈希没丢），只是 LRU 的记账没刷新、可能被提前淘汰。
+func cacheWriteBackErrText(op string, e error) string {
+	if errors.Is(e, cache.ErrEvictFailed) {
+		// 这一档哨兵自带"哈希条目已写回，仅 LRU 淘汰未完成"——改前这里一律写成
+		// "缓存写回失败"，而 Commit 早就成功了（§18.0 取证 #8）。原文照抄最诚实。
+		return "缓存淘汰未完成（不影响本次去重结果）：" + e.Error()
+	}
+	subject := "缓存写回"
+	consequence := "这批哈希没有进库，下次扫描还要重算"
+	if op == "缓存命中续期" {
+		subject = "缓存命中续期"
+		consequence = "条目本身还在库里，只是 LRU 的「最近用过」没刷新，它可能被提前淘汰"
+	}
+	cause := ""
+	if s := e.Error(); strings.Contains(s, "database is locked") || strings.Contains(s, "SQLITE_BUSY") {
+		cause = "缓存库正被其他程序占用（另一个窗口或命令行版同时打开同一个库最常见），稍后重试即可"
+	}
+	tail := "系统原文：" + e.Error()
+	if cause != "" {
+		tail = cause + "。" + tail
+	}
+	return subject + "未完成（不影响本次去重结果）：" + consequence + "。" + tail
+}
+
+// cacheStageItem 造一条 `Stage="cache"` 的失败项（M281：三处造句点共用）。
+//
+// 为什么 Path 里放的是**库文件**而不是某个用户文件：缓存失败根本没有对应到某个文件，
+// 空 `Path` 又不是可定位信息（抽屉里的"显示路径"那一列会是空白，用户无从判断这是哪件事）。
+// 没挂库时返回空串，不凭空造路径。
+func (p *Pipeline) cacheStageItem(msg string) model.FailedItem {
+	item := model.FailedItem{Stage: "cache", Err: msg}
+	if p.cch != nil {
+		item.Path = p.cch.DBPath()
+	}
+	return item
 }
 
 // corruptCacheNotice 生成轮末那条"库被确证损坏 ⇒ 停用"的说明（M74）。
@@ -472,20 +518,20 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			if e := p.cch.Store(pending); e != nil {
 				// 缓存失败不影响结果正确性：计入失败清单提示
 				if text, ok := cacheOpErrText("缓存写回", e); ok {
-					failed = append(failed, model.FailedItem{Stage: "cache", Err: text})
+					failed = append(failed, p.cacheStageItem(text))
 				}
 			}
 		}
 		if len(hitPaths) > 0 {
 			if e := p.cch.Touch(hitPaths); e != nil {
 				if text, ok := cacheOpErrText("缓存命中续期", e); ok {
-					failed = append(failed, model.FailedItem{Stage: "cache", Err: text})
+					failed = append(failed, p.cacheStageItem(text))
 				}
 			}
 		}
 		// M74：本轮把库确证成损坏 ⇒ 至多**一条**说明（造句点见 corruptCacheNotice）。
 		if msg := corruptCacheNotice(p.cch.DBErrors(), p.cch.Corrupted()); msg != "" {
-			failed = append(failed, model.FailedItem{Stage: "cache", Err: msg})
+			failed = append(failed, p.cacheStageItem(msg))
 		}
 	}()
 	runWorkers(ctx, workers, stagePanicHandler("prefilter"), func() error {

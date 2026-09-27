@@ -63,7 +63,14 @@ const (
 	// win32EpochDiff 1601-01-01 → 1970-01-01 之间的 100ns 间隔数。
 	win32EpochDiff = 116444736000000000
 	// fileBasicInfoClass FILE_INFO_BY_HANDLE_CLASS.FileBasicInfo。
-	fileBasicInfoClass = 1
+	//
+	// ★ M271：这里曾写成 1，而 1 是 **FILE_STANDARD_INFO**（allocSize/实占/链数）。
+	// 那次调用**不会失败**，所以旧形状不是"报错"而是"换个结构的字节按 basicInfo 解释"：
+	// 偏移 24~31 恰好落在 FILE_STANDARD_INFO 的 `BOOL Directory` + 补齐上 ⇒ 恒 0 ⇒
+	// CtimeNs 在 NTFS/exFAT/FAT32 三卷上**一律 0**，Windows 的 change time 从未取到过。
+	// 后果不在身份解析这一层，在**缓存命中判定**（`internal/cache` 的 dev/ino/ctime 三腿）：
+	// ctime 那一腿存 0 读 0、平凡通过，宣称的"第二重证据"实际只剩 inode 一重。
+	fileBasicInfoClass = 0
 
 	// CreateFileW 参数常量（取自 Win32 头文件）。
 	//

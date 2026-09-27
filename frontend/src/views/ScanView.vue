@@ -232,6 +232,13 @@ const progressPercent = computed(() => {
             @click="store.startScan()">
             开始扫描（{{ store.roots.length }} 个目录）
           </button>
+          <!-- M286：这颗按钮灰掉时，那句"为什么"原先只有 :title 一个出口，而 tooltip 由
+               OS 绘制——M293 用 UIA 读得出挂在元素上的字符串，两臂都合成不出那层浮窗，
+               ⇒ "挂在元素上"≠"用户看得见"。这里把它摆进 DOM。
+               ★ 判据面不新增：文案仍取 store.busyTip（busyReason 三因的唯一派生出口）；
+               本行所在的分支是"没有扫描在跑"，所以真正会显形的是 opsRunning / histLoading
+               那两因——扫描中的解释由进度页自己承担。 -->
+          <span v-if="store.busy" class="busy-note" role="status">{{ store.busyTip }}</span>
         </div>
       </div>
     </template>
@@ -341,4 +348,7 @@ const progressPercent = computed(() => {
 .exc-add { align-self: flex-start; margin-top: var(--sp-1); }
 .filter-foot { display: flex; justify-content: flex-end; gap: var(--sp-3); margin-top: 14px; }
 .start { font-size: var(--fs-lg); padding: 9px 22px; }
+/* M286：那一行可见的忙理由。`margin-right: auto` 让它在右对齐的 .filter-foot 里落到左侧，
+   读序就成了"左边说为什么点不动、右边是那颗点不动的按钮"。 */
+.busy-note { margin-right: auto; align-self: center; color: var(--text-3); font-size: var(--fs-sm); }
 </style>

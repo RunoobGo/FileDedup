@@ -455,6 +455,12 @@ function onConfirm(targetDir?: string) {
         <button class="btn-danger" :disabled="opDisabled"
           :title="opDisabledTip || '不可恢复，需二次确认'" @click="confirmKind = 'delete'">永久删除</button>
       </div>
+      <!-- M286：这一行是"这些按钮为什么是灰的"的**可见**出口。改前这句话只挂在 :title 上，
+           而 title 由 OS 绘制——M293 用 UIA 能把那串字符读成 HelpText（证明"挂在元素上"），
+           两臂都合成不出那层浮窗（证明不了"用户看得见"）⇒ 只有不可见出口的解释等于没有解释。
+           ★ 文案不在这里造句：仍取 store.busyTip（busyReason 的唯一派生出口，三因各一句），
+           与保留策略那一行的 应用/重置 共用同一个判据面。不忙时整行不渲染，不留空节点撑布局。 -->
+      <p v-if="store.busy" class="busy-note" role="status">{{ store.busyTip }}</p>
       <!-- 收窄发生时的**就地**说明。确认框里已经说了一次，但用户点"取消"后
            回到这一屏如果看不到任何痕迹，下一次可能就忘了自己开着处理策略——
            按钮禁用的原因也就无从得知（effectiveCount 为 0 时按钮是灰的）。 -->
@@ -630,6 +636,9 @@ button.stat:hover b { text-decoration: underline; }
 .proc-note svg { flex: none; margin-top: 3px; }
 .proc-note.warn { background: var(--warn-weak, var(--bg-hover)); color: var(--warn-ink, var(--text-2)); }
 .proc-note.warn b { color: inherit; }
+/* M286：那一行可见的忙理由。视觉上跟在操作按钮后面、比按钮弱一档就够了——
+   它解释的是"为什么点不动"，不是新的主操作。 */
+.busy-note { margin: 4px 0 0; text-align: right; color: var(--text-3); font-size: var(--fs-sm); }
 /* 跨卷软链接的常驻风险说明。视觉上刻意"存在感强但不刺眼"：
    用 info 色而非警告红——软链接合并是**正确可用**的操作，不是错误；
    但需要用户读完。因此：不折叠、可选中复制（user-select: text），

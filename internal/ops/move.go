@@ -136,7 +136,7 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 		return err
 	}
 	if err := os.Link(keep, tmp); err != nil {
-		return fmt.Errorf("硬链接失败（可能跨卷或权限）: %w", err)
+		return hardlinkLinkError(err)
 	}
 	if s := identityGuardSentence("保留源", tmp, keepID); s != "" {
 		_ = os.Remove(tmp)

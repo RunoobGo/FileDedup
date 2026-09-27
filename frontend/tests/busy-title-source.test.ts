@@ -167,6 +167,32 @@ test('RecordsView：可见的忙提示由 busyTip 供文案，不再单判 opsRu
   )
 })
 
+// 判据 (e)：M286 的取向本体——"为什么是灰的"必须有一处**可见文本**出口。
+//
+// 为什么 (a)~(d) 全绿仍不算 M286 落地：那四条钉的是"**有** title 时 title 得同源"，
+// 而 M286 登记的是 title **本身不是可取证的用户通道**（M293：UIA 能把 `title` 读成
+// HelpText，证的是"挂在元素上"；OS 绘制的那层浮窗两臂都合成不出来，证不了"看得见"）。
+// ⇒ 这一条只问一件事：每个因忙而灰的视图里，是否有一处**渲染进 DOM 的文本**。
+// ★ 顺带门控 `v-if`：不加门控就会在不忙时留一行空节点（把布局撑开、什么也不说）。
+function checkVisibleBusyExit(file: string) {
+  const src = viewSrc(file)
+  const hits = [...src.matchAll(/\{\{\s*store\.busyTip\s*\}\}/g)]
+  assert.ok(hits.length > 0, `${file}：忙理由只有 :title 这一个不可见出口（M286 的取向没落地）`)
+  for (const h of hits) {
+    const tagStart = src.lastIndexOf('<', h.index ?? -1)
+    const tagEnd = src.indexOf('>', tagStart)
+    const vif = /v-if="([^"]*)"/.exec(src.slice(tagStart, tagEnd))?.[1] ?? ''
+    assert.ok(/store\.busy\b/.test(vif), `${file}：可见忙提示没被 store.busy 门控 ⇒ 不忙时会留一行空文本：${vif || '(无 v-if)'}`)
+  }
+}
+
+test(`${RESULT_VIEW}：忙理由有一处可见文本出口（不只挂在 :title 上）`, () =>
+  checkVisibleBusyExit(RESULT_VIEW))
+test(`${RECORDS_VIEW}：忙理由有一处可见文本出口（不只挂在 :title 上）`, () =>
+  checkVisibleBusyExit(RECORDS_VIEW))
+test(`${SCAN_VIEW}：忙理由有一处可见文本出口（不只挂在 :title 上）`, () =>
+  checkVisibleBusyExit(SCAN_VIEW))
+
 // 判据 (d)：上面 (a)(b) 的**扫描面**自证——"因忙而灰"的判据只许出现在这三枚视图里。
 //
 // 为什么需要这一条：(a)(b) 都只遍历 RESULT/RECORDS/SCAN 三个文件，所以"第四处按钮

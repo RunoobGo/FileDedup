@@ -101,8 +101,12 @@ func TestCacheOpErrTextClassification(t *testing.T) {
 		t.Error("停用态在续期侧同样要吞掉（错误被包装后仍须认得）")
 	}
 	// ③ 真写回失败：措辞保持原样，不许被"已写回"污染。
+	// 〔2026-09-27 M281〕精确等值串整体换掉了：改前这一档是
+	// `缓存写回失败: disk I/O error`——"失败"两字把**降级**说成了事故，而且整句读不出
+	// "我的文件到底有没有被处理"。等值断言本身保留（它是这条钉的力度所在），
+	// 换的是被钉的那句话。
 	text, ok = cacheOpErrText("缓存写回", errors.New("disk I/O error"))
-	if !ok || text != "缓存写回失败: disk I/O error" {
+	if !ok || text != "缓存写回未完成（不影响本次去重结果）：这批哈希没有进库，下次扫描还要重算。系统原文：disk I/O error" {
 		t.Errorf("普通失败的文案走样：%q ok=%v", text, ok)
 	}
 	if _, ok := cacheOpErrText("缓存写回", errors.New("disk I/O error")); ok && strings.Contains(text, "已写回") {
@@ -174,8 +178,11 @@ func TestRunReportsCacheWriteBackFailureOnce(t *testing.T) {
 	if len(cacheItems) != 1 {
 		t.Fatalf("cache 失败项应恰好一条，实测 %d：%+v", len(cacheItems), cacheItems)
 	}
-	if !strings.HasPrefix(cacheItems[0].Err, "缓存写回失败") {
-		t.Errorf("暂时性故障应仍报写回失败：%q", cacheItems[0].Err)
+	// 〔2026-09-27 M281〕前缀从"缓存写回失败"换成"缓存写回未完成"：这一档是**降级**
+	// （本轮结果不受影响，只是哈希没进库），"失败"两字与下面的"不影响结果"自相矛盾，
+	// 而它又会与真正的文件操作失败混进同一个「失败项 n」计数。
+	if !strings.HasPrefix(cacheItems[0].Err, "缓存写回未完成") {
+		t.Errorf("暂时性故障应仍报缓存这一档：%q", cacheItems[0].Err)
 	}
 	if strings.Contains(cacheItems[0].Err, "已停用") || strings.Contains(cacheItems[0].Err, "损坏") {
 		t.Errorf("不可用 ≠ 确证损坏，不得冒出停用措辞：%q", cacheItems[0].Err)

@@ -317,13 +317,25 @@ func TestFillRecycledDstMergesIntoGivenMap(t *testing.T) {
 
 	table := map[string]string{"先已有.key": "先已有值"}
 	before := table
-	fillRecycledDst(table, []string{root + string(filepath.Separator)}, []string{cand}, now)
+	// 〔2026-09-27 M270〕证据改由调用方**一次枚举**后交进来（`scanRecycleBin`），
+	// 本函数的职责收窄成"就地合并"。原签名 `fillRecycledDst(table, roots, cand, now)`
+	// 自己扫一趟，会和复核那趟给出互相矛盾的读数。本条断言的"就地、不覆盖已有键"不变。
+	found, _ := scanRecycleBin([]string{root + string(filepath.Separator)}, []string{cand}, now)
+	fillRecycledDst(table, found)
 	if len(table) != 2 || table[cand] != dst {
 		t.Fatalf("合并结果 = %v，期望保留原有键并补上进站落点", table)
 	}
 	if len(before) != 2 {
 		t.Fatal("before 与 table 不是同一个表（fillRecycledDst 换了引用而不是就地写）")
 	}
+	// ★ 已有键优先：平台自己报过落点时，扫描不得把它改成回收站里的形状。
+	taken := map[string]string{cand: "平台自报的落点"}
+	fillRecycledDst(taken, found)
+	if taken[cand] != "平台自报的落点" {
+		t.Fatalf("已有键被扫描结果覆盖了：%v", taken[cand])
+	}
+	// ★ nil dst 不得 panic（defer 里 dst 也许还没建）。
+	fillRecycledDst(nil, found)
 }
 
 // ★ 接线锚（无 tag 也能读源码：文件就在仓库里，Linux CI 同样扫得到）：

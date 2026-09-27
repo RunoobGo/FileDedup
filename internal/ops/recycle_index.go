@@ -149,6 +149,11 @@ func recycleBinDirs(roots []string) []string {
 
 // collectRecycledDestinations 在给定卷根的回收站里，为 paths 找出**本轮**的进站证据。
 //
+// 它是 `scanRecycleBin` 的薄包装（只丢开第二份读数）。留着的原因：
+//  1. M279 那批测试只关心配对结果，逐条改签名会让"证据怎么配"这条判据的回归面变小；
+//  2. 新增消费方（M270 降级腿）要的是**另一份**读数，两者必须出自同一趟枚举——
+//     分开调两次就会出现"dst 说有证据、复核说没读到目录"这种自相矛盾。
+//
 // 三重筛子，缺一不算证据：
 //  1. 条目名的路径长度自洽且解得动（parseRecycleIndex）；
 //  2. 头部删除时间 ≥ notBefore − recycleScanSlack（同一路径的上一轮旧条目不得顶替本轮，
@@ -157,7 +162,36 @@ func recycleBinDirs(roots []string) []string {
 //
 // 同一路径命中多条时取**最新**那条。
 func collectRecycledDestinations(roots []string, paths []string, notBefore time.Time) map[string]string {
+	found, _ := scanRecycleBin(roots, paths, notBefore)
+	return found
+}
+
+// scanRecycleBin 一趟枚举交出**两份**读数：
+//
+//	found[原路径]  = 该文件在回收站里的 `$R…` 实体落点（M279 的 dst 证据）
+//	scanned[卷根] = 这一趟是否真的看见过该卷的回收站内容（至少一个 SID 目录列成功）
+//
+// ★ 第二份读数是 M270 修法的关键，别把它当成"顺手返回"。`SHQueryRecycleBinW` 在本机
+// 四卷恒 `ok=false`，于是 `checkRecycled` 判据 2 的两条 `continue` **每卷都命中**，
+// 整条事后复核在真机上从未执行过（读数：`err=<nil>`、`before=map[]`、`after=map[]`、
+// `expected=map[F:\:3]`）。降级腿要拿"逐条对账"顶上，就必须能区分两件事：
+//
+//	该卷根本没读到回收站 → **无证据**，只能报"复核不可用"
+//	读到了却配不上账      → **有证据表明没进站**，报"疑似静默永久删除"
+//
+// 少了 scanned 这一份，两者在调用方眼里长得一模一样，降级腿不是造假警报就是漏报。
+//
+// ★ `scanned` 的键用**调用方交进来的卷根原串**（不做二次规范化）：调用侧已经用
+// `toWinRoot` 统一过形状，而 `expected` 的键出自同一把尺子；这里再改一次形状，
+// 降级腿查表就永远查不到该卷 ⇒ 有证据的卷被报成"复核不可用"。
+//
+// ★ 判定"读到"的标准是**SID 子目录列成功**，不是 `$Recycle.Bin` 本身列成功：
+// 真机 ACL 读数说盘根给 `BUILTIN\Users` 的是 `ReadAndExecute`（列得出别人的 SID 名），
+// 而那些 SID 目录本身我们打不开。以盘根为准会把"只看得见别人的目录"记成可复核，
+// 配上零条证据 → 报成永久删除 → 又是一次 M279 型假警报。
+func scanRecycleBin(roots []string, paths []string, notBefore time.Time) (map[string]string, map[string]bool) {
 	out := map[string]string{}
+	scanned := map[string]bool{}
 	want := make(map[string]string, len(paths))
 	for _, p := range paths {
 		if p != "" {
@@ -165,49 +199,55 @@ func collectRecycledDestinations(roots []string, paths []string, notBefore time.
 		}
 	}
 	if len(want) == 0 {
-		return out
+		return out, scanned
 	}
 	floor := notBefore.Add(-recycleScanSlack)
 	minFiletime := winFiletime(floor)
 	best := map[string]int64{}
 
-	for _, dir := range recycleBinDirs(roots) {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue // 别的用户的 SID 目录：ACL 拒绝，不是失败
+	for _, root := range roots {
+		if root == "" {
+			continue
 		}
-		for _, e := range entries {
-			name := e.Name()
-			if e.IsDir() || !strings.HasPrefix(name, "$I") || len(name) < 3 {
-				continue
-			}
-			// 便宜的预筛：mtime 与头部删除时间逐秒一致（真机两条读数都验过），
-			// 用它挡掉历史条目的**读文件**成本；权威判据仍是下面头部里的 FILETIME。
-			if info, err := e.Info(); err == nil && info.ModTime().Before(floor) {
-				continue
-			}
-			raw, err := readRecycleIndexFile(filepath.Join(dir, name))
+		for _, dir := range recycleBinDirs([]string{root}) {
+			entries, err := os.ReadDir(dir)
 			if err != nil {
-				continue
+				continue // 别的用户的 SID 目录：ACL 拒绝，不是失败
 			}
-			orig, ft, ok := parseRecycleIndex(raw)
-			if !ok || ft < minFiletime {
-				continue
+			scanned[root] = true // 这一卷的回收站内容我们真看得见（哪怕下面一条都没配上）
+			for _, e := range entries {
+				name := e.Name()
+				if e.IsDir() || !strings.HasPrefix(name, "$I") || len(name) < 3 {
+					continue
+				}
+				// 便宜的预筛：mtime 与头部删除时间逐秒一致（真机两条读数都验过），
+				// 用它挡掉历史条目的**读文件**成本；权威判据仍是下面头部里的 FILETIME。
+				if info, err := e.Info(); err == nil && info.ModTime().Before(floor) {
+					continue
+				}
+				raw, err := readRecycleIndexFile(filepath.Join(dir, name))
+				if err != nil {
+					continue
+				}
+				orig, ft, ok := parseRecycleIndex(raw)
+				if !ok || ft < minFiletime {
+					continue
+				}
+				key := recyclePathKey(orig)
+				cand, hit := want[key]
+				if !hit {
+					continue
+				}
+				if prev, have := best[key]; have && prev >= ft {
+					continue
+				}
+				best[key] = ft
+				// 实体数据在同目录的 `$R…` 那一侧（`$I`/`$R` 只差前缀那一枚字母）。
+				out[cand] = filepath.Join(dir, "$R"+name[2:])
 			}
-			key := recyclePathKey(orig)
-			cand, hit := want[key]
-			if !hit {
-				continue
-			}
-			if prev, have := best[key]; have && prev >= ft {
-				continue
-			}
-			best[key] = ft
-			// 实体数据在同目录的 `$R…` 那一侧（`$I`/`$R` 只差前缀那一枚字母）。
-			out[cand] = filepath.Join(dir, "$R"+name[2:])
 		}
 	}
-	return out
+	return out, scanned
 }
 
 // readRecycleIndexFile 带上限地读一份 $I 元数据。
@@ -220,13 +260,17 @@ func readRecycleIndexFile(path string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, recycleIdxMaxRead))
 }
 
-// fillRecycledDst 把证据**就地**合并进 dst（调用方的 defer 依赖"就地"这一点：
+// fillRecycledDst 把一次扫描的证据**就地**合并进 dst（调用方的 defer 依赖"就地"这一点：
 // 换引用等于什么都没写进去）。已有的键不覆盖——若平台自己报过落点，以它为准。
-func fillRecycledDst(dst map[string]string, roots []string, paths []string, notBefore time.Time) {
+//
+// ★ 参数是**已扫好的证据**而不是"卷根+路径+时刻"：M270 要求一趟枚举同时喂 dst 与
+// 事后复核，若这里自己再扫一趟，两趟之间被别的进程清理就会造出"dst 说有证据、
+// 复核说没进站"的自相矛盾读数。
+func fillRecycledDst(dst map[string]string, found map[string]string) {
 	if dst == nil {
 		return
 	}
-	for src, d := range collectRecycledDestinations(roots, paths, notBefore) {
+	for src, d := range found {
 		if _, has := dst[src]; !has {
 			dst[src] = d
 		}

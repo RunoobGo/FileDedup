@@ -1,6 +1,10 @@
 package ops
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+	"unicode/utf16"
+)
 
 // 本文件承载"回收站可回收性判定"中**与平台无关的纯逻辑**。
 //
@@ -324,4 +328,108 @@ func recycleNukeReason(global, volume nukeStatus) string {
 		return "该卷的回收站已被单独禁用（Volume\\NukeOnDelete），此操作会直接永久删除"
 	}
 	return ""
+}
+
+// ---------- M265 / M269：Shell 回收站通道的路径长度上限 ----------
+
+// shellPathUnitLimit 是 `SHFileOperationW` 能安全受理的**最长路径（UTF-16 码元）**。
+//
+// ★ 单位是码元，不是字节、不是 rune（M269 立的就是这条量纲错）：真机第一批用 Go 的
+// `len()`（字节）记梯度，得到"355 才失效"的读数；改用纯 ASCII 语料逐档逼近后边界落在
+// **259 码元进站 / 260 码元丢弃**，回头算带中文段名那两组：355 字节＝259 码元进站、
+// 356 字节＝260 码元丢弃——与 ASCII 那条线重合。代理对（emoji）再钉一次：130 个 =
+// 260 码元必须拒，129 个 = 258 码元必须放行，rune 数在那两点上都是 130/129、毫无区分力。
+//
+// ★ 与 `LongPathsEnabled` **无关**：`=1` 态重跑九档逐格同读数（§6.45 二·一）。
+// 所以这一道预检不许写成"注册表没开才拒"——那会把已经量到的失效面放小。
+const shellPathUnitLimit = 259
+
+// pathUnits 数一条路径占多少个 UTF-16 码元。
+//
+// ★ 不加减任何偏移：`unicode/utf16.Encode` 不追加终止 NUL，所以它的返回长度就是码元数。
+// 边界 259/260 本来就是「不含 NUL 的路径长度」与 MAX_PATH(260，含 NUL) 的关系，
+// NUL 已经算在常数额度里了；这里再 `-1` 等于把上限推到 260 码元，正中静默删除那一格。
+func pathUnits(p string) int { return len(utf16.Encode([]rune(p))) }
+
+// shellPathDropReason 按**码元数**判定这条路径交给 Shell 回收站是否安全。
+// 返回 "" 放行；非空为拒绝原因（直接呈现给用户）。
+func shellPathDropReason(units int) string {
+	if units <= shellPathUnitLimit {
+		return ""
+	}
+	return fmt.Sprintf("路径长 %d 个 UTF-16 码元，超过系统回收站通道的上限（%d 码元可正常进站，%d 码元起失效）："+
+		"Shell 会返回成功却把文件**静默永久删除**（进站痕迹一条都不会有）。"+
+		"请改用「移动」把冗余文件挪走，或先自行把它们复制到短路径后再处理",
+		units, shellPathUnitLimit, shellPathUnitLimit+1)
+}
+
+// longPathDropReasonFor 是 Windows 预检的入口：给路径，交回拒绝原因。
+//
+// ★ 单列一层是为了让"调用点用的是哪把尺子"成为可测命题。只测 `shellPathDropReason(int)`
+// 的话，调用点写成 `shellPathDropReason(len(p))`（字节）照样全绿——而那正是 M269 的形状。
+func longPathDropReasonFor(p string) string {
+	return shellPathDropReason(pathUnits(p))
+}
+
+// ---------- M270：判据 2 被旁路时的降级复核 ----------
+
+// bypassedVolumes 交出"判据 2 实际上没跑"的那几卷。
+//
+// 规则：`expected[root] > 0`（本轮确有文件该进站）**且**快照两侧不齐全
+// （`checkRecycled` 的两条 `continue`：事前没基准 / 事后查不到，两者都会整卷跳过）。
+// 修前这两条 `continue` 就是 M270 的事故本体：`SHQueryRecycleBinW` 本机四卷恒
+// `ok=false` ⇒ 判据 2 **每卷都被旁路**，"报成功而复核一声未响"成为常态而非例外。
+//
+// expected 里没有的卷不入选：没有期待就没有对账，硬塞进降级腿只会造出 M279 那类假警报。
+func bypassedVolumes(expected, before, after RBState) []string {
+	var out []string
+	for root, want := range expected {
+		if want <= 0 {
+			continue
+		}
+		if _, hasBefore := before[root]; !hasBefore {
+			out = append(out, root)
+			continue
+		}
+		if _, hasAfter := after[root]; !hasAfter {
+			out = append(out, root)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkRecycledByEvidence 是判据 2 的降级腿：拿"逐条 `$I` 进站痕迹"替代"该卷条目数增量"。
+//
+// 三态必须分开，混成一句就是把 M265 的失明换个地方继续犯：
+//
+//	proven ≥ 期待        → 通过（而且比原判据更强：每条都有实体落点证据，不是计数差）
+//	proven < 期待        → 报"检出静默永久删除"，并报缺几条
+//	该卷根本没读到目录    → 报"该卷复核不可用"，**不许**写成数据已丢
+//
+// 第三态是本函数唯一的"不下结论"出口，但它**必须响亮**：改前的形状是静默 `continue`，
+// 用户拿到的是"已移入回收站"的成功提示。这里把它变成一条需要核实的错误，
+// 同时把话说准——我们没有证据表明文件没了，只是这台机器给不出证据。
+func checkRecycledByEvidence(expected RBState, roots []string, proven RBState, scanned map[string]bool) error {
+	for _, root := range roots {
+		want := expected[root]
+		if want <= 0 {
+			continue
+		}
+		if !scanned[root] {
+			return fmt.Errorf("该卷复核不可用：%s 上 %d 个文件已从原路径消失，"+
+				"但既读不到该卷回收站的条目数，也枚举不了它的 $Recycle.Bin 目录，"+
+				"因此无法证明它们进了回收站。"+
+				"请立即打开该卷回收站逐个核实（这通常是回收站被第三方工具接管、或该卷权限受限所致）",
+				root, want)
+		}
+		if got := proven[root]; got < want {
+			return fmt.Errorf("检出静默永久删除（逐条对账）：%s 上应有 %d 个文件进入回收站，"+
+				"$Recycle.Bin 里只找到 %d 条本轮进站痕迹，缺 %d 条。"+
+				"缺失的文件没有进站痕迹，可能已被直接删除，也可能在入站后被清理工具立即清走"+
+				"（Windows 的 SHQueryRecycleBinW 在本机不可用，故这里用逐条取证代替条目数增量）",
+				root, want, got, want-got)
+		}
+	}
+	return nil
 }
