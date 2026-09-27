@@ -1412,6 +1412,21 @@ func startCmd(cmd *exec.Cmd, onExit func(error)) error {
 // 缝只在绑定方法入口处读一次，读与用之间不跨锁、不跨 goroutine。
 var execRevealCmd = startCmd
 
+// windowsPathBase 按 **Windows 的分隔符语义**取路径末段：`/` 与 `\` 同为分隔符，
+// 尾部多余的分隔符先剥掉（`C:\a\explorer\` → `explorer`，与 Windows 上的 `filepath.Base` 同值）。
+//
+// ★ 为什么不用 `filepath.Base`：它认的是**宿主机**的分隔符。这里服务的判据是"注入
+// goos=windows 时按 Windows 语义裁决"，而 unix 宿主上 `filepath.Base` 对
+// `C:\Windows\explorer.exe` 是 no-op（整串原样返回）⇒ 那一格在 darwin/linux 腿恒读
+// false，只有 Windows 主机读得到 true，注入平台参数换来的"三平台同测"就成了空话。
+func windowsPathBase(p string) string {
+	p = strings.TrimRight(p, `/\`)
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
 // revealExitSilent 报告「这条外部定位命令的非零退出能不能当作成功」。
 //
 // M288（04 §6.50 W4-5 真机定案）：Windows 上 `explorer.exe` **成功也返回 1**。
@@ -1428,7 +1443,8 @@ func revealExitSilent(goos string, cmd *exec.Cmd) bool {
 	}
 	// 先转小写再剥 .exe：TrimSuffix 本身大小写敏感，而 Windows 上
 	// `C:\Windows\EXPLORER.EXE` 与裸名 `explorer` 是同一个程序。
-	return strings.TrimSuffix(strings.ToLower(filepath.Base(cmd.Path)), ".exe") == "explorer"
+	// ★ 取末段走 windowsPathBase 而不是 filepath.Base——后者认宿主机分隔符。
+	return strings.TrimSuffix(strings.ToLower(windowsPathBase(cmd.Path)), ".exe") == "explorer"
 }
 
 // warnRevealExit 是定位/打开/回收站这类外部命令 onExit 的统一出口。

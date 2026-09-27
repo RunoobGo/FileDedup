@@ -62,6 +62,8 @@ func TestRevealExitSilentOnlyWindowsExplorer(t *testing.T) {
 	}{
 		{"windows", "explorer", true, "LookPath 未跑通时 cmd.Path 仍是裸名"},
 		{"windows", `C:\Windows\explorer.exe`, true, "生产形态：解析后的绝对路径"},
+		{"windows", `C:\Windows\EXPLORER.EXE\`, true, "Windows 路径末段带尾分隔符仍取到 explorer"},
+		{"windows", `C:/Windows/explorer.exe`, true, "Windows 上正斜杠同样是分隔符"},
 		{"windows", "EXPLORER.EXE", true, "Windows 大小写不敏感"},
 		{"windows", "notepad", false, "只有 explorer 的退出码不作判据"},
 		{"linux", "explorer", false, "非 Windows 上这条判据不许生效"},
