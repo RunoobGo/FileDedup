@@ -6,6 +6,15 @@ import { useToastStore } from '../stores/toast'
 import { api } from '../wails'
 import { humanBytes, formatCount, formatUnixSec } from '../utils/format'
 import { undoBlockedTitle, undoTitleCodeForKind } from '../utils/undoReason'
+// M290/M297（2026-09-27 实施批）：软链接合并的"数据在哪儿、怎么拿回来"这一族
+// 判据与文案，全仓只写在 utils/keepsource.ts（M79 同一纪律：视图不内联整句、不自拼判据）。
+import {
+  KEEP_SOURCE_LABEL,
+  danglingKeepTitle,
+  keepSourceTitle,
+  offersInAppUndo,
+  revealKeepTitle,
+} from '../utils/keepsource'
 import Icon from '../components/Icon.vue'
 import type { HistoryMeta, OpRecord, OpRecordItem } from '../wails'
 
@@ -114,9 +123,24 @@ function askUndo(m: OpRecord) {
 
 const undoingItem = ref<number | null>(null)
 
-// done 可撤；undo_failed 给修正后重试通道（与批量回撤的后端口径一致）
+// done 可撤；undo_failed 给修正后重试通道（与批量回撤的后端口径一致）。
+// ★ 第三道门 offersInAppUndo 是本轮加的：软链接合并摆不出"应用内回撤"这个出口
+//   （M290 真机定案——合并成功即无条件删备份，而回撤以"备份必须在"为硬前提）。
+//   判据只写在 utils/keepsource.ts 一处，视图只引用（M79 同一纪律）。
 function canUndoItem(m: OpRecord, it: OpRecordItem): boolean {
-  return m.undoable && (it.state === 'done' || it.state === 'undo_failed')
+  return m.undoable && offersInAppUndo(m.kind) &&
+    (it.state === 'done' || it.state === 'undo_failed')
+}
+
+// revealKeep 明细行的「直达保留原目录」——撤下回撤按钮后，用户唯一的找回路径。
+//
+// ★ 刻意不做前端预检（"linkSrc 看着不存在就把按钮藏起来"）：目标不存在恰恰是
+//   最需要这个按钮的时候，而"没了就打开它所在的目录"是后端 RevealKeepSource 的
+//   判据（AS-H6 / 功能 4 同一纪律：前端拦下来只会把出口变成"没点可点"）。
+function revealKeep(it: OpRecordItem) {
+  const src = it.linkSrc
+  if (!src) return
+  api.revealKeepSource(src).catch((e: any) => toast.notifyError('打开保留源所在目录失败', e))
 }
 
 async function undoOne(m: OpRecord, it: OpRecordItem) {
@@ -165,18 +189,10 @@ function destSummary(it: OpRecordItem): string {
   return '—'
 }
 
-// danglingTitle 悬空链接的悬浮说明。
-//
-// 悬空 = 链接本身还在，但它指向的保留文件已经不在原路径了
-// （被删除、被移动、或所在磁盘未接入）。用户此时最需要知道的是
-// 「我的文件没丢，数据在保留源那边；而且这一条仍然可以回撤」——
-// 这正是它和"文件丢失"的根本区别，必须说清楚，否则用户会以为数据没了。
-function danglingTitle(it: OpRecordItem): string {
-  return `软链接已失效（悬空）：它指向的保留文件当前不可访问（可能已被删除、移动，或所在磁盘未接入）。\n` +
-    `你的数据没有丢失——合并时磁盘上只保留了一份，而这一条只是指向它的路径替身。\n` +
-    `目标：${it.linkSrc}\n` +
-    `如需恢复成独立文件，点右侧「回撤」即可（备份仍在，回撤不依赖链接是否有效）。`
-}
+// 悬空链接行的说明不住本文件（danglingKeepTitle，utils/keepsource）。
+// ★ 这里刻意**不复述**改前那两句 title 的原话：它们对用户的保证与盘上实况相反，
+//   而 frontend/tests/records-keepsource.test.ts 把那两个形状钉成"视图里不得再现"，
+//   注释里抄一遍就会把那条锚撞红（真机读数在 04 §6.50 一 W3-5，要看原话去那里）。
 </script>
 
 <template>
@@ -185,7 +201,12 @@ function danglingTitle(it: OpRecordItem): string {
       <button :class="{ on: tab === 'scans' }" @click="tab = 'scans'">扫描历史</button>
       <button :class="{ on: tab === 'ops' }" @click="tab = 'ops'">清理记录</button>
       <span class="spacer"></span>
-      <span v-if="tab === 'ops' && store.opsRunning" class="undo-hint">回撤执行中…</span>
+      <!-- M296（2026-09-27 实施批）：改前是 `v-if="… store.opsRunning"` 配一句写死的
+           「回撤执行中…」⇒ busy 的三个原因里只说得出一个，扫描中/历史载入中整页按钮
+           全灰却没有一句解释。文案直接取 store.busyTip（busyReason 的唯一派生出口），
+           这也是 M286 那条取向的落地：把"为什么是灰的"摆成**可见文本**，
+           而不是只挂在 title 上等 OS 绘制（M293 证过那层浮窗合成不出来）。 -->
+      <span v-if="tab === 'ops' && store.busy" class="undo-hint">{{ store.busyTip }}</span>
       <template v-if="tab === 'scans' && store.histList.length">
         <button v-if="!confirmClear" class="btn-ghost" @click="confirmClear = true">清空</button>
         <template v-else>
@@ -242,13 +263,20 @@ function danglingTitle(it: OpRecordItem): string {
                    恢复漏了 histLoading 之外的写法、重扫漏了 histLoading、删除什么都没挡。
                    openHistory 期间界面仍停在记录页（视图切换在回包之后），
                    于是"载入中"照样能点重扫/删除——新扫描与载入回包同时写同一批状态。 -->
+              <!-- M292（2026-09-27 实施批）：这一格的 :title 原先自拼一套
+                   scanning → opsRunning → loading 的优先级，与 store.busyReason() 的顺序
+                   **恰好相反**（那边 opsRunning 排第一），于是两态同真时"为什么是灰的"
+                   在两处给出两个句子——真机是三份逐采样日志读出来的（04 §6.50 一）。
+                   现在灰了就照读 busyReason 的那一句，不灰才说这个按钮干什么。 -->
               <button class="btn-primary" :disabled="store.histBusy"
-                :title="store.scanning ? '扫描进行中' : store.opsRunning ? '清理操作进行中' : loading ? '正在载入历史结果' : '恢复该结果并可继续清理'"
+                :title="store.busyTip || '恢复该结果并可继续清理'"
                 @click="open(m)">恢复</button>
+              <!-- M296 同一把尺子量到底：这两颗也吃 histBusy，静态 title 只说"干什么"、
+                   不说"为什么灰"⇒ 灰着时同样是一句假解释。 -->
               <button class="btn-ghost" :disabled="store.histBusy"
-                title="按此配置重新扫描" @click="rescan(m)">重扫</button>
+                :title="store.busyTip || '按此配置重新扫描'" @click="rescan(m)">重扫</button>
               <button class="btn-ghost del" :disabled="store.histBusy"
-                title="删除该条历史" @click="del(m)">删除</button>
+                :title="store.busyTip || '删除该条历史'" @click="del(m)">删除</button>
             </td>
           </tr>
         </tbody>
@@ -276,6 +304,11 @@ function danglingTitle(it: OpRecordItem): string {
               <td>
                 <span class="kind-badge" :class="'k-' + m.kind">{{ OP_KIND_LABEL[m.kind] ?? m.kind }}</span>
                 <span v-if="!m.undoable" class="no-undo" :title="noUndoTitle(m)">不可回撤</span>
+                <!-- 软链接合并的账本写的是 undoable=true（后端事实，本轮未改），但那条腿
+                     真机走不到 ⇒ 这一格不摆「回撤」，改摆用户此刻能做的事（M290/M297）。 -->
+                <span v-if="!offersInAppUndo(m.kind)" class="keep-hint" :title="keepSourceTitle()">
+                  {{ KEEP_SOURCE_LABEL }}
+                </span>
               </td>
               <td class="num">
                 {{ formatCount(m.items) }}
@@ -284,13 +317,13 @@ function danglingTitle(it: OpRecordItem): string {
               <td class="num">{{ m.undone ? formatCount(m.undone) : '—' }}</td>
               <td class="num">{{ humanBytes(m.reclaimable) }}</td>
               <td class="ops-col">
-                <button v-if="undoLeft(m) > 0" class="btn-primary"
+                <button v-if="offersInAppUndo(m.kind) && undoLeft(m) > 0" class="btn-primary"
                   :disabled="store.busy"
-                  :title="store.opsRunning ? '操作执行中' : `恢复 ${undoLeft(m)} 项文件`"
+                  :title="store.busyTip || `恢复 ${undoLeft(m)} 项文件`"
                   @click="askUndo(m)">
                   {{ confirmUndoId === m.id ? `确认回撤 ${undoLeft(m)} 项` : '回撤' }}
                 </button>
-                <button v-else-if="m.undoable && m.done" class="btn-ghost" disabled>已回撤</button>
+                <button v-else-if="offersInAppUndo(m.kind) && m.undoable && m.done" class="btn-ghost" disabled>已回撤</button>
                 <button v-if="confirmUndoId === m.id" class="btn-ghost"
                   @click="confirmUndoId = null">取消</button>
                 <button class="btn-ghost" @click="toggleOpDetail(m)">
@@ -313,7 +346,7 @@ function danglingTitle(it: OpRecordItem): string {
                         <!-- 悬空链接必须一眼可见（红标 + 可悬停看原因）。
                              不做自动修复：链接失效是用户环境变化（拔盘/移动文件）
                              的结果，应用替用户"修好"它反而可能指向错误的地方。 -->
-                        <span v-if="it.dangling" class="dangling-tag" :title="danglingTitle(it)">
+                        <span v-if="it.dangling" class="dangling-tag" :title="danglingKeepTitle(it.linkSrc)">
                           <Icon name="alert" :size="11" /> 链接已失效
                         </span>
                       </td>
@@ -321,9 +354,20 @@ function danglingTitle(it: OpRecordItem): string {
                       <td><span :class="stateCls(it.state)">{{ STATE_LABEL[it.state] ?? it.state }}</span></td>
                       <td class="err-cell" :title="it.err">{{ it.err }}</td>
                       <td class="ops-col">
+                        <!-- 软链接合并的找回路径：直达保留源（M290/M297）。
+                             判据用 negation 而不是新写一个"是不是软链接"：
+                             同一条规则只许有一处定义（offersInAppUndo），这里只是它的另一面。
+                             ★ 这里**不挂** :disabled="store.busy"（T2 复看时撤掉的）：它只是打开
+                               一个文件夹，不写后端状态，也不在 `opsRunning` 互斥门那八个绑定里，
+                               与 GroupCard 的「打开所在文件夹」同一形状（那个从不因忙而灰）。
+                               何况点"回撤"被拒之后，用户往往正是想先去看看那份数据在哪儿——
+                               把唯一的找回出口灰掉是帮倒忙。 -->
+                        <button v-if="!offersInAppUndo(m.kind) && it.linkSrc" class="btn-ghost xs"
+                          :title="revealKeepTitle(it.linkSrc)"
+                          @click="revealKeep(it)">直达保留原目录</button>
                         <button v-if="canUndoItem(m, it)" class="btn-ghost xs"
                           :disabled="store.busy"
-                          :title="store.opsRunning ? '操作执行中' : '仅回撤此文件（恢复回原位置）'"
+                          :title="store.busyTip || '仅回撤此文件（恢复回原位置）'"
                           @click="undoOne(m, it)">
                           {{ undoingItem === it.id ? '执行中…' : (it.state === 'undo_failed' ? '重试回撤' : '回撤') }}
                         </button>
@@ -373,6 +417,15 @@ function danglingTitle(it: OpRecordItem): string {
 .kind-badge.k-delete { color: var(--danger-ink); border-color: var(--danger-ink); }
 .kind-badge.k-trash { color: var(--primary-ink); border-color: var(--primary-ink); }
 .no-undo { margin-left: 6px; font-size: var(--fs-xs, 12px); color: var(--text-3); }
+/* 「数据在保留源，需手动放回」——这一格摆的是**可行动作**，不是坏消息，
+   所以用中性色而不是 .no-undo 的灰、更不是 .dangling-tag 的红（红留给真出错的那一行）。
+   为什么做成可见文本而不是只挂 title：04 §6.50 M293 定了 UIA 能读 title、但 OS 那层
+   浮窗合成不出来 ⇒ "文案挂在元素上"证得了，"用户看得见"证不了（M286 同一条取向）。 */
+.keep-hint {
+  margin-left: 6px; padding: 0 6px; border-radius: 999px;
+  font-size: var(--fs-xs, 12px); color: var(--text-2);
+  border: 1px solid var(--border);
+}
 .detail-row > td { background: var(--bg-2, rgba(127, 127, 127, 0.05)); padding: var(--sp-1) var(--sp-3) var(--sp-3); }
 .detail-loading { padding: var(--sp-3); color: var(--text-3); font-size: var(--fs-sm); }
 .item-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs, 12px); }

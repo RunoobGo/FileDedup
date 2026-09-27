@@ -11,6 +11,32 @@
 //   - 带 tag 的文件只做"读一个数、读一个卷标识，读不到就报 false"，不含任何判定。
 package realbytes
 
+import "syscall"
+
+// gleIsFailure 判一次 Win32 调用交回的 GetLastError 是否表示**真失败**（M295）。
+//
+// ★ 为什么不能写 `err != nil`：`LazyProc.Call` / `syscall.SyscallN` 的第三个返回值是把
+// gle **装箱**成 error，而 Go 在 gle==0 时也给出非 nil 的 `syscall.Errno(0)`（字符串是
+// "The operation completed successfully."；真机读数见 realbytes_gle_test.go 头部引的
+// b7g/errno_probe.txt 三态）⇒ `err != nil` 判失败是**恒真式**，守卫会退化成只看返回值。
+// 判失败只能取数值。
+//
+// 非 Errno 的非 nil error 按失败处理（fail-closed）：宁可回退逻辑大小 + known=false
+// （界面标"实占未知"），也不把说不清来历的数当可信实占写进账面。
+//
+// ★ 住无 tag 层是刻意的（本包分层约定：判定与回退规则全在这里，带 tag 的文件只读数）：
+// Linux 主门禁因此能直接断言这条判据，不必等 Windows 真机腿。
+// 同族判据在 `internal/ops/winerrno.go` 另有一份（那里还带 Win32 错误码具名表）——
+// 两份不合并是登记过的取向：合并要么让 ops 依赖本包（功能嫉妒），要么新建叶子包
+// （扩面，且与 winerrno.go:17-18 对 internal/ads 第三套的处置同案），本轮按 §1 约束 5 不做。
+func gleIsFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	e, ok := err.(syscall.Errno)
+	return !ok || e != 0
+}
+
 // BlockSize 是 st_blocks 的计数单位（POSIX 规定恒为 512 字节，与卷扇区大小无关）。
 // 导出的用途只有一个：调用方在展示"实占"时需要说明它按块对齐，
 // 因此实占**可以大于**逻辑大小。

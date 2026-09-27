@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 全套回归门禁 harness（04 §3.3 那 11 条命令 + 两条补的，共 **15 行读数**）。
+# 全套回归门禁 harness（04 §3.3 那 11 条命令 + 两条补的，共 **15 行判定读数**）。
+# 〔2026-09-27 M283 批追加第 16 行「文档锚点命中率」，**只报数不判定** ⇒ 判定行数仍是 15，
+#  `rows=` 的口径没有变（见该行注释与本文件末尾那两行说明）。〕
 #
 # 为什么要有这个文件（M106）：§3.3 是一份**给人抄的命令清单**，每批划账时靠人
 # 一条一条手敲再把 rc 抄进文档。此前这套命令只活在 `/tmp/run_gates.sh` 里，
@@ -59,6 +61,8 @@ row() {
 # ★ 为什么不干脆把 frontend-build 挪到第 2 行：npm 一失败，2~8 行根本没跑过，15 行读数表会留
 #   一片空行与级联红，比"一行都不齐且原因写在脸上"更难读。
 # ★ 不新增判定行：`rows=15` 这个口径被 docs/04 §3.2/§3.3 多处引用，加行等于制造新的文档错位。
+#   〔2026-09-27 M283 批：第 16 行确实加了，但按上面这条的理由做成 **REPORT 档不计入 rows=**
+#   ⇒ 那几处"15 行读数"一字未动仍然为真。〕
 # ★ 判据只到"存在"为止：**旧不等于坏**，据"比 src 旧"判红是另一种谎 ⇒ 那一格只打 NOTE 不判红。
 if [[ ! -f frontend/dist/index.html ]]; then
   echo "### 0 dist 前置检查"
@@ -190,16 +194,45 @@ sh_row "13 smoke-cli" 0 bash scripts/smoke-cli.sh
 sh_row "14 smoke-symlink-assert" 0 bash scripts/smoke-symlink-assert.sh
 sh_row "15 smoke-symlink" 1 bash scripts/smoke-symlink.sh
 
+# 16) 文档锚点命中率抽查（M299 取向：「红了只报数不自动改」）
+#
+# ★ 为什么它**不参与总判定**，而 04 §3.2/§3.3 引用的 `rows=15` 口径仍然成立：
+#   登记表约束 (1) 禁止改写已登记行 ⇒ 命中率红了也没有合法的修法可执行，硬判红只会
+#   把这一行训练成"大家都忽略的那一行"。所以第 16 行进 REPORT 档：打印、留日志、
+#   从 rows= 里扣掉（rows 仍是**参与判定**的行数），总判定不受它影响。
+# ★ 但"扫描面本身没成立"是另一件事，那一格必须红：awk 缺失、docs 改名、清单为空
+#   都会让 `anchors=` 一行都打不出来——读空当通过是 AS-K2 反复点名的形状（判据同 B1）。
+# ★ 明细（DRIFT/MISSING/OOR）整份留在本行日志里，划账时按 `anchors=` 那行抄总数。
+echo "### 16 anchor-hit-rate（只报数）"
+ANCH_SRCLIST="$LOGDIR/16.srclist"
+find . \( -name node_modules -o -name .git -o -name dist -o -name build -o -name .workbuddy \) -prune -o \
+  -type f \( -name '*.go' -o -name '*.ts' -o -name '*.tsx' -o -name '*.vue' -o -name '*.js' \
+             -o -name '*.mjs' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.md' \) -print \
+  | sed 's|^\./||' | sort > "$ANCH_SRCLIST"
+awk -v SRCLIST="$ANCH_SRCLIST" -f scripts/anchor-hits.awk docs/*.md > "$LOGDIR/16.anchor-hit-rate.log" 2>&1
+ANCH_RC=$?
+tail -n 4 "$LOGDIR/16.anchor-hit-rate.log"
+if [[ $ANCH_RC -ne 0 ]] || ! grep -q '^anchors=' "$LOGDIR/16.anchor-hit-rate.log"; then
+  echo "rc=$ANCH_RC 且日志里没有 anchors= 那行 ⇒ 扫描面本身没成立，按 FAIL 记（不是命中率红，是这条通道坏了）"
+  fail; note "16 anchor-hit-rate" FAIL
+else
+  note "16 anchor-hit-rate" REPORT   # 只报数：不进 PASS 数、不进 FAIL 数
+fi
+
 echo
 echo "=== 总判定 ==="
 i=0
 SKIPN=0
+REPORTN=0
 while [[ $i -lt ${#ROWS[@]} ]]; do
   printf '%-26s %s\n' "${ROWS[$i]}" "${VERDICTS[$i]}"
   [[ "${VERDICTS[$i]}" == SKIP ]] && SKIPN=$((SKIPN + 1))
+  [[ "${VERDICTS[$i]}" == REPORT ]] && REPORTN=$((REPORTN + 1))
   i=$((i + 1))
 done
-echo "rows=${#ROWS[@]} PASS=$(( ${#ROWS[@]} - FAILS - SKIPN )) SKIP=${SKIPN} FAIL=${FAILS}"
+# ★ `rows=` 的口径 = **参与判定的行数**（REPORT 档不计入），所以 M283 批加了第 16 行之后
+#   rows 仍是 15——docs/04 §3.2/§3.3 那几处"15 行读数"不必跟着改，改了反而是另一处错位。
+echo "rows=$(( ${#ROWS[@]} - REPORTN )) PASS=$(( ${#ROWS[@]} - FAILS - SKIPN - REPORTN )) SKIP=${SKIPN} FAIL=${FAILS} REPORT=${REPORTN}"
 if [[ $FAILS -gt 0 ]]; then
   echo "⇒ 全套门禁**未过**（有 ${FAILS} 行 FAIL），不得划账、不得交付"
   exit 1

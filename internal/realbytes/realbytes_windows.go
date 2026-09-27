@@ -44,10 +44,21 @@ func Reported(path string, info os.FileInfo) (uint64, bool) {
 	var high uint32
 	low, _, errno := procGetCompressedFileSizeW.Call(
 		uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&high)))
-	if low == invalidFileSize && errno != nil {
-		// 常见失败：目录、ACL 拒绝读属性、超过 MAX_PATH 且未加 \\?\ 前缀。
-		// 一律回退成逻辑大小 + known=false——长路径场景下宁可数字粗一点，
-		// 也不能让扫描报错。
+	// ★ M295（2026-09-27 实施批）：这里过去写的是 `errno != nil`，而装箱后的
+	//   `syscall.Errno(0)` **也非 nil** ⇒ 那一支恒真，守卫实际只看返回值 0xFFFFFFFF，
+	//   于是"低 32 位恰好全是 1 的合法尺寸"（4 GiB−1 / 8 GiB−1 …）被误判读不到、
+	//   静默回退逻辑大小并标 known=false。取数值才是二选一（判据本体见 gleIsFailure）。
+	if low == invalidFileSize && gleIsFailure(errno) {
+		// 真失败臂（现读读数）：不存在的路径 ⇒ low=0xFFFFFFFF + gle=2；ACL 拒读属性同理。
+		// ★ 一律回退成逻辑大小 + known=false——长路径场景下宁可数字粗一点，
+		//   也不能让扫描报错。
+		// 〔更正一处与运行时不符的旧列举〕原注释把"目录"也列为常见失败之一，
+		// 真机探针现读**不然**：目录臂交回 low=0x0 且 gle=Errno(0)，也就是读到 0、
+		// known=true（读数见 realbytes_gle_test.go 头部）。之所以这不构成产品读数偏差：
+		// 目录在遍历阶段就被 internal/scanner/scanner.go 的 IsDir / !IsRegular 两道挡在
+		// 本调用之前，压根走不到这里（同文件 :521-523 / :566 对 :550）。
+		// 第三类前提「超过 MAX_PATH 且未加 \\?\ 前缀」本机未取证（LongPathsEnabled=0x1
+		// 造不出该形状），不得读成已验证。
 		return 0, false
 	}
 	return uint64(high)<<32 | uint64(low), true

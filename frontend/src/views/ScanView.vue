@@ -157,7 +157,7 @@ const progressPercent = computed(() => {
              互斥收进 histBusy（含 histLoading），这里曾是同形漏网：openHistory 在途时
              这颗按钮还能点，两次回包交错就会把结果集换成"另一条记录"的数据。 -->
         <button class="btn-ghost" :disabled="store.histBusy"
-          title="恢复该结果集并可继续清理" @click="store.openHistory(lastScan.id)">恢复</button>
+          :title="store.busyTip || '恢复该结果集并可继续清理'" @click="store.openHistory(lastScan.id)">恢复</button>
         <button class="btn-ghost" @click="store.switchView('records')">查看历史</button>
       </div>
       <div class="panel roots">

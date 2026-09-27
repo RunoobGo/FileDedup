@@ -61,6 +61,18 @@ func main() {
 		// P3：println 在无控制台附加的发布版（Windows GUI 子系统）里等于丢弃错误，
 		// 用户只会看到"双击没反应"。写 stderr + 非零退出码，供快捷方式/日志排查。
 		fmt.Fprintf(os.Stderr, "FileDedup 启动失败: %v\n", err)
+		// M283：上面那句只对有终端的启动方式有效（命令行 / 快捷方式带控制台）。GUI 子系统
+		// 没有控制台 ⇒ 整条错误连同"该去哪看"一起蒸发。同一句话再落一份小日志，
+		// 并把路径说给 stderr——两边都看得到，缺一边的机器上另一边还在。
+		ucd := ""
+		if d, cerr := os.UserConfigDir(); cerr == nil {
+			ucd = d
+		}
+		// cfgDir 只在 startup 回调里写一次（M9 白名单同档：启动前置，无并发读者），
+		// 所以这里直读不加锁，与 openCache / openLedger / settingsPath 一个口径。
+		if p := writeStartupFailureLog(startupFailureDir(app.cfgDir, ucd), err); p != "" {
+			fmt.Fprintf(os.Stderr, "同一句话已写入 %s\n", p)
+		}
 		os.Exit(1)
 	}
 }

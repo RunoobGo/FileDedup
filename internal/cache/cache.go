@@ -86,7 +86,19 @@ type Cache struct {
 	// 且没有任何地方再判损坏（IsCorruption 只在 Open 跑过一次）。
 	dbErrs  atomic.Int64 // Lookup 遇到的非 ErrNoRows DB 错误条数（进程启动以来累计，M95）
 	corrupt atomic.Bool  // 确证损坏 ⇒ 不再向库发 SQL（停用，不是自愈）
+
+	// M285（2026-09-27 实施批）：本次 Open 是否走过「确证损坏 → 改名隔离 → 重建」。
+	// 与 internal/history 的同名字段同形——只在 Open 里写一次、之后只读，所以不需要锁。
+	// 存在的理由只有一条：那条路径唯一的告警出口是 stderr，而 GUI 没有终端。
+	quarantined string
 }
+
+// QuarantinedTo 返回本次打开时被隔离的旧库文件名；未发生隔离则返回空串。
+//
+// M285：缓存被隔离重建意味着**整表作废**——本次运行每次扫描都要全量重算。
+// 这个后果原先只有 stderr（history 侧同形问题已在 M12b 收口，cache 侧漏着），
+// 界面就此只会显示"缓存是空的"，用户既不知道发生了什么，也不知道该期待变慢。
+func (c *Cache) QuarantinedTo() string { return c.quarantined }
 
 // DBErrors 返回 Lookup 累计到的运行期 DB 错误条数（M74；不含正常的"未命中"）。
 // 口径与上面的字段一致：**进程启动以来**的累计，不随扫描轮次归零（M95）——
@@ -125,11 +137,15 @@ func (c *Cache) markCorruption(err error) {
 // busy/只读/满盘等暂时性故障一律直接报错（2026-09-18 审查 C4：原先无条件删库重建，
 // 一次误判就把可恢复的暂时故障变成整表缓存丢失，且删掉他进程正在写的
 // -wal 本身即可损坏主库）。调用方拿到错误会退化为「无缓存」，扫描照常。
+//
+// M285：走过隔离重建这条路时，结果记在 quarantined 字段里，由 QuarantinedTo() 交给
+// 应用层说给界面——代价是**整表作废**（本次运行每次扫描都全量重算），不该只有 stderr 知道。
 func Open(path string) (*Cache, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 	db, err := openDB(path)
+	var quarantinedTo string // M285：只在下面那条隔离分支里被赋值一次
 	if err != nil {
 		if !dbfile.Exists(path) || !dbfile.IsCorruption(err) {
 			return nil, fmt.Errorf("缓存库不可用（未改动任何文件）: %w", err)
@@ -139,6 +155,7 @@ func Open(path string) (*Cache, error) {
 			return nil, fmt.Errorf("缓存库影像损坏但隔离失败，已放弃重建（未删除文件）: %w（原始错误：%v）", qerr, err)
 		}
 		fmt.Fprintf(os.Stderr, "[cache] 缓存库影像损坏，已改名隔离为 %s 后重建\n", quarantined)
+		quarantinedTo = quarantined
 		db, err = openDB(path)
 		if err != nil {
 			return nil, fmt.Errorf("缓存库重建失败: %w", err)
@@ -150,7 +167,7 @@ func Open(path string) (*Cache, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Cache{db: db, path: path}, nil
+	return &Cache{db: db, path: path, quarantined: quarantinedTo}, nil
 }
 
 // enforceAlgoVersion 比对并刷新缓存语义版本；不符则清空哈希表。

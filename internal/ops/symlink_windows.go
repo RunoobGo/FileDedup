@@ -84,13 +84,12 @@ func createSymlink(target, linkPath string) error {
 			uintptr(unsafe.Pointer(tp)),
 			flags,
 		)
-		if r != 0 {
-			return 1, nil
-		}
-		if e == nil {
-			return 0, syscall.EINVAL
-		}
-		return 0, e
+		// ★ M289：这里原先写 `if r != 0 { return 1, nil }`，而 CreateSymbolicLinkW
+		// 返回的是 BOOLEAN——失败后它不把 RAX 归零，未提权实测留下 r=1280（0x500）的读数，
+		// 于是 `!= 0` 把失败读成成功，`describeSymlinkError` 那句为用户写好的指引一次都没走到。
+		// 判据必须是 `r == 1`，收口在 gleIsFailure/symlinkCallOutcome（无 build tag，
+		// 让 linux/darwin 的 CI 腿也能断言这张表）。
+		return symlinkCallOutcome(r, e)
 	}
 
 	r, err := call(symlinkFlagFile | symlinkFlagAllowUnprivilegedCreate)

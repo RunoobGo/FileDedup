@@ -19,7 +19,14 @@ import (
 	"filededup/internal/ops"
 )
 
-// requireRealTrash 要求本机**真的能**把文件移入回收站，不能则 Skip。
+// requireRealTrash 把本用例的回收站入口**换回平台实现**，并确认本机真能移入回收站，
+// 不能则 Skip。
+//
+// 〔2026-09-27 M294 起〕两件事合成一格，缺一不可：
+//   - 换回平台实现：整包的默认值现在是测试自造的假回收站（app_m294_fakebin_test.go），
+//     不调这句的用例一律不碰本机真回收站。t.Cleanup 把它换回去，否则一个用例的显式
+//     选择会泄漏给同一进程里后面的每个用例（Go 按文件名字序跑，泄漏点看不出来）。
+//   - 能力探测：换完之后真挪一次，不成立就 SKIP。
 //
 // 为什么要有这道门：darwin 的回收站实现是 osascript 调 Finder（internal/ops/trash_darwin.go），
 // 依赖 macOS 的「自动化」授权（系统设置 → 隐私与安全性 → 自动化）。未授权、无桌面会话
@@ -33,24 +40,56 @@ import (
 //
 // 两条判定缺一不可：err 非 nil 是"调用被拒"；err 为 nil 但文件还在，是那条「脚本应执行
 // 却零配对」防线（trash_darwin.go 的 batchOutputGap）兜住的形状——两者都不是通过。
+//
+// ★ 探测范围从"只问 darwin"扩到"每个平台都问"（M294 一并处理）：原来 windows/linux 直接
+// return，是因为那条腿默认就在真回收站上，没什么可问。现在真回收站成了**显式选择**，
+// 而 Windows 同样存在"环境不给"的形状（该卷回收站策略被禁用 → recyclableReason 整批拒绝、
+// Shell 被组策略拦下），不探测就会以 FAIL 出现——那正是 M260 拒绝的形状。
 func requireRealTrash(t *testing.T) {
 	t.Helper()
-	// windows 走 SHFileOperationW、linux 走自研 XDG Trash，都不依赖 GUI 会话授权。
-	if runtime.GOOS != "darwin" {
-		return
-	}
+	prev := ops.Trash
+	ops.Trash = realTrashFn
+	t.Cleanup(func() { ops.Trash = prev })
+
 	probe := filepath.Join(t.TempDir(), "TrashCapabilityProbe.bin")
 	if err := os.WriteFile(probe, []byte("probe"), 0o644); err != nil {
 		t.Fatalf("构造回收站能力探针失败: %v", err)
 	}
-	if _, err := ops.Trash([]string{probe}); err != nil {
-		t.Skipf("本机无法真实移入回收站（%v）：darwin 回收站经 osascript 调 Finder，需要 macOS"+
-			"「自动化」授权；未授权/无桌面会话/被沙箱拦截一律如此。这是环境缺能力，不是产品缺陷，"+
-			"按 SKIP 处理（SKIP 不读作通过）", err)
+	dstMap, err := ops.Trash([]string{probe})
+	if err != nil {
+		t.Skipf("本机无法真实移入回收站（%v）。%s ⇒ 这是环境缺能力，不是产品缺陷，按 SKIP 处理（SKIP 不读作通过）",
+			err, trashCapabilityNote())
 	}
 	if _, err := os.Stat(probe); err == nil {
-		t.Skipf("本机 osascript 返回成功但探针文件仍未被移走（Finder 零配对，" +
-			"回收站实际没动作）。同上，按 SKIP 处理")
+		t.Skipf("本机回收站调用返回成功但探针文件仍在原处（零配对 / 落位复核未过，%s）。同上，按 SKIP 处理",
+			trashCapabilityNote())
+	}
+	// ★ M279（2026-09-27 实施批）：这台能力探针顺手钉住"平台报得出落点"。
+	// 修前 Windows 的 defaultTrashLocked 交回**恒空** dst，而执行器回退分支靠
+	// `known[p]` 命中才把"源已消失"判成"已进站" ⇒ 那条路径在 Windows 上永不可达，
+	// 一次部分成功的批次就稳定长成 20 条要求用户"考虑用数据恢复工具找回"的**假**事故。
+	// 断言挂在**本来就要付一条回收站条目**的探针上，不为 M279 单独再污染真回收站——
+	// 那是 M294 刚刚清掉的东西，不能再吃回来。
+	if runtime.GOOS == "windows" {
+		d := dstMap[probe]
+		if d == "" {
+			t.Errorf("Windows 平台 trash 交回的落点为空 ⇒ M279 回来了（假警报的根因）：dst=%v", dstMap)
+		} else if _, err := os.Stat(d); err != nil {
+			t.Errorf("落点 %q 读不到: %v ⇒ 交回的是一条不存在的路径，记录页「去向」会指空", d, err)
+		}
+	}
+}
+
+// trashCapabilityNote 说明**本平台**的回收站要什么才够用——SKIP 文案里那句"环境缺能力"
+// 必须落到具体的申请对象上，否则下一位读者只会重新去查产品代码。
+func trashCapabilityNote() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "darwin 回收站经 osascript 调 Finder，需要 macOS「自动化」授权；未授权 / 无桌面会话 / 被沙箱拦截一律如此"
+	case "windows":
+		return "windows 走 SHFileOperationW，需要该卷的回收站可用（策略禁用、非固定卷、组策略拦下 Shell 均如此）"
+	default:
+		return "linux 走自研 XDG Trash，需要 $HOME/.local/share/Trash 可写（无 XDG 目录时会创建）"
 	}
 }
 

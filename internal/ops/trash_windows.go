@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -212,6 +213,11 @@ func unsafeDriveReason(p string) string {
 // （hNameMappings 需额外 COM 释放处理），恒返回空映射；
 // 回撤以「打开系统回收站」引导代替（spec §7）。
 //
+// 〔2026-09-27 M279 更正本段第一句〕"恒返回空映射"已经不成立：落位改由
+// `$Recycle.Bin\<SID>\$I…` 元数据反查（`recycle_index.go`，全程只读），
+// 因为空映射本身是一条**假事故警报**的根因（详见下面 defaultTrashLocked 的 ★ 段）。
+// 回撤仍走「打开系统回收站」引导——本改动只补"哪些文件已进站"的账，不改回撤语义。
+//
 // ★ 2026-09-20 缺陷修复：「移入回收站」后文件被静默永久删除。
 //
 // FOF_ALLOWUNDO 是**尽力而为**，不是保证。当文件无法进入回收站时
@@ -241,8 +247,40 @@ func defaultTrash(paths []string) (map[string]string, error) {
 	return withTrashSerial(defaultTrashLocked, paths)
 }
 
+// recycledVolumeRoots 交出这批路径涉及的卷根（去重、统一成 `X:\`）。
+//
+// 之所以留在 windows 侧：`toWinRoot` 依赖盘符形状，而回收站实体目录是**按卷**存在的
+// （真机读数：F:\$Recycle.Bin 下并列 7 个 SID 目录）。扫描面按卷收，
+// 不去猜无关卷上会不会有同名条目。
+func recycledVolumeRoots(paths []string) []string {
+	var roots []string
+	seen := map[string]bool{}
+	for _, p := range paths {
+		root := toWinRoot(p)
+		if root == "" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		roots = append(roots, root)
+	}
+	return roots
+}
+
 func defaultTrashLocked(paths []string) (map[string]string, error) {
 	dst := map[string]string{}
+	// ★ M279：`dst` 建完就走是这条缺陷的本体——它让执行器回退分支里那条
+	// `known[p]` 命中路径在 Windows 上**永不可达**，于是批量部分成功
+	// （真机读数：80 项混批里 15 个被占用 ⇒ SHFileOperation 返错误码 32，
+	// 其余 65 项其实已进站）时，源已消失的项全被记成
+	// 「可能已被直接删除，请立即到回收站核实……考虑用数据恢复工具找回」，
+	// 而 `$I` 逐条对账 20/20 都在回收站里。
+	//
+	// 归拢成**一条 defer**而不是逐分支补写：本函数有五条出口，逐分支写迟早漏一条，
+	// 而漏掉的症状是"偶发假警报又回来了"。defer 里只读回收站、不写（M279 全程零写入，
+	// 见 recycle_index.go 头部），且只在解出自洽证据时才落键 ⇒ 配不到证据时交回的
+	// 仍是空表，2026-09-20 那道"静默永久删除"的 strict Failed 防线一寸未松。
+	started := time.Now()
+	defer func() { fillRecycledDst(dst, recycledVolumeRoots(paths), paths, started) }()
 	if len(paths) == 0 {
 		return dst, nil
 	}

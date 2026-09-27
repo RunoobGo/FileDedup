@@ -666,7 +666,10 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 						return
 					}
 					if m, err := trash([]string{p}); err != nil {
-						settle(i, outcome{code: ocFailed, err: err.Error()})
+						// ★ M279 ③：stage 必须与上面那条 strict 臂同源。修前这里不给 stage，
+						// 聚合时落成 "ops"，而同一批的假警报是 "trash" ⇒ 同一抽屉里
+						// 同类操作被分成两种来源标签，用户按来源筛就漏一半。
+						settle(i, outcome{code: ocFailed, stage: "trash", err: err.Error()})
 					} else {
 						settle(i, outcome{code: ocOK, dst: m[p]})
 					}

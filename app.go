@@ -396,6 +396,24 @@ func (a *App) openCache() {
 	}
 	a.cch = cch
 	a.pipe = a.pipe.WithCache(cch)
+	// M285（2026-09-27 实施批；源头是 W9-9 那半格真机读数）：库打不开已经有 M25 的
+	// 提示，但「打开成功、代价是整表作废」这条路原先只写 stderr —— GUI 用户没有终端，
+	// 看到的只是"这软件每次扫描都很慢"。与 openLedger 里 M12b 那条同形。
+	if q := cch.QuarantinedTo(); q != "" {
+		a.addStartupNotice(cacheQuarantineNotice(q))
+	}
+}
+
+// cacheQuarantineNotice 把"哈希缓存影像损坏已隔离重建"翻成界面文案（纯函数）。
+//
+// 与 cacheUnavailableNotice 同形（出了什么事 / 在哪个文件上 / 对用户意味着什么），
+// 但两者互斥：那一条是"根本没开成"，这一条是"开成了、旧表整表作废"。
+// 后果层必须说准——丢失的是**缓存行**不是用户数据：去重结果不受影响，
+// 变的只是本次运行的速度（每条候选都要重算一遍，首扫尤其明显）。
+func cacheQuarantineNotice(quarantined string) string {
+	return "哈希缓存影像损坏，已隔离为 " + filepath.Base(quarantined) + " 并重建（旧缓存整表作废），" +
+		"本次运行的每次扫描都要重新计算，速度会变慢；不影响去重结果。" +
+		"旧文件仍在配置目录，需要时可手工查看。"
 }
 
 // cacheUnavailableNotice 把"哈希缓存打不开"翻成界面文案（纯函数）。
@@ -1320,8 +1338,11 @@ func (a *App) RevealInFolder(id uint64) error {
 		return err
 	}
 	// M58：定位命令"起得来但立刻非零退出"过去完全静默，现象是点一下没反应。
+	// M288：同一出口的**反方向**——Windows 的 explorer 成功也返回 1，故退出码
+	// 是否作数由 warnRevealExit 判，两侧在这一个出口上同时成立。
 	return startCmd(cmd, func(werr error) {
-		a.warnBackground("reveal", fmt.Sprintf("打开所在文件夹失败（%s）：%v", e.Path, werr))
+		a.warnRevealExit(runtime.GOOS, cmd, "reveal",
+			fmt.Sprintf("打开所在文件夹失败（%s）", e.Path), werr)
 	})
 }
 
@@ -1391,6 +1412,46 @@ func startCmd(cmd *exec.Cmd, onExit func(error)) error {
 // 缝只在绑定方法入口处读一次，读与用之间不跨锁、不跨 goroutine。
 var execRevealCmd = startCmd
 
+// revealExitSilent 报告「这条外部定位命令的非零退出能不能当作成功」。
+//
+// M288（04 §6.50 W4-5 真机定案）：Windows 上 `explorer.exe` **成功也返回 1**。
+// 真机四个定位动作（三条路径 + 一次回收站）误弹 4/4、真失败 0/4，而 OS 侧
+// （四扇 CabinetWClass 顶层窗口同时在场、标题逐条对得上）证明窗口真的开起来了。
+// ⇒ 在这条通道上 explorer 的退出码**不含成败信息**（失败回 1，成功也回 1），
+// 拿它当判据造出的正是"狼来了"：真失败时那条 toast 与假告警逐字同形。
+//
+// 平台真值经参数注入（APP-6 同族）：判据在任一主机上都能把三平台各跑一遍，
+// 不必等 Windows CI。
+func revealExitSilent(goos string, cmd *exec.Cmd) bool {
+	if goos != "windows" {
+		return false
+	}
+	// 先转小写再剥 .exe：TrimSuffix 本身大小写敏感，而 Windows 上
+	// `C:\Windows\EXPLORER.EXE` 与裸名 `explorer` 是同一个程序。
+	return strings.TrimSuffix(strings.ToLower(filepath.Base(cmd.Path)), ".exe") == "explorer"
+}
+
+// warnRevealExit 是定位/打开/回收站这类外部命令 onExit 的统一出口。
+//
+// M58 与 M288 是同一把 `startCmd` 的两个相反方向的错，这里一次满足两侧：
+//   - 真失败看得见——空路径与"路径不存在/无法访问"在 checkRevealPath 就以
+//     **返回值**回绝（根本走不到 exec），Start 失败同样走返回值；这条腿不受影响。
+//   - 假成功不报错——退出码不作数的命令（Windows 的 explorer）只写 stderr 留痕，
+//     不弹 error 级 toast；其余命令逐字沿用 warnBackground 的双通道。
+//
+// subject 是**已含路径与"失败"字样的整句话**，本函数只在其后拼"：原因"——
+// 用户可见文案由调用方独家决定（P-19-2c 同一条规矩：出口不许替调用方说话）。
+func (a *App) warnRevealExit(goos string, cmd *exec.Cmd, tag, subject string, werr error) {
+	if werr == nil {
+		return
+	}
+	if revealExitSilent(goos, cmd) {
+		fmt.Fprintf(os.Stderr, "[%s] %s：%v（该命令成功也返回非零，退出码不作判据，未提示用户）\n", tag, subject, werr)
+		return
+	}
+	a.warnBackground(tag, fmt.Sprintf("%s：%v", subject, werr))
+}
+
 // checkRevealPath 校验前端回送的路径，返回规整后的绝对化入参与 stat 结果。
 //
 // 失败清单里的路径是"后端算出 → 前端展示 → 原样送回"的一圈往返，属于新的信任
@@ -1451,7 +1512,8 @@ func (a *App) RevealPath(path string) error {
 		return err
 	}
 	return execRevealCmd(cmd, func(werr error) {
-		a.warnBackground("reveal", fmt.Sprintf("打开所在文件夹失败（%s）：%v", p, werr))
+		a.warnRevealExit(runtime.GOOS, cmd, "reveal",
+			fmt.Sprintf("打开所在文件夹失败（%s）", p), werr)
 	})
 }
 
@@ -1466,8 +1528,36 @@ func (a *App) OpenPath(path string) error {
 		return err
 	}
 	return execRevealCmd(cmd, func(werr error) {
-		a.warnBackground("open", fmt.Sprintf("打开失败（%s）：%v", p, werr))
+		a.warnRevealExit(runtime.GOOS, cmd, "open",
+			fmt.Sprintf("打开失败（%s）", p), werr)
 	})
+}
+
+// RevealKeepSource 直达「保留源」——软链接合并后磁盘上唯一那一份数据所在的位置。
+//
+// M290/M297 的实施腿（用户裁定：改文案 + 给直达出口，不改备份生命周期）：
+// 合并成功路径无条件删合并前的 `.fdd-old`，而回撤把"备份必须在"当硬前提 ⇒ 应用内
+// 回撤对走完流程的软链接合并**不可达**，数据只在保留源那一份上。既然不替用户搬回来，
+// 界面至少要把"去哪儿拿回它"给出来：
+//   - 保留源还在 → 与 RevealPath 同一条腿（打开所在文件夹并选中它）；
+//   - 保留源已被删/挪走（悬空那一臂，正是最需要找回数据的场景）→ 打开**它所在的目录**；
+//   - 连目录都不可达（盘拔了、网络卷断了）→ 明确报错，不弹空窗（同 checkRevealPath 的理由）。
+//
+// ★ 父目录必须在 Go 侧算：路径语义（`E:\a\b`、`/a/b`、尾分隔符、UNC）交给前端
+// 就是 M116 / AS-H6 那一族"两份实现各自漂移"的成因。
+func (a *App) RevealKeepSource(path string) error {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return fmt.Errorf("路径为空")
+	}
+	if _, err := os.Lstat(p); err == nil {
+		return a.RevealPath(p)
+	}
+	dir := filepath.Dir(p)
+	if _, err := os.Lstat(dir); err != nil {
+		return fmt.Errorf("保留源与其所在目录都不可达（%s）：%v", p, err)
+	}
+	return a.RevealPath(dir)
 }
 
 // ---------- 设置（单一事实源，01 §7.3） ----------
@@ -2914,26 +3004,33 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 func (a *App) OpenTrash() error {
 	// M58：三平台共用一句失败文案与同一条出口。回收站打不开时用户正需要它
 	//（清理完想找回东西），静默等于把恢复引导变成"点了没反应"。
+	// M288：Windows 那一臂走的是 explorer，退出码不作判据，由同一出口分流。
+	// ★ 执行缝从裸 startCmd 换成 execRevealCmd：生产值恒等（默认就是 startCmd），
+	//   差别只在于本条从此可测——改前它没有任何用例，因为用例一跑就真的弹出回收站窗口。
+	var cmd *exec.Cmd
 	onExit := func(werr error) {
-		a.warnBackground("trash", fmt.Sprintf("打开系统回收站失败：%v", werr))
+		a.warnRevealExit(runtime.GOOS, cmd, "trash", "打开系统回收站失败", werr)
 	}
 	switch runtime.GOOS {
 	case "darwin":
 		home, _ := os.UserHomeDir()
-		return startCmd(exec.Command("open", filepath.Join(home, ".Trash")), onExit)
+		cmd = exec.Command("open", filepath.Join(home, ".Trash"))
 	case "windows":
-		return startCmd(exec.Command("explorer", "shell:RecycleBinFolder"), onExit)
+		cmd = exec.Command("explorer", "shell:RecycleBinFolder")
 	default:
 		root := os.Getenv("XDG_DATA_HOME")
 		if root == "" {
 			home, _ := os.UserHomeDir()
 			root = filepath.Join(home, ".local", "share")
 		}
-		return startCmd(exec.Command("xdg-open", filepath.Join(root, "Trash", "files")), onExit)
+		cmd = exec.Command("xdg-open", filepath.Join(root, "Trash", "files"))
 	}
+	return execRevealCmd(cmd, onExit)
 }
 
-// ExportReport M5-T01 实现。
+// ExportReport M5-T01 **未交付**：这是空桩，调用只会拿到下面那句固定错误。
+// 登记表 04 §2 与手册都按"未交付"记（M300 立账的就是这一度写反的注释）；
+// 契约面仍列它，是因为前端 `api` 层刻意不包装无实现的方法（35/38 之差由此而来）。
 func (a *App) ExportReport(format, path string) (string, error) {
 	return "", fmt.Errorf("报告导出将在 M5 提供")
 }

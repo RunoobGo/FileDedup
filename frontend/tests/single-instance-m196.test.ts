@@ -62,7 +62,9 @@ test('M196-C 解绑后不再收（C12 同一姿势：HMR 重挂不得把提示�
 
   unbind()
   const before = useToastStore().toasts.length
-  stub.emit('app:second-instance', { args: [], workingDirectory: '/tmp' })
+  // 传 allowNoListener：这一格要证的正是"没人接住"，默认那道抛是拦别的用例的（M304）。
+  const delivered = stub.emit('app:second-instance', { args: [], workingDirectory: '/tmp' }, { allowNoListener: true })
+  assert.equal(delivered, 0, '解绑后仍有订阅者接住 ⇒ 重挂时会重复弹')
   assert.equal(useToastStore().toasts.length, before, '已解绑却仍弹提示 ⇒ 重挂时会重复弹')
   stub.restore()
 })

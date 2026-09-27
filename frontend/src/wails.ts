@@ -376,6 +376,10 @@ export interface BackendAPI {
   // checkRevealPath 定，前端只负责把显示的那条路径原样送回去、把拒绝原样报出来。
   RevealPath(path: string): Promise<void>
   OpenPath(path: string): Promise<void>
+  // RevealKeepSource 直达「保留源」——软链接合并后磁盘上唯一那一份数据的位置。
+  // 判据全在 Go 侧（空路径 / 目标还在就选中它 / 目标没了就打开它所在目录 /
+  // 连目录都不可达就报错），前端只把明细里显示的那条 linkSrc 原样送出去。
+  RevealKeepSource(keepPath: string): Promise<void>
   GetSettings(): Promise<Settings>
   SaveSettings(s: Settings): Promise<Settings>
   GetVersion(): Promise<string>
@@ -459,6 +463,11 @@ export const api = {
   // 只会把失败变成 M83 那一族的"点了没反应"。
   revealPath: (path: string): Promise<void> => backend().RevealPath(path),
   openPath: (path: string): Promise<void> => backend().OpenPath(path),
+  // revealKeepSource：记录页明细行的「直达保留原目录」（M290/M297 实施批）。
+  // 与上面两条同一条规矩：这一腿前端**只做交接**，路径原样送出、后端拒绝原样抛回，
+  // 不在这里判"目标看着不存在就不发了"——正因为目标可能已经没了，
+  // 才需要后端那一份"没了就打开它所在目录"的退档判据。
+  revealKeepSource: (keepPath: string): Promise<void> => backend().RevealKeepSource(keepPath),
   getSettings: (): Promise<Settings> => backend().GetSettings(),
   saveSettings: (s: Settings): Promise<Settings> => backend().SaveSettings(s),
   getVersion: (): Promise<string> => backend().GetVersion(),
