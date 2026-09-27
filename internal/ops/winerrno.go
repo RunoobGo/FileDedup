@@ -17,6 +17,9 @@ import "syscall"
 // 注：internal/ads 包另有第三套（同为 2/3/87，但是 int 不是 Errno）。跨包收归需要
 // 新建一个叶子包来承载，属扩面，本轮按 §1 约束 5 登记不实施。
 const (
+	// ERROR_INVALID_FUNCTION = 1：exFAT/FAT32 上 CreateHardLinkW 的实测返回码
+	// （M273，docs/05 W5-3）——该卷的文件系统根本不实现"建硬链接"这个请求。
+	errInvalidFunction     = syscall.Errno(1)    // ERROR_INVALID_FUNCTION
 	errInvalidParameter    = syscall.Errno(87)   // ERROR_INVALID_PARAMETER
 	errPrivilegeNotHeld    = syscall.Errno(1314) // ERROR_PRIVILEGE_NOT_HELD
 	errFileNotFound        = syscall.Errno(2)    // ERROR_FILE_NOT_FOUND

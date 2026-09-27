@@ -11,17 +11,14 @@ import (
 
 // Win32 建硬链接失败码 → 中文归因。
 //
-// 真值取自 Win32 错误码表：
-//   - ERROR_INVALID_FUNCTION = 1：卷的文件系统**根本不实现**"建硬链接"这个请求。
+// 真值取自 Win32 错误码表，**常数一律住在 winerrno.go 的全包唯一命名表**（OPS-9：
+// 一处判定一处实现——本文件最初的版本把 1/50/5 三个数又私设了一遍名字，那正是
+// 这张表存在要消灭的两套命名漂移面）：
+//   - errInvalidFunction = 1：卷的文件系统**根本不实现**"建硬链接"这个请求。
 //     ★ 这是 exFAT / FAT32 上的**实测值**（M273，W5-3），而 docs/05 那一格原本预期的是 50；
-//   - ERROR_NOT_SUPPORTED  = 50：预期里的那一个，一并接住（ReFS 与部分过滤驱动走这支）；
-//   - ERROR_NOT_SAME_DEVICE= 17：跨卷（同一常数已住在 crossdevice_windows.go，复用它）；
-//   - ERROR_ACCESS_DENIED  = 5：权限/安全软件拦下。
-const (
-	winErrorInvalidFunction = syscall.Errno(1)
-	winErrorNotSupported    = syscall.Errno(50)
-	winErrorAccessDenied    = syscall.Errno(5)
-)
+//   - errNotSupportedByFS  = 50：预期里的那一个，一并接住（ReFS 与部分过滤驱动走这支）；
+//   - winErrorNotSameDevice= 17：跨卷（同一常数已住在 crossdevice_windows.go，复用它）；
+//   - errAccessDeniedWindows = 5：权限/安全软件拦下。
 
 // hardlinkLinkError 把 `os.Link` 的失败翻成"归因覆盖卷型"的错误。
 //
@@ -37,12 +34,12 @@ func hardlinkLinkError(err error) error {
 	if errors.As(err, &le) {
 		if errno, ok := le.Err.(syscall.Errno); ok {
 			switch errno {
-			case winErrorInvalidFunction, winErrorNotSupported:
+			case errInvalidFunction, errNotSupportedByFS:
 				return fmt.Errorf("硬链接失败（该卷不支持硬链接：Windows 上只有 NTFS 提供，"+
 					"exFAT/FAT/ReFS 一律拒绝，与跨卷和权限无关）: %w", err)
 			case winErrorNotSameDevice:
 				return fmt.Errorf("硬链接失败（两个路径不在同一卷，硬链接只能连同卷文件）: %w", err)
-			case winErrorAccessDenied:
+			case errAccessDeniedWindows:
 				return fmt.Errorf("硬链接失败（权限不足或被安全软件拦截）: %w", err)
 			}
 		}

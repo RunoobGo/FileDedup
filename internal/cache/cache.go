@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,23 @@ func (c *Cache) Corrupted() bool { return c.corrupt.Load() }
 // 与真正的文件操作失败混在同一个计数里。这个访问器唯一的用途是让那条 Item 指回
 // 用户能找到的那个文件（隔离重建后 `path` 仍是原路径，所以报出去的就是在用的那个）。
 func (c *Cache) DBPath() string { return c.path }
+
+// IsBusy 报告 err 是否是"库正被其他进程/连接占用"那一档（SQLITE_BUSY，M20/M281）。
+//
+// 为什么判定住在本包而不是消费侧：pipeline 的 M281 造句要按"占用"分档给原因，而
+// 本仓的纪律是**分类只在 cache 侧做一次**（I5，与 ErrCorruptDisabled 等哨兵同一条
+// 约束）——消费侧重新解释驱动文本，两处就各自漂移。驱动的 busy 档没有可靠的
+// 错误值可 errors.Is（modernc 驱动交回的是拼好文本的 error），文本匹配是当下
+// 唯一可靠的判据；真机读数（§6.48 W9-7：`database is locked (5) (SQLITE_BUSY)`）
+// 两种形状都出现过，两条都收。认不出交回 false——消费侧对 false 的处置是
+// "只交回原文、不配原因"，方向安全，不猜。
+func IsBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "database is locked") || strings.Contains(s, "SQLITE_BUSY")
+}
 
 // ErrCorruptDisabled 库被确证损坏后的自我停用（M74）。句子是完整的，调用方原样上报即可。
 var ErrCorruptDisabled = errors.New("哈希缓存库在运行期确证损坏，已停用：不影响去重结果，只是每次扫描都要重算")
