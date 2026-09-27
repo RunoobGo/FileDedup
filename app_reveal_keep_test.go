@@ -49,8 +49,14 @@ func TestRevealKeepSourceSelectsExistingTarget(t *testing.T) {
 		}
 		return
 	}
-	if !containsExact(argv, keep) {
-		t.Errorf("argv 里应恰好有一个元素是完整保留源路径：%q", argv)
+	// linux 的探测表是环境相关的（revealCmd 优先级注释的两档设计）：选中档
+	// （nautilus/dolphin/thunar/nemo）收到保留源本身，只开档（pcmanfm 收目录、
+	// gio/xdg-open 收父目录）收到的只是目录。M312：CI runner 上装的是 gio，
+	// 走的就是只开档 ⇒ 判据按"两档任一"断言；containsExact 的整串不拆
+	// （名字里的 `; echo pwned` 注入形状）逐字保留。
+	parent := filepath.Dir(keep)
+	if !containsExact(argv, keep) && !containsExact(argv, parent) {
+		t.Errorf("argv 里应恰好有一个元素是完整保留源路径或完整父目录：%q", argv)
 	}
 }
 

@@ -1421,14 +1421,21 @@ var execRevealCmd = startCmd
 // 拿它当判据造出的正是"狼来了"：真失败时那条 toast 与假告警逐字同形。
 //
 // 平台真值经参数注入（APP-6 同族）：判据在任一主机上都能把三平台各跑一遍，
-// 不必等 Windows CI。
+// 不必等 Windows CI。⇒ 取基名**不许**用 filepath.Base：它在非 Windows 平台
+// 不认 `\`，`C:\Windows\explorer.exe` 会被整串留下（M312：unix CI 腿上
+// "生产形态：解析后的绝对路径" 这一臂当场红）。这里显式按两种分隔符切，
+// Windows 真机上的解析结果（exec.Command 的 LookPath 产物）行为不变。
 func revealExitSilent(goos string, cmd *exec.Cmd) bool {
 	if goos != "windows" {
 		return false
 	}
+	name := cmd.Path
+	if i := strings.LastIndexAny(name, `\/`); i >= 0 {
+		name = name[i+1:]
+	}
 	// 先转小写再剥 .exe：TrimSuffix 本身大小写敏感，而 Windows 上
 	// `C:\Windows\EXPLORER.EXE` 与裸名 `explorer` 是同一个程序。
-	return strings.TrimSuffix(strings.ToLower(filepath.Base(cmd.Path)), ".exe") == "explorer"
+	return strings.TrimSuffix(strings.ToLower(name), ".exe") == "explorer"
 }
 
 // warnRevealExit 是定位/打开/回收站这类外部命令 onExit 的统一出口。
