@@ -103,7 +103,25 @@ func SymlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	}
 
 	// ---- 步骤 4：临时链接原子顶替 dup 位置 ----
+	//
+	// ★ M344：与硬链接侧同一条纪律（move.go 的那处有完整论证）——这一步是"腾空
+	// 之后的落位"，dup 位此刻是空的，而 os.Rename 对已存在的普通文件是静默替换。
+	// 先用 claimExact 占住名字，随后替换的是我们自己的占位，不再赌"没人来"。
+	// 软链接侧原本与硬链接侧一样是裸改名（两处都缺这一道）。
+	claim, claimed, claimErr := claimExact(dup)
+	if claimErr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("目标位置 %s 在合并期间无法确认可用（%v），已放弃合并；"+
+			"原始文件现位于 %s（请自行核对后再处置）", dup, claimErr, backup)
+	}
+	if !claimed {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("目标位置 %s 在合并期间被第三方文件占用，已放弃合并（未处置该文件）；"+
+			"原始文件现位于 %s（请自行核对后再处置）", dup, backup)
+	}
+	fireBeforeClaimRename(dup) // 测试接缝：抢占之后、改名之前落子
 	if err := hardlinkRename(tmp, dup); err != nil {
+		claim.release()
 		return rollbackAfterSwapFailure(backup, dup, tmp, dupID, err)
 	}
 

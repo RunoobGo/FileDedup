@@ -511,6 +511,10 @@ func (c *Cache) evictLocked() error {
 		c.cntValid = true
 	}
 	if c.cnt <= MaxEntries {
+		// 本次没有淘汰 ⇒ "最近淘汰"必须是 0。修前 lastEvicted 只在淘汰时写、
+		// 只在 Clear 时归零，于是界面上「最近淘汰 N」会在后续每一轮 CacheStats
+		// 里反复报同一个数，读起来像"每轮都在淘汰 N 条"。
+		c.lastEvicted = 0
 		return nil
 	}
 	over := c.cnt - MaxEntries
@@ -520,6 +524,13 @@ func (c *Cache) evictLocked() error {
 	}
 	c.cnt -= over
 	c.lastEvicted = over
+	// ★ 淘汰后整组计数失效，而不只是 cnt。
+	// DELETE 的影响行数只说"删了几行"，说不出"其中几行带 full" ⇒ cntFull 无法
+	// 就地修正。修前 cntFull 停在淘汰前的值、Entries 却已减 ⇒ 统计页会交出
+	// 两个**不同时刻**的读数，极端情况下 WithFull > Entries（自相矛盾）。
+	// 置失效后由下一次 GetStats / evictLocked 走 COUNT 重算（淘汰本就是低频事件，
+	// 一次全表 COUNT 的代价可以接受）。
+	c.cntValid = false
 	return nil
 }
 

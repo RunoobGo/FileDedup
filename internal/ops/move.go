@@ -178,7 +178,28 @@ func HardlinkMerge(keep, dup string, keepID, dupID fsid.ID) error {
 	if !backupOwnershipStill(backup, dupID) {
 		return abandonForeignBackup(backup, dup, tmp)
 	}
+	// ★ M344（2026-09-28 第七轮补审 P0）：这一改名是"腾空之后的落位"，dup 位此刻
+	// 是空的，而 `os.Rename` 对已存在的普通文件是**静默替换**——窗口内第三方落子
+	// 会被连名字带内容一起覆盖，且随后 verifyHardlinked / identityStill 全过、
+	// 账本记 done、**零告警**（第三方文件连内容凭空消失）。
+	//
+	// 与 M48 那三处（restoreInPlace / undoSymlink / abandonForeignBackup）同一条纪律：
+	// 先用 claimExact 占住这个名字，随后的改名替换的是**我们自己的 0 字节占位**，
+	// 不再赌"这段时间没人来"。抢不到就放弃合并——一个字节都不碰第三方的东西。
+	claim, claimed, claimErr := claimExact(dup)
+	if claimErr != nil {
+		_ = os.Remove(tmp) // 我们自己的临时链接
+		return fmt.Errorf("目标位置 %s 在合并期间无法确认可用（%v），已放弃合并；"+
+			"原始文件现位于 %s（请自行核对后再处置）", dup, claimErr, backup)
+	}
+	if !claimed {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("目标位置 %s 在合并期间被第三方文件占用，已放弃合并（未处置该文件）；"+
+			"原始文件现位于 %s（请自行核对后再处置）", dup, backup)
+	}
+	fireBeforeClaimRename(dup) // 测试接缝：抢占之后、改名之前落子
 	if err := hardlinkRename(tmp, dup); err != nil {
+		claim.release() // 改名没成，名字还给系统
 		return rollbackAfterSwapFailure(backup, dup, tmp, dupID, err)
 	}
 	// 收尾复核（见函数头注释）：确认 dup 现在真的是 keep 的那个文件。
@@ -414,7 +435,11 @@ func (c claimedDst) release() {
 // 调用方对它与 ok=false 的处置相同（走另名恢复），真正的错误会在同一个目录上
 // 以同样的原因再报一次——与 claimDst 分支对 Lstat 异常的处理同口径。
 func claimExact(path string) (claimedDst, bool, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	// M344：抢名一律走 openExclusive（它注释里写的就是"占位抢名的唯一落点"），
+	// 不再直接调 os.OpenFile。生产行为**逐字相同**（openExclusive 默认即 os.OpenFile），
+	// 但这样"抢占那一刻名字已被第三方占用"才成为可构造的形状——否则这条防线
+	// 永远不会被测试需要（与 M48 立 beforeClaimRename 接缝同一条理由）。
+	f, err := openExclusive(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	switch {
 	case err == nil:
 		_ = f.Close()
