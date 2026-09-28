@@ -34,7 +34,14 @@ func containsName(xs []string, x string) bool {
 // 函数），要么明写理由后再把期望值改成新的调用点清单。
 // （2026-09-20 全仓审计 M5：登记该契约。）
 func TestSameVolumeNotUsedForExecutionDecisions(t *testing.T) {
-	want := []string{"executor.go"} // 唯一合法调用点：同卷软链接的非阻断提示
+	// M337（2026-09-28）：期望值由 `executor.go` 改为 `executor_branches.go`
+	// ——**不是新增调用点，是同一个调用点随分支体搬了文件**（`Execute` 的
+	// symlink 分支整体移入 executor_branches.go，语句一字未改）。
+	// 语义与数量都未变：唯一合法调用点仍是"同卷软链接的**非阻断提示**"那一处，
+	// 它没有参与任何执行决策（删源/合并准入都不看它）。
+	// 本次是按上面注释给的第二条路处理：明写理由后更新期望清单；扩容闸门照旧有效
+	// ——往**任何**新文件里再加一个 sameVolume 调用点，这里照样红。
+	want := []string{"executor_branches.go"} // 唯一合法调用点：同卷软链接的非阻断提示
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {

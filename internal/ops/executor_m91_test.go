@@ -508,9 +508,19 @@ func TestM91LetsTouchedButUnchangedDupThrough(t *testing.T) {
 // 为什么要有它：guardContent 只在三处接线，逐条用例各测自己那一条腿，
 // **没有任何一处**能读出「是不是漏了新腿 / 是不是多接了旧腿」。
 func TestM91DestructiveLegWiringCount(t *testing.T) {
-	src, err := os.ReadFile("executor.go")
-	if err != nil {
-		t.Fatal(err)
+	// M337（2026-09-28）：扫描面由 `executor.go` 单文件扩到
+	// 「executor.go + executor_branches.go」——五个分支体搬进了后者，
+	// 但"三条破坏性腿各接一道内容复核"这件事**没有变**。
+	// ★ 本钉钉的是"三腿各有一道"，不是"它们写在哪个文件里"：
+	// 只钉单文件会让一次纯搬迁把判据打成红，那是假的红（与 M336 时
+	// `TestF1StaticAnchors` 同一条纪律）。
+	var src []byte
+	for _, name := range []string{"executor.go", "executor_branches.go"} {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src = append(src, b...)
 	}
 	// 锚点的字形在 R1-1（§30.1）改过：delete 那条腿从 `if guardContent(i, e) {` 改成
 	// 先接住 (handled, vid) 再判，所以整句字面不再三处相同。计数判据换成调用点前缀
