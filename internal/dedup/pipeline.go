@@ -380,7 +380,6 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 			p.OnStage(model.StageEvent{Stage: s, Desc: desc})
 		}
 	}
-	_ = stage
 
 	threads := cfg.Threads
 	if threads < 1 {

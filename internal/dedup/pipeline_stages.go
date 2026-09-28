@@ -589,6 +589,8 @@ func (s *scanRun) emitGroups() error {
 		}
 		return s.groups[i].Files[0].Path < s.groups[j].Files[0].Path
 	})
+	// 采样唯一（桶内仅 1 个）的文件不可能与任何文件重复，无需进入最终分组。
+	// （M341 搬移时曾把这条注释丢在旧文件——Explore-9 逐段比对发现的唯一遗漏，已补回。）
 	// 组号在排序**之后**按序号发放（1..N）：同输入两跑的组序与组号因此都一致。
 	for i := range s.groups {
 		s.groups[i].GroupID = uint64(i + 1)
