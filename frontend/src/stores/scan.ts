@@ -6,6 +6,7 @@ import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
 import { undoBlockedText } from '../utils/undoReason'
 import { errWithDetail } from '../utils/errShell'
+import { replaySelection } from '../utils/selection'
 // AS-H6（2026-09-20）：路径归属判据收回后端，这里不再 import 前端的 dirContains
 // 与大小写猜测——判据只有一份才不会再漂移。utils/pathpolicy.ts 只剩卷比较用的纯函数。
 
@@ -303,14 +304,15 @@ export const useScanStore = defineStore('scan', () => {
   // 结果页加载串行化：滚动加载/排序/筛选并发触发时按序执行，
   // 避免同页重复请求（:key 冲突）与新旧响应交错覆盖
   let resultChain: Promise<void> = Promise.resolve()
-  function loadResultPage(append: boolean): Promise<void> {
+  // keepSelection：重取后**回放**勾选（M342）。false 时保持 Y8 纪律（行集被替换 ⇒ 清空）。
+  function loadResultPage(append: boolean, keepSelection = false): Promise<void> {
     resultChain = resultChain
-      .then(() => doLoadResultPage(append))
+      .then(() => doLoadResultPage(append, keepSelection))
       .catch((e: any) => toast().notifyError('加载结果失败', e))
     return resultChain
   }
 
-  async function doLoadResultPage(append: boolean) {
+  async function doLoadResultPage(append: boolean, keepSelection = false) {
     // Y7：已达放量上限时忽略滚动追加，需经 loadMore 显式放量
     if (append && groups.value.length >= loadCap.value) return
     const gen = resultGen
@@ -331,10 +333,20 @@ export const useScanStore = defineStore('scan', () => {
         groups.value.push(...r.groups)
         resultPage.value++
       } else {
+        // M342：重取前先留下勾选快照——「隐藏非拟处理项」是**显示偏好**，
+        // 翻它不该把用户已经勾好的东西抹掉（09 §6.1 / 10 §2.4 承诺"纯显示层、
+        // 勾选一字不变"）。
+        const prevSel = keepSelection ? new Set(selection.value) : null
         groups.value = r.groups
         resultPage.value = 1
-        // Y8：列表被替换（排序/筛选/新扫描/操作后刷新）时勾选已无意义 → 清空
-        resetSelection()
+        if (prevSel && prevSel.size > 0) {
+          // 回放的判据在 utils/selection.ts（纯函数、有单测）：
+          //   仍可见且可勾 ⇒ 留；被这一轮隐藏（或就是保留项）⇒ 不再背着勾。
+          selection.value = replaySelection(prevSel, groups.value)
+        } else {
+          // Y8：列表被替换（排序/筛选/新扫描/操作后刷新）时勾选已无意义 → 清空
+          resetSelection()
+        }
       }
       totalGroups.value = Number(r.total)
       // 全量口径（含未加载页）：统计条与 totalGroups 同源
@@ -763,15 +775,20 @@ export const useScanStore = defineStore('scan', () => {
   // hasResult 门槛：clearStaleResult（换代）也会经 clearProc* 走到这里，
   // 那时重取会把**旧结果集**的行盖回刚清空的界面（新扫描正在途）。
   function refreshPendingProjection() {
-    if (hideNonPending.value && hasResult.value) void loadResultPage(false)
+    // M342：keepSelection=true —— 这是显示偏好的重取，不是"结果集换了"。
+    if (hideNonPending.value && hasResult.value) void loadResultPage(false, true)
   }
 
   // toggleHideNonPending 翻开关；只在**打开**时需要重取——打开前加载的行
   // 是没带策略算的投影（只反映"非保留"），不重取就藏不全。
   // 关闭不需要：isPending 不再被读，陈旧值无害。
-  // 重取的连带效果是勾选被重置（Y8 纪律：行集被替换 ⇒ 清空勾选），
-  // 与改排序/筛选同一形状——这里更该如此：被藏掉的行若还背着勾，
-  // "已选 N"就在替看不见的东西说话。
+  //
+  // ★ M342（2026-09-28 第七轮补审 P0）：这里**曾经**把"重取 ⇒ 勾选被清空"写成
+  // 刻意设计（原注释：被藏掉的行若还背着勾，"已选 N"就在替看不见的东西说话）。
+  // 但本开关是**显示偏好**：09 §6.1 与 10 §2.4 都明写"纯显示层、勾选一字不变"，
+  // 而实行为翻一次开关就静默抹掉全部勾选，且**不可回溯**（行看不见了就没法取消勾选）。
+  // 现在改为"重取后回放勾选"：仍可见且可勾的行一字不变；被这一轮隐藏的行不再
+  // 背着勾 ⇒ 手册承诺与原注释那条顾虑**同时**成立（顾虑只对被藏起来的行成立）。
   function toggleHideNonPending() {
     hideNonPending.value = !hideNonPending.value
     refreshPendingProjection()
