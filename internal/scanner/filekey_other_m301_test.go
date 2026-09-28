@@ -93,11 +93,21 @@ func TestM301CallSitesStillThere(t *testing.T) {
 	if !strings.Contains(string(scan), "keyFromInfo(") {
 		t.Error("scanner.go 里的 keyFromInfo 调用点不见了 ⇒ 本文件的兜底腿判据已无的放矢，请连带更新这两枚用例")
 	}
-	pipeline, err := os.ReadFile("../dedup/pipeline.go")
-	if err != nil {
-		t.Fatalf("dedup/pipeline.go 读不到：%v", err)
+	// M341（2026-09-28）：扫描面由 `../dedup/pipeline.go` 单文件扩到
+	// 「pipeline.go + pipeline_stages.go」——`Run` 的阶段体搬进了后者，
+	// 但 `scanner.ResolveKey` 这个调用点**一字未动**，只是换了文件。
+	// ★ 这是本轮静态钉因"读单文件"而红的**第六例**（F1 锚／sameVolume／M91 接线／
+	//   cachefull_r6 锚／本条），且本条还是**跨包**读源文件——他包的一次纯重构
+	//   就能把它打成红。钉的是"调用点还在"，不是"它在哪个文件里"。
+	var pipeline []byte
+	for _, name := range []string{"../dedup/pipeline.go", "../dedup/pipeline_stages.go"} {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("%s 读不到：%v", name, err)
+		}
+		pipeline = append(pipeline, b...)
 	}
 	if !strings.Contains(string(pipeline), "scanner.ResolveKey(") {
-		t.Error("pipeline.go 里的 scanner.ResolveKey 调用点不见了 ⇒ 同上，判据失去对象")
+		t.Error("dedup 包里的 scanner.ResolveKey 调用点不见了 ⇒ 同上，判据失去对象")
 	}
 }

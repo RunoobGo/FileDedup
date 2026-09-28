@@ -17,9 +17,17 @@ import (
 )
 
 func TestCacheHitSampleMismatchAdoptsRecomputedFullForSmallFiles(t *testing.T) {
-	src, err := os.ReadFile("pipeline.go")
-	if err != nil {
-		t.Fatalf("读 pipeline.go: %v", err)
+	// M341（2026-09-28）：扫描面由 `pipeline.go` 单文件扩到
+	// 「pipeline.go + pipeline_stages.go」——阶段体搬进了后者，但被钉的这段
+	// 分支结构一字未动。★ 与 ops 侧那两条静态钉（sameVolume 调用点、M91 三腿
+	// 接线计数）同一族：钉的是**形状**，不是物理位置。
+	var src []byte
+	for _, name := range []string{"pipeline.go", "pipeline_stages.go"} {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("读 %s: %v", name, err)
+		}
+		src = append(src, b...)
 	}
 	s := string(src)
 
