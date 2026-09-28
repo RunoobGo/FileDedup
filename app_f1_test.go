@@ -157,7 +157,8 @@ func historyIDs(ms []HistoryMeta) string {
 // 四条本机取不到行为级红的改动：注释与 CLI 退出路径。这里钉"改对的形状不许退回去"。
 // 手法先例：ops 侧读 filter.go 源文件的 P-1 钉。★ 只锚标识符与判据句，不锚整段措辞。
 func TestF1StaticAnchors(t *testing.T) {
-	appSrc := readSource(t, "app.go")
+	// M336：面是整个 main 包（方法已按簇拆进 app_*.go），不是 app.go 单文件。
+	appSrc := readMainPkgSource(t)
 	cacheSrc := readSourceAt(t, filepath.Join("internal", "cache", "cache.go"))
 	cliSrc := readSourceAt(t, filepath.Join("cmd", "fdd-cli", "main.go"))
 
@@ -204,6 +205,38 @@ func TestF1StaticAnchors(t *testing.T) {
 func readSource(t *testing.T, name string) string {
 	t.Helper()
 	return readSourceAt(t, name)
+}
+
+// readMainPkgSource 把 main 包的**全部非测试源文件**拼成一份再交给静态钉。
+//
+// M336（2026-09-28 第七轮审查批）：app.go 的绑定方法按职责簇拆进了
+// app_lifecycle.go / app_scan.go / app_result.go / app_reveal.go / app_ops.go /
+// app_history.go / app_settings.go 七个文件。本文件的静态钉钉的是"这个形状
+// 不许退回去"，不是"它必须物理上待在 app.go 里"——只钉单文件会让一次纯移动
+// 把判据打成红，那是假的红（形状还在，只是换了文件）。
+//
+// 因此这里把面放大到整个包：**排除 _test.go**（钉的形状若在测试里出现等于没钉）。
+func readMainPkgSource(t *testing.T) string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("列不出工作目录（静态钉无法执行，不得读作通过）：%v", err)
+	}
+	var sb strings.Builder
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		sb.WriteString(readSource(t, name))
+		sb.WriteString("\n")
+		n++
+	}
+	if n == 0 {
+		t.Fatal("main 包一个非测试 .go 都没读到：静态钉无法执行，不得读作通过")
+	}
+	return sb.String()
 }
 
 func readSourceAt(t *testing.T, rel string) string {
