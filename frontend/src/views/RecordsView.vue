@@ -177,6 +177,55 @@ async function clearAllOps() {
   await store.clearOps()
 }
 
+// ---------- 记录导出 / 导入（M351/M352/M353，裁定 R-2） ----------
+//
+// 这一对按钮是本仓"防误删"唯一有恢复力的出口：清缓存那格的 cache-backup.db 只保哈希
+// 缓存（本就可重算），账本不可再生。导出的意义全在"以后还能导回来"，所以回执上的
+// 每个数字都要报给用户——只说"导出成功"等于什么都没证实。
+const exporting = ref(false)
+const importing = ref(false)
+const confirmImport = ref(false)
+
+async function exportRecords() {
+  exporting.value = true
+  try {
+    const res = await api.exportRecords()
+    if (res.cancelled) return // 取消不是失败，弹任何 toast 都是 noise
+    toast.notifySuccess(
+      `已导出记录：扫描历史 ${formatCount(res.scans)} 条 · 清理记录 ${formatCount(res.ops)} 条 · ` +
+      `${humanBytes(res.bytes)}（影像 ${res.dbPath}）`
+    )
+  } catch (e: any) {
+    toast.notifyError('导出记录失败', e)
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 导入是两步式就地确认（与本页两个「清空」同一形状，不用原生 confirm()）。
+// 为什么导入也要确认：它会把外来文件的路径写进本地账本，而账本里的 dest_path/link_src
+// 在明细展示与「直达保留原目录」那条腿上是**被信任**的（设计段 §6.4 记了这条让步）。
+async function importRecords() {
+  if (!confirmImport.value) { confirmImport.value = true; return }
+  confirmImport.value = false
+  importing.value = true
+  try {
+    const res = await api.importRecords()
+    if (res.cancelled) return
+    toast.notifySuccess(
+      `已导入记录：新增扫描 ${formatCount(res.scansAdded)} 条（跳过重复 ${formatCount(res.scansSkipped)}）· ` +
+      `新增清理记录 ${formatCount(res.opsAdded)} 条（跳过重复 ${formatCount(res.opsSkipped)}）` +
+      (res.opsOrphaned > 0 ? ` · ${formatCount(res.opsOrphaned)} 条未能关联到本地扫描历史` : '')
+    )
+    // 两个列表都要刷：导入同时新增扫描历史与清理记录，只刷当前 tab 会让另一侧停留在旧读数。
+    await Promise.all([store.refreshHistory(), store.refreshOps()])
+  } catch (e: any) {
+    toast.notifyError('导入记录失败', e)
+  } finally {
+    importing.value = false
+  }
+}
+
 // 明细表「去向」列：trash/move 看 destPath，链接类（hardlink/symlink）看 linkSrc
 // destSummary 条目「去向」列的文案。
 //
@@ -203,12 +252,25 @@ function destSummary(it: OpRecordItem): string {
       <button :class="{ on: tab === 'scans' }" @click="tab = 'scans'">扫描历史</button>
       <button :class="{ on: tab === 'ops' }" @click="tab = 'ops'">清理记录</button>
       <span class="spacer"></span>
+      <!-- M353：导出/导入两个入口常驻（不随 tab 隐藏）——账本是两张表，任一表的恢复
+           都需要成对导出，藏在 tab 里会让人以为"这个 tab 才导这个 tab 的记录"。 -->
+      <button class="btn-ghost" :disabled="store.busy || exporting || importing"
+        :title="store.busyTip || '导出记录影像（.db，可导回）与只读镜像（.json，给人核对）各一份'"
+        @click="exportRecords">{{ exporting ? '导出中…' : '导出记录' }}</button>
+      <button v-if="!confirmImport" class="btn-ghost" :disabled="store.busy || exporting || importing"
+        :title="store.busyTip || '从影像增量并入本地记录：只新增本地没有的行，不删除、不改写已有记录'"
+        @click="importRecords">{{ importing ? '导入中…' : '导入记录' }}</button>
+      <template v-else>
+        <span class="confirm-tip">确认导入所选记录影像？只新增本地没有的记录，不会删除或改写已有记录</span>
+        <button class="btn-primary" :disabled="store.busy || exporting || importing" @click="importRecords">确认导入</button>
+        <button class="btn-ghost" @click="confirmImport = false">取消</button>
+      </template>
       <!-- M296（2026-09-27 实施批）：改前是 `v-if="… store.opsRunning"` 配一句写死的
            「回撤执行中…」⇒ busy 的三个原因里只说得出一个，扫描中/历史载入中整页按钮
            全灰却没有一句解释。文案直接取 store.busyTip（busyReason 的唯一派生出口），
            这也是 M286 那条取向的落地：把"为什么是灰的"摆成**可见文本**，
            而不是只挂在 title 上等 OS 绘制（M293 证过那层浮窗合成不出来）。 -->
-      <span v-if="tab === 'ops' && store.busy" class="undo-hint">{{ store.busyTip }}</span>
+      <span v-if="store.busy" class="undo-hint">{{ store.busyTip }}</span>
       <template v-if="tab === 'scans' && store.histList.length">
         <button v-if="!confirmClear" class="btn-ghost" @click="confirmClear = true">清空</button>
         <template v-else>

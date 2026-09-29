@@ -276,6 +276,24 @@ wiring 'src/views/SettingsView.vue' 'res.reclaimedBytes' '' \
 wiring 'src/views/SettingsView.vue' "toast.push(toast.errText(e), 'warn'" '清空缓存失败' \
 	'回收失败那一档走 warn 且不得写「清空缓存失败」（M347/M349：条目已删净，那半截是真话）'
 
+# M353（2026-09-29 设计段 §7）：记录页导出/导入四个形状。四条都锚**标识符/写法**，
+# 不锚中文文案（改措辞安全）；每条都预测了变异，见 04 §6.65 划账。
+wiring 'src/views/RecordsView.vue' 'api.exportRecords()' '' \
+	'导出入口问的是后端 ExportRecords（M353：视图不得自己拼落盘，两件产物的成对性只在后端）'
+wiring 'src/views/RecordsView.vue' 'api.importRecords()' 'if (!confirm(' \
+	'导入走后端 + 两步式就地确认（M353/R3-5：原生 confirm() 在无边框窗体里合成不出来，等于没告知）'
+# ★ 这一条锚的是"两个都刷"这件事本身：只刷当前 tab 会让导入显示成"导入没生效"，
+#   而合并同时动了两张清单（扫描历史 + 清理记录），这正是本批要消灭的那类误读。
+wiring 'src/views/RecordsView.vue' 'store.refreshHistory(), store.refreshOps()' '' \
+	'导入完成后两张清单一起重取（M353：只刷一个 = 界面在讲半截真话）'
+# ★ 这里刻意用 wiring_window 而不是 wiring()：`res.cancelled` 在本文件出现**两处**
+#   （导出与各有一份），全文件 grep 的锚删掉任一处都照样绿——变异 MU-l 实测逃过，
+#   正是 R4-4/M215 记过的那条缺口（"锚存在性"≠"每一处都在"）。行窗口把两处各自钉住。
+wiring_window 'src/views/RecordsView.vue' 'await api.exportRecords()' 3 'res.cancelled' \
+	'导出：取消走 cancelled 字段、不走异常（M353：把"点了又反悔"显示成一次失败是假话）'
+wiring_window 'src/views/RecordsView.vue' 'await api.importRecords()' 3 'res.cancelled' \
+	'导入：取消同样走 cancelled 字段（M353：同上，且这一处与导出各自独立钉，缺一即红）'
+
 # 拟处理清单（2026-09-23，设计段 specs/2026-09-23-pending-files-query-design.md §5）：
 # 抽屉与 store 状态机有 node 用例钉，但 .vue 打不进 node --test（M116/M118 同族限制）——
 # 视图接线只能走锚。三条都锚**标识符**，不锚中文文案（改措辞安全）。

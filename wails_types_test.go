@@ -53,6 +53,10 @@ var wailsMirrors = []mirrorPair{
 	{"FailedItem", reflect.TypeOf(model.FailedItem{}), ""},
 	{"Settings", reflect.TypeOf(Settings{}), ""},
 	{"KeepDecision", reflect.TypeOf(ops.KeepDecision{}), ""},
+	// KeepPolicy 是**入参**类型（ApplyKeepPolicy 的 policy）：原先 TS 侧只在内联对象类型里
+	// 写死 `{ Kind: string; Directories: string[] }`，命名接口没有 ⇒ 正向闸（M353）一照就现形。
+	// 内联键不参与字段比对（tsInterfaceFields 只认本层），升级为命名接口才真有契约。
+	{"KeepPolicy", reflect.TypeOf(model.KeepPolicy{}), ""},
 	{"KeepOutcome", reflect.TypeOf(KeepOutcome{}), ""},
 	{"OpsProgress", reflect.TypeOf(model.OpsProgress{}), ""},
 	{"OpsResult", reflect.TypeOf(model.OpsResult{}), ""},
@@ -65,6 +69,8 @@ var wailsMirrors = []mirrorPair{
 	{"UndoResult", reflect.TypeOf(UndoResult{}), ""},
 	{"CacheStats", reflect.TypeOf(cache.Stats{}), ""},
 	{"CacheClearResult", reflect.TypeOf(CacheClearResult{}), ""},
+	{"RecordsExportResult", reflect.TypeOf(RecordsExportResult{}), ""},
+	{"RecordsImportResult", reflect.TypeOf(RecordsImportResult{}), ""},
 	{"PreviewData", reflect.TypeOf(PreviewData{}), ""},
 	// M44/G10（2026-09-21 审查）：Go 下发但 TS 压根没有镜像的类型，M30 的枚举方向
 	// 看不到（§14.0 G10）——它是 PreviewProcessPolicy 的返回类型。
@@ -476,6 +482,92 @@ func TestWailsInterfacesAreAllMapped(t *testing.T) {
 		if isInterface && !table[name] {
 			t.Errorf("wails.ts 的 export interface %s 未登记进映射表：新增的镜像面必须登记，或写明豁免理由", name)
 		}
+	}
+}
+
+// goBindingStructTypes 反射收集 App 全部导出方法**签名里出现的**本仓结构体类型
+// （入参与返回，含指针/切片/映射解包）。纯函数，不读文件。
+//
+// 只收本仓类型（main 或 filededup/... 包），stdlib 与 error 接口一律不参与：
+// 判据要钉的是"我们下发的 JSON 形状有没有镜像"，不是标准库。
+//
+// ★ 刻意**不**递归进字段：字段类型是父类型的一部分，TS 侧把它们摊平进父接口
+// （`ScanSummary` 里的 `failed: FailedItem[]` 就是 `model.FailedItem`），给它们各开一枚
+// 镜像反而是假的契约面。这一把尺子只钉"方法签名上直接出现的类型"——也就是
+// Wails 真正会当成一个 JSON 值下发的那些。
+func goBindingStructTypes(t reflect.Type) []reflect.Type {
+	registered := map[reflect.Type]bool{}
+	var out []reflect.Type
+	var walk func(reflect.Type)
+	walk = func(ft reflect.Type) {
+		if ft == nil {
+			return
+		}
+		for ft.Kind() == reflect.Ptr || ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Map {
+			walk(ft.Elem())
+			ft = ft.Key()
+			for ft.Kind() == reflect.Ptr || ft.Kind() == reflect.Slice {
+				ft = ft.Elem()
+			}
+		}
+		if ft.Kind() != reflect.Struct {
+			return
+		}
+		pkg := ft.PkgPath()
+		if !strings.HasPrefix(pkg, "filededup") && pkg != "main" {
+			return
+		}
+		if registered[ft] {
+			return
+		}
+		registered[ft] = true
+		out = append(out, ft)
+	}
+	for i := 0; i < t.NumMethod(); i++ {
+		m := t.Method(i).Type
+		for j := 1; j < m.NumIn(); j++ { // j=0 是接收者：App 本身不是下发的数据
+			walk(m.In(j))
+		}
+		for j := 0; j < m.NumOut(); j++ {
+			walk(m.Out(j))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	return out
+}
+
+// TestGoBindingTypesAreAllRegistered 类型面的**正向**完整性（M353，2026-09-29 设计段 §7）。
+//
+// 为什么已有的两项不够：TestWailsTypesCoverGoFields 与 TestWailsInterfacesAreAllMapped
+// 都是**从 TS 侧枚举**的——它们能报"TS 有而表里没有"和"两边字段不等"，但一枚 Go 下发
+// 的结构体只要 TS 侧压根没写、表里也没登记，就**两头都不露面**（§12.0 G10 记过这一族，
+// 当时靠人工补行）。本轮实测：把新加的 RecordsImportResult 从 wailsMirrors 里删掉，
+// 两项都照样绿（变异 MU-o 读数见 04 §6.65）——那正是"零豁免"这句话原本兜不住的一格。
+//
+// 这一把尺子从 Go 反射出发，所以它不看 TS 写了什么：只要某个导出方法的**签名**上出现了一枚
+// 本仓结构体，它就必须出现在映射表里。新增返回类型忘了登记 ⇒ 当场红。
+func TestGoBindingTypesAreAllRegistered(t *testing.T) {
+	seen := map[reflect.Type]string{}
+	for _, p := range wailsMirrors {
+		if p.goType != nil {
+			seen[p.goType] = p.ts
+		}
+	}
+	var missing []string
+	for _, ft := range goBindingStructTypes(reflect.TypeOf(&App{})) {
+		if _, ok := seen[ft]; !ok {
+			missing = append(missing, ft.String())
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("Go 侧下发 %d 枚结构体没登记进 wailsMirrors（前端按类型取不到，而 TS 侧枚举看不见这件事）：%s",
+			len(missing), strings.Join(missing, ", "))
+	}
+	if len(seen) < 20 {
+		t.Errorf("映射表只有 %d 枚 Go 类型（本轮基线 31，下限 20）：表被清空或大段删除时本项不得读作通过", len(seen))
 	}
 }
 

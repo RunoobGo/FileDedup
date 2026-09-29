@@ -161,6 +161,13 @@ export interface KeepDecision {
   removeIDs: number[]
 }
 
+// KeepPolicy 一键保留策略的入参（Go 侧 model.KeepPolicy，无 json tag ⇒ 键名取 Go 字段名）。
+// directory 策略的 Directories 是**有序**优先级列表：靠前目录优先保留。
+export interface KeepPolicy {
+  Kind: string
+  Directories: string[]
+}
+
 // 保留策略结果（app.go KeepOutcome）。unmatchedGroups > 0 表示有组在
 // 「按目录保留」下一条保留者都没标出来，这些组不受保护，必须提示用户。
 export interface KeepOutcome {
@@ -308,6 +315,32 @@ export interface CacheClearResult {
   snapshotPath: string
 }
 
+// RecordsExportResult 是「导出记录」的回执（M351，Go 侧 app_records_io.go 同名结构体）。
+// cancelled 单独成字段：对话框取消在 Wails 那条腿上是空路径 + 无错误，
+// 若不区分，前端就只能靠"字段是不是空"猜用户到底有没有导出过。
+export interface RecordsExportResult {
+  cancelled: boolean
+  dir: string
+  dbPath: string
+  jsonPath: string
+  scans: number
+  ops: number
+  bytes: number
+}
+
+// RecordsImportResult 是「导入记录」的回执（M352）。
+// 五个计数一个都不能少：少了 skipped 说不清"是不是已经导过了"，
+// 少了 orphaned 说不清导入的清理记录还能不能联动。
+export interface RecordsImportResult {
+  cancelled: boolean
+  source: string
+  scansAdded: number
+  scansSkipped: number
+  opsAdded: number
+  opsSkipped: number
+  opsOrphaned: number
+}
+
 export interface PreviewData {
   kind: string
   content: string
@@ -402,7 +435,7 @@ export interface BackendAPI {
   LoadScanHistory(id: number): Promise<ScanSummary>
   DeleteScanHistory(id: number): Promise<void>
   ClearScanHistory(): Promise<void>
-  ApplyKeepPolicy(policy: { Kind: string; Directories: string[] }): Promise<KeepOutcome>
+  ApplyKeepPolicy(policy: KeepPolicy): Promise<KeepOutcome>
   ClearKeepDecisions(): Promise<void>
   ExecuteOperation(op: OpRequest): Promise<string>
   // FilterInDirs 后端判定「paths 里哪些位于任一优先目录下」，返回命中的下标。
@@ -417,6 +450,11 @@ export interface BackendAPI {
   ClearOpRecords(): Promise<void>
   CacheStats(): Promise<CacheStats>
   CacheClear(): Promise<CacheClearResult>
+  // ExportRecords / ImportRecords：记录的导出与增量导入（M351/M352，裁定 R-2）。
+  // 恢复力全在这一对上——「清空缓存」的 cache-backup.db 只保哈希缓存（本就可重算），
+  // 账本不可再生，所以防误删的出口在这里，不在清缓存那一格。
+  ExportRecords(): Promise<RecordsExportResult>
+  ImportRecords(): Promise<RecordsImportResult>
   // ExportReport **目前是 M5 空桩**：Go 侧固定返回错误「报告导出将在 M5 提供」
   // （app.go 的 ExportReport）。声明在此只为了让方法面与 Go 对齐（G5），不代表
   // 功能可用——调用必然 reject。实现落在 M9，届时签名可能变化（format/path → 返回值），
@@ -514,6 +552,11 @@ export const api = {
   clearOpRecords: (): Promise<void> => backend().ClearOpRecords(),
   cacheStats: (): Promise<CacheStats> => backend().CacheStats(),
   cacheClear: (): Promise<CacheClearResult> => backend().CacheClear(),
+  // exportRecords / importRecords：记录页的两个新出口（M353）。
+  // 取消走 cancelled 字段、不走异常，所以这里不做 .then(r => r ?? []) 之类的兜底——
+  // 零值结构体在 cancelled=false 时是"导了个空账本"，界面必须能分辨。
+  exportRecords: (): Promise<RecordsExportResult> => backend().ExportRecords(),
+  importRecords: (): Promise<RecordsImportResult> => backend().ImportRecords(),
 }
 
 // 事件订阅（Wails runtime）
