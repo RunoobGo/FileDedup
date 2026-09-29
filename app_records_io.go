@@ -146,6 +146,9 @@ func (a *App) exportRecordsTo(hs *history.Store, dir string, now time.Time) (Rec
 	// 只把 .json 做成 0600、放任 .db 是 0644，等于隐私承诺只兑了一半。
 	// 设不上就停止：静默留一份 0644 的账本影像在很可能共享的导出目录里，
 	// 比"这次导出没成"更难看（M61 的在册取向：不确定的写入要在落账前拒绝）。
+	// ★ 但这一步**只在 unix 腿兑现那句"仅所有者可读写"**：Windows 的模式位只表达"只读属性"，
+	//   `0600` 与 `0644` 在那条腿上读回同一个 `0666`（CI 现读，04 §6.66 / M354），真正的访问权
+	//   由所在目录的 NTFS ACL 继承 ⇒ 手册按分平台措辞写，不拿这句冒称跨平台保证。
 	if err := os.Chmod(tmpDB, 0o600); err != nil {
 		cleanup()
 		return res, shellRPCError(fmt.Errorf("记录影像权限设置失败（导出已停止）: %w", err))

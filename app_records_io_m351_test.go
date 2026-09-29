@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -155,17 +156,45 @@ func TestExportRecordsWritesBothFiles(t *testing.T) {
 	}
 }
 
-// 两件产物都必须只有所有者可读写（M353）。
+// 两件产物的权限收口（M353；windows 腿的读数由 M354 补）。
 //
 // 这条不是形式主义：导出目录是用户选的，很可能是外置盘或共享目录，而两件里装的都是
 // **这台机器上的全部文件路径**。实测 `VACUUM INTO` 建的影像是 0644（跟 SQLite 默认），
 // 只有 `os.WriteFile` 那件吃了 0o600 ⇒ 影像得显式 Chmod，否则承诺只兑了一半。
+//
+// ★ 判据分平台，因为**操作系统的权限模型不同**，不是为了让哪条腿变绿：
+//   - unix（darwin / linux CI 腿）：POSIX 位真实生效 ⇒ 硬断 `0600`。删掉 Chmod 的变异
+//     MU-s 在这两条腿上红（读数回到 0644）。
+//   - windows：POSIX 位**不参与**该文件的访问判定（实际权限由所在目录的 NTFS ACL 继承），
+//     且 Go 侧 `Stat` 对普通可写文件恒报 `0666`。首版断言吃了这条错前提，CI windows 腿
+//     那条红（`run 36587694247`，读数 **0666**）就是它的照片。
+//     ⇒ windows 这一臂**不判成功**，而是把"承诺在这条腿上落空"钉成一条会红的断言：
+//     读数若不是那个"POSIX 位不被表达"的形状（owner 可写、且 group/other 没被收掉），
+//     说明平台语义变了、或代码真的收口成功 ⇒ 必须回来同步手册措辞与本条判据。
 func TestExportArtifactsAreOwnerOnly(t *testing.T) {
 	a := recordsApp(t)
 	dir := t.TempDir()
 	res, err := a.exportRecordsTo(a.histSnapshot(), dir, fixedNow())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		for _, p := range []string{res.DbPath, res.JsonPath} {
+			st, serr := os.Stat(p)
+			if serr != nil {
+				t.Fatal(serr)
+			}
+			// 本轮 CI 基线 **0666**（`run 36587694247` 现读）：Go 在 Windows 上只把
+			// "只读属性"映射进模式位，`0600` 与 `0644` 在那条腿上读回同一个 0666，
+			// 真正的访问权由所在目录的 NTFS ACL 决定 ⇒ "仅所有者可读写"这句**不成立**。
+			// 读数若不再是 0666，说明 Go/OS 语义变了或代码真的收口了：两者都要求回来
+			// 同步 09 §6.8 / 10 §2.13 的措辞与本条判据，不许让它悄悄变成"承诺已兑现"的假象。
+			if perm := st.Mode().Perm(); perm != 0o666 {
+				t.Errorf("M354：%s 在 windows 腿报出 %04o（本轮基线 0666 ⇒ POSIX 位在这条腿上不被表达）。"+
+					"读数变了就得回来同步手册措辞与本条判据", filepath.Base(p), perm)
+			}
+		}
+		return
 	}
 	for _, p := range []string{res.DbPath, res.JsonPath} {
 		st, serr := os.Stat(p)

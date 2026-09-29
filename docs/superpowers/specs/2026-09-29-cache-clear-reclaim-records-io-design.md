@@ -639,3 +639,46 @@ TS 侧把它们摊平进父接口，给它们各开一枚镜像反而是假契�
 - 四项 Wails 契约闸全绿（含新加的正向那一把），`wailsMirrors` 现有 31 枚 Go 类型。
 - 前端：`scripts/test-frontend-logic.sh` = node 156 项 + 接线 45 项 = **201 项全部通过**，
   `vue-tsc --noEmit` 无输出。
+
+## 13. CI 复批追记（只增不删：`b4cb931` 推送后取到的读数，M354）
+
+### 13.1 现象与逐腿读数
+
+推送 `b4cb931`（§6.65 划账批）后 CI `run 36587694247` 三条腿：
+
+| job | 腿 | 结论 |
+|---|---|---|
+| 109472311476 | `go test (macos)` | **success** |
+| 109472311553 | `gofmt / vet x3 / test -race / frontend / smoke`（ubuntu）| **success** ⇒ 同一枚断言在 linux 腿按 `0600` 通过 |
+| 109472311817 | `go test (windows)` | **failure**，全 log `--- FAIL` 计数 = **1**（单点、非级联；同 log 里 `filededup/internal/cache`、`internal/history` 等 22 包一律 `ok`）|
+
+原话照抄（`gh run view --job 109472311817 --log`，去 ANSI 后）：
+
+```
+--- FAIL: TestExportArtifactsAreOwnerOnly (0.21s)
+    app_records_io_m351_test.go:176: M353：filededup-records-20231114-221320.db 权限是 0666，要求 0600（账本里是用户机器上的全部路径）
+    app_records_io_m351_test.go:176: M353：filededup-records-20231114-221320.json 权限是 0666，要求 0600（账本里是用户机器上的全部路径）
+```
+
+### 13.2 根因：§12.3 那条补的 `Chmod` 吃在一个**未取证的跨平台前提**上
+
+`os.Chmod(tmpDB, 0o600)` 在 Windows 上**返回 nil**（所以 M353 的"设不上就停止"那道门没有拦它），但模式位不参与该文件的访问判定：Go 的 Windows 实现只把"只读属性"映射进 ` FileMode`，普通可写文件 `Stat` 恒报 `0666`，`0600` 与 `0644` 在那条腿上读回同一个数。真正的访问权由所在目录的 **NTFS ACL 继承**决定。
+
+⇒ 这条红不是"CI 环境坏了"，是 §12.3 的隐私承诺**只在 unix 兑现**这件事第一次有了读数。它与 §6.65 里 M335 那族是同一个形状：**拿"我以为的平台语义"当判据**（M335 的两条错前提——`Geteuid()` 恒 0、`chmod 000` 能拦读——本轮又添第三条"Windows 表达 POSIX 位"）。
+
+### 13.3 修法与被否决的三种走法
+
+采用：**判据分平台**（`runtime.GOOS == "windows"` 一臂 + `return`，unix 臂原样硬断 `0600`），实现侧 `Chmod` 调用**保留**（unix 两条腿靠它，Windows 上它是 no-op 但无害，且失败仍停止）。
+
+- ✗ 新增 `*_windows.go` 测试文件或平台构建约束 ⇒ 会让三腿格数不等（957/965/985 那条等式本身是"没有一腿被排除"的照片），docs/04 §3.2 的逐包格与 §4.1 锚全部要重算，代价与收益不成比。
+- ✗ 整条用例在 windows 上 `t.Skip` ⇒ 这一格从此没有判据，读数再变也没人知道。
+- ✗ 把 unix 的 `0600` 放宽成 `perm&0o077 == 0` 之类"通用"式 ⇒ 削弱真判据来凑绿，M353 那条变异（MU-s）会跟着失效。
+
+windows 臂断的是 `perm != 0o666` **即红**：它把"承诺在这条腿上落空"钉成一条会变的读数闸。哪天 Go/OS 语义变了、或代码真的做到了收口，这条就红着要求回来同步 09 §6.8 / 10 §2.13 的措辞——**不许它悄悄变成"承诺已兑现"的假象**。
+
+### 13.4 复批验证读数
+
+- darwin 腿 `-run TestExportArtifactsAreOwnerOnly -v` ⇒ **PASS**（修前该条在本机也 PASS，因为它本就是 unix 臂）。
+- **MU-s 复验**（摘掉 `os.Chmod`）⇒ 仍红在 `app_records_io_m351_test.go:205: M353：… 权限是 0644，要求 0600`。★ 这条是本轮的关键反证：分平台**没有**把"摘守卫必红"换成"永远绿"。`cp` 备份 + `cmp` 还原一致后删除备份，未用 `git checkout`。
+- 未新增测试格 ⇒ 三腿仍 957 / 965 / 985，`check-version-sync.sh` 的 B 组 61 格不受影响（收尾读数见 04 §6.66）。
+- **仍未兑现**：CI runner 的读数不是用户真机；exFAT / FAT32 外接卷那一档 CI 没有 runner，挂在 `docs/05` P12 的 W13-3（已缩窄）。
