@@ -26,10 +26,16 @@ async function clearCache() {
   if (!confirmClearCache.value) { confirmClearCache.value = true; return }
   confirmClearCache.value = false
   try {
-    await api.cacheClear()
-    toast.notifySuccess('哈希缓存已清空')
+    // M349：后端现在给回执（清了几条 / 回收多少字节）。改前这里只有一个 error，
+    // 于是"条目 0 但占用没变"这种读数界面拿不出反证——用户只能判断"没清掉"。
+    const res = await api.cacheClear()
+    toast.notifySuccess(
+      `哈希缓存已清空 ${formatCount(res.entriesCleared)} 条 · 回收 ${humanBytes(res.reclaimedBytes)}`)
   } catch (e: any) {
-    toast.notifyError('清空缓存失败', e)
+    // 只有空间回收失败那一档（M347）条目其实已经删净。后端在这一腿把整句真话
+    // 拼进了错误串（含条数与快照落点），所以这里走 warn 档原样报出：
+    // 这一档不许被重写成整件事失败的措辞（那句会成假话），门禁的禁止侧正盯着它。
+    toast.push(toast.errText(e), 'warn', 9000)
   }
   await refreshCache()
 }
@@ -111,7 +117,8 @@ async function save() {
           <button class="btn-ghost" @click="confirmClearCache = true">清空缓存</button>
         </template>
         <template v-else>
-          <span class="hint">确认清空哈希缓存？下次扫描将退化为首次扫描速度。</span>
+          <span class="hint">确认清空哈希缓存？下次扫描将退化为首次扫描速度；清空前会先把现有缓存快照到
+            <code>cache-backup.db</code>（只留最近一次，下次清空覆盖它）。</span>
           <button class="btn-danger" @click="clearCache">确认清空</button>
           <button class="btn-ghost" @click="confirmClearCache = false">取消</button>
         </template>

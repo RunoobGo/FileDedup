@@ -268,6 +268,14 @@ wiring 'src/views/RecordsView.vue' 'if (!accepted) undoingItem.value = null' '' 
 wiring 'src/views/SettingsView.vue' 'confirmClearCache' 'if (!confirm(' \
 	'清空缓存走两段式就地确认（R3-5：原生 confirm() 是全仓唯一残留，绕开 useModal 收口的那套）'
 
+# M349（2026-09-29 设计段 §3.4）：清空缓存必须消费后端回执、并且不许把"只有空间
+# 没回收"那一档说成整次失败。两条都锚代码形状：前者锚回执字段（改回 notifySuccess
+# 写死一句话就红），后者用禁止侧钉那句假话（warn 档的写法本身已被必须侧锚住）。
+wiring 'src/views/SettingsView.vue' 'res.reclaimedBytes' '' \
+	'清空回执把"回收了多少字节"报给用户（M349：改前只有一个 error，"条目 0 但占用没变"无从反证）'
+wiring 'src/views/SettingsView.vue' "toast.push(toast.errText(e), 'warn'" '清空缓存失败' \
+	'回收失败那一档走 warn 且不得写「清空缓存失败」（M347/M349：条目已删净，那半截是真话）'
+
 # 拟处理清单（2026-09-23，设计段 specs/2026-09-23-pending-files-query-design.md §5）：
 # 抽屉与 store 状态机有 node 用例钉，但 .vue 打不进 node --test（M116/M118 同族限制）——
 # 视图接线只能走锚。三条都锚**标识符**，不锚中文文案（改措辞安全）。

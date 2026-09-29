@@ -41,8 +41,13 @@ type Entry struct {
 
 // Stats 缓存统计（CacheStats 契约）。
 type Stats struct {
-	Entries     int   `json:"entries"`
-	WithFull    int   `json:"withFull"`
+	Entries  int `json:"entries"`
+	WithFull int `json:"withFull"`
+	// DBSizeBytes 是主库 + `-wal` 的字节和（M348；改前只算主库）。
+	// 口径改的原因：这一格在界面上标的是「占用」，而 WAL 下一条都没 checkpoint 的
+	// 改动全在 -wal 里 —— 实测填满 2 万条时主库 4,300,800 B、-wal 4,375,472 B，
+	// 只报主库就少报一半。`-shm` 不计入：它 32 KB 量级恒定、随最后一个连接退出即消失，
+	// 不承载数据（本库没有 checkpoint 之后的"持久残留"，它只是运行期内存映射索引）。
 	DBSizeBytes int64 `json:"dbSizeBytes"`
 	LastEvicted int   `json:"lastEvicted"`
 }
@@ -145,6 +150,11 @@ var ErrCorruptDisabled = errors.New("哈希缓存库在运行期确证损坏，�
 // ErrEvictFailed 写回已 Commit 成功、只有 LRU 淘汰失败（M75(a)）。
 // 上游必须据此分岔文案——把它报成"缓存写回失败"是一句假话（条目已经在库里）。
 var ErrEvictFailed = errors.New("缓存 LRU 淘汰失败")
+
+// ErrReclaimFailed 哈希条目已删、只有空间回收没走完（M347）。
+// 与 ErrEvictFailed 同一条纪律：上游必须分岔文案，把它报成"清空缓存失败"是一句假话
+// （条目确实已经没了，缺的是磁盘字节）。
+var ErrReclaimFailed = errors.New("哈希缓存已清空，但磁盘空间未能回收")
 
 // noteDBError 记一次运行期库错误（M74）：计数 + 确证损坏时置停用位。
 // 计数用原子、不持 c.mu：Lookup 的读侧持 RLock，这里若在持锁路径上再取写锁会自锁。
@@ -558,13 +568,67 @@ func (c *Cache) GetStats() (Stats, error) {
 		}
 	}
 	s.LastEvicted = c.lastEvicted
-	if st, err := os.Stat(c.path); err == nil {
-		s.DBSizeBytes = st.Size()
-	}
+	s.DBSizeBytes = c.diskUsageLocked()
 	return s, nil
 }
 
-// Clear 清空缓存。
+// diskUsageLocked 返回库族文件在盘上的真实占用：主库 + `-wal`（M348）。
+// 侧文件缺失按 0 计入而不报错——这一格是展示量，不值得为它把整个 CacheStats 变成 error
+// （与改前对 `os.Stat(c.path)` 失败即留 0 的宽松度同档）。
+// 调用方须持任一锁（GetStats 走读锁；Clear 在改完计数后也用它取"清完还剩多少"）。
+func (c *Cache) diskUsageLocked() int64 {
+	var total int64
+	for _, p := range []string{c.path, c.path + "-wal"} {
+		if st, err := os.Stat(p); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
+// checkpointFn 是 WAL 截断的注入点（测试接缝，惯例同 evictFn / renameFile / dbfile.renameFile）。
+// 为什么要接缝：`busy=1` 那一档要第二个连接真的握着 WAL 写锁才造得出，
+// 本机既无 Linux 运行时、又要跨进程编排两个 GUI，比一条包级接缝贵得多。
+// 返回值是 PRAGMA 的 busy 列（0=做完，1=没做完但**不报错**）。
+var checkpointFn = func(db *sql.DB) (int, error) {
+	var busy, logSize, checkpointed int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logSize, &checkpointed); err != nil {
+		return 0, err
+	}
+	return busy, nil
+}
+
+// reclaimLocked 把已删条目占的空间真正交回文件系统。三步，**顺序即判据**（M347）：
+//
+//	DELETE 只把页挂进 freelist，SQLite 从不主动缩文件（实测 1044 页 ×4096 挂在库里）；
+//	VACUUM 把影像压实、freelist 归 0，但 WAL 模式下它写的是 -wal，主库字节一格不减
+//	（实测仍 4,300,800）⇒ 只加 VACUUM 是"看起来修了、其实没修"的那版修法；
+//	wal_checkpoint(TRUNCATE) 才把压实后的影像落回主库并把 -wal 截成 0
+//	（实测主库 24,576、-wal 0）。
+//
+// 两条探针因此分开写、各钉一层（见 cache_reclaim_m347_test.go 的注释）。
+// 调用方须持写锁；VACUUM 不能进事务，这里也不给它包事务。
+func (c *Cache) reclaimLocked() error {
+	if _, err := c.db.Exec(`VACUUM`); err != nil {
+		return err
+	}
+	busy, err := checkpointFn(c.db)
+	if err != nil {
+		return err
+	}
+	// ★ busy=1 不是 error：用 Exec 一发不管返回值，就会把"没回收成功"读成"回收成功"，
+	// 那等于把本条的假话从"字节没减"升级成"报告说字节减了"。认不准就不说成功（同 IsBusy 的纪律）。
+	if busy != 0 {
+		return fmt.Errorf("WAL 正被其他连接占用（checkpoint busy），主库体积暂未回落")
+	}
+	return nil
+}
+
+// Clear 清空哈希表并回收磁盘空间（M347；契约口径见 09 §缓存维护 9「想立即回收空间」）。
+//
+// 只动 `hash_cache` 一张表：`cache_meta`（算法语义版本）原样保留，账本四张表在本包之外、
+// 从来不由这里触碰（那条边界有结构守卫，根包 M350 探针）。
+// 返回 ErrReclaimFailed 时**条目已经删干净了**，只有空间没回来 —— 上游不得报成"清空失败"。
 func (c *Cache) Clear() error {
 	if c.corrupt.Load() {
 		return ErrCorruptDisabled // M214：停用后不再发 SQL，与 Lookup/Store/Touch 同档
@@ -574,7 +638,35 @@ func (c *Cache) Clear() error {
 	_, err := c.db.Exec(`DELETE FROM hash_cache`)
 	c.cntValid = false // C5：清空后计数失效
 	c.lastEvicted = 0
-	return err
+	if err != nil {
+		c.markCorruption(err)
+		return err
+	}
+	if rerr := c.reclaimLocked(); rerr != nil {
+		return fmt.Errorf("%w（%v）", ErrReclaimFailed, rerr)
+	}
+	return nil
+}
+
+// Snapshot 把当前库导成一份**自包含单文件**影像（M349）。
+//
+// 为什么用 VACUUM INTO 而不是 io.Copy 主库：WAL 模式下未 checkpoint 的内容都在 -wal 里，
+// 单拷主库得到的是一个旧影像（实测填满 2 万条时 -wal 与主库同量级），"备份"了个寂寞。
+// VACUUM INTO 产出的影像自带一致快照、不需要侧文件（实测可独立 Open 并逐条命中）。
+//
+// ★ dest 必须**不存在**——这是 SQLite 对该语句的硬约束（撞名即错）。所以"覆盖式"的
+// 落笔方（App.CacheClear）先写 dest+".tmp-<nano>" 再 rename 覆盖到 dest，
+// 新快照失败时旧的那份仍在原地。
+func (c *Cache) Snapshot(dest string) error {
+	if c.corrupt.Load() {
+		return ErrCorruptDisabled // 同上档：停用期不发 SQL，也不每轮重犯
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.db.Exec(`VACUUM INTO ?`, dest); err != nil {
+		return fmt.Errorf("生成缓存快照失败: %w", err)
+	}
+	return nil
 }
 
 // Close 关闭。

@@ -64,6 +64,7 @@ var wailsMirrors = []mirrorPair{
 	{"OpRecordDetail", reflect.TypeOf(OpRecordDetail{}), ""},
 	{"UndoResult", reflect.TypeOf(UndoResult{}), ""},
 	{"CacheStats", reflect.TypeOf(cache.Stats{}), ""},
+	{"CacheClearResult", reflect.TypeOf(CacheClearResult{}), ""},
 	{"PreviewData", reflect.TypeOf(PreviewData{}), ""},
 	// M44/G10（2026-09-21 审查）：Go 下发但 TS 压根没有镜像的类型，M30 的枚举方向
 	// 看不到（§14.0 G10）——它是 PreviewProcessPolicy 的返回类型。

@@ -43,7 +43,7 @@ func TestCchFieldReadsRaceWithShutdown(t *testing.T) {
 
 	readers := []func(){
 		func() { _, _ = a.CacheStats() },
-		func() { _ = a.CacheClear() },
+		func() { _, _ = a.CacheClear() },
 	}
 
 	stop := make(chan struct{})
@@ -89,7 +89,7 @@ func TestCacheStatsReportsUnavailableAfterShutdown(t *testing.T) {
 	if _, err := a.CacheStats(); err == nil {
 		t.Fatal("句柄已释放，CacheStats 仍报成功（§15.0-A APP-2）")
 	}
-	if err := a.CacheClear(); err == nil {
+	if _, err := a.CacheClear(); err == nil {
 		t.Fatal("句柄已释放，CacheClear 仍报成功（§15.0-A APP-2）")
 	}
 }

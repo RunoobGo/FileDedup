@@ -293,8 +293,19 @@ export interface UndoResult {
 export interface CacheStats {
   entries: number
   withFull: number
+  // dbSizeBytes 是主库 + `-wal` 的字节和（M348：改前只算主库，常态少报约一倍）。
+  // `-shm` 不计入——它不承载数据、随最后一个连接退出即消失。
   dbSizeBytes: number
   lastEvicted: number
+}
+
+// CacheClearResult 是「清空缓存」的回执（M349）。
+// 改前 CacheClear 只返回 error，界面那格「占用」又要从 CacheStats 另取，
+// 于是"条目 0 · 占用 4.1 MB"这种自相矛盾的读数没有反证可给。
+export interface CacheClearResult {
+  entriesCleared: number
+  reclaimedBytes: number
+  snapshotPath: string
 }
 
 export interface PreviewData {
@@ -405,7 +416,7 @@ export interface BackendAPI {
   UndoOperationItem(opLogId: number, itemId: number): Promise<string>
   ClearOpRecords(): Promise<void>
   CacheStats(): Promise<CacheStats>
-  CacheClear(): Promise<void>
+  CacheClear(): Promise<CacheClearResult>
   // ExportReport **目前是 M5 空桩**：Go 侧固定返回错误「报告导出将在 M5 提供」
   // （app.go 的 ExportReport）。声明在此只为了让方法面与 Go 对齐（G5），不代表
   // 功能可用——调用必然 reject。实现落在 M9，届时签名可能变化（format/path → 返回值），
@@ -502,7 +513,7 @@ export const api = {
   undoOperationItem: (opLogId: number, itemId: number): Promise<string> => backend().UndoOperationItem(opLogId, itemId),
   clearOpRecords: (): Promise<void> => backend().ClearOpRecords(),
   cacheStats: (): Promise<CacheStats> => backend().CacheStats(),
-  cacheClear: (): Promise<void> => backend().CacheClear(),
+  cacheClear: (): Promise<CacheClearResult> => backend().CacheClear(),
 }
 
 // 事件订阅（Wails runtime）
