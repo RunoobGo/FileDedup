@@ -468,3 +468,58 @@ R-2 原话「导入时以增量的形式扩展本地记录」⇒ 三条硬约束
 - 不给 `history.db` 加 VACUUM/checkpoint（本仓不向 UI 报账本体积，症状不存在；
   要清账本磁盘是另一格，登记为后续观察项，不混进本批）。
 - 不做快照的多份轮转（R-3 定一份）。
+
+## 11. 批 1 实施后追记（只增不删：本节是设计段落笔时**没有**的读数）
+
+### 11.1 `-wal` 在"只读打开"下就存在 —— §2.3 那条判据的前提被现读否掉
+
+设计段原本打算钉"没有侧文件时 `dbSizeBytes` 仍等于主库"。现读否掉了这个夹具：
+**只要有一条活连接，`-wal` 就在场**——新建库、只 `Open` 不写任何东西，读数就是
+主库 4,096 B / `-wal` 57,712 B。所以"无侧文件"不是一个能自然出现的运行态，
+把它写成用例等于钉一句永远不会被走到的话。
+
+拆成两条真判据：
+- `TestStatsWalEmptyEqualsMain`：清空（走完整 checkpoint/TRUNCATE）之后 `-wal` 确实
+  是 0 字节 ⇒ 此时 `dbSizeBytes == 主库`。这才是"侧文件为 0 时不多算"的真照片。
+- `TestDiskUsageToleratesMissingFiles`：直接对 `diskUsageLocked` 造缺失文件，钉的是
+  helper 的容忍性（展示量不值得为一条 `os.Stat` 失败把整个 `CacheStats` 变成 error）。
+
+### 11.2 ★ 探针缺陷（自纠，必须留痕）：第一版 busy 用例是**假造的**，变异当场空转
+
+MU-c 第一次跑是 **全绿**。原因是我在探针里覆盖了 `checkpointFn` 接缝、直接返回
+`busy=1`——于是"把真函数换成 `db.Exec` 并忽略 busy 列"这个变异改的正是被我覆盖掉的那段，
+用例看不见任何差别。这不是变异没杀伤力，是**用例没有对真实现取证**。
+
+修法：删掉假接缝，改用**第二个真实连接**复现——`sql.Open("sqlite", cch.DBPath())` 另开一腿，
+持一个未消费完的 `rows` 游标，再对本库写 200~300 条 ⇒ `PRAGMA wal_checkpoint(TRUNCATE)`
+自己回 `busy=1`，`-wal` 实测留在 86,552 B 不截。此时 MU-c 才落红。
+接缝本身保留在 `reclaimLocked` 里（它是这条路径可测的唯一手段），但**判据不许建立在接缝的
+返回值上**；这条约束对以后所有 `*Fn` 接缝通用。
+
+MU-d 同样逃逸过一次：锚点断言的是"暂未回落"，那句话在**内层** busy 串里，重写外层哨兵时
+它照样存活。补的是 `TestErrReclaimFailedTextDoesNotDenyTheDeletion`——直接断言哨兵自身
+含「已清空」且**不含**「失败」，把"文案纪律"钉在文案自己身上而不是钉在拼装处。
+
+### 11.3 busy 那一档的**代价**读数：约 5 秒
+
+`busy_timeout=5000` 是每条连接都吃的会话级 PRAGMA（`connPragmas`），所以 checkpoint 撞上
+持锁方时不是立刻返回，而是**先等满 5 s 再回 `busy=1`**。实测 `TestClearBusyDoesNotClaimSuccess`
+单条 5.04 s、`TestCacheClearReclaimFailStillReports` 5.04 s——这两格的时长本身就是这条通道的
+照片。后果要如实说：清空缓存这个动作在他进程持写锁时**会卡住界面约 5 秒**，然后才报出
+"已清空但空间未回收"。这比修前（立刻返回、但字节没减）慢，换来的是那句话是真话。
+本批**不**调小超时：5 s 是全库共用的让路窗口，为这一格单独收紧会把 M20 那批的取向改掉。
+
+### 11.4 前端两条接线锚的变异读数（批 1 交付证据补齐）
+
+- MU-k（catch 臂改回 `toast.notifyError('清空缓存失败', e)`）⇒ 门禁 rc=1，红在预测的那一条：
+  「回收失败那一档走 warn 且不得写「清空缓存失败」」，理由是"未引用 `toast.push(toast.errText(e), 'warn'`"。
+- MU-l（成功臂改成写死的 `notifySuccess('哈希缓存已清空')`）⇒ 门禁 rc=1，红在
+  「清空回执把"回收了多少字节"报给用户」，理由"未引用 `res.reclaimedBytes`"。
+- 还原后基线：`node 用例 156 项 + 接线断言 40 项 = 合计 196 项全部通过`（接线 38 → 40 即本批两枚）。
+
+### 11.5 一处需要更正的自我引用
+
+`CacheClear` 的注释最初指向 `app_cache_boundary_m350_test.go`——该文件从未存在，M350 的守卫
+实际落在 `app_cache_clear_m349_test.go` 的 `TestCacheClearLeavesLedgerUntouched`。已就地改正。
+登记在这里的理由：注释指向一个不存在的文件名，和文档写"已在 docs/05 挂格"是同一类说谎，
+只是它藏在代码里、没有门禁会替我抓。
