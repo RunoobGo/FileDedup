@@ -523,3 +523,119 @@ MU-d 同样逃逸过一次：锚点断言的是"暂未回落"，那句话在**�
 实际落在 `app_cache_clear_m349_test.go` 的 `TestCacheClearLeavesLedgerUntouched`。已就地改正。
 登记在这里的理由：注释指向一个不存在的文件名，和文档写"已在 docs/05 挂格"是同一类说谎，
 只是它藏在代码里、没有门禁会替我抓。
+
+## 12. 批 2 实施后追记（只增不删：设计段落笔时**没有**的读数）
+
+编号规则：§11 的 MU-* 是批 1 的；本节从 MU-o 起是批 2 我这轮**逐条亲手跑过**的，
+没有一条是"听上一轮说跑过"。跑法一律是"打坏→跑判据→记红→还原→复跑记绿"，
+还原后 rc 全为 0（读数见 §12.6 末行）。
+
+### 12.1 ATTACH 那一形状被现读判死 —— §6 落笔时的设计不成立
+
+设计段 §6 写的增量合并是 `ATTACH DATABASE ? AS srcdb` + 一句 `INSERT ... SELECT`。
+实测（一次性探针，跑完即删）：
+
+- 事务内 `ATTACH` 与跨库 `SELECT` 都成功；
+- 事务内 `DETACH DATABASE srcdb2` ⇒ **`database srcdb2 is locked (1)`**；
+- 同一连接在事务**外** ATTACH 再 DETACH ⇒ 两者都成功。
+
+⇒ ATTACH 形状要么把 DETACH 推到事务外（源库在整个导入期间挂在写连接上），
+要么让连接一直带着一个外来 schema。两条都比"另开只读连接 + 本地逐行事务"更含混，
+所以实施走后者（`openReadOnly` / `ImportFrom`）。这不是偏好，是 DETACH 那条错误判的。
+
+### 12.2 只读通道与影像的四条实测（`export.go` 页首引的就是这四条）
+
+| # | 读数 |
+|---|---|
+| (1) | `VACUUM INTO` 产物 `journal_mode="delete"`、单文件 **40,960 B**、`page_count=10`，目录里**没有**它的 `-wal`/`-shm`；同一时刻源库是 main 4,096 B + `-wal` 74,192 B ⇒ "自包含"是可以数的：未 checkpoint 的内容被一并收进那 10 页 |
+| (2) | `PRAGMA query_only=ON` 下 `UPDATE op_records SET done_count = done_count WHERE 1=0` ⇒ **`attempt to write a readonly database (8)`**（零行语句也被拒：拒的是权限，不是影响行数） |
+| (3) | 只读连接打开前后，影像字节 **40,960 → 40,960**，`os.ReadFile` 全等 |
+| (4) | 事务内 `DETACH` ⇒ `database srcdb2 is locked (1)`（§12.1） |
+
+读数 (2)(3) 是"读外来库不许走 `history.Open`"这条约束的证据面：`Open` 会执行
+`PRAGMA journal_mode=WAL` 与两条 `UPDATE op_items` 收口语句，确证损坏时还会改名隔离——
+四件事全在**改动用户刚选中的那个文件**。判据落在 `TestImportLeavesSourceFileUntouched`
+（字节全等 + 目录里不许出现 `image-*` 侧文件）。
+
+### 12.3 ★ 影像的权限实测是 0644 —— 注释许了诺、代码没做的一格（本轮新发现）
+
+`exportRecordsTo` 的注释写着"0o600 而不是 0o644：账本里是用户机器上的**全部文件路径**"，
+而实测两件产物：
+
+```
+产物 filededup-records-20231115-061320.db   权限=0644
+产物 filededup-records-20231115-061320.json 权限=0600
+```
+
+只有 `os.WriteFile` 那件吃了 0o600；`.db` 跟的是 SQLite 自己的默认。可那句话讲的隐私
+对两件**同样**成立（影像里就是那五张表逐行）。⇒ 补 `os.Chmod(tmpDB, 0o600)`，
+设不上就停止导出（M61 的在册取向：不确定的写入要在落账前拒绝；静默留一份 0644 的
+账本影像在"很可能是外置盘/共享目录"的导出目录里，比这次没导成更难看）。
+判据 `TestExportArtifactsAreOwnerOnly`，变异 MU-s 见 §12.6。
+
+登记这一条的理由：没有任何门禁会替我抓"注释说了、代码没做"，它和 §11.5 那条
+"注释指向不存在的文件"是同一类，只是这次是权限位。
+
+### 12.4 `MarshalIndent` 会重排内层 `RawMessage` —— §5.3 的"字节一致"判据不成立
+
+设计段 §5.3 想让镜像与库里的 TEXT 列**逐字节相同**（理由是"镜像的存在理由就是 diff"）。
+实测 `json.MarshalIndent(mirror, "", "  ")` 会把内层 `json.RawMessage`（roots 那一段）
+重新缩进——于是任何"整份镜像 == 库里字节"的断言必然假红。改后的判据：`json.Compact`
+归一化之后比**内容**（`TestExportMirrorIsParseableJSON`）。搬运这件事仍然成立
+（字段序、空数组表示都不重编），只是它的可断言形状是内容等值而不是字节等值。
+
+### 12.5 正向类型面闸：G10 那一族被照出来，而且本仓真有一枚
+
+批 2 前段（本轮上下文早段）跑 MU-o 时发现：删掉 `wailsMirrors` 里新加的行，
+`TestWailsTypesCoverGoFields` 读作绿。这轮把 MU-o 做成两个形状，读数不同，分开记：
+
+- **形状 A**——TS 有命名接口 `RecordsImportResult`、表里删掉那一行：
+  `TestWailsInterfacesAreAllMapped` 与新增的正向闸**双双落红**。
+  ⇒ 这一格老闸本来就兜得住（"TS 有而表里没有"正是它的判据），先前记的"两项都绿"
+  只对 `TestWailsTypesCoverGoFields` 成立，这里更正，不沿用那句过头的话。
+- **形状 B**——Go 下发一枚**入参**结构体，TS 侧只写内联对象类型、表里也不登记：
+  两项老闸（`TestWailsTypesCoverGoFields`、`TestWailsInterfacesAreAllMapped`）**全绿**，
+  只有新增的 `TestGoBindingTypesAreAllRegistered` 红在
+  `Go 侧下发 1 枚结构体没登记进 wailsMirrors…：model.KeepPolicy`。
+
+形状 B 不是假想的夹具：`model.KeepPolicy` 在本仓的真实形状就是
+`wails.ts` 里的内联 `{ Kind: string; Directories: string[] }`——Go 侧改了字段名而 TS 不跟，
+**没有一把尺子量得到**。修法是把它升成命名接口 `KeepPolicy` + 登记一行
+（顺带让字段比对第一次覆盖到这枚入参），而不是在判据代码里给它开洞。
+
+新闸的边界（写进注释，防止下一个人以为它管全部）：只扫**方法签名上直接出现**的
+本仓结构体（入参与返回，解包指针/切片/映射），**不递归字段**——字段是父类型的一部分，
+TS 侧把它们摊平进父接口，给它们各开一枚镜像反而是假契约面。
+另带一条防空转的下限：`len(seen) < 20` 直接红（本轮实际 31 枚）。
+
+### 12.6 批 2 变异读数（逐条，含两条自纠）
+
+| 变异 | 打坏的守卫 | 读数 |
+|---|---|---|
+| MU-o(A/B) | 类型面登记 | 见 §12.5：形状 B 只有新闸红 |
+| MU-r | `rawColumn` 的 `json.Valid` 拦截整段删掉 | **首次全绿**（夹具没有一列是坏的）⇒ 补 `TestExportRejectsCorruptColumn`（四列逐列循环）后复跑：roots / filters / failed_json / keep_paths **四子项全红** |
+| MU-r2 | `ExportTo` 失败分支不再 `cleanup()` | 红在「留下了残留 `filededup-records-20231115-061320.db.tmp`」——残留正是那件**已经生成**的影像，这条同时证明用例非空转 |
+| MU-s | 删掉影像的 `os.Chmod(0600)` | 红在「权限是 0644，要求 0600」（§12.3） |
+| MU-t | 结构不符的哨兵文案换成通用「导入失败」 | 红在 `TestImportRejectsMissingTable` |
+| MU-u | 子行合并失败被 `_ = err` 吞掉、继续提交 | 红在 `TestImportMidChildFailureRollsBack` |
+| MU-n1 | 自库守卫 `srcPath == s.path` 改成永不相等 | 红在 `TestImportRefusesSelf` |
+| MU-n2 | 存在性守卫失效 | **第一次跑的是假红**：整行换掉后 `"os" imported and not used` 编译失败，rc=1 但判据根本没跑到。改成保留 `os.Stat`、只中和条件（`err != nil && false`）⇒ 真红，且红得与 §6 的预言逐字对上：「不存在的文件报成了结构错误：表 scan_history 整张不存在…」（SQLite 对不存在的库会**建出**空库） |
+| MU-n3 | `sum.OpsOrphaned++` 删掉 | 红在 `TestImportOrphanHistIDIsZeroed` |
+| MU-n4 | 子行归位改用源库 id | 红在 `TestImportRemapsChildIds` |
+| MU-n5 | 取消被报成 `error` | 红在 `TestExportCancelIsNotFailure` |
+| MU-n6 | 导入后只重取一张清单 | 门禁 rc=1，红在接线锚「未引用 `store.refreshHistory(), store.refreshOps()`」 |
+
+★ 与 §11.2 同一条自纠记法：MU-r 与 MU-n2 第一次都是**假通过/假红**——前者是判据没覆盖
+（夹具缺坏列），后者是变异改不动（编译挡路）。两次都不是"实现没问题"的证据，
+都是"我这轮还没取证"的证据。
+批 1 的 MU-c（checkpoint 的空清理）维持**无判据覆盖**：本机造不出那条分支（§11.2）。
+本节没有任何一条变异是"锚点找不到、于是没执行"。
+
+### 12.7 交付读数（批 2）
+
+- 新增用例 **30 项**：`internal/history/export_m351_test.go` 5（含 4 个坏列子项）、
+  `import_m352_test.go` 12、`app_records_io_m351_test.go` 13。
+- `go build ./...` OK；`go test ./... -count=1` 全绿（无一包 FAIL）。
+- 四项 Wails 契约闸全绿（含新加的正向那一把），`wailsMirrors` 现有 31 枚 Go 类型。
+- 前端：`scripts/test-frontend-logic.sh` = node 156 项 + 接线 45 项 = **201 项全部通过**，
+  `vue-tsc --noEmit` 无输出。
