@@ -1,6 +1,11 @@
 package fscase
 
 // 2026-09-18 审查 I2 回归：大小写语义必须来自实测，且测完不留残渣。
+//
+// 〔2026-09-30 第八轮批 3 / 拟 M369〕"不可写目录退回默认"那一格搬去了
+// `fscase_unwritable_nix_test.go`（带 `//go:build !windows`）：它的夹具前提
+// （`0o500` + `os.Geteuid()`）在 Windows 上根本不成立，留在这里等于让 windows 腿
+// 白跑一格假绿。本文件其余用例**跨平台都成立**，所以按格搬、不按文件加 tag。
 
 import (
 	"os"
@@ -39,23 +44,6 @@ func TestSensitiveLeavesNoTrace(t *testing.T) {
 	}
 	if len(names) != 0 {
 		t.Fatalf("探测在目录里留下 %d 个条目: %s", len(names), names[0].Name())
-	}
-}
-
-// TestSensitiveFallsBackToDefaultWhenUnwritable 只读/不可写目录不得瞎猜：
-// 退回平台默认（与改动前的硬编码行为一致）。
-func TestSensitiveFallsBackToDefaultWhenUnwritable(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 用户无权限拒绝语义")
-	}
-	dir := t.TempDir()
-	ro := filepath.Join(dir, "ro")
-	if err := os.Mkdir(ro, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
-	if got := Sensitive(ro); got != Default() {
-		t.Fatalf("不可写目录返回 %v, want 默认 %v", got, Default())
 	}
 }
 

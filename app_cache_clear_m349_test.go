@@ -53,6 +53,23 @@ func seedCache(t *testing.T, c *cache.Cache, n int) {
 	}
 }
 
+// walBytes 实测库族侧文件 `-wal` 的字节数（不存在记 0）。
+//
+// M370：busy 现场成不成立**只认盘上不认返回值** —— `CacheClear` 报成功有两种成因
+// （SQLite 真做完了 / 回收代码吞了 busy=1），返回值分不开，字节数分得开。
+// 与包层 `internal/cache` 的 `sideSize` 同判据（那两个包不共享测试代码，各留一份）。
+func walBytes(t *testing.T, dbPath string) int64 {
+	t.Helper()
+	st, err := os.Stat(dbPath + "-wal")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		t.Fatalf("stat -wal 失败: %v", err)
+	}
+	return st.Size()
+}
+
 // seedLedgerRows 在账本里落 1 条扫描历史 + 1 笔清理记录（含 items）。
 func seedLedgerRows(t *testing.T, hs *history.Store) {
 	t.Helper()
@@ -196,9 +213,19 @@ func TestCacheClearReclaimFailStillReports(t *testing.T) {
 	seedCache(t, cch, 300) // 推进 WAL，让 TRUNCATE 截不动
 
 	res, err := a.CacheClear()
+	// ★ M370（第八轮批 3，§3.2e）：与包层 `TestClearBusyDoesNotClaimSuccess` 用**同一条**
+	// 在场判据 —— 盘上的 -wal，不是返回值。改前这里写的是 `case err == nil: t.Skip(...)`，
+	// 而包层同结局是 Errorf ⇒ 两条测试对同一个结局各说一套（P2-4 那条）。更重的一层：
+	// `err == nil` 既可能是"SQLite 真把回收做完了"，也可能是"回收代码把 busy=1 吞了"，
+	// 只看返回值分不开，而后者正是 M347 立的账 —— 一条 Skip 会把吞 busy 的变异判成"没测到"。
+	// 现在：wal>0 且报成功 = FAIL；wal=0 = SKIP + 原因（不冒充 PASS）；wal>0 且落
+	// ErrReclaimFailed = 预期档。
+	wal := walBytes(t, cch.DBPath())
 	switch {
+	case err == nil && wal > 0:
+		t.Fatalf("M370：-wal 仍有 %d 字节（回收显然没做成），CacheClear 却报成功 ⇒ busy 被吞，界面会把「空间已拿回」端给用户", wal)
 	case err == nil:
-		t.Skip("本次 busy 没复现（SQLite 把回收做完了），本格读数交回 CI 腿")
+		t.Skipf("本次 SQLite 自己把回收做完了（-wal=%d 字节），busy 现场在本机不成立 ⇒ 这一档交回能复现的腿", wal)
 	case errors.Is(err, cache.ErrReclaimFailed):
 		// 预期档：哨兵身份保住
 	default:
@@ -209,7 +236,8 @@ func TestCacheClearReclaimFailStillReports(t *testing.T) {
 	}
 	// ★ reject 路径的契约：前端在 err != nil 时只收得到这句话，res 会被丢掉，
 	//   所以条数必须同时写在错误串里，否则用户看到的就是一句没有数的"失败"。
-	if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("已清空 %d 条", res.EntriesCleared)) {
+	//   （M370 后走到这里 err 必非空，上面的 nil 两档已分别 Fatalf/Skip。）
+	if !strings.Contains(err.Error(), fmt.Sprintf("已清空 %d 条", res.EntriesCleared)) {
 		t.Errorf("M349：错误串没带条数（reject 路径唯一可达的半截真话丢了）：%v", err)
 	}
 	if strings.Contains(err.Error(), "清空缓存失败") {

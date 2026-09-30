@@ -6,7 +6,8 @@ package main
 // ExecuteOperation/history.Store.ListOps），所以在修复落地前必须能编译并且必须红
 // （改前真读数已抄进 §19.5）。
 //
-// P-19-2 / P-19-2b 走的是新签名 startCmd(cmd, onExit)：改前树编译不过，
+// P-19-2 / P-19-2b 走的是新签名 startCmd(a, cmd, onExit)（M374 起首参是 App，
+// waiter 要挂 a.cmdWg）：改前树编译不过，
 // 其"修前必红"由变异 M19-b（回调改回 `_ = cmd.Wait()`）提供（见 §19.4）。
 //
 // M60（APP-12）：cfgDir 取不到时 startup 留空串，openCache/openLedger 各自有
@@ -158,8 +159,9 @@ func exitCodeCmd(code string) *exec.Cmd {
 // 退出状态必须经回调交回调用方（改前这里是 `_ = cmd.Wait()`，整个丢掉，
 // 现象就是"点一下没任何反应"）。
 func TestStartCmdReportsNonZeroExit(t *testing.T) {
+	a := NewApp() // M374：startCmd 加收 App（waiter 挂 a.cmdWg）；本组只用到这一个字段
 	reported := make(chan error, 1)
-	if err := startCmd(exitCodeCmd("3"), func(werr error) { reported <- werr }); err != nil {
+	if err := startCmd(a, exitCodeCmd("3"), func(werr error) { reported <- werr }); err != nil {
 		t.Fatalf("子进程启动失败，前提塌了：%v", err)
 	}
 	select {
@@ -179,7 +181,7 @@ func TestStartCmdReportsNonZeroExit(t *testing.T) {
 func TestStartCmdStartFailureUsesReturnOnly(t *testing.T) {
 	reported := make(chan error, 1)
 	cmd := exec.Command(filepath.Join(t.TempDir(), "no-such-file-manager"))
-	if err := startCmd(cmd, func(werr error) { reported <- werr }); err == nil {
+	if err := startCmd(NewApp(), cmd, func(werr error) { reported <- werr }); err == nil {
 		t.Error("不存在的可执行文件必须由 Start 返回错误，实测 err == nil")
 	}
 	select {
@@ -196,7 +198,7 @@ func TestStartCmdStartFailureUsesReturnOnly(t *testing.T) {
 // 已是三个数量级的余量。
 func TestStartCmdQuietOnSuccess(t *testing.T) {
 	reported := make(chan error, 4)
-	if err := startCmd(exitCodeCmd("0"), func(werr error) { reported <- werr }); err != nil {
+	if err := startCmd(NewApp(), exitCodeCmd("0"), func(werr error) { reported <- werr }); err != nil {
 		t.Fatalf("子进程启动失败，前提塌了：%v", err)
 	}
 	select {

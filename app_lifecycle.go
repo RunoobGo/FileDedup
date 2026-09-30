@@ -195,6 +195,13 @@ func (a *App) shutdown(ctx context.Context) {
 		// 与 M7 那四处是同一件事，没有理由只留在看不见的 stderr 里。
 		a.warnLedger(fmt.Sprintf("在途任务未在 %s 内收口，句柄先行释放（本次落账可能缺失，历史记录未必完整）", inflightDrainGrace))
 	}
+	// M374：外部定位命令的 waiter 另立一个短上限。这里等的是"那行非零退出的留痕
+	// 有没有写出来"，与账本无关，所以超时走 warnBackground 而不是 warnLedger
+	// （复用 warnLedger 会造出"一条 Finder 卡住被报成账本写入失败"那种假话）。
+	// 超时**不拦退出**：一条挂住的桌面程序不该把关窗口无限期拖住。
+	if !waitGroupTimeout(&a.cmdWg, cmdDrainGrace) {
+		a.warnBackground("reveal", fmt.Sprintf("外部定位命令未在 %s 内退出（子进程仍在回收，不拦退出）", cmdDrainGrace))
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.cch != nil {

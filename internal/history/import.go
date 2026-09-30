@@ -51,6 +51,8 @@ type ImportSummary struct {
 	OpsSkipped   int `json:"opsSkipped"`
 	// OpsOrphaned 是 hist_id 在源库里就指不到东西的清理记录条数（源库自己缺那行扫描）。
 	// 它们的 hist_id 被置 0（= 无关联）并如实计数，不猜、不硬塞。
+	// ★ M371：只计**真的落库**的行——被去重跳过的重复导入不在这里记账，
+	// 否则回执会出现"没新增任何东西，却发现 N 条孤儿"这种自相矛盾。
 	OpsOrphaned int `json:"opsOrphaned"`
 }
 
@@ -417,11 +419,16 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		k := opKey{CreatedAt: op.createdAt, OpKind: op.kind, TargetDir: op.targetDir,
 			DoneCount: op.doneCount, Reclaimed: op.reclaimed}
 		newHist := int64(0)
+		// M371（§3.2e）：孤儿是一**格归属**，不是一格计数动作——先记下"指不到东西"这个事实，
+		// 等这一条真的要落库时才计进回执。改前 `sum.OpsOrphaned++` 就地加，而去重跳过
+		// （下面那个 `continue`）在它之后才发生 ⇒ 同一份影像导第二次时一行都没新增，
+		// 回执却写着"发现 N 条孤儿"（一份自相矛盾的收据，前端原样展示）。
+		orphan := false
 		if op.histID != 0 {
 			local, ok := scanMap[op.histID]
 			if !ok {
 				// 源里这条 op 指向一个源库自己没有的扫描 ⇒ 无从映射，置 0 并如实记账。
-				sum.OpsOrphaned++
+				orphan = true
 			} else {
 				newHist = local
 			}
@@ -434,6 +441,9 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		opID, err := insertOpRow(tx, op, newHist)
 		if err != nil {
 			return sum, err
+		}
+		if orphan {
+			sum.OpsOrphaned++
 		}
 		localOps[k] = opID
 		sum.OpsAdded++

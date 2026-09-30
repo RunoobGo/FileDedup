@@ -87,7 +87,7 @@ func (a *App) RevealInFolder(id uint64) error {
 	// M58：定位命令"起得来但立刻非零退出"过去完全静默，现象是点一下没反应。
 	// M288：同一出口的**反方向**——Windows 的 explorer 成功也返回 1，故退出码
 	// 是否作数由 warnRevealExit 判，两侧在这一个出口上同时成立。
-	return startCmd(cmd, func(werr error) {
+	return startCmd(a, cmd, func(werr error) {
 		a.warnRevealExit(runtime.GOOS, cmd, "reveal",
 			fmt.Sprintf("打开所在文件夹失败（%s）", e.Path), werr)
 	})
@@ -129,7 +129,7 @@ func (a *App) RevealPath(path string) error {
 	if err != nil {
 		return err
 	}
-	return execRevealCmd(cmd, func(werr error) {
+	return execRevealCmd(a, cmd, func(werr error) {
 		a.warnRevealExit(runtime.GOOS, cmd, "reveal",
 			fmt.Sprintf("打开所在文件夹失败（%s）", p), werr)
 	})
@@ -145,7 +145,7 @@ func (a *App) OpenPath(path string) error {
 	if err != nil {
 		return err
 	}
-	return execRevealCmd(cmd, func(werr error) {
+	return execRevealCmd(a, cmd, func(werr error) {
 		a.warnRevealExit(runtime.GOOS, cmd, "open",
 			fmt.Sprintf("打开失败（%s）", p), werr)
 	})

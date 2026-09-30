@@ -38,7 +38,7 @@ func stubRevealExec(t *testing.T) (got *[]string, restore func()) {
 	t.Helper()
 	rec := []string{}
 	old := execRevealCmd
-	execRevealCmd = func(cmd *exec.Cmd, _ func(error)) error {
+	execRevealCmd = func(_ *App, cmd *exec.Cmd, _ func(error)) error {
 		// 记录 argv：元素用 \x00 连接后整体存一条——"路径是一个元素"可以逐字节断言
 		rec = append(rec, strings.Join(cmd.Args, "\x00"))
 		return nil

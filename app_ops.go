@@ -317,7 +317,7 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 	meta, items, err := hs.GetOp(opLogID)
 	if err != nil {
 		release()
-		return "", err
+		return "", shellRPCError(err) // M367：回撤腿同样不许把驱动原话直接端给界面
 	}
 	if !meta.Undoable {
 		release()
@@ -431,7 +431,7 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 	meta, items, err := hs.GetOp(opLogID)
 	if err != nil {
 		release()
-		return "", err
+		return "", shellRPCError(err) // M367：回撤腿同样不许把驱动原话直接端给界面
 	}
 	if !meta.Undoable {
 		release()
@@ -486,17 +486,26 @@ func (a *App) OpenTrash() error {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		home, _ := os.UserHomeDir()
+		// M368（§3.2b）：主目录拿不到就**一条命令都不发**。改前是 `home, _ :=` 忽略错误后
+		// filepath.Join ⇒ 拼出相对当前工作目录的 `.Trash`，命令"成功启动"而什么都没打开，
+		// 用户此刻正是清理完想找回东西的那个人。形状照 app_lifecycle.go 的 herr==nil 那一支。
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			return fmt.Errorf("拿不到用户主目录，无法打开系统回收站: %w", herr)
+		}
 		cmd = exec.Command("open", filepath.Join(home, ".Trash"))
 	case "windows":
 		cmd = exec.Command("explorer", "shell:RecycleBinFolder")
 	default:
 		root := os.Getenv("XDG_DATA_HOME")
 		if root == "" {
-			home, _ := os.UserHomeDir()
+			home, herr := os.UserHomeDir()
+			if herr != nil {
+				return fmt.Errorf("拿不到用户主目录，无法打开系统回收站: %w", herr)
+			}
 			root = filepath.Join(home, ".local", "share")
 		}
 		cmd = exec.Command("xdg-open", filepath.Join(root, "Trash", "files"))
 	}
-	return execRevealCmd(cmd, onExit)
+	return execRevealCmd(a, cmd, onExit)
 }

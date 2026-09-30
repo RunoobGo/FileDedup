@@ -312,6 +312,13 @@ type App struct {
 	wg          sync.WaitGroup
 	quitPending int
 
+	// cmdWg 记的是"外部定位命令的回收 goroutine"（M374，2026-09-30 第八轮批 3）。
+	// 与 wg 分开两个集合，是因为两者的对错标准不同：wg 里的是**账本**能不能写完
+	// （超时上限 10 秒、超时那句告警说的是"本次落账可能缺失"），而 cmdWg 里的是
+	// 一条 Finder/explorer/xdg-open 的退出留痕（挂住既不该拖住关窗口，也不该被
+	// 报成账本的问题）。两条出口两句文案，各自说各自的事。
+	cmdWg sync.WaitGroup
+
 	// startupNotice 启动阶段产生、但事件送不达的提示（M12b）。
 	// startup 跑在前端注册监听之前，emit 出去也没人接（app:ready 之所以能用，
 	// 是因为它只是给界面变个版本号，丢了无所谓；本条丢了就等于没修），
@@ -501,6 +508,17 @@ var scanAboutToSaveHook func()
 // var 而非常量（APP-3 探针）：取值一字未改，只是让"超时真的发生"成为单测里
 // 可构造的形状——否则那条留痕路径要拿 10 秒的真实等待去换一次断言。
 var inflightDrainGrace = 10 * time.Second
+
+// cmdDrainGrace 退出前排空外部定位命令 waiter 的上限（M374）。
+//
+// 为什么是 2 秒而不是 10 秒（= inflightDrainGrace）：这一格等的是 Finder/xdg-open
+// 这类"起了就不管"的子进程，它们既不产账本也不需要收尾，唯一要做的是把非零退出的
+// 那行留痕写出来（正常情况几毫秒）。为一条挂住的桌面程序把关窗口拖十秒是纯代价；
+// 代价如实记在册：极端情况下关闭窗口会多等这 2 秒。
+//
+// var 而非常量：与 inflightDrainGrace 同一条理由 —— 让"超时真的发生"成为单测里
+// 可构造的形状，否则那条留痕路径要拿 2 秒的真实等待去换一次断言。
+var cmdDrainGrace = 2 * time.Second
 
 // waitGroupTimeout 等待 wg 归零，返回是否在期限内完成。
 func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration) bool {
@@ -724,11 +742,17 @@ func revealCmd(path string) (*exec.Cmd, error) {
 // onExit 只在"启动成功但没成"时调用；Start 本身失败仍走 error 返回值，
 // 两条通道不重复报同一件事。退出码 0 时**一次都不调**（反面钉见 P-19-2b：
 // 否则每开一次 Finder 就弹一条提示）。
-func startCmd(cmd *exec.Cmd, onExit func(error)) error {
+//
+// ★ M374：waiter 挂进 `a.cmdWg`（Add 必须在 `go` 之前，否则与 shutdown 的
+// Wait 撞成"Wait 先返回、Add 后到"的经典漏排空）。onExit 在 Done 之前调用，
+// 于是"shutdown 等到 cmdWg 归零"等价于"那行留痕已经写出来"——这正是本格要的保证。
+func startCmd(a *App, cmd *exec.Cmd, onExit func(error)) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	a.cmdWg.Add(1)
 	go func() {
+		defer a.cmdWg.Done()
 		if err := cmd.Wait(); err != nil && onExit != nil {
 			onExit(err)
 		}

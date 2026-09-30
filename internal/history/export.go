@@ -118,6 +118,15 @@ func rawColumn(histID int64, col string, b []byte) (json.RawMessage, error) {
 // （未 checkpoint 的内容都在 -wal 里）。dest 必须不存在（SQLite 对该语句的硬约束），
 // 覆盖式落笔由调用方用 tmp+rename 完成。
 //
+// ★ 顺序：**先建镜像、最后落影像**（M372，2026-09-30 第八轮批 3）。改前是
+// `VACUUM INTO` 打头、读完五张表才返回——于是"影像已生成、读列读不动"这一档
+// 会**留下一个调用方无法认领的 .db**：调用方按"ExportTo 返回 nil ⇒ 这个名字是我建的"
+// 记账，失败路径上就不敢删它（怕删掉的是第三方抢先占名的文件），盘上于是多出一个
+// 半件影像（`TestExportImageBuiltThenFailureLeavesNoResidue` 抓到的正是这一档）。
+// 现在所有会失败的读都排在落笔之前 ⇒ 失败必发生在"一个文件都还没建"的时刻，
+// 而唯一可能留下文件的失败（VACUUM INTO 自己）恰好就是"目标名已被占"那一档——
+// 那种情况下的文件**不是**调用方建的，因此"不删别人的文件"这条判据不受影响。
+//
 // 顺序一律按 id 升序：镜像要能 diff，就得有一个**不因查询方式改变**的次序，
 // 而 id 是唯一的候选（ListScans 那个 saved_at DESC 是展示序，不是账本序）。
 // 空清单编成 `[]` 而不是 `null`（与 ListScans/ListOps 同一条在册口径：
@@ -125,9 +134,6 @@ func rawColumn(histID int64, col string, b []byte) (json.RawMessage, error) {
 func (s *Store) ExportTo(dest string) (Mirror, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`VACUUM INTO ?`, dest); err != nil {
-		return Mirror{}, fmt.Errorf("生成记录影像失败: %w", err)
-	}
 	m := Mirror{SchemaVersion: SchemaVersion, ExportedAt: time.Now().Unix(),
 		Scans: []MirrorScan{}, Ops: []MirrorOp{}}
 
@@ -281,6 +287,11 @@ func (s *Store) ExportTo(dest string) (Mirror, error) {
 			return m, err
 		}
 		is.Close()
+	}
+	// 两件产物的"同一时刻"由这把写锁保证（见方法头注释）；影像落在最后，
+	// 于是上面任何一步读不动都在"还没建任何文件"的时刻失败。
+	if _, err := s.db.Exec(`VACUUM INTO ?`, dest); err != nil {
+		return Mirror{}, fmt.Errorf("生成记录影像失败: %w", err)
 	}
 	return m, nil
 }

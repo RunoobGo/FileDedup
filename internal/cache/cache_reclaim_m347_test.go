@@ -188,8 +188,25 @@ func TestClearBusyDoesNotClaimSuccess(t *testing.T) {
 		t.Fatalf("夹具写入报错: %v", err)
 	}
 	err = c.Clear()
-	if !errors.Is(err, ErrReclaimFailed) {
-		t.Errorf("M347：checkpoint 明显没做成（-wal 未截断），Clear 却没说\u201c回收未完成\u201d —— err=%v", err)
+	// ★ M370（第八轮批 3，§3.2e）：在场判据从"返回值"换成"盘上的 -wal"。
+	// `err == nil` 有两种成因，只看返回值分不开：① SQLite 自己把回收做完了（合法，
+	// 本机/APFS 与部分 CI 腿就是这一档）；② 回收代码把 busy=1 吞了（假话，正是 M347
+	// 立账的那一支）。改前这里无条件断 `ErrReclaimFailed`，而末尾只用 `t.Log` 记
+	// 「busy 腿竟也截断了 -wal，不算失败」—— 一条自认不算失败的前提却挂着 Errorf，
+	// 于是**现场成立时判红、现场不成立时也判红**，只有 ① 恰好被 SQLite 兜住时才绿。
+	// 现在三条分支各自可判：wal>0 且报成功 = FAIL；wal=0 = SKIP + 原因（不冒充 PASS）；
+	// wal>0 且落 ErrReclaimFailed = 预期档。与 `TestCacheClearReclaimFailStillReports`
+	// （app 层）同判据 —— 改前同一结局两条测试一个 Skip 一个 Errorf，就是 P2-4 那条。
+	wal := sideSize(t, c.path+"-wal")
+	switch {
+	case err == nil && wal > 0:
+		t.Fatalf("M370：-wal 仍有 %d 字节（回收显然没做成），Clear 却报成功 ⇒ busy 被吞，上游会把「空间已拿回」端给用户", wal)
+	case err == nil:
+		t.Skipf("本次 SQLite 自己把回收做完了（-wal=%d 字节），busy 现场在本机不成立 ⇒ 这一档交回能复现的腿", wal)
+	case errors.Is(err, ErrReclaimFailed):
+		// 预期档：哨兵身份保住
+	default:
+		t.Fatalf("M370：回收失败没落到 ErrReclaimFailed 上，上游无法分岔文案: %v", err)
 	}
 	st, serr := c.GetStats()
 	if serr != nil {
@@ -197,9 +214,6 @@ func TestClearBusyDoesNotClaimSuccess(t *testing.T) {
 	}
 	if st.Entries != 0 {
 		t.Errorf("M347：回收失败被误报成清空失败的另一半 —— 条目本该已删净，实际剩 %d 条", st.Entries)
-	}
-	if wal := sideSize(t, c.path+"-wal"); wal == 0 {
-		t.Log("注：本次 busy 腿竟也截断了 -wal，busy 判据的取证前提需在 CI 复核（不算失败）")
 	}
 }
 

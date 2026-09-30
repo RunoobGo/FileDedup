@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,6 +79,17 @@ var (
 	}
 )
 
+// exportAboutToCreateHook 是"预检已过、还没动手"那一刻的卡点，**生产恒为 nil**（M372）。
+//
+// 为什么需要它：撞名预检（`exists`）与真正创建之间有一个时间窗，窗口里第三方占掉
+// `<stem>.json.tmp` / `<stem>.db.tmp` 的名字，旧写法会**截断或删掉别人的文件**
+// （覆盖第三方文件在 §6.63 是 P0 形状）。这个窗人手点不出来、CI 上也掐不准，
+// 所以留一条恒 nil 的缝让用例把那一刻卡住 —— 先例是 `app.go` 的 `scanAboutToSaveHook`
+// （同为"新符号 ⇒ 改前必红不存在"的形状）。
+//
+// ★ 缝只用来造时序，判据一律落在真实文件系统上（同 pickExportDir 那条纪律）。
+var exportAboutToCreateHook func(tmpDB, tmpJSON string)
+
 // ExportRecords 把整本账本导出到用户选定的目录（M351）。
 //
 // 一次导出交回两个文件：`filededup-records-<时间戳>.db`（影像，唯一能导回的形状）
@@ -122,25 +134,40 @@ func (a *App) exportRecordsTo(hs *history.Store, dir string, now time.Time) (Rec
 
 	// 同秒二次导出会撞名。VACUUM INTO 对"目标已存在"直接报错，改名（os.Rename）却会
 	// **静默覆盖**——所以撞名必须在动手前挡下来，而不是让第二次导出把第一次的影像顶掉。
+	// ★ 预检（M351 起就有）只服务话术：它挡得住"动手前名已被占"这一档，挡不住
+	// "预检之后才被占"的时间窗（TOCTOU）。安全判据因此挪到下面两处：创建标记
+	// （`cleanup` 只删自己建的）与 `O_EXCL`（名字被占时失败，而不是截断别人的文件）。
 	if exists(dbPath) || exists(jsonPath) {
 		return res, fmt.Errorf("目标目录里已有同名的导出文件（%s），请换目录或稍后再试", stem)
 	}
 	tmpDB, tmpJSON := dbPath+".tmp", jsonPath+".tmp"
 	// 残留的 .tmp 也挡一下：它落位时会覆盖别人的 .tmp（第三方文件名撞上这一格是可能的，
-	// 而覆盖第三方文件在本仓是 P0 级形状，见 §6.63 那条落位改名）。
+	// 而覆盖第三方文件在本仓是 P0 级形状，见 §6.63 那条落位改名）。同预检：话术。
 	if exists(tmpDB) || exists(tmpJSON) {
 		return res, fmt.Errorf("目标目录里已有同名的临时文件（%s.tmp），请清理后重试", stem)
 	}
+	// 创建标记（M372）：cleanup 只删**本次真的建过**的那件。旧版无条件 unlink 两个
+	// tmp 名，于是"窗口里被别人抢先占了 .db.tmp"这一档会把别人的文件删掉（P-32）。
+	madeDB, madeJSON := false, false
 	cleanup := func() {
-		_ = os.Remove(tmpDB)
-		_ = os.Remove(tmpJSON)
+		if madeDB {
+			_ = os.Remove(tmpDB)
+		}
+		if madeJSON {
+			_ = os.Remove(tmpJSON)
+		}
 	}
 
+	if exportAboutToCreateHook != nil {
+		exportAboutToCreateHook(tmpDB, tmpJSON)
+	}
 	mirror, err := hs.ExportTo(tmpDB)
 	if err != nil {
 		cleanup()
 		return res, shellRPCError(err)
 	}
+	// VACUUM INTO 对"目标已存在"直接报错 ⇒ 走到这里就说明这个名字是本次建的。
+	madeDB = true
 	// ★ 影像的权限得自己收：`VACUUM INTO` 建的文件跟 SQLite 默认走（实测 0644），
 	// 而它里面装的是**同一条隐私内容**（五张表逐行，含用户机器上的全部路径）。
 	// 只把 .json 做成 0600、放任 .db 是 0644，等于隐私承诺只兑了一半。
@@ -160,7 +187,25 @@ func (a *App) exportRecordsTo(hs *history.Store, dir string, now time.Time) (Rec
 	}
 	// 0o600 而不是 0o644：账本里是用户机器上的**全部文件路径**（含回收站落位路径），
 	// 导出目录很可能是别的盘、甚至别人可读的共享目录。
-	if err := os.WriteFile(tmpJSON, append(body, '\n'), 0o600); err != nil {
+	//
+	// ★ O_EXCL 而不是 WriteFile（M372）：`os.WriteFile` 是"创建并截断"，窗口里若有人
+	// 先占了这个名字，写下去就是把别人的文件清成我们的内容；`O_CREATE|O_EXCL` 在这一格
+	// 只会失败。失败后必须把本次已建的 .db tmp 收回（cleanup 靠创建标记，不动别人的）。
+	f, err := os.OpenFile(tmpJSON, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		cleanup()
+		if errors.Is(err, os.ErrExist) {
+			return res, fmt.Errorf("目标目录里已有同名的临时文件（%s.tmp），请清理后重试", stem)
+		}
+		return res, shellRPCError(fmt.Errorf("记录镜像写入失败（导出已停止）: %w", err))
+	}
+	madeJSON = true
+	if _, err := f.Write(append(body, '\n')); err != nil {
+		_ = f.Close()
+		cleanup()
+		return res, shellRPCError(err)
+	}
+	if err := f.Close(); err != nil {
 		cleanup()
 		return res, shellRPCError(err)
 	}

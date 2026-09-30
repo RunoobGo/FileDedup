@@ -26,7 +26,7 @@ func (a *App) ListScanHistory() ([]HistoryMeta, error) {
 	}
 	ms, err := hs.ListScans()
 	if err != nil {
-		return nil, err
+		return nil, shellRPCError(err) // M367：账本腿的裸原话进中文壳（§3.2a）
 	}
 	out := make([]HistoryMeta, 0, len(ms))
 	for _, m := range ms {
@@ -57,7 +57,7 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 
 	meta, groups, err := hs.LoadScan(id)
 	if err != nil {
-		return ScanSummary{}, err
+		return ScanSummary{}, shellRPCError(err)
 	}
 	byID := make(map[uint64]*model.FileEntry, meta.Files)
 	var reclaim uint64
@@ -122,7 +122,7 @@ func (a *App) DeleteScanHistory(id int64) error {
 		return fmt.Errorf("历史库不可用")
 	}
 	if err := hs.DeleteScan(id); err != nil {
-		return err
+		return shellRPCError(err)
 	}
 	a.mu.Lock()
 	if a.curHistID == id {
@@ -139,7 +139,7 @@ func (a *App) ClearScanHistory() error {
 		return fmt.Errorf("历史库不可用")
 	}
 	if err := hs.ClearScans(); err != nil {
-		return err
+		return shellRPCError(err)
 	}
 	a.mu.Lock()
 	a.curHistID = 0
@@ -236,8 +236,10 @@ func (a *App) beginJournal(hs *history.Store, histID int64, op model.OpRequest,
 	}
 	// 不可回撤类：留痕放行
 	msg := fmt.Sprintf("本次操作未写入清理账本（%v）：该操作本就不支持应用内回撤，已照常执行并在此留痕", jerr)
-	fmt.Fprintf(os.Stderr, "[history] %s\n", msg)
-	a.emit(a.ctx, "app:error", map[string]string{"error": msg})
+	// M373（§3.2g）：走统一出口，而不是裸调 emit。Wails 的 runtime 在拿到空 ctx 时
+	// 走的是 log.Fatal ⇒ **整个进程直接退出**（比 panic 更狠，`recoverGoroutine` 都兜不住），
+	// 而 `a.ctx` 要等 startup 才接线。warnBackground 带 nil 守卫，stderr 那行逐字不变。
+	a.warnBackground("history", msg)
 	return 0, nil
 }
 
@@ -247,7 +249,11 @@ func (a *App) ListOpRecords() ([]history.OpMeta, error) {
 	if hs == nil {
 		return nil, fmt.Errorf("历史库不可用")
 	}
-	return hs.ListOps()
+	ms, err := hs.ListOps()
+	if err != nil {
+		return nil, shellRPCError(err)
+	}
+	return ms, nil
 }
 
 // GetOpRecord 单条清理记录的条目明细。
@@ -270,7 +276,7 @@ func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 	}
 	m, items, err := hs.GetOp(opID)
 	if err != nil {
-		return OpRecordDetail{}, err
+		return OpRecordDetail{}, shellRPCError(err)
 	}
 	list := make([]OpRecordItem, 0, len(items))
 	for _, it := range items {

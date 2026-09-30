@@ -148,7 +148,7 @@ func TestRevealPathWindowsExplorerNoiseEndToEnd(t *testing.T) {
 	}
 	var got []*exec.Cmd
 	old := execRevealCmd
-	execRevealCmd = func(cmd *exec.Cmd, onExit func(error)) error {
+	execRevealCmd = func(_ *App, cmd *exec.Cmd, onExit func(error)) error {
 		got = append(got, cmd)
 		onExit(exitStatusOne) // 子进程"成功打开窗口后返回 1"
 		return nil
