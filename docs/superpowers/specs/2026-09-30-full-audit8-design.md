@@ -657,3 +657,51 @@ stderr 那行逐字不变（tag 仍是 `history`）、事件仍发一条，差�
    docs/05 §0.1 第 3 条在册）⇒ 挂 MAC/W 腿。
 6. `scanKey` 粗粒度按 R-8-3 **只登记**，本批不动码、不动文档；两个取向的代价写在 3.2 末尾，
    裁定回来再另起一批。
+
+### 3.6 实施期追记（判据被实测改写处，逐条留档）
+
+这一节按批 1/批 2 的先例写在实施之后：**只记被实测推翻或补全的话**，
+§3.2 的正文一字不改（读 M36x 那一格以本节为准）。
+
+1. **§3.2 里 M367 的理由句被实测推翻，判据本身不变。** 原文写"`ClearOpRecords` 的
+   `claimMaintenance` 拒绝与 `beginJournal` 的账本不可用拒绝包了会造出「中文（系统原文：中文）」的假话"。
+   实测不成立：`shellRPCError` 的判据是 `errorShell` 给出的 shell 与 raw **相同即原样返回同一个
+   error 值**（保 `errors.Is` 身份），自撰中文两句 shell==raw ⇒ 再包一层是**恒等变换**。
+   证据：变异 MU-17（把拒绝也套上 `shellRPCError`）在宽集上**全绿**——这是一条语义等价变异，
+   杀不掉也不该去杀。P-26 的价值改述为"**不给自撰中文套壳/不破坏错误身份**"，其"修对必红"
+   证据改用换代变异 MU-17x（把拒绝改写成 `fmt.Errorf("…（系统原文：%v）", err)` 那种**伪造外壳**），
+   实测红在 `TestM367ChineseRejectionsStayVerbatim`。
+2. **Wails 空 ctx 的后果比"panic"更硬：是 `log.Fatal` 直接终止进程。** §3.2 只写"走的是 `log.Fatal`"，
+   实施时取到逐字原文：`cannot call 'github.com/wailsapp/wails/v2/pkg/runtime.EventsEmit':
+   An invalid context was passed.`，进程 rc=1 且**同一测试二进制里其后的用例一条都不再执行**
+   （MU-23 的实测形状：根包整体 FAIL、无任何 `--- FAIL: <用例名>` 行）⇒ `recoverGoroutine` 也兜不住。
+   P-33 的两条断言（不 panic、返回 `0,nil`）因此更有分量：它钉的是"这条留痕路径在 startup 之前
+   被调到也不许把进程带走"。
+3. **M372 的"改前红不存在"被实施顺序推翻。** §3.5 第 3 条按 `scanAboutToSaveHook` 的先例写"改前树连
+   用例都编译不过 ⇒ 证据交 MU-21/MU-22"。实际做法是**先落卡点缝**（生产恒 nil 的
+   `exportAboutToCreateHook`）**再落用例**，于是两格都取到了真实改前红：
+   P-31 改前读数是"**导出反而报成功**"（`os.WriteFile` 截断第三方文件后一路走到落位），
+   P-32 是"别人的 `.db.tmp` 被 `cleanup()` 删掉"。MU-21/MU-22 照跑（读数见 04 §6.67），
+   本节把 §3.5 第 3 条那句话按实测更正为"改前红已取到"。
+4. **一条设计段没料到的缺陷，是既有用例在干净树上当场抓住的。** M372 的第一版只改了
+   `.json.tmp` 与创建标记，`TestExportImageBuiltThenFailureLeavesNoResidue` 立刻红——
+   根因在 `internal/history/export.go`：`ExportTo` 原先 **`VACUUM INTO` 打头、读五张表在后**，
+   于是"镜像读不动"这一档会留下**调用方无法认领的 .db**（调用方按"`ExportTo` 返回 nil ⇒
+   这个名字是我建的"记账，失败路径上就不敢删它，怕删掉第三方抢先占名的文件）。修法是把
+   `VACUUM INTO` 挪到函数末尾：所有会失败的读都排在落笔之前 ⇒ 失败必发生在"一个文件都还没建"
+   的时刻，而唯一可能留下文件的失败（`VACUUM INTO` 自己）恰好就是"目标名已被占"那一档，
+   那种情况下的文件**不是**调用方建的，"不删别人的文件"因此不受影响。新增变异 **MU-25**
+   （把 `VACUUM INTO` 挪回函数开头）与该顺序配对，实测红在
+   `TestExportImageBuiltThenFailureLeavesNoResidue`。同一条用例的注释按实测改写（断言一字未动）。
+5. **MU-22 的实测集比预测集宽一格。** 摘掉创建标记后，除 P-32 之外 **P-31 也红**：
+   `O_EXCL` 失败路径同样要 `cleanup()`，无标记时会把第三方那个 `.json.tmp` 一并删掉。
+   预测集 {P-32}、实测集 {P-31, P-32} ⇒ 差集 {P-31}，成因如上（两条腿共用一个 `cleanup`）。
+6. **M370 的两条归因句必须逐字同一份。** 设计段要求"归因句两条用同一句话"，落地时两条测试
+   各自持一份**同字面量**（`本次 SQLite 自己把回收做完了（-wal=%d 字节），busy 现场在本机不成立
+   ⇒ 这一档交回能复现的腿`）——包不共享测试代码，故不抽公共函数，靠本节把"必须同句"钉进在册。
+   现读三腿该格 busy **都是真复现**：darwin 上两条各 5.12s PASS（`busy_timeout=5000` 的等待），
+   没有一条落在 Skip 上。
+7. **M374 的实现代价比设计段写的多一处**：除 `startCmd`/`execRevealCmd` 的签名与五处测试调用形状，
+   还要改 `app_m58_m60_m61_test.go` 文件头那句"走的是新签名 `startCmd(cmd, onExit)`"（现为
+   `startCmd(a, cmd, onExit)`）。Windows 臂的夹具（`blockingCmd` 走 `ping -n 1 -w N`）本机无读数，
+   与 §3.5 第 5 条一并记为未兑现。
