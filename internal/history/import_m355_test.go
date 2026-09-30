@@ -336,7 +336,8 @@ func TestM355ImportScanSideEmptyHashStillDiesOnConstraint(t *testing.T) {
 // ★ 这条**改前就绿**，它是防漂的钉子而不是修前红探针——按 §6.11 那批的口径如实标注。
 // 它存在的全部理由：手册与代码注释三处写成"刚导进来的记录若排在最旧一侧会被淘汰"，
 // 而外来行不带 id 插入 ⇒ 必然拿最高自增号 ⇒ 按 id 保新删旧的淘汰**碰不到它们**，
-// 被清掉的是用户自己的本地最旧记录。取向本身待裁（拟 M357），本条只钉现读行为。
+// 被清掉的是用户自己的本地最旧记录。取向本身**已于 2026-10-01 裁定维持现状**（M378，划账 04 §6.69）
+// ⇒ 本条的身份从"待裁现读"转为**裁定依据**：它钉的就是这份账以后长期保持的行为，断言一字未改。
 func TestM356TrimEvictsLowestIdLocalNotImportedRows(t *testing.T) {
 	local := newStoreAt(t, t.TempDir(), "local.db")
 	// 本地灌满 20 条（id 1..20），时间戳各不相同、roots 各异 ⇒ 自然键互不相同

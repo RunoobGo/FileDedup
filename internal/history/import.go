@@ -198,12 +198,21 @@ func checkUndoEvidence(src *sql.DB) error {
 // 判成"本地已有"就静默吞掉一条真记录——那是导入功能自己能造出来的数据丢失形状。
 // ★ 为什么不认 id：id 是各库自己的 AUTOINCREMENT，跨库无意义，照 id 插要么撞主键、
 // 要么错关联。
+// ★ 为什么 threads / paranoid / orig_files / reclaimable 必须在键里（M377，裁定 M375 取向①）：
+// 这四列改变的是这份扫描的**语义结论**——paranoid 决定分组是否可信、orig_files 与
+// reclaimable 是读数本身、threads 是当时的工况。同五字段而参数不同是**两次不同的判断**，
+// 判成重复不只抑制子行，还会把外来的 ops 关联到本地另一套参数跑出来的那条扫描上
+// （把两份判断合并成一份）。改前的键只有五字段，真读数见 04 §6.69 的 P-39/P-40。
 type scanKey struct {
 	SavedAt     int64
 	Roots       string
 	Filters     string
 	GroupsCount int
 	FilesCount  int
+	Threads     int64
+	Paranoid    bool
+	OrigFiles   int64
+	Reclaimable int64
 }
 
 type opKey struct {
@@ -317,7 +326,9 @@ func loadSrcOps(src *sql.DB) ([]srcOp, error) {
 // （import_m355_test.go 的 TestM356TrimEvictsLowestIdLocalNotImportedRows）。
 // 也就是说：导入这件事的真实代价不是"导进来的会丢"，而是"本地最旧的那条会因此提前丢"——
 // 两句话在手册里必须分开写，混成一句就是另一种谎（09/10 两处已同步更正）。
-// 裁剪取向本身（按 saved_at 还是按 id、外来行要不要豁免）要动判据，登记待裁、本批不自行选边。
+// 裁剪取向本身（按 saved_at 还是按 id、外来行要不要豁免）：**2026-10-01 已裁定维持现状**
+// ——按 id 保新删旧、外来行不豁免（M378，划账 04 §6.69；依据是上面那段现读 + P-10 钉子）。
+// 判据、断言与手册口径都不动；要改这一格必须重新起一批并给出新证据，不许顺手改。
 func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 	var sum ImportSummary
 	if srcPath == "" {
@@ -397,7 +408,9 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 	scanMap := make(map[int64]int64, len(scans))
 	for _, sc := range scans {
 		k := scanKey{SavedAt: sc.savedAt, Roots: sc.roots, Filters: sc.filters,
-			GroupsCount: int(sc.groupsCount), FilesCount: int(sc.filesCount)}
+			GroupsCount: int(sc.groupsCount), FilesCount: int(sc.filesCount),
+			Threads: sc.threads, Paranoid: sc.paranoid,
+			OrigFiles: sc.origFiles, Reclaimable: sc.reclaimable}
 		if id, ok := localScans[k]; ok {
 			sum.ScansSkipped++
 			scanMap[sc.id] = id
@@ -458,7 +471,8 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 // 重复键（历史遗留或并发写造成）保留 id 最小的那条：判重只看存在性，
 // 而"指到哪一条"要有一个不随查询计划变化的确定答案。
 func (s *Store) localScanKeys() (map[scanKey]int64, error) {
-	rows, err := s.db.Query(`SELECT id, saved_at, roots, filters, groups_count, files_count
+	rows, err := s.db.Query(`SELECT id, saved_at, roots, filters, groups_count, files_count,
+		threads, paranoid, orig_files, reclaimable
 		FROM scan_history ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -472,7 +486,8 @@ func (s *Store) localScanKeys() (map[scanKey]int64, error) {
 			roots, filters     []byte
 			groupsCount, files int64
 		)
-		if err := rows.Scan(&id, &k.SavedAt, &roots, &filters, &groupsCount, &files); err != nil {
+		if err := rows.Scan(&id, &k.SavedAt, &roots, &filters, &groupsCount, &files,
+			&k.Threads, &k.Paranoid, &k.OrigFiles, &k.Reclaimable); err != nil {
 			return nil, err
 		}
 		k.Roots, k.Filters = string(roots), string(filters)

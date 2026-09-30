@@ -171,6 +171,17 @@ func initConn(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// hardenFileMode 是"把账本影像收成仅所有者可读写"这一步的注入点（接缝惯例同 cache 侧那一枚）。
+//
+// ★ 两包各一枚、不抽公共 helper：cache 与 history 今天互不依赖，为一行 Chmod 新增跨包耦合
+//
+//	是把加固做成结构改动的开始。
+//
+// ★ 收在接缝里面、以及"只在 unix 腿兑现"那两条理由，逐字同 internal/cache/cache.go 同名接缝
+//
+//	（M360/M354 的现读与措辞纪律）。
+var hardenFileMode = func(path string) error { return os.Chmod(path, 0o600) }
+
 // Open 打开或创建历史库。**仅**在库影像确证损坏时改名隔离并重建
 // （2026-09-18 审查 C4：原先对任何打开错误都无条件删库，busy/只读/满盘一次误判
 // 就会清空用户全部回撤账本）。启动收尾：上次进程死于执行中的 planned
@@ -196,6 +207,12 @@ func Open(path string) (*Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("历史库重建失败: %w", err)
 		}
+	}
+	// M376（第八轮裁定回收，设计段 §2.1）：存量账本的档位。这份库里是用户机器上的**全部文件
+	// 路径**（含回收站落位路径），批 2 之前一直按 0644 躺在 0755 的目录里。
+	// ★ 收紧失败只出声、不让 Open 失败：账本不在场用户丢的是**回撤能力**，比留着 0644 更糟。
+	if err := hardenFileMode(path); err != nil {
+		fmt.Fprintf(os.Stderr, "[history] 历史库档位收紧失败（文件按现有权限保留，账本照常可用；系统原文：%v）\n", err)
 	}
 	if _, err := db.Exec(`UPDATE op_items SET state = ?,
 		err = '应用中断（记录不完整，未处理项请查看文件系统现状）'

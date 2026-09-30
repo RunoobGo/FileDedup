@@ -171,6 +171,18 @@ func (c *Cache) markCorruption(err error) {
 	}
 }
 
+// hardenFileMode 是"把库影像收成仅所有者可读写"这一步的注入点
+// （接缝惯例同 cacheClearSnapshot / dbfile.renameFile / cache.evictFn）。
+//
+// ★ 收在接缝里面、而不是留在调用方分两步：档位是"这份影像能用"的一部分，分开写就能出现
+//
+//	"打开了但忘了补档"的实现，而只看最终落点的断言抓不到它（M360 同一条理由）。
+//
+// ★ 只在 unix 腿兑现：Windows 的模式位只表达"只读属性"，0600 与 0644 在那条腿上读回同一个
+//
+//	0666（M354 现读），真访问权由所在目录的 NTFS ACL 继承 ⇒ 手册与用例都按分平台措辞写。
+var hardenFileMode = func(path string) error { return os.Chmod(path, 0o600) }
+
 // Open 打开或创建缓存库。
 //
 // **仅**在库影像确证损坏时改名隔离并重建（最坏退化为首扫速度）；
@@ -200,6 +212,13 @@ func Open(path string) (*Cache, error) {
 		if err != nil {
 			return nil, fmt.Errorf("缓存库重建失败: %w", err)
 		}
+	}
+	// M376（第八轮裁定回收，设计段 §2.1）：存量影像的档位。批 2 的 M360 只把**新产影像**收成
+	// 0600，而打开路径此前一处 chmod 都没有 ⇒ 盘上老库一直按 SQLite 建文件时的 umask 落 0644。
+	// ★ 收紧失败**只出声、不把 Open 变成失败**：这条腿真会失败的实际形状是"库文件属别人/被外部
+	// 工具锁住"，此时让用户失去缓存比留着 0644 更糟（加固动作的失败不许升级成可用性事故）。
+	if err := hardenFileMode(path); err != nil {
+		fmt.Fprintf(os.Stderr, "[cache] 缓存库档位收紧失败（文件按现有权限保留，缓存照常可用；系统原文：%v）\n", err)
 	}
 	// P0-2 / P2：算法语义版本校验。版本不符（含旧库无版本标记）即整表作废，
 	// 否则旧语义的缓存行会继续命中，可能导致错误分组或漏报。
