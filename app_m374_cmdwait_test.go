@@ -15,9 +15,8 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,17 +25,21 @@ import (
 
 // blockingCmd 起一个"先活一会儿、再以非零码退出"的子进程。
 //
-// 三条腿各用各的等价形态（`sleep` 在 Windows 上不存在，`timeout` 又要控制台）：
-// 退出码固定 3 ⇒ onExit 一定会被调用，于是"排空是否覆盖了 onExit"才有观测面。
-// ★ 时长走**位置参数**而不是拼进脚本文本（脚本一个字面量，`$1` 才是变量）。
+// 用**测试二进制自己**当子进程（同 `exitCodeCmd` 的既有手法，见 app_m58_m60_m61_test.go）：
+// 三条腿行为一致，退出码固定 3 ⇒ onExit 一定会被调用，"排空是否覆盖 onExit"才有观测面。
+//
+// ★ M374 复批（2026-09-30，CI windows 腿首红）：首版按平台选 `sh -c 'sleep…'` /
+// `cmd /c "ping -n 1 -w N …"`，而 Windows 上回环**立即应答**、`-w` 只管应答超时
+// ⇒ 子进程秒退，本机 darwin 的 `sleep` 恰好盖住了这个差异；windows 腿于是落在
+// 「超时放行却完全静默」（子进程早退、`cmdWg` 已在 30ms 前排空）。改成测试二进制桩后，
+// 睡眠时长由环境变量给，与平台无关。
 func blockingCmd(t *testing.T, d time.Duration) *exec.Cmd {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		// ping 是本机最省事的"睡一会儿"：-w 是每包超时（毫秒），-n 1 只发一包
-		return exec.Command("cmd", "/c",
-			fmt.Sprintf("ping -n 1 -w %d 127.0.0.1 >NUL & exit 3", int(d.Milliseconds())))
-	}
-	return exec.Command("sh", "-c", `sleep "$1"; exit 3`, "sh", fmt.Sprintf("%g", d.Seconds()))
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperExitCode$", "-test.timeout=60s")
+	cmd.Env = append(os.Environ(),
+		"TEST_HELPER_EXIT=3",
+		"TEST_HELPER_SLEEP="+d.String())
+	return cmd
 }
 
 // 正常排空这一格：shutdown 必须等到 waiter（含它调用的 onExit）跑完才返回，

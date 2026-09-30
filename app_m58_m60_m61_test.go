@@ -138,6 +138,17 @@ func TestHelperExitCode(t *testing.T) {
 	if code == "" {
 		return
 	}
+	// M374 复批（2026-09-30）：加一格"先睡一会儿再退出"，供外部命令 waiter 的
+	// 在途/超时两条判据造真子进程。为什么不拿 `ping -n N 127.0.0.1` 当跨平台睡眠：
+	// Windows 上回环**立即应答**，`-w` 只管应答超时 ⇒ 子进程秒退，而本机 darwin 的
+	// `sleep` 恰好把这个差异盖住了 —— CI 的 windows 腿当场红在「超时放行却完全静默」。
+	if d := os.Getenv("TEST_HELPER_SLEEP"); d != "" {
+		dur, derr := time.ParseDuration(d)
+		if derr != nil {
+			t.Fatalf("TEST_HELPER_SLEEP=%q 不是时长", d)
+		}
+		time.Sleep(dur)
+	}
 	n, err := strconv.Atoi(code)
 	if err != nil {
 		t.Fatalf("TEST_HELPER_EXIT=%q 不是退出码", code)

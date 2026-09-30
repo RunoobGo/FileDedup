@@ -705,3 +705,11 @@ stderr 那行逐字不变（tag 仍是 `history`）、事件仍发一条，差�
    还要改 `app_m58_m60_m61_test.go` 文件头那句"走的是新签名 `startCmd(cmd, onExit)`"（现为
    `startCmd(a, cmd, onExit)`）。Windows 臂的夹具（`blockingCmd` 走 `ping -n 1 -w N`）本机无读数，
    与 §3.5 第 5 条一并记为未兑现。
+
+8. **M374 的夹具在 Windows 上被 CI 当场证伪（复批，§6.68）。** §3.6 第 7 条把"Windows 臂夹具本机无读数"
+   记成未兑现，实际发生的是更重的一档：它**在 windows 腿直接红**。首版 `blockingCmd` 的 Windows 臂
+   用 `ping -n 1 -w N 127.0.0.1` 造"睡一会儿"，而**回环立即应答**、`-w` 只管应答超时 ⇒ 子进程秒退，
+   `cmdWg` 在宽限期前排空 ⇒ 走"排空成功"支而断言期待超时支（红在 `app_m374_cmdwait_test.go:90/:96`）。
+   ★ 判据本身没错（复批后重跑 MU-26 仍双红），错的是夹具；修法 = `blockingCmd` 改用测试二进制桩
+   （`os.Args[0]` + `TEST_HELPER_EXIT`/`TEST_HELPER_SLEEP`），睡眠语义与平台无关。
+   这条属 §6.40「夹具前提必须在本平台也成立」的第三次同族复发。
