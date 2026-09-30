@@ -213,3 +213,193 @@ P-10 = §1.3 表里编号 P-6 的裁剪真值钉子。
    四条用例一起红在 `op_items.state` 约束上——红在夹具，判据一格没碰。
 2. **前提自检要比"预期的那个数"，不要自己算偏移**：P-10 首版写 `importedMin <= localOldest+20`
    把 off-by-one 判在 21 上，钉子红在"夹具前提不成立"；改成直接取 `MAX(id)` 比大小才对。
+
+---
+
+## §2 批 2：P1 六条（R-8-2「两个都收紧」全套）—— 拟 M359~M366
+
+### 2.1 取证（七条，全部为现读，逐字抄自工作树）
+
+**(a) 清缓存一条闸都不接。** `app_settings.go` 里 `opsRunning` / `scanInFlight` 的 `grep -c` 现读是
+**0**，`CacheClear` 的第一句实质动作就是 `cch := a.cchSnapshot()`。对照本仓已经立好的两处形状：
+`StartScan` 在**一个** `a.mu` 临界区里查 `scanInFlight`、查 `opsRunning`、再置 `scanInFlight`；
+`ExecuteOperation` 同锁双检（含 `resultsReady`）后再置 `opsRunning`。⇒ 清缓存既能撞进扫描/清理在途，
+也没有任何东西挡得住"清缓存期间开新扫描或点清理"。★ 本批把这一格按**不对称**取证（M285 立的法：
+`openLedger` 有、`openCache` 没有），不主张"交错会造成哪一种具体损坏"（见 2.5 第 3 条）。
+
+**(b) 快照跟 SQLite 默认档位走，全程没有 Chmod。** scratch `main` 实测（跑完即删，未留文件）：
+
+```
+snapshotMode=644 cacheMode=644 euid=501
+```
+
+与 M353 在 `app_records_io.go` 注释里记的那条同值（同一条 `VACUUM INTO`）。全仓非测试代码的
+`os.Chmod` 只有两处命中，都在记录导出那条腿。而快照装的是 `hash_cache` 全表 =
+用户机器上的**全部路径** + size + mtime。
+
+**(c) 落位是一次无条件改名。**
+
+```go
+if err := os.Rename(tmpPath, snapPath); err != nil {
+```
+
+本仓对这句话已经有三条在册口径：`internal/ops/merge_guard.go` 的注释写死了
+「Go 没有 O_EXCL 语义的改名原语（os.Rename 一律替换）」；§6.63 把"合并落位改名静默覆盖第三方文件"
+记为 **P0**（M344）；同一序列给了三档形状的 `claimSlot`——不存在 ⇒ 放行、`ours()` 证明是自己的 ⇒ 处置、
+证明不了 ⇒ **显式失败并说清文件在哪**，原话「宁可显式失败并说清文件在哪，也不替第三方销毁文件」。
+记录导出那条腿的做法更硬：动手前 `exists(dbPath) || exists(jsonPath)` 就直接拒。
+★ 固定名快照**不能**照抄"存在就拒"：覆盖上一份正是用户裁定 R-3 承诺的内容。也**不能**照抄
+`claimSlot` 的第三档"显式失败"：缓存此刻已经清空，失败就等于让刚清空的缓存失去快照保护，
+而改名本身一个字节都不丢 ⇒ 第三档改成"另落 + 如实报真实落点"。
+
+**(d) 回执被第二次 GetStats 吞掉。** `CacheClear` 末尾：
+
+```go
+after, err := cch.GetStats()
+if err != nil {
+	return res, shellRPCError(err)
+}
+```
+
+清空**已经成立**、快照**已经落位**，只差"回收字节没能核对"这一腿；而 Wails 在 `err != nil` 时把结构体
+丢掉（这条函数注释里自己写过），于是"已清空 N 条 · 快照在 X"这两半真话一起没了。对照同一函数里的
+`reclaimOnly` 那一腿——同一种形状已经明确处理过（条数刻意拼进错误串）。⇒ 一个函数、两条臂、
+同一契约两种兑现，这是本仓记过一次的不对称。
+
+**(e) `ImportFrom` 不取 `s.mu`。** `internal/history` 非测试代码里 `s.mu.Lock()` 现读 **16** 处，
+`import.go` 命中 **0**。同包另一条写路径 `ExportTo` 是 `s.mu.Lock()` + `defer s.mu.Unlock()` 整段包住。
+而 `ImportFrom` 的形状是"集合式读本地键（`localScanKeys` / `localOpKeys`）→ 开 tx → 逐行插"，
+读与写之间没有任何串行化保证 ⇒ 两个并发 `ImportFrom` 同一份影像会各自判成"本地没有"，双双插到底，
+把在册承诺「连点两次不翻倍」踩穿。（`s.db` 只有 1 条连接，所以坏的不是字节，是**判据的时点**。）
+
+**(f) `ClearOpRecords` 判与写分两段。**
+
+```go
+a.mu.Lock()
+busy := a.opsRunning
+a.mu.Unlock()
+if busy { ... }
+hs := a.histSnapshot()
+...
+return hs.ClearOps()
+```
+
+`opsRunning` 的**置位**发生在 `ExecuteOperation` 自己的临界区里，而这里的**检查**在另一段临界区里，
+中间窗口能放行一笔新清理，随后 `DELETE FROM op_records` 抽走它刚落的账。
+★ 修法不能是"把 `a.mu` 一路握到 `ClearOps` 之后"：`app_history.go` 明写着
+「hist 访问不与 `a.mu` 嵌套」，而 `hs.ClearOps()` 内部要拿 history 包自己的 `s.mu`。
+
+**(g) 前端两把锁缺的是同一件东西。** `SettingsView` 的 `clearCache` 没有任何 in-flight ref
+（同仓 `RecordsView` 的 `exportRecords` / `importRecords` 各有 `exporting` / `importing` + `finally` 复位），
+且确认态在 `await` **之前**就回到 `false`（本页两个「清空」同形）：
+
+```js
+async function clearAllOps() {
+  if (!confirmClearOps.value) { confirmClearOps.value = true; return }
+  confirmClearOps.value = false
+  await store.clearOps()
+}
+```
+
+⇒ RPC 在途期间按钮恢复成初态、也不带 `:disabled`，"确认清空"再点两下就并发发出第二、第三次
+`CacheClear` / `ClearOpRecords`——正好撞在 (a)、(f) 那两条没有闸的窗口上。
+
+### 2.2 判据（七条修法 + 一条登记待裁）
+
+1. **M359 维护在途标记（双向闸）**。`App` 增字段 `maintaining string`（空即无维护在途），配
+   `claimMaintenance(what string) error`：**同一个** `a.mu` 临界区内查 `scanInFlight`、`opsRunning`、
+   `maintaining` 三件，全空才占位；配 `releaseMaintenance()`。`CacheClear`、`ClearOpRecords` 各自
+   开头认领、`defer` 释放；`StartScan` 与 `ExecuteOperation` 的既有临界区各加一支
+   `a.maintaining != ""` ⇒ 拒，文案点名是哪一项维护。
+   - ★ 用 `string` 而不是 `bool`：拒绝的话必须说得出"是清缓存还是清记录"，否则用户在扫描页只看到
+     一句无主的"维护进行中"。
+   - ★ 标记是**闩**不是锁：占位与释放各在一次 `a.mu` 临界区内，真正的库操作在锁外 ⇒ 不违反 (f) 里
+     那条嵌套惯例。
+   - ★ 既有两支的文案与**顺序**一字不动（既有断言直接抄了「上一个扫描任务尚未收尾」这类原话）。
+2. **M360 快照 0600**。tmp 影像一成形即 `os.Chmod(tmpPath, 0o600)`；设不上即停止并走既有
+   「清空缓存已取消：快照未能生成，未删除任何缓存数据」那一档的形状（此时一条缓存都还没删，
+   取消是实话）。注释按 M354 的双回写口径写：这句"仅所有者可读写"只在 unix 腿兑现，
+   Windows 的模式位只表达只读属性。
+3. **M361 落位带所有权证明**。新增 `landCacheSnapshot(tmp, snap string) (landed, note string, err error)`：
+   - `os.Lstat(snap)` 报不存在 ⇒ 原位改名，note 空；
+   - 存在且**证明得了是本应用自己的**⇒ 原位覆盖，note 空；
+   - 存在但证明不了（不是常规文件：symlink / 目录 / 设备；或 unix 腿属主 ≠ 当前 euid）⇒ **绝不碰它**，
+     把新快照落到 O_EXCL 抢占的时间戳名（`cache-backup.db.aside-<ts>`，撞名递增），note 写明
+     「固定名被一份不属于本应用的对象占着，本次快照另存在此」；
+   - 连撞若干次都占不到名 ⇒ 返回错误，措辞沿用 §6.63 的「本应用不会删除它」。
+   属主证明按平台分档，两枚带 tag 的文件（惯例同 `internal/ads`、`internal/fsid`）：`!windows` 走
+   `st.Sys().(*syscall.Stat_t).Uid == os.Geteuid()`；windows 腿只主张到"常规文件"这一档，注释与本段
+   同时写明属主证明在 Windows 未兑现（M354 同族：不拿弱腿冒称强腿）。
+   `CacheClearResult` 增 `SnapshotNote string`；`SnapshotPath` 一律填**真实落点**。
+4. **M362 统计失败不吞回执**。加 `cacheClearStats` 接缝（惯例同 `cacheClearSnapshot`）包住两次取统计；
+   第二腿失败 ⇒ `EntriesCleared` / `SnapshotPath` 保持已填，错误串写成
+   「缓存已清空 N 条，快照在 X，但磁盘占用未能核对（回收字节暂报 0）：<原错误>」，
+   `ReclaimedBytes` 如实留 0——不许把"没核对上"说成"回收了 0 字节"以外的任何断言。
+5. **M363 `ImportFrom` 补锁**。`s.mu` 从 `localScanKeys()` 之前一路握到 `tx.Commit()`；
+   **不开新事务、不改判据**，只把"读集合 → 写"并进同一临界区。死锁自证：区间内调的
+   `insertScanRow` / `mergeScanChildren` / `insertOpRow` / `mergeOpItems` / `blobArg` 全是自由函数
+   （`grep '^func '` 现读，无一处取 `s.mu`），`src` 是另一条 `*sql.DB`。
+6. **M364 `ClearOpRecords` 判+写同临界区**。走 1) 的 `claimMaintenance("清空清理记录")`，
+   对 `opsRunning` 那一支**沿用既有原话**（免得既有断言要改）；另在 `hs.ClearOps()` 外面加一层
+   `ledgerClearOps` 接缝——★ 接缝本身是**纯重构**，先落地再写探针，这样"改前必红"才落在行为上
+   而不是落在编译错误上。
+7. **M365 前端两把锁**。`clearCache` 加 `clearing` ref（`try/finally` 复位）+ 两个按钮 `:disabled` +
+   确认态只在 RPC 落定后关；`clearAllOps` 加 `clearingOps` ref，同形。判据走
+   `scripts/test-frontend-logic.sh` 的 `wiring` / `wiring_window` 锚点（正侧钉新形状、负侧钉
+   "await 之前关确认"这个旧形状不许回来）。
+8. **M366 登记待裁（本批不动）**：同一次实测里 `cache.db` 自身也是 0644（`history.db` 同档）。
+   本批把**新产的影像**收成 0600，而**存量库文件**的档位是另一件事——要动 `Open` 路径、要处置
+   盘上既有文件、跨平台还牵扯 NTFS ACL。R-8-2 的字面范围只到"快照 0600"，故只登记不实施。
+
+### 2.3 探针（P-11 ~ P-24）
+
+| 编号 | 判据格 | 修前预期 |
+| --- | --- | --- |
+| P-11 | `opsRunning=true` ⇒ `CacheClear` 拒，且缓存条目一条不少 | **红**：改前 `err=nil` 且真清走 |
+| P-12 | `scanInFlight=true` ⇒ 同上 | **红** |
+| P-13 | 反向闸：清缓存在途（快照接缝里暂停）⇒ `StartScan` 拒 | **红**：改前受理并起跑 |
+| P-14 | 反向闸：同一暂停点 ⇒ `ExecuteOperation` 拒 | **红** |
+| P-15 | 快照模式位：unix 腿硬断 `0600`；windows 腿断"读数必须仍是 `0666`"（M354 同形） | **红**：实测 644 |
+| P-16 | 固定名上是 symlink ⇒ 链接自身与其目标一字不动、快照另落、note 非空、`SnapshotPath`=另落名 | **红**：`os.Rename` 顶掉 symlink |
+| P-17 | 固定名上是"属主不是本机"的常规文件（属主证明接缝给 false）⇒ 不覆盖、另落 | **红**：覆盖 |
+| P-18 | 正控制：固定名上是上一份自己的快照 ⇒ 原位覆盖、note 空、盘上仍只 1 份 | 绿／改后绿（防"全另落"） |
+| P-19 | 另落名已被占 ⇒ 走下一个 O_EXCL 名，那个文件内容不变 | **红**：改前根本没有另落这条路 |
+| P-20 | 第二腿统计失败 ⇒ 错误串含「已清空 N 条」与快照落点，`res` 两字段仍填好 | **红**：只剩一句壳错误 |
+| P-21 | 两个并发 `ImportFrom` 同一影像 ⇒ 行数不翻倍 | **红（概率性）**：复现不出即按 2.5 第 4 条如实记账 |
+| P-22 | `ClearOpRecords` 在途（`ledgerClearOps` 暂停点）⇒ `StartScan` 与 `ExecuteOperation` 都拒，且 `maintaining` 已占住 | **红** |
+| P-23 | 前端锚点正侧：两个 handler 都有 in-flight ref + `:disabled` + 落定后关确认 | **红**：锚点缺失 |
+| P-24 | 前端锚点负侧：`await` 之前关确认态的旧形状不得回来 | 绿（钉子） |
+
+★ P-13 / P-14 / P-22 必须先跑**前提自检**（M93 的教训：夹具穿不过门禁链下游某道门时，"被拒"
+无法归因给被测门禁）：同一夹具在不占维护标记时必须**真的受理**，自检不过即当场红。
+
+### 2.4 变异（预测集先写死，交付时对账）
+
+| 变异 | 预测变红 |
+| --- | --- |
+| MU-5 摘掉 `CacheClear` 的 `claimMaintenance` 调用（函数留着） | P-11、P-12、P-13、P-14 |
+| MU-6 只摘 `claimMaintenance` 里 `opsRunning` 一支 | 只有 P-11 |
+| MU-7 摘掉 `os.Chmod(tmpPath, 0o600)` | P-15（unix 腿） |
+| MU-8 属主证明恒 true | P-17；★ 预测 P-16 **仍绿**（symlink 那支走模式位判定，不经属主） |
+| MU-9 所有权判定退化成"存在就另落" | P-18（过度拒绝，防"用多拒绝换绿"） |
+| MU-10 第二腿统计失败改成 `_ = err` 继续 | P-20 |
+| MU-11 摘掉 `ImportFrom` 的 `s.mu` | P-21（概率性，实测单独记） |
+| MU-12 前端确认态改回 `await` 之前关 | P-23 |
+
+还原一律 `cp`+`diff`，**不用** `git checkout --`（§1.4 同一条）。
+
+### 2.5 边界与未兑现（划账时照抄，不许读成已通过）
+
+1. 本机只有 darwin：M360 的 windows 臂只断"读数仍是 0666"，**"Windows 上快照仅所有者可读写"
+   这句不成立**；手册与注释按分平台措辞写（M354 同口径）。
+2. **M361 的属主那一档在 Windows 腿未兑现**（那条腿的 `os.Stat` 不表达属主，访问权由所在目录的
+   NTFS ACL 继承）⇒ 挂 docs/05 真机清单。P-16 需要 `os.Symlink`，Windows 无特权会失败 ⇒ 该格按
+   `internal/ads` 惯例放进带 `//go:build !windows` 的文件，windows 腿**不进**这一格 ⇒
+   §6.67 的三条平台腿格数必须逐腿重取，不许照抄"合计 +N"。
+3. 双闸钉的是"互斥拒绝"这一格；本批**不主张**清缓存与扫描交错会造成哪一种具体损坏
+   （那需要真机时序取证）。判据只到"同一时刻只许有一个动 `hash_cache` / `history.db` 的主体"。
+4. P-21 是概率性探针：若改前复现不出红，按「代码已改、探针未复现」如实记，另以结构钉子
+   （读集合与写 tx 同临界区）钉住，**不许**把"改后也绿"当成改前就该绿。
+5. M366（存量 `cache.db` / `history.db` 的 0644）登记待裁，本批未动。
+6. 前端两把锁的判据是**静态锚点**（node 侧不能 import `.vue`）⇒「双击确实只发一次 RPC」
+   这一格仍挂 docs/05 真机清单。
