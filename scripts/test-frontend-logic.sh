@@ -348,6 +348,28 @@ wiring_window 'src/App.vue' '!store.preview && !store.confirmOpen' 1 '!store.pen
 wiring_window 'src/App.vue' '!store.preview && !store.confirmOpen' 1 '!store.failedOpen' \
 	'快捷键模态门补 failedOpen（C2：失败抽屉开着时同上）'
 
+# ---- M365（第八轮批 2，设计段 §2.1(g)）：两个维护口的前端在途锁 ----
+# 后端本批补了 scan/ops 双闸，前端这两把锁是同一条承诺的另一半：改前 clearCache 连
+# in-flight ref 都没有（同仓 exportRecords/importRecords 各有 exporting/importing），
+# 而两个「清空」的确认态都写在 await **之前** —— RPC 在途期间按钮恢复成初态且不带
+# :disabled，"确认清空"再点两下就并发发出第二、第三次请求，正好撞在闸的窗口上。
+# ★ .vue 打不进 node --test（M116/M118 同族限制）⇒ 判据走静态锚点，"双击只发一次"
+#   那一格仍挂 docs/05 真机清单（设计段 §2.5 第 6 条）。
+wiring 'src/views/SettingsView.vue' 'const clearingCache = ref(false)' '' \
+	'清空缓存有在途标记（M365：与本页导出/导入同一形状，改前一件都没有）'
+wiring_count 'src/views/SettingsView.vue' ':disabled="clearingCache"' 3 \
+	'清空缓存那一行的三枚按钮全挂在在途标记上（M365：只灰确认钮的话，入口钮与"取消"仍可再点一次）'
+wiring_window 'src/views/SettingsView.vue' 'await api.cacheClear()' 1 'confirmClearCache.value = false' \
+	'确认态在 RPC 落定之后紧接着才关（M365：窗口从 8 行收到 1 行是 MU-12 实测逼出来的——8 行窗口把 catch 里那句一起算了，移回 await 之前照样假绿）'
+wiring_count 'src/views/SettingsView.vue' 'confirmClearCache.value = false' 2 \
+	'确认态只在成功腿与失败腿各关一次（M365：多一处就是有人把它挪回 await 之前）'
+wiring 'src/views/RecordsView.vue' 'const clearingOps = ref(false)' '' \
+	'清空清理记录有在途标记（M365：store.busy 不含"正在清记录"这一档）'
+wiring_count 'src/views/RecordsView.vue' ':disabled="store.busy || clearingOps"' 2 \
+	'清空清理记录的入口与确认两枚按钮都追加在途标记（M365：缺一枚就还剩一次并发机会）'
+wiring_window 'src/views/RecordsView.vue' 'await store.clearOps()' 5 'confirmClearOps.value = false' \
+	'清理记录确认态在 RPC 落定之后才关（M365：同上）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1

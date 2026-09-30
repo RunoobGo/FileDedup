@@ -87,6 +87,8 @@ function stateCls(s: string): string {
 
 const confirmUndoId = ref<number | null>(null)
 const confirmClearOps = ref(false)
+// M365：清空清理记录的在途标记（形状同本页的 exporting/importing，也同 scan store 的 busy）。
+const clearingOps = ref(false)
 const expandedOp = ref<number | null>(null)
 const opDetail = ref<OpRecordItem[] | null>(null)
 const opDetailLoading = ref(false)
@@ -173,8 +175,17 @@ watch(() => store.opsRunning, (now, prev) => {
 
 async function clearAllOps() {
   if (!confirmClearOps.value) { confirmClearOps.value = true; return }
-  confirmClearOps.value = false
-  await store.clearOps()
+  // M365（第八轮批 2）：store.busy 只含"扫描/清理在途"这一档，不含"正在清记录"，
+  // 而改前确认态写在 await **之前** ⇒ 请求还在路上入口钮就复活，连点会并发发出
+  // 第二次 ClearOpRecords，正好撞在本批后端补的那道闸上。落定之后才关。
+  if (clearingOps.value) return
+  clearingOps.value = true
+  try {
+    await store.clearOps()
+  } finally {
+    confirmClearOps.value = false
+    clearingOps.value = false
+  }
 }
 
 // ---------- 记录导出 / 导入（M351/M352/M353，裁定 R-2） ----------
@@ -282,12 +293,13 @@ function destSummary(it: OpRecordItem): string {
       <template v-if="tab === 'ops'">
         <button class="btn-ghost" title="在系统回收站中查看/还原已回收文件" @click="store.openTrash()">打开系统回收站</button>
         <template v-if="store.opList.length">
-          <!-- B3-1：账本在途时不可清空（后端同样拒绝，这里免掉"点了才报错"） -->
-          <button v-if="!confirmClearOps" class="btn-ghost" :disabled="store.busy"
+          <!-- B3-1：账本在途时不可清空（后端同样拒绝，这里免掉"点了才报错"）。
+               M365：store.busy 不含"正在清记录"这一档，所以两枚按钮各自再挂在 clearingOps 上。 -->
+          <button v-if="!confirmClearOps" class="btn-ghost" :disabled="store.busy || clearingOps"
             :title="store.busyTip || '清空全部清理记录'" @click="confirmClearOps = true">清空</button>
           <template v-else>
             <span class="confirm-tip">确认清空清理记录？清空后未回撤的操作将无法再回撤</span>
-            <button class="btn-danger" :disabled="store.busy" @click="clearAllOps">确认清空</button>
+            <button class="btn-danger" :disabled="store.busy || clearingOps" @click="clearAllOps">确认清空</button>
             <button class="btn-ghost" @click="confirmClearOps = false">取消</button>
           </template>
         </template>

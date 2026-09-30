@@ -313,6 +313,9 @@ export interface CacheClearResult {
   entriesCleared: number
   reclaimedBytes: number
   snapshotPath: string
+  // snapshotNote 只在快照没落在承诺的固定名上时非空（M361）：固定名被一份不属于
+  // 本应用的对象占着时，本次影像另存在带时间戳的名字上，真实落点靠这句说明。
+  snapshotNote: string
 }
 
 // RecordsExportResult 是「导出记录」的回执（M351，Go 侧 app_records_io.go 同名结构体）。

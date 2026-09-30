@@ -287,16 +287,35 @@ func (a *App) GetOpRecord(opID int64) (OpRecordDetail, error) {
 // B3-1：清理/回撤在途时拒绝——账本此刻正被 FinishItem/FinalizeOp 逐项落账，
 // 整表删除会让一个仍在移动文件的操作失去全部记录（事后既无从回撤也无从追溯），
 // 而界面上只表现为"清空成功"。
+// M364（第八轮批 2）：那一道闸原先是「锁内问一句 → 锁外删整表」两段式，
+// 中间放行的一笔新清理会先写好写前账本、再把账本被这次整表删除抽走；同一段也没有
+// 挡住在途扫描（扫描的写回腿正往 history.db 落行）。现在走 claimMaintenance，
+// 三问与占位在同一个临界区里定下，并在整表删除期间一直保持占住（闩，不是锁）。
+//
+// ★ 两个名字不合成一个：撞在 opsRunning 上那半句要用**改前就立好的原话**
+//
+//	「清理/回撤操作执行中，请等待结束后再清空记录」（B3 的文案，一字不许动），
+//	而别人被这一格挡在门外时该听到「清空清理记录进行中……」（与「清空缓存」对称，
+//	用户要知道在等什么）。一个串两用必然挑错一种 ⇒ claimMaintenance 收两个参数。
+//
+// ledgerClearOps 是"整表删除清理账本"的注入点（接缝惯例同 cacheClearSnapshot、
+// cacheClearStats）。
+//
+// 为什么这条也要接缝：M364 的承重判据是**编排顺序**——"有没有在途操作"这一问与
+// "整表删除"这一步必须在同一个临界区里定下来（判完到删之间放行一笔新清理，
+// 就会把一笔正在逐项落账的操作的账本抽走）。要断言这一句，测试必须能在删除真正
+// 发生的那一刻暂停下来，从旁边看一眼闸门是否已经占住；而 `hs.ClearOps()` 本身
+// 是一个瞬间完成的 SQL，没有可插的缝。
+var ledgerClearOps = func(hs *history.Store) error { return hs.ClearOps() }
+
 func (a *App) ClearOpRecords() error {
-	a.mu.Lock()
-	busy := a.opsRunning
-	a.mu.Unlock()
-	if busy {
-		return fmt.Errorf("清理/回撤操作执行中，请等待结束后再清空记录")
+	if err := a.claimMaintenance("清空清理记录", "清空记录"); err != nil {
+		return err
 	}
+	defer a.releaseMaintenance()
 	hs := a.histSnapshot()
 	if hs == nil {
 		return fmt.Errorf("历史库不可用")
 	}
-	return hs.ClearOps()
+	return ledgerClearOps(hs)
 }

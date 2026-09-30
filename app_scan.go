@@ -53,6 +53,14 @@ func (a *App) StartScan(cfg model.ScanConfig) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("清理操作执行中，请等待完成后再扫描")
 	}
+	// M359（第八轮批 2）：维护动作（清空缓存 / 清空清理记录）在途时不开新扫描。
+	// 清缓存吃的是 hash_cache 整表 + WAL 截断，新扫描正要把算出来的条目往同一张表写回；
+	// 反向那一半（清缓存拒绝在扫描在途时开工）在 CacheClear 里，两边同锁串行才叫闭合。
+	if a.maintaining != "" {
+		m := a.maintaining
+		a.mu.Unlock()
+		return "", fmt.Errorf("%s进行中，请等待完成后再扫描", m)
+	}
 	a.scanInFlight = true
 	myGen := a.resultGen.Add(1) // 代际号：goroutine 收尾据此判断自己是否已被取代
 	a.groups = nil

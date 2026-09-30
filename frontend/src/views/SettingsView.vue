@@ -22,20 +22,34 @@ async function refreshCache() {
 // （role/aria-modal/焦点归还原，P2-3）；在 webview 里它甚至可能被静默挡掉，
 // 于是"点了清空缓存却没反应"。改用与 RecordsView 清空记录同一形状的**两段式就地确认**。
 const confirmClearCache = ref(false)
+// M365（第八轮批 2）：RPC 在途锁。改前确认态写在 await **之前**，请求还在路上按钮就
+// 复活成初态、而且三枚按钮都不带 :disabled——"确认清空"连点两下会并发发出第二次请求，
+// 正好撞在本批后端补的那道闸上（后一次被拒，用户看到的是"清不掉"）。
+// 形状同本页的导出/导入（那两件事各有 exporting/importing，唯独清缓存没有）。
+const clearingCache = ref(false)
 async function clearCache() {
   if (!confirmClearCache.value) { confirmClearCache.value = true; return }
-  confirmClearCache.value = false
+  if (clearingCache.value) return
+  clearingCache.value = true
+  // M349：后端现在给回执（清了几条 / 回收多少字节）。改前这里只有一个 error，
+  // 于是"条目 0 但占用没变"这种读数界面拿不出反证——用户只能判断"没清掉"。
   try {
-    // M349：后端现在给回执（清了几条 / 回收多少字节）。改前这里只有一个 error，
-    // 于是"条目 0 但占用没变"这种读数界面拿不出反证——用户只能判断"没清掉"。
     const res = await api.cacheClear()
-    toast.notifySuccess(
-      `哈希缓存已清空 ${formatCount(res.entriesCleared)} 条 · 回收 ${humanBytes(res.reclaimedBytes)}`)
+    confirmClearCache.value = false // M365：落定之后才关确认态（这一行的位置就是判据）
+    // M361：快照没能落在承诺的固定名上时，落点与说明都由后端如实报回来，界面转述。
+    // 这一句要停得比平时久——用户得看清这次找回档该去哪个名字底下找。
+    const aside = res.snapshotNote ? ` · ${res.snapshotNote}` : ''
+    const receipt = `哈希缓存已清空 ${formatCount(res.entriesCleared)} 条 · 回收 ${humanBytes(res.reclaimedBytes)}`
+    if (aside) toast.push(receipt + aside, 'success', 9000)
+    else toast.notifySuccess(receipt)
   } catch (e: any) {
+    confirmClearCache.value = false
     // 只有空间回收失败那一档（M347）条目其实已经删净。后端在这一腿把整句真话
     // 拼进了错误串（含条数与快照落点），所以这里走 warn 档原样报出：
     // 这一档不许被重写成整件事失败的措辞（那句会成假话），门禁的禁止侧正盯着它。
     toast.push(toast.errText(e), 'warn', 9000)
+  } finally {
+    clearingCache.value = false
   }
   await refreshCache()
 }
@@ -114,13 +128,15 @@ async function save() {
         <!-- R3-5：两段式就地确认（第一下只把风险说清，第二下才动手）。
              清空缓存不毁数据，但会让下次扫描退回首次速度，值得一句确认。 -->
         <template v-if="!confirmClearCache">
-          <button class="btn-ghost" @click="confirmClearCache = true">清空缓存</button>
+          <!-- M365：三枚按钮全钉在在途标记上。只灰"确认清空"的话，入口钮与"取消"
+               在 RPC 在途期间仍可再点一次，确认态会被翻回去。 -->
+          <button class="btn-ghost" :disabled="clearingCache" @click="confirmClearCache = true">清空缓存</button>
         </template>
         <template v-else>
           <span class="hint">确认清空哈希缓存？下次扫描将退化为首次扫描速度；清空前会先把现有缓存快照到
             <code>cache-backup.db</code>（只留最近一次，下次清空覆盖它）。</span>
-          <button class="btn-danger" @click="clearCache">确认清空</button>
-          <button class="btn-ghost" @click="confirmClearCache = false">取消</button>
+          <button class="btn-danger" :disabled="clearingCache" @click="clearCache">确认清空</button>
+          <button class="btn-ghost" :disabled="clearingCache" @click="confirmClearCache = false">取消</button>
         </template>
       </div>
 

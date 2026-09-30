@@ -288,6 +288,17 @@ type App struct {
 	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
 	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
+	// maintaining 是**维护类动作**（清空缓存 / 清空清理记录）的在途标记，空即无。
+	// M359（第八轮批 2）：这两件各自要动 hash_cache 整表或 op_records 整表，而扫描的
+	// 写回腿、清理的逐项落账腿吃的正是同一份磁盘状态——原先两个维护口一条闸都不接
+	// （app_settings.go 里 opsRunning/scanInFlight 命中数为 0），而 StartScan 与
+	// ExecuteOperation 早已互相双向闭合；这条不对称就是本批修的东西。
+	// ★ 为什么是 string 而不是 bool：拒绝的话必须说得出"是清缓存还是清记录"，
+	//   否则用户在扫描页只看到一句无主的"维护进行中"，不知道在等什么。
+	// ★ 它是**闩**不是锁：占位与释放各在一次 a.mu 临界区内完成，真正的库操作在锁外做
+	//   ⇒ 不违反 hist 访问不与 a.mu 嵌套那条惯例（见下面 hist 字段）。
+	maintaining string
+
 	// resultGen 结果集代际号（2026-09-18 审查 C7）：StartScan 在锁内自增，
 	// 扫描 goroutine 收尾前比对——不等即「本任务已被新扫描取代」，弃写。
 	// scanInFlight 挡不住这一段：它在写回结果集时就已复位，而随后还有
@@ -352,6 +363,50 @@ func NewApp() *App {
 		a.emit(a.ctx, "scan:stage", ev)
 	}
 	return a
+}
+
+// claimMaintenance 占住一项维护动作（清空缓存 / 清空清理记录）。
+//
+// 三问与置位在**同一个** a.mu 临界区里完成，与 StartScan / ExecuteOperation 自己的
+// 那段 check-and-set 同锁串行 ⇒ 双向闭合：维护先占住则扫描/清理被拒，扫描或清理先起跑
+// 则维护被拒。原样分两段（先问再删）时，中间窗口足够放行一笔新清理，而它的账会被这次
+// 整表删除抽走（M364 的取证见设计段 §2.1(f)）。
+//
+// 两个名字分开给：
+//   - name   写进 a.maintaining，是"别人被拒时听到的那半句"里的事名（要短、要说得出在等什么）
+//   - action 填进拒绝话术的后半句，用来**原样保住既有那句**
+//
+// ★ 为什么要 action 这一格：ClearOpRecords 撞在 opsRunning 上那句话是本批之前就立好的
+//
+//	文案（「清理/回撤操作执行中，请等待结束后再清空记录」，B3 定的），而它在"进行中"
+//	那半句里该叫「清空清理记录」（与「清空缓存」对称）。一个串两种用法会挑出错的
+//	那一种 —— 宁可传两个，也不改既有文案，也不造无主的"维护进行中"。
+//
+// 文案按"哪一格拦住了"分别给：
+//   - scanInFlight ⇒ 「扫描进行中，请等待结束后再<action>」
+//   - opsRunning   ⇒ 「清理/回撤操作执行中，请等待结束后再<action>」
+//   - 另一项维护   ⇒ 「<该项的 name>进行中，请等待完成后再<action>」
+func (a *App) claimMaintenance(name, action string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.scanInFlight {
+		return fmt.Errorf("扫描进行中，请等待结束后再%s", action)
+	}
+	if a.opsRunning {
+		return fmt.Errorf("清理/回撤操作执行中，请等待结束后再%s", action)
+	}
+	if a.maintaining != "" {
+		return fmt.Errorf("%s进行中，请等待完成后再%s", a.maintaining, action)
+	}
+	a.maintaining = name
+	return nil
+}
+
+// releaseMaintenance 交还维护标记。与 claimMaintenance 配对，走 defer。
+func (a *App) releaseMaintenance() {
+	a.mu.Lock()
+	a.maintaining = ""
+	a.mu.Unlock()
 }
 
 // cacheQuarantineNotice 把"哈希缓存影像损坏已隔离重建"翻成界面文案（纯函数）。

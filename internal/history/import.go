@@ -352,6 +352,19 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		return sum, err
 	}
 
+	// M363（第八轮审查批 2）：读集合 → 判重 → 写 tx → Commit 必须在**同一个** s.mu 临界区里。
+	// 本方法是 internal/history 里唯一一个不取 s.mu 的写者（非测试代码 16 处 s.mu.Lock，
+	// import.go 原先一处都没有），而 Store 的注释明写"全部方法内部串行化"。
+	// ⇒ 两次并发导入（或多线程 RPC）各自读到"本地没有"，同一条外来扫描被写两遍：
+	//   判重依据在两次调用之间已经过期，而写它用的是**另一段**临界区都算不上的裸 tx。
+	// ★ 锁加在这里而不是函数开头：前面的 openReadOnly / validateForeignLedger /
+	//   checkUndoEvidence 只碰 src，握锁等于把外来文件的 IO 时间算进本地写锁；
+	//   而且它们失败时直接返回，不需要串行化。区间内的 insertScanRow / mergeScanChildren /
+	//   insertOpRow / mergeOpItems 全是自由函数（不取 s.mu），src 是另一条 *sql.DB
+	//   ⇒ 不存在回头再拿同一把锁的路径，死锁自证见设计段 §2.2 判据 5)。
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// 本地自然键先行读入：既是判重依据，也是"源里那条扫描被判成重复"时
 	// op_records.hist_id 要指向的那个**本地 id**（约束 (3) 里最容易做错的一格）。
 	localScans, err := s.localScanKeys()

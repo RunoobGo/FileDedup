@@ -49,6 +49,14 @@ func (a *App) ExecuteOperation(op model.OpRequest) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("扫描进行中，请等待结束后再执行清理")
 	}
+	// M359（第八轮批 2）：维护动作在途时不受理清理。清缓存期间落进来的清理会与
+	// "快照拍到半张表"同时发生；清空清理记录期间落进来的清理更重——它先写好写前账本，
+	// 随后那次整表删除把账抽走，文件已经动了而回撤无从进行（M364）。
+	if a.maintaining != "" {
+		m := a.maintaining
+		a.mu.Unlock()
+		return "", fmt.Errorf("%s进行中，请等待完成后再执行清理", m)
+	}
 	// v0.5.0：门槛由「pipe 状态 Done」改为「结果集就绪」。历史恢复出的结果集
 	// 引擎处于 Idle，旧判定会永久拒绝清理；resultsReady 在扫描完成/历史载入
 	// 时置真，StartScan 入口置假，语义与旧判定在扫描路径上完全等价。

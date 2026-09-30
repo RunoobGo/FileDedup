@@ -111,6 +111,13 @@ type CacheClearResult struct {
 	EntriesCleared int    `json:"entriesCleared"`
 	ReclaimedBytes int64  `json:"reclaimedBytes"`
 	SnapshotPath   string `json:"snapshotPath"`
+	// SnapshotNote 只在"落位没有按承诺落在固定名上"时非空（M361）。
+	//
+	// 为什么单开一句而不是塞进 SnapshotPath：确认框里已经告诉用户快照会落在
+	// cache-backup.db，那是**承诺**；固定名被一份不属于本应用的对象占着时，本次影像
+	// 另落在一个带时间戳的名字上，用户必须知道"这次和你说好的那个名字不是一回事"，
+	// 否则他下次去找回档找的是错文件。正常覆盖上一份时这一格留空，界面不多说话。
+	SnapshotNote string `json:"snapshotNote"`
 }
 
 // CacheClearSnapshotName 是缓存快照的**固定**文件名（落在 cache.db 同目录）。
@@ -120,15 +127,40 @@ type CacheClearResult struct {
 // 那一档，走记录页的「导出记录」（可选到别的盘，M351）。
 const CacheClearSnapshotName = "cache-backup.db"
 
-// cacheClearSnapshot 是"落快照"这一步的注入点（测试接缝，惯例同 a.emit 字段、
-// cache.evictFn、dbfile.renameFile）。
+// cacheClearSnapshot 是"落一张**仅所有者可读写**的影像"这一步的注入点（测试接缝，
+// 惯例同 a.emit 字段、cache.evictFn、dbfile.renameFile）。
 //
 // 为什么要接缝：M349 的承重判据是**编排顺序**（快照不成就不删），要在根包里断言；
 // 而真实造出 `VACUUM INTO` 失败的手段（只读目录、满盘）在本仓既有读数里全是平台条件
 // ——§6.40 的 Windows 教训："只读目录造改名失败"在 Windows 上不成立。
 // "这条语句真能产出可用影像"由不碰接缝的成功格（读回条目数并逐条命中）与包内探针负责，
 // 两边合起来才把这条覆盖完整。
-var cacheClearSnapshot = func(c *cache.Cache, dest string) error { return c.Snapshot(dest) }
+//
+// ★ M360 把 Chmod 收进接缝**里面**而不是留在调用方：档位是"这张影像成形"的一部分，
+//
+//	不是一个独立的后续动作。分开写时，任何"改名之后才补 chmod"的实现都能通过只看
+//	最终落点档位的断言，而 SQLite 手里那段 0644 的时间窗（P-15b 钉的就是它）没人看；
+//	收进来之后调用方**没有**忘记补档位这条路可走。设不上档位即整步失败 ⇒ 调用方那条
+//	「清空缓存已取消：快照未能生成，未删除任何缓存数据」仍然是一句实话（tmp 会被收回，
+//	盘上没留下一份可用的影像，缓存也一条没动）。
+var cacheClearSnapshot = func(c *cache.Cache, dest string) error {
+	if err := c.Snapshot(dest); err != nil {
+		return err
+	}
+	// ★ 这句"仅所有者可读写"只在 unix 腿兑现：Windows 的模式位只表达"只读属性"，
+	//   0600 与 0644 在那条腿上读回同一个 0666（M354 的现读），真正的访问权由所在目录
+	//   的 NTFS ACL 继承 ⇒ 手册与测试都按分平台措辞写，不拿这句冒称跨平台保证。
+	return os.Chmod(dest, 0o600)
+}
+
+// cacheClearStats 是"读缓存统计"的注入点（接缝惯例同 cacheClearSnapshot）。
+//
+// 为什么这条也要接缝：清缓存的回执跨两次取统计——删之前拿条数、删之后算回收字节。
+// 后一次失败时**清空已经成立**，用户该拿到的那半句真话（"已清空 N 条 · 快照在 X"）
+// 只能从错误串里到达（Wails 在 err != nil 时丢掉结构体，M349 已记过一次），
+// 而"后一次失败"这一档在真实机器上要靠满盘/句柄被关去撞，CI 造不出来。
+// 有了接缝，这一档就是一条可以钉死的判据（M362）。
+var cacheClearStats = func(c *cache.Cache) (cache.Stats, error) { return c.GetStats() }
 
 // CacheClear 清空哈希缓存（M4-T01；回收与快照见 M347/M349）。
 //
@@ -145,11 +177,21 @@ var cacheClearSnapshot = func(c *cache.Cache, dest string) error { return c.Snap
 // TestCacheClearLeavesLedgerUntouched，M350）。
 func (a *App) CacheClear() (CacheClearResult, error) {
 	var res CacheClearResult
+	// M359（第八轮批 2）：这一句是整个函数的第一道门槛。原先 app_settings.go 里
+	// opsRunning / scanInFlight 的命中数是 0——清缓存既能在扫描写回 hash_cache 时插进来，
+	// 也能被"清缓存期间点清理"撞出去；StartScan 与 ExecuteOperation 早已互相双向闭合，
+	// 唯独这两个维护口一条闸都不接（不对称本身是缺陷）。占位与三问同临界区，
+	// 与那两处的 check-and-set 同锁串行 ⇒ 双向闭合。
+	if err := a.claimMaintenance("清空缓存", "清空缓存"); err != nil {
+		return res, err
+	}
+	defer a.releaseMaintenance()
+
 	cch := a.cchSnapshot()
 	if cch == nil {
 		return res, fmt.Errorf("缓存不可用")
 	}
-	before, err := cch.GetStats()
+	before, err := cacheClearStats(cch)
 	if err != nil {
 		return res, shellRPCError(err)
 	}
@@ -163,6 +205,8 @@ func (a *App) CacheClear() (CacheClearResult, error) {
 		//   （app_error_shell_test.go 的 B 档护栏专门盯这条透传）。
 		return res, fmt.Errorf("清空缓存已取消：快照未能生成，未删除任何缓存数据（%w）", err)
 	}
+	// M360：档位（0600）收在 cacheClearSnapshot 里面，见那一段的注释——
+	// 改名会把模式位一起带过去，所以收 tmp 一处就够；两条落位臂（原位与另落）都跟着走。
 	// 2) 清空
 	clearErr := cch.Clear()
 	reclaimOnly := errors.Is(clearErr, cache.ErrReclaimFailed)
@@ -171,16 +215,26 @@ func (a *App) CacheClear() (CacheClearResult, error) {
 		_ = os.Remove(tmpPath)
 		return res, shellRPCError(clearErr) // M214：中文哨兵原样保身份，英文 SQL 腿套壳
 	}
-	// 3) 清空成立（含"只有回收失败"那一档）⇒ 新快照才配顶掉旧快照
-	if err := os.Rename(tmpPath, snapPath); err != nil {
-		_ = os.Remove(tmpPath)
+	// 3) 清空成立（含"只有回收失败"那一档）⇒ 新快照才配顶掉旧快照。
+	//    ★ 落位要先证明固定名上那份（若有）是本应用自己的影像（M361）：
+	//      os.Rename 一律替换，而"覆盖掉一份不属于我们的文件"在本仓是记过的 P0 形状
+	//      （§6.63 / M344）。证明不了就另落并如实报出真实落点——缓存此刻已经清空，
+	//      这一腿**不能**取消，否则用户拿不到任何快照。
+	landed, note, err := landCacheSnapshot(tmpPath, snapPath)
+	if err != nil {
 		return res, fmt.Errorf("缓存已清空 %d 条，但快照落位失败（保留的仍是旧快照或无快照）：%w", before.Entries, err)
 	}
-	res.SnapshotPath = snapPath
+	res.SnapshotPath = landed
+	res.SnapshotNote = note
 	res.EntriesCleared = before.Entries
-	after, err := cch.GetStats()
+	after, err := cacheClearStats(cch)
 	if err != nil {
-		return res, shellRPCError(err)
+		// M362：清空与快照**都已经成立**，缺的只是"回收字节没能核对"。这一句必须同时
+		// 把条数与快照落点带进错误串——Wails 在 err != nil 时丢掉结构体，前端 catch 到的
+		// 只有这句话；只回一句壳错误等于把已经做成的两件事一起说没了（对照下面 reclaimOnly
+		// 那一腿，同一条契约在同一函数里已经处理过一次）。
+		return res, fmt.Errorf("缓存已清空 %d 条，快照在 %s，但磁盘占用未能核对（回收字节暂报 0）：%w",
+			res.EntriesCleared, landed, err)
 	}
 	if d := before.DBSizeBytes - after.DBSizeBytes; d > 0 {
 		res.ReclaimedBytes = d
@@ -191,7 +245,7 @@ func (a *App) CacheClear() (CacheClearResult, error) {
 		//   前端 catch 到的只有这句话（wails.ts 的 reject 形状是字符串/Error message，
 		//   见 SettingsView 那条 catch），所以"已清空 N 条"这一半真话只能靠它到达用户。
 		return res, fmt.Errorf("%w；已清空 %d 条、拿回 %d 字节，快照在 %s",
-			clearErr, res.EntriesCleared, res.ReclaimedBytes, snapPath)
+			clearErr, res.EntriesCleared, res.ReclaimedBytes, landed)
 	}
 	return res, nil
 }

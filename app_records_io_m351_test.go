@@ -49,7 +49,15 @@ func seedForeignLedger(t *testing.T, hs *history.Store) {
 		[]*model.DuplicateGroup{mkGroup(1, 2048, "/other/root/a.bin", "/other/root/b.bin")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	var h [32]byte
+	// ★ M355（第八轮批 1）之后，外来账本里"可回撤"的条目必须带得出内容证据，
+	//   否则导入侧那道闸会把这份影像整单拒绝 —— 而这三个用例要验的是合并与互斥，
+	//   不是那道闸（闸另有 P-1~P-8 专门钉）。留全零 [32]byte 的话，
+	//   TestImportRefusesWhileOpsRunning 会红在**错的门**上（被证据闸拒了却算作
+	//   "opsRunning 挡住了"）——M93 记过的"恒绿却什么都没测"换一副面孔回来。
+	h := [32]byte{}
+	for i := range h {
+		h[i] = byte(0x41 + i%26)
+	}
 	opID, err := hs.BeginOp("move", "/other/root", 1, true,
 		[]history.OpItemPlan{{OrigPath: "/other/root/b.bin", Hash: h, Size: 2048, MtimeNs: 9}})
 	if err != nil {
@@ -522,6 +530,20 @@ func TestImportRefusesWhileOpsRunning(t *testing.T) {
 	}
 	if got := ledgerCounts(t, a); got != before {
 		t.Errorf("M352：在途拒绝却改了账本 before=%v after=%v", before, got)
+	}
+
+	// ★ 归因自检（M93 的教训）：同一份影像、同一个 App，把 opsRunning 放开之后必须
+	//   **真的导入成功**。缺这一格，"被拒"这个结果可能来自门禁链下游的另一道门
+	//   （例如 M355 的内容证据闸），于是本用例会在闸门被摘掉时照样绿。
+	a.mu.Lock()
+	a.opsRunning = false
+	a.mu.Unlock()
+	res, err := a.ImportRecords()
+	if err != nil {
+		t.Fatalf("M352 前提走样：空闲时同一份影像仍被拒（%v）⇒ 上面的拒绝无法归因给 opsRunning 闸门", err)
+	}
+	if res.ScansAdded != 1 || res.OpsAdded != 1 {
+		t.Errorf("M352 前提走样：空闲导入没真走到底（回执 %+v）⇒ 上面的拒绝无法归因给 opsRunning 闸门", res)
 	}
 }
 
