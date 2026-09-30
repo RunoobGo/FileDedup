@@ -139,6 +139,57 @@ func validateForeignLedger(src *sql.DB) error {
 	return nil
 }
 
+// undoEvidenceLen 是内容证据的满长字节数，取自回撤读腿实际用的那个数组类型
+// （OpItem.Hash 是 [32]byte），不写死 32：将来证据换形时这一格要跟着判据一起改，
+// 而不是留一个还绿着的字面量。
+const undoEvidenceLen = len([32]byte{})
+
+// undoEvidenceSQL 问的是"**回撤真会吃到的那一集合**"里有没有条目拿不出满长内容证据。
+//
+// 为什么这一格必须在导入侧判死：ops/undo.go 的 undoSourceCheck 与 restoreInPlace 在
+// `it.Hash == [32]byte{}` 时会**同时**跳过全量 BLAKE3 复核与身份复核，只剩一条按
+// `it.Size` 的比对——而 size 是外来账本自己填的。于是"来历不明的 .db + 点一次全部回撤"
+// = 按外来路径搬动本机真实文件，且账本记"回撤成功"。前置校验 importRequired 只看
+// **列名在不在**、不看值，所以这条豁免今天能被外来文件选中（真读数见 §6.67 的 P-7）。
+//
+// 三处判据细节，每一处都对应本轮实测到的一个形状：
+//   - COALESCE(length(i.hash), -1) <> ?：SQLite 三值逻辑下 length(NULL) <> 32 判定成
+//     NULL（不是真），只写长度比较会被 NULL 绕过 ⇒ 空值必须先折成一个必不等于满长的数。
+//   - i.hash = 满长全零：这一支是设计段 §1.2 原判据**漏掉**的一档，实施时补上（见 §1.6 追记）。
+//     只量长度的闸会放行它，而它经 oplog.go 的 copy(it.Hash[:], hb) 折出来的正是那个零值数组
+//     ⇒ 同一个洞，只是换了个字节数。
+//   - state IN (done, undo_failed)：与 app_ops.go 的回撤选择集**逐字同一集合**
+//     （if it.State == history.StateDone || it.State == history.StateUndoFailed）。
+//     放宽到全表就是过度拒绝——会把"只搬历史台账看数据"这一档正常用法打掉（P-4/P-5 钉它）。
+//
+// ★ 满长零值 BLOB 走参数位绑定，不做语句拼接。
+const undoEvidenceSQL = `SELECT COUNT(*), COUNT(DISTINCT i.op_id) FROM op_items i
+	JOIN op_records r ON r.id = i.op_id
+	WHERE r.undoable = 1 AND i.state IN (?, ?)
+	  AND (COALESCE(length(i.hash), -1) <> ? OR i.hash = ?)`
+
+// checkUndoEvidence 在**任何本地写入之前**拒绝"外来账本给回撤豁免开后门"。
+// 取向出自裁定 R-8-1（只在导入侧 fail-closed、不加列、不改回撤腿的零值放行分支）：
+// 本地老账本里本就存在的零哈希行行为一字不动，只是这条豁免**不再能由外来文件选中**。
+//
+// 代价如实说（要写进 09/10，不藏）：用户自己的"升级前老账本 → 新版导出 → 导进另一台机"
+// 会被这一闸挡住，那本老账的条目拿不出内容证据。
+func checkUndoEvidence(src *sql.DB) error {
+	var badItems, badOps int
+	if err := src.QueryRow(undoEvidenceSQL,
+		StateDone, StateUndoFailed, undoEvidenceLen, make([]byte, undoEvidenceLen)).
+		Scan(&badItems, &badOps); err != nil {
+		return fmt.Errorf("读外来账本的内容证据失败（本地记录未改动）: %w", err)
+	}
+	if badItems == 0 {
+		return nil
+	}
+	return fmt.Errorf("外来记录里有 %d 条可回撤的清理条目（涉及 %d 笔操作）拿不出满 %d 字节的内容证据；"+
+		"这种条目一旦导入，回撤会跳过内容比对与身份复核，可能按外来路径搬动本机文件，"+
+		"因此本次导入已拒绝，本地记录未改动。请在本机重新扫描并清理后再导出，或只导入新版导出的记录",
+		badItems, badOps, undoEvidenceLen)
+}
+
 // scanKey 与 opKey 是两条自然键（裁定 R-2 的判重依据）。
 //
 // ★ 为什么不能只比 saved_at / created_at：同一秒内的两次扫描（自动化、重试）会撞键，
@@ -255,9 +306,16 @@ func loadSrcOps(src *sql.DB) ([]srcOp, error) {
 // （含"子行插到第 37 行失败"这种半截情况——那正是设计段要求"要么全成要么全不动"要防的形状）。
 //
 // ★ 不做 MaxScanHistory 裁剪：裁剪要 DELETE 本地最旧的记录，直接违反约束 (1)，
-// 而这个功能的全部理由就是"防止误删除"。代价如实说：导入后本地可能超过 20 条，
-// 而**下一次扫描**的 SaveScan 会按 id 保留最新 20 条 ⇒ 刚导进来的记录若排在最旧一侧，
-// 会在下一次扫描时被淘汰。这条交互写进手册（09/10），不藏。
+// 而这个功能的全部理由就是"防止误删除"。代价如实说：导入后本地可能超过 20 条。
+//
+// ★★ 下一轮淘汰**吃的是谁**（M356 更正，此前此处与手册两处都写反了）：
+// 外来行插入时不带 id ⇒ 一律拿最高的自增号；而 SaveScan 的裁剪按 id 保新删旧
+// （`ORDER BY id DESC LIMIT -1 OFFSET 20`）⇒ **刚导进来的记录排在最新一侧，淘汰碰不到它们**，
+// 被清掉的是**用户自己的本地最旧记录**。真读数由 P-10 那格钉子钉住
+// （import_m355_test.go 的 TestM356TrimEvictsLowestIdLocalNotImportedRows）。
+// 也就是说：导入这件事的真实代价不是"导进来的会丢"，而是"本地最旧的那条会因此提前丢"——
+// 两句话在手册里必须分开写，混成一句就是另一种谎（09/10 两处已同步更正）。
+// 裁剪取向本身（按 saved_at 还是按 id、外来行要不要豁免）要动判据，登记待裁、本批不自行选边。
 func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 	var sum ImportSummary
 	if srcPath == "" {
@@ -285,6 +343,12 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		if dbfile.IsCorruption(err) {
 			return sum, fmt.Errorf("要导入的记录文件不是一份可用的账本（本地记录未改动）：%v", err)
 		}
+		return sum, err
+	}
+
+	// M355（第八轮审查 P0-1）：结构过关 ≠ 内容证据过关。外来账本里"可回撤但无从比对"
+	// 的条目必须在**任何本地写入之前**拒绝，理由见 checkUndoEvidence 的注释。
+	if err := checkUndoEvidence(src); err != nil {
 		return sum, err
 	}
 
@@ -510,6 +574,31 @@ func mergeScanChildren(tx *sql.Tx, src *sql.DB, srcHistID, newHistID int64) erro
 	return nil
 }
 
+// blobArg 把驱动读回的 nil 还原成"零长 BLOB"再交给 INSERT。
+//
+// ★ 这是一条实测的**往返不对称**，不是顺手兜一下（探针 P-4/P-5 的红因，读数见 §6.67）：
+// modernc 驱动把参数里的 []byte{} 编成 X”（typeof=blob），却把 X” **读回**成 nil；
+// nil 再写出去就是 NULL ⇒ 而本地 op_items.hash 是 NOT NULL
+// ⇒ 一条本来合法的外来记录会撞在英文驱动串上、整单回滚。
+// 搬运的口径是"照原样"：源里是零长 BLOB，本地就该是零长 BLOB。
+//
+// 读侧无法区分 NULL 与 X”（两者都折成 nil），因此外来文件给 NULL 时也按零长 BLOB 落地。
+// 这不放松安全性：闸（checkUndoEvidence）问的是**回撤会吃到的那一集合**，
+// 而 NULL 与 X” 在回撤判据上是同一档（都经 copy 折成零值数组）——那一集合里的两者
+// 已经整单拒收，落到这里的只剩回撤永远选不中的行。
+//
+// ★ 扫描侧的 hist_groups.hash 有**同一个**缺陷，本批刻意不修（拟登记）：那条腿现在是
+// import_m352_test.go 里 TestImportMidChildFailureRollsBack 的**夹具支点**（它靠
+// "外来 hist_groups.hash 给 NULL ⇒ 撞本地 NOT NULL"来构造"子行插到一半失败"）。
+// 一起归一化会把那条回滚用例的前提抽掉，而重造它的失败形状属于改既有测试的夹具——
+// 与"本批只加判据"的动面不是一回事，留作单独一批处理。
+func blobArg(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
+}
+
 func mergeOpItems(tx *sql.Tx, src *sql.DB, srcOpID, newOpID int64) error {
 	rows, err := src.Query(`SELECT orig_path, dest_path, link_src, hash, size, mtime_ns, state, err
 		FROM op_items WHERE op_id = ? ORDER BY id ASC`, srcOpID)
@@ -526,7 +615,7 @@ func mergeOpItems(tx *sql.Tx, src *sql.DB, srcOpID, newOpID int64) error {
 		if _, err := tx.Exec(`INSERT INTO op_items
 			(op_id, orig_path, dest_path, link_src, hash, size, mtime_ns, state, err)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			newOpID, it.origPath, it.destPath, it.linkSrc, it.hash, it.size, it.mtimeNs,
+			newOpID, it.origPath, it.destPath, it.linkSrc, blobArg(it.hash), it.size, it.mtimeNs,
 			it.state, it.errMsg); err != nil {
 			return fmt.Errorf("写入外来清理条目失败（本地记录未改动）: %w", err)
 		}
