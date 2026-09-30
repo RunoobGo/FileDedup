@@ -465,3 +465,195 @@ ClearOpRecords 撞在 `opsRunning` 上那句话是批 2 之前就立好的文案
 ★ MU-13/14/15 是 §2.4 表之外的追加三条：双向闸的三支各自承重这件事，只有分头摘掉才证得出来。
 ★ 还原一律 `cp`+`diff` 校验，本轮无一处用 `git checkout --`（§1.4 同一条）。
 ★ 前端侧本轮读数：M365 锚点 7 条、接线断言合计 52 条、node 用例 156 条、合计 208 条全通过。
+
+---
+
+## §3 批 3：P2 八条（R-8-3「能本机验证的全修」）—— 拟 M367~M374 + 一条登记待裁
+
+拟号不等于分配（§6.26 六）。本段用 **M367~M374** 作占位，最终号以 §6.67 登记表为准；
+`scanKey` 粗粒度按 R-8-3 只登记不修。裸号（`MU-…`/`P-…`）只在"变异/探针"二字之后出现。
+
+### 3.1 取证（八条，全部为现读，逐字抄自工作树；行号是本段动笔时的读数）
+
+**(a) 账本类 RPC 把驱动原话裸透传，而同包的壳早就立好了。** `app_history.go` 里八条腿中有六条
+直接返回底层错误：`ListScanHistory`（第 29 行 `return nil, err`）、`LoadScanHistory`（第 60 行）、
+`DeleteScanHistory`（第 125 行）、`ClearScanHistory`（第 142 行）、`ListOpRecords`（第 250 行
+`return hs.ListOps()` 整句透传）、`GetOpRecord`（第 273 行）；`app_ops.go` 的两条回撤入口
+（第 320、434 行）在 `hs.GetOp` 失败时同样裸 return。对照：`app_records_io.go`、`app_reveal.go`、
+`app_settings.go` 三处已在用 `app_error_shell.go` 第 130 行的 `shellRPCError`，其契约是
+「中文外壳 + 原话整串降级到（系统原文：…）」。**用户看到的是一句 `database is locked`，
+而 M202/M214 立这条壳的理由是"界面不许把英文原话当结论"** ⇒ 这是同契约的残腿，不是新设计。
+
+**(b) `OpenTrash` 把"拿不到主目录"当成拿到了。** `app_ops.go` 第 489 行（darwin 臂）与第 496 行
+（linux 臂的 `XDG_DATA_HOME` 兜底）都是 `home, _ := os.UserHomeDir()`，忽略错误后直接
+`filepath.Join`。HOME 未设时 `home` 是空串 ⇒ 拼出 `.Trash`（相对路径）与
+`.local/share/Trash/files`，于是"打开系统回收站"exec 的是**当前工作目录下的相对名字**。
+本仓在 `app_lifecycle.go` 第 26 行已有正确形状（`} else if home, herr := os.UserHomeDir(); herr == nil {`），
+M60 也已在别处判死过"取不到目录就不动"这一档。
+
+**(c) 只读目录夹具没有平台闸。** `internal/fscase/fscase_test.go` 首行是 `package fscase`，
+**全文件没有 `//go:build`**。第 47 行那条 `TestSensitiveFallsBackToDefaultWhenUnwritable`
+用 `os.Mkdir(ro, 0o500)` 造"不可写目录"，唯一的自保是 `os.Geteuid() == 0` 那一句 Skip——
+而 Windows 上 `Geteuid()` 恒为 **-1**，闸门永不开 ⇒ 那一格在 windows 腿造不出前提，
+断言比的又是 `Default()`，于是**摘掉 `fscase.go` 第 260-267 行那条"探测失败退回默认"的守卫它照绿**。
+这是本仓第四次撞同一形状（§6.40 / §6.66 同族，M213/M335/M354 一脉），
+仓里已有七枚带 `//go:build !windows` 的测试文件可依样（含本批 2 刚落地的 `app_cache_snapshot_other_m361_test.go`）。
+
+**(d) 同一个"busy 没复现"的结局，两条测试各判各的。** `app_cache_clear_m349_test.go` 第 201 行在
+`CacheClear` 返回 `nil` 时 `t.Skip("本次 busy 没复现（SQLite 把回收做完了），本格读数交回 CI 腿")`；
+`internal/cache/cache_reclaim_m347_test.go` 第 192 行对同一件事（`Clear()` 没落到 `ErrReclaimFailed`）
+直接 `t.Errorf`。两格用的都是"第二个真实连接 + 本库继续写"这套时序夹具，busy 能不能复现
+取决于 SQLite 何时肯把 WAL 截干净 ⇒ **后一条在 linux CI 腿是随机红**。
+★ 取证时必须一并记下两者的**共同弱点**：两格都拿"返回值"当前在场据，而"返回值没报 busy"
+既可能是"真没 busy"（前提缺席，该 Skip），也可能是"busy 真发生了但回收代码把标志吞了"
+（**那正是这一格要抓的变异**，必须 FAIL）。`internal/cache/cache.go` 第 593 行的 `checkpointFn`
+返回的是 `(busy int, err error)`，而 -wal 的**实际大小**是独立可观测——在册的旧变异
+（"Exec 忽略 busy"当年全绿那一版）栽的就是"用返回值当代场判据"这一格。
+
+**(e) `OpsOrphaned` 给没插过的行记账。** `internal/history/import.go` 第 424 行在
+`if !ok { sum.OpsOrphaned++ }` 里计数，而同一轮的去重判定在第 427-431 行
+（`if id, ok := localOps[k]; ok { sum.OpsSkipped++; continue }`）**之后**才发生 ⇒
+同一份影像导第二次时 `OpsAdded` 正确报 0、`OpsSkipped` 正确，而 `OpsOrphaned` 翻倍。
+后果是一份自相矛盾的回执（"什么都没新增"与"发现 N 条孤儿"同时说），`RecordsView.vue` 原样展示。
+
+**(f) 导出失败时的清场会 unlink 本次从未创建的名字。** `app_records_io.go` 第 134-137 行的
+`cleanup()` 无条件 `os.Remove(tmpDB)` + `os.Remove(tmpJSON)`；两处前置防线（第 125、131 行）
+是 `exists()`（`os.Stat`）**检查后动作**。落点：JSON 那条腿用的是第 163 行的 `os.WriteFile`
+（`O_CREATE|O_TRUNC`）——预检通过之后、写之前，第三方在那个名字上落了文件，本应用会
+**截断并接管**它，失败时再把它**删掉**。§6.63 / M344 把"覆盖或删除第三方文件"记为 **P0 形状**，
+本批 2 的 `landCacheSnapshot` 已经给了同一条修法（O_EXCL 认领 + 只处置证明得了的）。
+
+**(g) `beginJournal` 的留痕是裸 emit。** `app_history.go` 第 239-240 行写的是
+`fmt.Fprintf(os.Stderr, ...)` 之后 `a.emit(a.ctx, "app:error", ...)`，没有同文件第 189 行
+`warnBackground` 那句 `if a.emit != nil && a.ctx != nil`。可达路径不是假想：C3 裁定给
+"不承诺回撤的类（永久删除、Windows 回收站）"留的就是这一支留痕放行，
+而 `startup` 之前或测试里裸 `&App{}` 走到这一支就是 nil func 调用。
+
+**(h) 外部命令的 waiter 不在关闭排空里。** `app.go` 第 727-737 行 `startCmd` 起的 goroutine
+只做 `cmd.Wait()` 再调 `onExit`，**不挂任何 WaitGroup**；`app_lifecycle.go` 第 193 行的
+`shutdown` 只排 `a.wg`。⇒ 窗口关闭可以在 `onExit` 还没跑完时就释放句柄并返回，
+迟到的那条留痕（`warnRevealExit` → `warnBackground` → emit）丢在半路；
+`RevealPath` / `OpenPath` / `OpenTrash` 三条腿共用这一个入口。
+
+### 3.2 判据（八条修法 + 一条登记待裁）
+
+**M367 六条账本腿 + 两条回撤腿进中文壳。** 八处一律 `shellRPCError(err)`；`ListOpRecords`
+要先接住 `err` 再返回。★ 同时立一条**负侧**判据：`ClearOpRecords` 的 `claimMaintenance` 拒绝
+（第 313 行）与 `beginJournal` 的"账本不可用已拒绝执行"（第 235 行）**不许**一起包——
+那两句本来就是中文话术，包了会造出「中文（系统原文：中文）」的假话。
+
+**M368 拿不到主目录就不 exec。** darwin 与 linux 两臂改成先取 `os.UserHomeDir()`、
+拿不到就返回一句点名错误（「拿不到用户主目录，无法打开系统回收站：…」），**一条命令都不启动**；
+形状照 `app_lifecycle.go` 第 26 行。windows 臂不依赖 HOME，一字不动。
+
+**M369 只读目录夹具带 `!windows` 闸，Windows 那一格转真机清单。** 把 `TestSensitiveFallsBackToDefaultWhenUnwritable`
+整条搬进 `internal/fscase/fscase_unwritable_nix_test.go`（首行 `//go:build !windows`），
+原文件的其余格子（大小写实测、不留残渣、缓存一致性）**不动**——它们跨平台都成立，
+一文件一文件地加 tag 会把能跑的格子一起关掉。Windows 腿的对应判据落进 docs/05 W 组新行：
+真机上用只读卷 / ACL 造"写不进去的目录"，验 `Sensitive()` 必须退回 `Default()` 而不是猜。
+★ 读数代价写死：这一改让 windows 腿的用例清单**少一格**，三条腿自此不等量平移（本批 2 是第一条
+造成不等的修法，§6.67 逐腿重取，不许照抄"合计 +N"）。
+
+**M370 busy 的"在场判据"从返回值换成 -wal 实测，两条测试共用同一条裁决规则。** 两格都改成：
+先读 `-wal` 的实际字节数，再读返回值，四种组合只有一格该 Skip——
+`wal>0 && err==nil` ⇒ **FAIL**（前提在场而代码没报，正是变异形状）；
+`wal==0 && err==nil` ⇒ **SKIP**，归因句两条用**同一句话**；
+`err` 是 `ErrReclaimFailed` ⇒ 走原有断言（条目已删净、回执带条数、哨兵身份）；
+其它错误 ⇒ `Fatalf`（无从归因）。
+★ 这条**不是**"为了让门禁变绿把 Errorf 改成 Skip"：现读三腿该格都是真复现（交付前跑 `-v` 取
+"PASS 而非 SKIP"的读数），改后同一夹具仍给 PASS；改的是前提缺席时的裁决，而且顺带把
+"回收代码吞 busy"这一支从旧形状的 **Skip（杀不掉）** 抬成 **FAIL（杀得掉）**——判据变强，不变弱。
+两条另一处不统一（第二连接起不来时 m349 Skip、m347 Fatal）**如实保留**并说明理由：
+`internal/cache` 的夹具本来就用同一个驱动开自己的库，驱动缺席=夹具坏了，该 Fatal；
+根包那一格是跨包借驱动，缺席是真的可能。
+
+**M371 孤儿只给真要插入的行计。** 把 `OpsOrphaned++` 从"映射失败"那一句挪到"确实走到
+`insertOpRow`"之后（映射失败但整条被去重跳过的，一行都没新增，就不该报孤儿）。
+判据本体是一句回执契约：**同一份影像导第二次，`OpsAdded=0 / OpsSkipped=N / OpsOrphaned=0` 三者必须同时成立**。
+
+**M372 只删自己建的那件。** 两条腿：① 第 163 行的 `os.WriteFile(tmpJSON, …, 0o600)` 换成
+`os.OpenFile(tmpJSON, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)` 写后关 ⇒ "名字被占"从
+**截断别人的文件**变成**这次导出失败**；② 加 `madeDB / madeJSON` 创建标记，`cleanup()` 只删标记为真的那件。
+`.db` 那条腿的在场证明就是 `VACUUM INTO` 本身——它对已存在的目标直接报错（`app_records_io.go`
+第 123-124 行的注释原话），成功即"这名字是我们建的"。第 125、131 行的 `exists()` 预检**保留**
+（那是给用户的话术），但在册说明：安全判据已经从"预检"挪到"O_EXCL + 创建标记"，
+预检挡不住的是那个时间窗。
+
+**M373 留痕走统一出口。** 第 239-240 行那两行换成 `a.warnBackground("history", msg)`：
+stderr 那行逐字不变（tag 仍是 `history`）、事件仍发一条，差别只在于 nil 守卫不再是例外。
+★ 抽 `warnBackground` 的理由注释里已经写了（`warnLedger` 会多加一句"账本写入失败："，
+直接复用会造出"一条 Finder 启动失败被报成账本写入失败"那种假话）——这里要的正是它本体。
+
+**M374 waiter 计入关闭排空，但另立一个集合。** `startCmd` / `execRevealCmd` 加收一个
+`*App`（缝的签名同步），waiter 挂进 App 自己的 `cmdWg`；`shutdown` 在排完 `a.wg` 之后用
+**独立的短上限**排 `cmdWg`（`cmdDrainGrace`，var、默认 2 秒，形状照 `inflightDrainGrace`），
+超时走 `warnBackground` 留痕、不拦退出。
+★ 为什么不直接挂进 `a.wg`：那一格的 10 秒上限说的是"本次落账可能缺失"，而 Finder/xdg-open
+挂住既不该把关闭窗口拖到 10 秒，也不该触发那句**关于账本**的告警——两个集合、两句文案，
+各自说各自的事。
+
+**登记待裁（不修）：`scanKey` 粗粒度。** `internal/history/import.go` 第 148-154 行的自然键是
+`savedAt + roots + filters + groupsCount + filesCount`，不含 `paranoid / threads / origFiles / reclaimable`
+⇒ 外来影像里一条"同键但不同 paranoid"的扫描会被判成重复、整条抑制子行，并把它的 ops 关联到
+本地那条**另一套参数**跑出来的扫描上。为什么不本机拍板：加字段要动导入判重语义（匹配面一变，
+"重复导入"的判定跟着变），而"这种碰撞真发生过没有"需要**存量库读数**——和 M366 那一格同一种
+未兑现。两个取向连同代价一并登记：① 键补齐四字段（判重变严，历史重复导入的容忍度下降）；
+② 键不动、命中时逐字段比内容、不一致就按"新行"插（判重语义不变，代价是多一次内容比较与
+"同一扫描两条行"的可能）。
+
+### 3.3 探针（P-25 ~ P-34）
+
+| 编号 | 判据格 | 修前预期 |
+| --- | --- | --- |
+| P-25 | 账本句柄关掉后逐条走 `ListScanHistory` / `LoadScanHistory` / `DeleteScanHistory` / `ClearScanHistory` / `ListOpRecords` / `GetOpRecord` / 两条回撤入口，每条错误必须带中文外壳且原话仍在「系统原文」里 | **红**：八条腿现读全是裸原话 |
+| P-26 | 负侧钉子：`ClearOpRecords` 的在途拒绝与 `beginJournal` 的账本不可用拒绝，错误串里**不得**出现「系统原文」 | 绿（防 M367 顺手包错地方） |
+| P-27 | `t.Setenv("HOME","")` + 记录器桩住 `execRevealCmd` ⇒ `OpenTrash` 必须返回点名错误，且记录器里**零条命令** | **红**：改前 exec 出相对路径 `.Trash` |
+| P-28 | M369：windows 腿不再编进那一格；本机 darwin 腿该格读数不变 | 本机无动态读数（见 3.5 第 2 条） |
+| P-29 | M370 的在场判据本体：`wal>0 && err==nil` 必须 FAIL、`wal==0 && err==nil` 必须 SKIP，两格同一句话 | **红**：改前两格都没有这条分岔 |
+| P-30 | 同一份影像导两次 ⇒ 第二次回执 `OpsAdded=0 / OpsSkipped=N / OpsOrphaned=0` | **红**：`OpsOrphaned` 翻倍 |
+| P-31 | 导出窗口里第三方在 `<stem>.json.tmp` 上落了文件 ⇒ 导出失败、那文件**内容一字不变**、不留半件 | 新符号 ⇒ 无改前红（3.5 第 3 条），证据交变异 |
+| P-32 | 同一窗口里第三方占 `<stem>.db.tmp` ⇒ `cleanup()` 不得 unlink 它 | 同上 |
+| P-33 | 裸 `&App{}`（`emit=nil`、`ctx=nil`）走 `beginJournal` 的留痕放行支 ⇒ 不 panic、返回 `0,nil` | **红**：改前 nil func 调用 |
+| P-34 | 一条真在途的 reveal waiter 存在时：`waitGroupTimeout(&a.cmdWg, 10ms)` 必须 false，且 `shutdown` 返回时 `onExit` 已跑完 | **红**：改前 `cmdWg` 不存在 / 不计时 |
+
+★ P-27 的 windows 臂不成立（那一臂不吃 HOME）⇒ 用例里按 `runtime.GOOS == "windows"` 显式 Skip 并写明原因，
+不拿 darwin 的读数冒充三腿。★ P-31/P-32 需要一个"预检之后、创建之前"的卡点缝（生产恒 nil），
+新符号 ⇒ 修前必红不存在，先例是 `app.go` 里的 `scanAboutToSaveHook` 那段自陈。
+
+### 3.4 变异（预测集先写死，交付时对账）
+
+| 变异 | 预测变红 |
+| --- | --- |
+| MU-16 摘掉 `ListScanHistory` 一处的壳 | 只有 P-25 里对应那一格 |
+| MU-17 给 `claimMaintenance` 的拒绝也包上壳 | P-26 |
+| MU-18 `OpenTrash` 的 HOME 检查退回 `home, _ :=` | P-27 |
+| MU-19 `checkpointFn` 恒报 busy=0（回收代码吞标志） | P-29；★ 预测**旧形状杀不掉**（那时是 Skip），这一条是 M370 的立据 |
+| MU-20 `OpsOrphaned++` 挪回去重之前 | P-30 |
+| MU-21 `.json.tmp` 退回 `os.WriteFile` | P-31 |
+| MU-22 `cleanup()` 摘掉创建标记 | P-32 |
+| MU-23 `beginJournal` 退回裸 `a.emit` | P-33 |
+| MU-24 waiter 不挂 `cmdWg` | P-34 |
+
+★ 对账口径沿批 2：宽集一律重取（根包 `-run 'TestM359|TestM360|TestM361|TestM362|TestM363|TestM364|TestM367|TestM368|TestM370|TestM371|TestM372|TestM373|TestM374|TestCacheClear|TestClearOpRecords|TestImport|TestOpenTrash'`
+＋ `./internal/history/ -run 'TestImport|TestM363|M371'` ＋ `./internal/cache/ -run 'TestClearBusy|TestM347'`
+＋ `./internal/fscase/`），逐条记**预测集 / 实测集 / 差集**，不许只记杀了几条。
+还原一律 `cp`+`diff` 校验，**不用** `git checkout --`。
+
+### 3.5 边界与未兑现（划账时照抄，不许读成已通过）
+
+1. **M369 的 Windows 那一格本批拿不到读数**：本机只有 darwin，加 tag 之后 windows 腿是"这一格没跑"，
+   不是"这一格过了"。docs/05 的新行必须写明造法（只读卷或 ACL 拒写）与判据（退回 `Default()`），
+   并在 §6.67 记为未兑现。
+2. **M369 没有本机动态探针**：能给的只有门禁第 5 行（`GOOS=windows go vet` 仍绿 = 那一格被排除在
+   windows 编译单元之外后其它文件仍编得过）＋ 文件首行的静态读数。★ 不把它写成"P-28 通过"。
+3. **P-31 / P-32 的改前红不存在**（卡点缝是本批新符号），改前树连用例都编译不过 ⇒
+   按 `scanAboutToSaveHook` 的先例，这两格的"修对必红"证据由 MU-21 / MU-22 提供，
+   §6.67 要照这句话写，不写"修前已复现红"。
+4. **M370 不改生产代码**：它是一条测试形状改动，所以没有"改前红"这回事；它的证据是
+   MU-19 在旧形状下判 Skip、在新形状下判 FAIL 这一对读数。现读三腿该格的 busy 是否真复现，
+   交付前要各跑一次 `-v` 抄原文。
+5. **M374 的关闭窗口耗时是代价，不是收益**：`cmdDrainGrace` 设 2 秒意味着极端情况下（Finder 卡住）
+   关闭窗口要多等 2 秒才放行。真机上的实际等待时长本机测不到（CI 三腿都不起 GUI，
+   docs/05 §0.1 第 3 条在册）⇒ 挂 MAC/W 腿。
+6. `scanKey` 粗粒度按 R-8-3 **只登记**，本批不动码、不动文档；两个取向的代价写在 3.2 末尾，
+   裁定回来再另起一批。
