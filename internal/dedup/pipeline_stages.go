@@ -10,6 +10,12 @@ package dedup
 //   ① 外层局部变量改写成 `s.xxx`；② 取消检查点的 `return nil, failed, err`
 //   改成 `return err`（由 `Run` 统一返回 `nil, s.failed, err`）。
 // 验证它的判据是 `pipeline_behavior_lock_test.go`（提取前的行为锁）**逐字仍绿**。
+//
+// ★ 读法（E2，2026-10-01 第九轮修订批）：下面各阶段体标题注释里的「原 pipeline.go:NNN」
+// 一律指 **M341 拆分之前**的行号。现 `pipeline.go` 只剩 699 行，那些号（708/812/824/859 …）
+// 按号跳转会越界落空——它们记的是"这段语句从哪儿搬来"，是历史出处，不是当前定位；
+// 当前定位看各方法名本身（`stageDedupFileKey` / `stagePrefilter` / `stageFullHash` /
+// `groupByFullHash` / `emitGroups`）。
 
 import (
 	"context"
@@ -278,9 +284,10 @@ func (s *scanRun) stagePrefilter() error {
 				e.Size = actual
 				// REAL-1（2026-09-21 审查）：实占栏必须同步作废。Actual 是按**截断前
 				// 那份**测得的读数，留着它就成了"逻辑栏已纠正、实占栏没纠正"——
-				// 双口径并存的前提是两个口径各自说真话（I6），否则界面上一栏说真话、
+				// 双口径并存的前提是两个口径各自说真话（I6），否则一栏说真话、
 				// 另一栏冒充，比两处都错更难查。作废后按 ActualBytes() 的回退口径
-				// 退回逻辑大小，并由 AnyActualKnown 如实显示"未统计"。
+				// 退回逻辑大小，并由 AnyActualKnown 如实标成"未统计"（E1：界面当前
+				// 不渲染这个口径，属 M8；本处作废是数据侧义务，与界面接没接无关）。
 				e.ActualKnown = false
 				e.Actual = 0
 			}

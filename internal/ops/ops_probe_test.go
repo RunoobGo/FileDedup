@@ -157,7 +157,7 @@ func TestClaimDstIsBounded(t *testing.T) {
 			t.Errorf("错误应说明是到达递增上限，实际：%v", o.err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("claimDst 在候选名持续被占时不收敛（挂死）：同包 trash_linux.go:104 对同形状循环" +
+		t.Fatalf("claimDst 在候选名持续被占时不收敛（挂死）：同包 move.go:473 对同形状循环" +
 			"已给出结论——不设上限会让全部并发 goroutine 一起挂死（§15.0-A OPS-10）")
 	}
 }

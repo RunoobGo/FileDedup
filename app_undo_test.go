@@ -504,7 +504,7 @@ func TestUndoOperationItemMissingDestFails(t *testing.T) {
 // M79（2026-09-22）：第一道改比**原因码**（同 `TestUndoOperationNotUndoable` 的注释）；
 // 第二道比的「不存在」、第三道（在途，只断言被拒、不比串）都不出自那两句被搬家的中文 ⇒ 一字未动，
 // 也别把它们算进搬家对账里。同族还有一处「不可回撤」在 `TestUndoOperationItemSingleRestore`，
-// 钉的是 `app.go:2326` 那句**按状态**的拒绝，同理不计入。
+// 钉的是 `app_ops.go:467` 那句**按状态**的拒绝，同理不计入。
 func TestUndoOperationItemGuards(t *testing.T) {
 	a, _ := newHistApp(t)
 	opID := seedDoneOp(t, a, "delete", false, []string{"/nn/x.bin"}, []string{""}, 3)

@@ -213,7 +213,7 @@ func TestM377IdenticalParamsStillDedup(t *testing.T) {
 
 // TestM377SameKeyInsideOneImageStillDedup 是 P-42 负控制（改前即绿）：
 // 同一份外来文件**内部**有两条自然键完全相同的扫描 ⇒ 第二条仍认成重复
-// （import.go:410 那行 `localScans[k] = histID` 的行为不许被本批改掉）。
+// （import.go:426 那行 `localScans[k] = histID` 的行为不许被本批改掉）。
 func TestM377SameKeyInsideOneImageStillDedup(t *testing.T) {
 	local := newStoreAt(t, t.TempDir(), "local.db")
 	src := newStoreAt(t, t.TempDir(), "src.db")

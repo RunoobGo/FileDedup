@@ -4,7 +4,7 @@ package cache
 // Store 的 UPSERT 无条件写 `full=excluded.full`。当第二轮对同一路径只算到 partial
 // （大文件预筛后被淘汰，Entry.Full=nil → SQL NULL）时，它会把上一轮已算好的**有效**
 // full 抹成 NULL —— 下一次扫描本该直接命中 full 免算，却被逼着在阶段 3 重算全量。
-// partial 早就用 CASE 防了同款覆盖（cache.go:350），full 却没有。修法比照 partial：
+// partial 早就用 CASE 防了同款覆盖（cache.go:491），full 却没有。修法比照 partial：
 // excluded.full 为 NULL 时保留原值。方向安全：从不写入错误的 full，只是不丢已有的。
 
 import (

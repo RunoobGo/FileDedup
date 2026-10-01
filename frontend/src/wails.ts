@@ -112,8 +112,13 @@ export interface GroupView {
   reclaimable: number
   // 实占口径（M6-P2）。actualKnown=false 表示组内**没有任一成员**读到过实占
   // （历史恢复、或该卷不提供 st_blocks/压缩尺寸）：此时 reclaimableActual 完全
-  // 来自逻辑回退，界面须显示"实占未统计"而不是这个数。部分成员 unknown 时
-  // 按逻辑大小计入，数字仍是可信下界（宁可少说，不把未知算成 0）。
+  // 来自逻辑回退，**不得当成实占播报**。部分成员 unknown 时按逻辑大小计入，
+  // 数字仍是可信下界（宁可少说，不把未知算成 0）。
+  // ★ E1（2026-10-01 第九轮审查）：`frontend/src` 里**没有任何组件读取这两个字段**
+  // （全目录检索只命中本文件类型声明；另出现的两处是生成绑定 `frontend/wailsjs/go/models.ts`
+  // 和测试桩，都不渲染）。结果页"实占未统计"横幅属 M8、未做（04 §6.9.3 兑现边界第 1 条）。
+  // 这两个字段是留给 M8 的接线位，不是已生效的防线；组件里将来若渲染，必须成对消费，
+  // 不许单拿 reclaimableActual 出数。
   reclaimableActual: number
   actualKnown: boolean
   size: number

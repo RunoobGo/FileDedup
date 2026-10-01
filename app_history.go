@@ -66,8 +66,11 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 		reclaim += g.Reclaimable
 		// M6-P2：历史库没有实占口径，LoadScan 按"成员全部 unknown"回填，
 		// 所以这里两数**必然相等**。相等不是"实占恰好等于逻辑大小"的结论，
-		// 而是"没统计过"——界面须靠成员的 ActualKnown 判定并显示"未统计"，
-		// 不得把这个数当成实占播报（与 M6-P4 三项计数同一处置）。
+		// 而是"没统计过"——消费方须靠成员的 ActualKnown 判定，不得把这个数
+		// 当成实占播报（与 M6-P4 三项计数同一处置）。
+		// ★ E1（2026-10-01 第九轮审查）：界面腿**尚未接**——结果页当前不渲染实占
+		// 口径，"显示'未统计'"属 M8（04 §6.9.3 兑现边界第 1 条 :1832）。本函数的
+		// 回填只是把"没统计过"如实带到 JSON，不是一条已经生效的界面防线。
 		reclaimActual += g.ReclaimableActual
 		for _, f := range g.Files {
 			byID[f.ID] = f

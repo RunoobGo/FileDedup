@@ -2,11 +2,11 @@ package ops
 
 // M113（第 2 轮 §23.2，04 §6.11 OPS-14e）：undoMove 必须把 MoveFile 的落点交回去。
 //
-// MoveFile 有两条"返回 dst 且 err != nil"的部分成功路径（move.go:60-65 复制期间源被顶替、
-// :66-72 删源失败）：盘上已经是两份，`dst` 是这份副本在整条链路上唯一的留痕。
+// MoveFile 有两条"返回 dst 且 err != nil"的部分成功路径（move.go:110-117 复制期间源被顶替、
+// :118-124 删源失败）：盘上已经是两份，`dst` 是这份副本在整条链路上唯一的留痕。
 // 而 undo.go:197-199 改前是 `return "", err`，把落点丢在函数里 ⇒
-// app 层那两格兜子（undoExecuteItem:2255 连带 restored 一起返回、
-// undoFailure:2211-2215 见 restored 非空就补"（数据已在 …）"，M86 立的规矩）
+// app 层那两格兜子（undoExecuteItem 现 app_ops.go:378 起、连带 restored 一起返回、
+// undoFailure 现 app.go:1083 起、见 restored 非空就补"（数据已在 …）"，M86 立的规矩）
 // 永远拿不到 target，用户看到的是一条不带落点的纯失败。
 //
 // 判据落在**返回值**而不是错误文本：MoveFile 的文本本来自带落点，

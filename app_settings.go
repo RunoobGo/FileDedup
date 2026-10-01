@@ -14,6 +14,7 @@ import (
 	"filededup/internal/cache"
 	"filededup/internal/dedup"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -36,8 +37,13 @@ func (a *App) GetSettings() Settings {
 		// 异常，下一次保存又把它写回磁盘，原始证据就此消失。
 		// 现在改名为 .corrupt 留证（用户仍可手工恢复），并把失败原因报给界面。
 		msg := "设置文件无法解析，本次使用默认设置"
-		if rerr := os.Rename(path, path+".corrupt"); rerr == nil {
-			msg += "，损坏文件已留证为 settings.json.corrupt"
+		// E8 / 拟 M397（2026-10-01 第九轮 P2-2）：留证这一步**自己**也会销毁证据——
+		// os.Rename 覆盖目标，于是第二次损坏会把第一次那份（唯一能解释"为什么坏"的物证）抹掉。
+		// 落点因此改成"撞名就让位"（判据见 corruptBackupPath），且提示那句写的是**真实落点**
+		// （与 M285 缓存隔离件点名落点同一形状），否则用户按 settings.json.corrupt 去找会扑空。
+		target := corruptBackupPath(path, time.Now())
+		if rerr := os.Rename(path, target); rerr == nil {
+			msg += "，损坏文件已留证为 " + filepath.Base(target)
 		}
 		if a.emit != nil {
 			a.emit(a.ctx, "app:error", map[string]string{"error": msg + "（" + jerr.Error() + "）"})
@@ -45,6 +51,34 @@ func (a *App) GetSettings() Settings {
 		s = defaultSettings()
 	}
 	return s
+}
+
+// corruptBackupPath 为损坏的设置件挑一个**不会覆盖上一次证据**的落点（E8 / 拟 M397）。
+//
+// 取向（为什么不选"覆盖最新"）：这份文件是唯一能解释"设置为什么坏"的物证，而 M10b 立留证
+// 这条分支防的正是"证据消失"——让加固动作自己销毁证据不成立。
+//
+// ★ 时钟由参数注入而不是内部调 time.Now：同一秒内连续第二次损坏时秒级时间戳必然撞名，
+//
+//	这一格只有把时钟钉进那一秒才测得到，否则判据是摆设。
+//
+// ★ Stat 报**任何**错都不算"落点空闲"，只有 ErrNotExist 才算：目录权限出问题的时候，
+//
+//	把"问不动"读成"没有"会让重命名撞在一个真实存在、只是统计失败的文件上。
+func corruptBackupPath(path string, now time.Time) string {
+	base := path + ".corrupt"
+	if _, err := os.Stat(base); errors.Is(err, fs.ErrNotExist) {
+		return base // 盘上还没有旧证据：沿用 M10b 起那个固定名（既有恢复习惯与手册都认它）
+	}
+	sec := now.Unix()
+	for i := int64(0); i < 60; i++ {
+		cand := fmt.Sprintf("%s-%d", base, sec+i)
+		if _, err := os.Stat(cand); errors.Is(err, fs.ErrNotExist) {
+			return cand
+		}
+	}
+	// 60 格全占（同一秒内第 61 次损坏）：退到纳秒位。仍然宁可多留一份，不覆盖。
+	return fmt.Sprintf("%s-%d", base, now.UnixNano())
 }
 
 // SaveSettings 保存设置到 settings.json。

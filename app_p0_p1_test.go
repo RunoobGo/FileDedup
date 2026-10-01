@@ -106,7 +106,7 @@ func newProbeApp(t *testing.T) (*App, *eventRecorder, string) {
 //
 // 为什么必须一起铺三件（resultsReady / groups / 账本）：ExecuteOperation 的门禁链
 // 是 opsRunning → scanInFlight → resultsReady → len(groups) → 写前账本
-// （app.go:1805-1820、:1776-1787）。缺一件，请求就停在互斥门**下游**，
+// （app_ops.go:44-70 的门禁链，写前账本腿在 :183 的 beginJournal 调用）。缺一件，请求就停在互斥门**下游**，
 // 把 `if a.scanInFlight` 整条删掉用例也不会红（改前真读数：**-count=6 全绿）。
 //
 // 组内两个成员都指向不存在的路径：清理必然 ENOENT → Skipped，不必真造文件
@@ -264,7 +264,7 @@ func TestScanAfterCancel(t *testing.T) {
 // M93 补强（不是修死门禁 —— 变异 M-R1-c 下改前这条也 6/6 转红，它一直是活的；
 // 这里只把**归因**从侥幸变成保证）：改前只断「err != nil」而不看拒因，并用
 // sleep+轮询 Status 等上一次扫描收尾，而 Status 变 Done 早于 scanInFlight 复位
-// （复位在 app.go:669）。落在那个窗口里时，拒因来自上游的 scanInFlight 门，
+// （复位在 app_scan.go:134）。落在那个窗口里时，拒因来自上游的 scanInFlight 门，
 // 删掉 opsRunning 门禁这条也不会红。现在等终止事件（scan:done 必晚于复位）
 // 并断拒因，另加一条锁内自检钉住「上游门是开的」。
 func TestStartScanRejectedWhileOpsRunning(t *testing.T) {

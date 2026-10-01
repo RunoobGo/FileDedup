@@ -203,7 +203,7 @@ func identityStill(path string, id fsid.ID) bool {
 //   - 路径被 rename 换成另一个 inode ⇒ 必须拦截，放行就是错删第三方文件。
 //
 // 混在一起的后果不只是文案难看：Skipped 与 OK 同路进 app.go 的 gone 集合
-// （app.go:1898-1901）去清结果集与 byID，记 Failed 则留下一个盘上已不存在的路径。
+// （app_ops.go:237-240）去清结果集与 byID，记 Failed 则留下一个盘上已不存在的路径。
 //
 // gone 的判据用 errors.Is(err, os.ErrNotExist)：unix 腿（fsid_unix.go:27）返回
 // os.Lstat 的 *PathError，Windows 腿（fsid_windows.go:128）返回 syscall.Errno，
@@ -219,7 +219,7 @@ func identityStill(path string, id fsid.ID) bool {
 //   - executor 那六处不是直读，而是共用 executor.go:371 的 guardIdentity（它读 identityCheck）；
 //   - 2026-09-22（M114 残半 a）之后，HardlinkMerge 与 SymlinkMerge 的四道守卫也不再
 //     用本视图，它们改走 identityGuardSentence；剩下的 identityStill 用户是
-//     move.go:72（跨卷删源前）、undo.go:173（回撤回填前）、symlink.go:117（步骤 5 终局复核）、
+//     move.go:110（跨卷删源前）、undo.go:225（回撤回填前）、symlink.go:135（步骤 5 终局复核）、
 //     claimedDst.stillOurs 与 merge_guard.go:44/:90/:133 —— 各自的"消失"处置语义并不相同，
 //     其中 merge_guard.go:90 是**刻意**的 fail-closed，与 identityStill 的 fail-open 相反。
 func identityStatus(path string, id fsid.ID) (still bool, gone bool) {

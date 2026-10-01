@@ -111,9 +111,12 @@ else
 fi
 
 # 2~5) 编译与三平台 vet
-# 三行的 GOOS/GOARCH 与 CI 逐字对齐：`ci.yml:98` 是 `GOOS=windows GOARCH=amd64`、
-# `:101` 是 `GOOS=darwin GOARCH=arm64`，linux 行取 CI 原生 job（ubuntu-latest = amd64）
-# 的平台。★ 只钉 GOOS 不钉 GOARCH 是不够的：本机 GOARCH=arm64 会被继承，
+# 三行的 GOOS/GOARCH 与 CI 逐字对齐：CI 的 windows 腿是 `GOOS=windows GOARCH=amd64`、
+# darwin 腿是 `GOOS=darwin GOARCH=arm64`，linux 行取 CI 原生 job（ubuntu-latest = amd64）
+# 的平台。★ 行号不写死（2026-10-01 第九轮修订批 E4：原写 `ci.yml:98`/`:101`，b3e3a4a 加
+# 了一个步骤就把它们挪成了 :100/:103，注释却留在旧值上）。要重数跑：
+#   grep -n 'GOOS=\(windows\|darwin\) GOARCH=[a-z0-9]* go vet' .github/workflows/ci.yml
+# ★ 只钉 GOOS 不钉 GOARCH 是不够的：本机 GOARCH=arm64 会被继承，
 # 于是 windows 行跑成 windows/arm64、与 §3.3 那份配方（钉了 GOARCH）不同口径。
 # 列序是 "序号 行名 GOOS GOARCH"：取错列会把行名当成 GOOS 交给 go，
 # 三行会以「build constraints exclude all Go files」恒红（本文件首跑即栽在此），

@@ -5,7 +5,7 @@ package ops
 // 命中 ENOENT，把一条**已经成功**的腿在结果账里覆写成 failed（用户看到"清理失败"，
 // 实际早已清理），并可能重复计入 TrashedBytes/Reclaimed。
 //
-// 修法与 planOpItems（app.go:2576）/ 选择集去重（app.go:1664）同源：入口按 fid 去重。
+// 修法与 planOpItems（app.go:1013）/ 选择集去重（app_result.go:306）同源：入口按 fid 去重。
 // 去重后进度分母仍是 len(op.FileIDs)，故跳过重复项时要 report("") 推一格，
 // 与既有"文件不在结果集"分支同款，保证 n 走到 total。
 

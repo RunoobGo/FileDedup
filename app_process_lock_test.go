@@ -105,7 +105,7 @@ func TestWarmSensitivityIsCacheHitAfterWarm(t *testing.T) {
 // 里那次 `ops.ApplyProcessPolicy` 没有：它跑在 `a.opsRunning = true` **之后**。
 // 后果不是卡住一把锁（那时 `a.mu` 已经放开），而是卡住整个操作面——
 // 探测永不返回 ⇒ `resetOps` 永不执行 ⇒ `opsRunning` 永久为真 ⇒
-// 此后每次清理（app.go:1823）与每次新扫描（app.go:611）都被拒，
+// 此后每次清理（app_ops.go:46）与每次新扫描（app_scan.go:52）都被拒，
 // 而 `CancelOperation` 只 cancel 一个没人读的 `opCtx`，解不了这一步。
 
 // TestExecuteOperationProbesBeforeOpsRunning 钉"探测发生在占互斥位之前"。

@@ -248,7 +248,9 @@ func (s *Store) LoadScan(id int64) (ScanMeta, []*model.DuplicateGroup, error) {
 		g := &model.DuplicateGroup{GroupID: uint64(gr.id), Reclaimable: gr.reclaimable}
 		// 实占（M6-P2）：库里没有这个口径，恢复时**不拿逻辑值冒充已统计的实占**，
 		// 而是让成员全部保持 ActualKnown=false——组的实占因此恒等于逻辑口径，
-		// 且界面可凭"组内无一成员 known"如实显示"实占未统计"。
+		// 且消费方可凭"组内无一成员 known"如实标成"实占未统计"。
+		// E1（2026-10-01 第九轮审查）：界面当前不渲染这个口径（属 M8，§6.9.3 兑现边界
+		// 第 1 条），所以这里保证的是**下发数据不撒谎**，不是界面上已经有了一条防线。
 		g.ReclaimableActual = gr.reclaimable
 		copy(g.Hash[:], gr.hash)
 		frows, err := s.db.Query(`SELECT id, path, size, mtime_ns FROM hist_files

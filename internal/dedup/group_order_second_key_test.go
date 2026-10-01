@@ -1,6 +1,6 @@
 package dedup
 
-// M137（第 3 轮 §24.4 DDP-3）：排序**第二级键**（成员数降序，pipeline.go:809-811）
+// M137（第 3 轮 §24.4 DDP-3）：排序**第二级键**（成员数降序，`pipeline_stages.go` 里 `sort.Slice(s.groups` 块的 `len(...Files)` 那一腿）
 // 每一对组比较都会被执行到，却从来没有 decisive 过。现有夹具 tiePayloads 是
 // A=3×300KiB、B=C=2×600KiB：删掉整级之后 A 仍由第三级键落在原位
 // （组内最小路径 m-a1 < y-c1 < z-b1），输出序逐格相同 ⇒ 变异 R3-MU3 全绿
@@ -13,7 +13,7 @@ package dedup
 //	第二级（成员数降序）  ：Q 3 个 > P 2 个 ⇒ 只有这一级能把 Q 提到前面
 //	第三级（组内最小路径）：a-p1.bin < b-q1.bin ⇒ 第二级一旦被删，P 就被提前
 //
-// 期望序 [Q, P] 完全由第二级给出 ⇒ 删 pipeline.go:809-811 必须红在本用例，
+// 期望序 [Q, P] 完全由第二级给出 ⇒ 删 `sort.Slice(s.groups` 块里 `len(...Files)` 那一腿必须红在本用例，
 // 而 TestGroupOrderAndIDsAreDeterministic 继续绿（那个反差正是 M137 记的形状）。
 // ★ 「可释放量相同、成员数不同」这一格由本用例独家钉住，M137 钉的就是这一格；
 // 既有那条的 want 一字不改，它继续钉第一、三级。

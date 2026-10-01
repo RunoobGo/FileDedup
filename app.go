@@ -100,9 +100,12 @@ type GroupView struct {
 	Reclaimable uint64 `json:"reclaimable"`
 	// ReclaimableActual/ActualKnown 实占口径（M6-P2）。ActualKnown=false 表示
 	// 组内**没有任一成员**读到过实占（历史恢复、或该卷不提供 st_blocks/
-	// 压缩尺寸），此时 ReclaimableActual 完全来自逻辑回退，界面必须显示
-	// "实占未统计"而不是这个数。部分成员 unknown 时按逻辑大小计入，
-	// 数字仍是可信下界（宁可少说，不把未知算成 0）。
+	// 压缩尺寸），此时 ReclaimableActual 完全来自逻辑回退，**不得当成实占播报**。
+	// 部分成员 unknown 时按逻辑大小计入，数字仍是可信下界（宁可少说，不把未知算成 0）。
+	// ★ 界面现状（E1，2026-10-01 第九轮审查）：结果页**当前不渲染实占口径**，"据此显示
+	// '实占未统计'"整条属 M8、未做——04 §6.9.3 兑现边界第 1 条（:1831-1832）那句
+	// "当前界面仍只显示逻辑口径"是唯一真话。所以这两个字段是**留给 M8 的接线位**，
+	// 不是已经生效的防线；判据目前只在 JSON 下发与 fdd-cli 报告一侧成立。
 	ReclaimableActual uint64     `json:"reclaimableActual"`
 	ActualKnown       bool       `json:"actualKnown"`
 	Size              uint64     `json:"size"`

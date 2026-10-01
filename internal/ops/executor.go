@@ -391,7 +391,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 			// o.dst 一直是空串，所以这一位在别处是惰性的。
 			// 落点进 `dest_path` 列不会虚增收益也不会凭空多出一个可回撤目标：
 			// reclaimed 只 SUM state=done（oplog.go:129-130），回撤候选只认
-			// done / undo-failed（app.go:2095、:2174）。
+			// done / undo-failed（app_ops.go:345、:465）。
 			emitItem(ItemResult{OrigPath: toProcess[i].Path, DestPath: o.dst,
 				State: "failed", Err: o.err})
 		}
@@ -406,7 +406,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	//     VerdictSkipped、delete 分支的 os.IsNotExist→Skipped 同一个形状，目标已达成；
 	//   - 被 rename 换成另一个 inode ⇒ 必须拦截，放行就是错删第三方文件。
 	// 混记 Failed 的代价不只是文案：Skipped 与 OK 同路进 app.go 的 gone 集合去清
-	// 结果集与 byID（app.go:1898-1901），记 Failed 就在结果集里留一个盘上没有的路径。
+	// 结果集与 byID（app_ops.go:237-240），记 Failed 就在结果集里留一个盘上没有的路径。
 	//
 	// M114（04 §6.11 OPS-13b，设计段 §23.3）在这两格之外补第三格：**读不动身份**
 	// （EACCES/EIO/ESTALE/ENOTDIR，或原先能解析现在解析不出）。它既不是"已经没了"，
@@ -458,7 +458,7 @@ func Execute(opts Options, op model.OpRequest) model.OpsResult {
 	// 重算期间路径可以被 rename 换成另一个对象，哈希照样通过。修前这里 `v, _ :=` 把身份丢掉，
 	// 于是 delete 这条**唯一不可逆**的腿变成：复核的是 A，动手删的是按路径找到的 B。
 	// 只有 delete 消费它——hardlink/symlink 的破坏性改名在 Merge 内部各自还有一道紧贴的守卫
-	// （move.go:125 / symlink.go:84 的 identityGuardSentence），move/trash 根本不接这道复核。
+	// （move.go:163 / symlink.go:84 的 identityGuardSentence），move/trash 根本不接这道复核。
 	guardContent := func(i int, e *model.FileEntry) (bool, fsid.ID) {
 		if beforeActContentRecheck != nil {
 			beforeActContentRecheck(e.Path)

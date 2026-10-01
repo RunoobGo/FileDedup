@@ -255,7 +255,7 @@ func (s *execScope) execHardlink() {
 		// M91：dup 侧同样要内容级复核——HardlinkMerge 会用源覆盖 dup 位置上的
 		// 那份数据，就地改写过的 dup（同一个 inode）光靠身份复核挡不住。
 		// vid 不消费（R1-1 只补 delete 这一格）：真正销毁数据的改名在 HardlinkMerge 内部，
-		// 它自己在 rename 前一行跑 identityGuardSentence（move.go:125），已经紧贴动作。
+		// 它自己在 rename 前一行跑 identityGuardSentence（move.go:163），已经紧贴动作。
 		if handled, _ := s.guardContent(i, e); handled {
 			return
 		}

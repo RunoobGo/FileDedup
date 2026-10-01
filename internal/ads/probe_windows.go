@@ -29,7 +29,7 @@ type win32FindStreamData struct {
 
 // Win32 ABI 契约：尺寸一偏离，系统调用就会朝 Go 变量里多写/少写字节——少写只是
 // 读错字段，多写直接越界踩坏栈。8 + 296*2 = 600，与 C 侧逐字节等值。
-// 手法照 internal/fsid/fsid_windows.go:41-53（那里也是先踩过一次布局错）。
+// 手法照 internal/fsid/fsid_windows.go:46-50（那里也是先踩过一次布局错）。
 var (
 	_ [600 - unsafe.Sizeof(win32FindStreamData{})]byte
 	_ [unsafe.Sizeof(win32FindStreamData{}) - 600]byte

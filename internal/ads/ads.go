@@ -138,7 +138,7 @@ type Outcome struct {
 
 const (
 	reasonNamed = "文件含备用数据流，去重会丢失备用流内容，已拒绝操作"
-	// 判不了就拒：与 internal/ops/verify.go:104-108 的同族决策同向——
+	// 判不了就拒：与 internal/ops/verify.go 的"判不了就拦"决策同向（`VerdictUnverifiable` 返回腿现读 :60）——
 	// "宁可拦一次让用户重扫，也不放行一次可能覆盖他人文件的操作"。
 	reasonUnknownFmt = "无法确认文件是否存在备用数据流（%s），为避免丢失其内容已拒绝操作"
 )

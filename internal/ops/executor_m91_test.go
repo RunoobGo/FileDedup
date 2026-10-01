@@ -6,7 +6,7 @@ package ops
 //
 // 症状不是「没复核」，而是「复核的口径不对」：
 //
-//	校验循环（executor.go:266）✅ → [用户看结果 / 勾选项 / 点执行：**无界时间**] →
+//	校验循环（executor.go:301）✅ → [用户看结果 / 勾选项 / 点执行：**无界时间**] →
 //	  guardIdentity ✅ → guardContent（修前不存在）→ os.Remove / HardlinkMerge / SymlinkMerge
 //
 // guardIdentity 读的是 `(dev,ino)`。这个索引的定义域只到「同时存活的对象」
