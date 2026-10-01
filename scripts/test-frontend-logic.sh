@@ -369,6 +369,23 @@ wiring_count 'src/views/RecordsView.vue' ':disabled="store.busy || clearingOps"'
 	'清空清理记录的入口与确认两枚按钮都追加在途标记（M365：缺一枚就还剩一次并发机会）'
 wiring_window 'src/views/RecordsView.vue' 'await store.clearOps()' 5 'confirmClearOps.value = false' \
 	'清理记录确认态在 RPC 落定之后才关（M365：同上）'
+# ---- P-47（第九轮批 A2，拟 M381）：扫描历史的「确认清空」四层防线 ----
+# 报告 P1-2：清空清理记录那一条腿有四层（后端 claimMaintenance + store guard + 按钮
+# :disabled + 复位时机），扫描历史的删除/清空两条腿**四层里只有一层**（后端都没有，
+# 是本批 A2 后端补的）。★ .vue 与 pinia store 打不进 node --test（M116/M118 同族限制）
+# ⇒ 下面全部是**静态接线锚**，不得读作行为级红；行为半边由 P-45/P-46 的后端判据兜住。
+wiring 'src/views/RecordsView.vue' 'const clearingHistory = ref(false)' '' \
+	'清空扫描历史有在途标记（M381：形状同本页 clearingOps）'
+wiring_count 'src/views/RecordsView.vue' ':disabled="store.busy || clearingHistory"' 2 \
+	'清空历史的入口与确认两枚按钮都追加在途标记（M381：改前这两枚根本没有 :disabled）'
+wiring_window 'src/views/RecordsView.vue' 'await store.clearHistory()' 5 'confirmClear.value = false' \
+	'历史确认态在 RPC 落定之后才关（M381：改前写在 await **之前**，双击会并发发出第二次清空）'
+wiring_window 'src/views/RecordsView.vue' 'await store.clearHistory()' 3 '} finally {' \
+	'复位落在 finally 里（M381：只挪到成功腿的话，后端回绝那一路会把按钮永久卡灰）'
+wiring 'src/stores/scan.ts' "if (!guard('清空全部历史')) return" '' \
+	'clearHistory 走 store 的同一道忙门（M381：改前两条历史腿都绕过 guard，与 clearOps 不同形）'
+wiring 'src/stores/scan.ts' "if (!guard('删除历史记录')) return" '' \
+	'deleteHistory 走 store 的同一道忙门（M381：同上）'
 
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2

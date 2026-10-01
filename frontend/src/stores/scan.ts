@@ -462,7 +462,11 @@ export const useScanStore = defineStore('scan', () => {
     startScan()
   }
 
+  // M381（第九轮批 A2）：这两条腿原先绕过了 guard —— 与 clearOpRecords 不同形，
+  // 于是"连点在界面先被置忙再复位"和"操作途中整表删除历史"两道都没人挡。
+  // 后端的 claimMaintenance 现在会回绝，但那一层只在失败时才弹 toast，不是防线的前两层。
   async function deleteHistory(id: number) {
+    if (!guard('删除历史记录')) return
     try {
       await api.deleteScanHistory(id)
       if (histResult.value?.id === id) histResult.value = null
@@ -473,6 +477,7 @@ export const useScanStore = defineStore('scan', () => {
   }
 
   async function clearHistory() {
+    if (!guard('清空全部历史')) return
     try {
       await api.clearScanHistory()
       histResult.value = null // 当前结果集仅断开历史联动，仍可继续使用

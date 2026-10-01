@@ -116,7 +116,15 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 
 // DeleteScanHistory 删除一条历史；若正是当前结果集的来源，仅断开联动
 // （内存结果仍可看可清，只是后续裁剪不再回写）。
+//
+// M381（第九轮批 A2）：这条腿原先**一条闸都不接** —— 报告 P1-2 的"确认清空"四层防线
+// 缺的就是后端这一层。现在与 ClearOpRecords 同形：claimMaintenance 占位期间做 SQL
+// （闩不是锁，库操作在 a.mu 之外，见 app.go 的 maintaining 注释）。
 func (a *App) DeleteScanHistory(id int64) error {
+	if err := a.claimMaintenance("删除历史记录", "删除历史记录"); err != nil {
+		return err
+	}
+	defer a.releaseMaintenance()
 	hs := a.histSnapshot()
 	if hs == nil {
 		return fmt.Errorf("历史库不可用")
@@ -133,7 +141,14 @@ func (a *App) DeleteScanHistory(id int64) error {
 }
 
 // ClearScanHistory 清空全部扫描历史（当前结果集仅断开联动）。
+//
+// M381：同 DeleteScanHistory —— 整表删除必须与扫描写回、清理逐项落账、回撤、
+// 以及另一项维护互斥，否则"清空成功"会把一笔正在落账的扫描的归属抽走。
 func (a *App) ClearScanHistory() error {
+	if err := a.claimMaintenance("清空全部历史", "清空全部历史"); err != nil {
+		return err
+	}
+	defer a.releaseMaintenance()
 	hs := a.histSnapshot()
 	if hs == nil {
 		return fmt.Errorf("历史库不可用")

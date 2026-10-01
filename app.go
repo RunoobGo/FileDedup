@@ -288,7 +288,8 @@ type App struct {
 	opsCancel    context.CancelFunc // 当前清理操作的取消函数（P2：可中止）
 	taskSeq      atomic.Uint64      // 任务/操作序号（P3：taskID 唯一性）
 
-	// maintaining 是**维护类动作**（清空缓存 / 清空清理记录）的在途标记，空即无。
+	// maintaining 是**维护类动作**（清空缓存 / 清空清理记录 / 删除·清空扫描历史）的在途标记，空即无。
+	// 谁问它、谁没问 —— 判据在 claimMaintenance 的「覆盖清单」注释里，不在这里复述。
 	// M359（第八轮批 2）：这两件各自要动 hash_cache 整表或 op_records 整表，而扫描的
 	// 写回腿、清理的逐项落账腿吃的正是同一份磁盘状态——原先两个维护口一条闸都不接
 	// （app_settings.go 里 opsRunning/scanInFlight 命中数为 0），而 StartScan 与
@@ -372,12 +373,22 @@ func NewApp() *App {
 	return a
 }
 
-// claimMaintenance 占住一项维护动作（清空缓存 / 清空清理记录）。
+// claimMaintenance 占住一项维护动作（清空缓存 / 清空清理记录 / 删除·清空扫描历史）。
 //
-// 三问与置位在**同一个** a.mu 临界区里完成，与 StartScan / ExecuteOperation 自己的
-// 那段 check-and-set 同锁串行 ⇒ 双向闭合：维护先占住则扫描/清理被拒，扫描或清理先起跑
-// 则维护被拒。原样分两段（先问再删）时，中间窗口足够放行一笔新清理，而它的账会被这次
-// 整表删除抽走（M364 的取证见设计段 §2.1(f)）。
+// 三问与置位在**同一个** a.mu 临界区里完成，与请求方自己的那段 check-and-set 同锁串行
+// ⇒ 双向闭合：维护先占住则请求方被拒，请求方先起跑则维护被拒。原样分两段（先问再删）时，
+// 中间窗口足够放行一笔新清理，而它的账会被这次整表删除抽走（M364 的取证见设计段 §2.1(f)）。
+//
+// ★ **覆盖清单本身是判据**（第九轮批 A1/A2，拟 M380/M381）：这一句在 M359 落地时写作
+//
+//	"双向闭合：维护先占住则扫描/清理被拒"，而当时真正问 `maintaining` 的只有 StartScan 与
+//	ExecuteOperation 两处 —— 两条回撤腿（UndoOperation / UndoOperationItem）和删除/清空
+//	扫描历史都读不到这个闩，话术比代码多报了一半。本批补齐后的**真实**清单：
+//	   - 已接闩：扫描（app_scan.go）、清理（app_ops.go ExecuteOperation）、
+//	     回撤两条腿（app_ops.go）、删除/清空扫描历史（app_history.go）、清空清理记录、清空缓存
+//	   - **未接闩**：载入历史（LoadScanHistory 只问 opsRunning/scanInFlight）、导出/导入
+//	     （app_records_io.go 只问 opsRunning）。后果与裁定去向登记在 `docs/04` 号表。
+//	清单要跟着代码走，不是代码跟着清单走（M210）。
 //
 // 两个名字分开给：
 //   - name   写进 a.maintaining，是"别人被拒时听到的那半句"里的事名（要短、要说得出在等什么）

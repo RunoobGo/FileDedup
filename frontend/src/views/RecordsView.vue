@@ -24,6 +24,8 @@ const toast = useToastStore()
 const tab = ref<'scans' | 'ops'>('scans')
 // ConfirmDialog 是清理操作专用（勾选数/移动目标耦合），历史/记录的确认用两步式行内确认
 const confirmClear = ref(false)
+// M381：扫描历史"确认清空"的在途标记（形状同本页的 clearingOps）
+const clearingHistory = ref(false)
 
 onMounted(() => {
   store.refreshHistory()
@@ -49,8 +51,16 @@ function del(m: HistoryMeta) { store.deleteHistory(m.id) }
 
 async function clearAll() {
   if (!confirmClear.value) { confirmClear.value = true; return }
-  confirmClear.value = false
-  await store.clearHistory()
+  // M381（第九轮批 A2）：形状逐字对齐 clearAllOps —— 改前确认态写在 await **之前**，
+  // 请求还在路上入口钮就复活，连点会并发发出第二次 ClearScanHistory。
+  if (clearingHistory.value) return
+  clearingHistory.value = true
+  try {
+    await store.clearHistory()
+  } finally {
+    confirmClear.value = false
+    clearingHistory.value = false
+  }
 }
 
 // ---------- 清理记录（功能 4） ----------
@@ -283,10 +293,12 @@ function destSummary(it: OpRecordItem): string {
            而不是只挂在 title 上等 OS 绘制（M293 证过那层浮窗合成不出来）。 -->
       <span v-if="store.busy" class="undo-hint">{{ store.busyTip }}</span>
       <template v-if="tab === 'scans' && store.histList.length">
-        <button v-if="!confirmClear" class="btn-ghost" @click="confirmClear = true">清空</button>
+        <!-- M381：两枚按钮补 :disabled，形状与 ops 腿（下方 clearingOps 那两枚）逐字对齐。 -->
+        <button v-if="!confirmClear" class="btn-ghost" :disabled="store.busy || clearingHistory"
+          :title="store.busyTip || '清空全部扫描历史'" @click="confirmClear = true">清空</button>
         <template v-else>
           <span class="confirm-tip">确认清空全部历史？（不影响当前结果集）</span>
-          <button class="btn-danger" @click="clearAll">确认清空</button>
+          <button class="btn-danger" :disabled="store.busy || clearingHistory" @click="clearAll">确认清空</button>
           <button class="btn-ghost" @click="confirmClear = false">取消</button>
         </template>
       </template>

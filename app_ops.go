@@ -296,6 +296,15 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 		a.mu.Unlock()
 		return "", fmt.Errorf("扫描进行中，请等待结束后再回撤")
 	}
+	// M380（第九轮批 A1）：维护闩原先只管到扫描与清理两条腿，回撤腿是漏的 ——
+	// 「清空清理记录」整表删除在途时，回撤读到的账本随时被那次删除抽走，文件却已经动了。
+	// ★ 第三问必须落在**同一个临界区**里：先问再占的两段式（挪到 a.mu.Lock() 之前）
+	//   在暂停点上照样被拒 ⇒ P-44 抓不到，只有 TestM380MaintainingCheckSharesCriticalSection
+	//   那枚静态锚钉得住（实测读数见 04 §6.70）。
+	if a.maintaining != "" {
+		a.mu.Unlock()
+		return "", fmt.Errorf("%s进行中，请等待完成后再回撤", a.maintaining)
+	}
 	hs := a.hist // 锁内快照：goroutine 内不得再解引用可变字段
 	if hs == nil {
 		a.mu.Unlock()
@@ -409,6 +418,11 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 	if a.scanInFlight {
 		a.mu.Unlock()
 		return "", fmt.Errorf("扫描进行中，请等待结束后再回撤")
+	}
+	// M380：与批量腿同一道第三问（增量腿漏掉就是半个闸）。
+	if a.maintaining != "" {
+		a.mu.Unlock()
+		return "", fmt.Errorf("%s进行中，请等待完成后再回撤", a.maintaining)
 	}
 	hs := a.hist // 锁内快照：goroutine 内不得再解引用可变字段
 	if hs == nil {
