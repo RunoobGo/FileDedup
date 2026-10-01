@@ -73,8 +73,12 @@ fails=0
 #   SMOKE_GATE_SUMMARY ⇒ 默认摘要入口本机从未执行"这一格覆盖盲区，补 I 组 4 条（CI 形状落点、
 #   文案真的进 GITHUB_STEP_SUMMARY、两个入口都没有时的临时文件回退、mktemp 的 `-t` 静态锚）
 #   ⇒ 本机实跑读数 **32**，下限照同一算法抬到 **31 = 现值 − 1**。删掉整个 I 组会红（28 < 31）。
+# ★ 2026-10-01（M408，设计段 §3.2）J 组 2 条进来 ⇒ 实跑 **34**，下限随之 **33 = 现值 − 1**。
+#   算式照旧：整段 J 被摘 ⇒ 34−2=32 < 33 ⇒ 红；只摘 J-① 或 J-② 其中一条 ⇒ 33 ≥ 33 ⇒ **不红**
+#   ⇒ "整个自证步被删"两条锚都能拦（删步 ⇒ 两条同时红），而"步骤退化成只看 rc"那一格
+#   由 **J-② 独扛**、没有下限闸兜着。这条边界写在这里，别读成"两条各自都有下限闸"。
 checks=0
-MIN_CHECKS=31
+MIN_CHECKS=33
 ok() { checks=$((checks + 1)); printf '  ✓ %s\n' "$1"; }
 bad() {
 	checks=$((checks + 1))
@@ -491,6 +495,28 @@ else
 	fi
 fi
 
+# ---- J：判红臂的 runner 侧自证步还在，且它自己核了文案落点（M408 静态锚）----
+say_title 'J ci.yml 里"判红臂 runner 自证"那一步没被删、也没退化成只看 rc（M408）'
+# 为什么要锚：那一步是 M408 补进来的、唯一能在 runner 上证"文案发得出去"的东西；
+# 它一旦在某次清理里被删掉，H/I 两组照绿（它们跑的是桩入口），D3 的那一半就静默消失。
+# 两条缺一即红：J-① 挡"整步删掉"（真跑那步还在 ⇒ 只看"有没有调脚本"会假绿），
+# J-② 挡"步骤退化成只断言 rc"（那正是"红的时候人看不见原因"的原缺陷形状）。
+CIYML="$REPO_ROOT/.github/workflows/ci.yml"
+gate_calls=$(LC_ALL=C grep -v '^[[:space:]]*#' "$CIYML" |
+	LC_ALL=C grep -c 'bash scripts/ci-smoke-symlink-gate.sh')
+if [ "${gate_calls:-0}" -lt 2 ]; then
+	bad "ci.yml 非注释行里只调用门禁脚本 ${gate_calls:-0} 次（应 ≥ 2：真跑 ＋ M408 判红臂自证）⇒ 自证那一步没了，D3 的文案通道在 runner 上重新变成零读数"
+else
+	ok "ci.yml 调用门禁脚本 ${gate_calls} 次 ≥ 2（真跑 ＋ 判红臂自证都在，M408）"
+fi
+sumline=$(LC_ALL=C grep -v '^[[:space:]]*#' "$CIYML" |
+	LC_ALL=C grep -c 'GITHUB_STEP_SUMMARY.*未通过\|未通过.*GITHUB_STEP_SUMMARY')
+if [ "${sumline:-0}" -lt 1 ]; then
+	bad "ci.yml 里没有任何一行同时提到 GITHUB_STEP_SUMMARY 与「未通过」⇒ 自证步骤只看 rc、不核文案落点（M408 的判据被摘）"
+else
+	ok "自证步骤自己核了文案落点（同一行含摘要入口与判红标题，实得 ${sumline} 行）"
+fi
+
 printf '\n'
 printf 'smoke-symlink-assert: 走到断言 %s 条（下限 %s 条），其中失败 %s 条\n' \
 	"$checks" "$MIN_CHECKS" "$fails"
@@ -504,5 +530,5 @@ if [ "$checks" -lt "$MIN_CHECKS" ]; then
 		"⇒ 有分支整段没被执行，不读作通过" >&2
 	exit 1
 fi
-echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归 / G 包装接线锚 / H 四臂判红 / I 默认摘要入口）"
+echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归 / G 包装接线锚 / H 四臂判红 / I 默认摘要入口 / J 判红臂 runner 自证锚）"
 exit 0

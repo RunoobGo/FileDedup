@@ -161,6 +161,38 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/ci-smoke-symlink-gate.sh
 
+      # ★ 2026-10-01 M408（设计段 §3.2）：上面那步恒 rc=0，而门禁脚本只在 `124/2` 两臂写
+      #   步骤摘要（`0)` 那一臂只 echo 到 stdout）⇒ 正常绿跑对 GITHUB_STEP_SUMMARY 的贡献
+      #   结构上是零字节，"红的时候人看得见原因"这半句在 runner 上一直没有实物见证；
+      #   smoke-symlink-assert.sh 的 H/I 两组打的又是桩入口（SMOKE_GATE_SUMMARY=临时文件），
+      #   证的是脚本逻辑，不是 runner 那份摘要真发得出去。这一步用桩强制走 `2)` 那一臂，
+      #   且**故意不设**桩入口 ⇒ 逼它走 M407 修好的 GITHUB_STEP_SUMMARY 默认支。
+      #   判据两格：门禁脚本交回 rc=1（不是 0、也不是 2）；「跨卷软链接冒烟未通过」那段文案
+      #   真的出现在步骤摘要文件里。★ 刻意不用 continue-on-error——那等于"这步红了也算绿"，
+      #   正是 D3 本轮推翻的 M8/M133 那个"环境受限不该怪代码"的定性。
+      - name: 冒烟门禁判红臂 runner 自证（M408）
+        timeout-minutes: 5
+        run: |
+          set -u
+          STUB="$RUNNER_TEMP/d3-red-stub.sh"
+          printf '%s\n' 'echo "SKIP（跳过，非通过）: 本行是 M408 自证桩，不是真挂载失败现场"; exit 2' >"$STUB"
+          chmod +x "$STUB"
+          if SMOKE_GATE_CMD="bash $STUB" SMOKE_GATE_LOG="$RUNNER_TEMP/d3-red.log" \
+               bash scripts/ci-smoke-symlink-gate.sh; then
+            rc=0
+          else
+            rc=$?
+          fi
+          if [ "$rc" != 1 ]; then
+            echo "::error::判红臂没交回 rc=1（实得 rc=${rc}）⇒ D3 那一半在 runner 上不成立"
+            exit 1
+          fi
+          if ! grep -qF '跨卷软链接冒烟未通过' "$GITHUB_STEP_SUMMARY"; then
+            echo "::error::判红文案没进 GITHUB_STEP_SUMMARY（实得：$(tr '\n' ' ' <"$GITHUB_STEP_SUMMARY" | cut -c1-200)）"
+            exit 1
+          fi
+          echo "OK(M408): 判红臂在 runner 上交回 rc=1，且文案真的进了本次 job 的步骤摘要"
+
       # 冒烟脚本自身的判据（退出码契约 + loop 设备不泄漏 + 失败信息可排查）。
       # 不需要 root：它用桩命令驱动 smoke-symlink.sh 的各分支。
       - name: 冒烟脚本判据自证（smoke-symlink-assert）
