@@ -70,7 +70,10 @@ QUARANTINE=()
 # )
 
 if [ "${#QUARANTINE[@]}" -eq 0 ]; then
-	exec go test -count=1 ./...
+	# M331：走 ci-go-test.sh 补 -v 并打 SKIP/FAIL 清册（改前 windows 腿的包级 ok
+	# 分不清 PASS 与 SKIP，而这一腿的环境性 skip 是**在册的常态**，见上面 2026-09-20 段）。
+	# 刻意不给这一腿加 -race：本清单服务的是 Windows 腿，mingw 不在依赖清单里。
+	exec bash "$(dirname "$0")/ci-go-test.sh" -count=1 ./...
 fi
 
 # 1) 条目语法自检：只允许合法用例名（字母数字下划线，可含 . 与 / 之外的
@@ -110,5 +113,6 @@ done
 
 # 3) 锚定后的正则交给 go test：`^(A|B)$` 只会整名匹配，
 #    前缀相同的兄弟用例不受影响（AS-K2 的理由 ①）。
-echo "==> go test -count=1 -skip '${patterns}' ./..."
-exec go test -count=1 -skip "$patterns" ./...
+#    M331：同上面那条，改走 ci-go-test.sh（-v 与 SKIP 清册由它统一负责）。
+echo "==> ci-go-test.sh -count=1 -skip '${patterns}' ./..."
+exec bash "$(dirname "$0")/ci-go-test.sh" -count=1 -skip "$patterns" ./...

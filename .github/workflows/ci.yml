@@ -102,12 +102,17 @@ jobs:
       - name: go vet（GOOS=darwin）
         run: GOOS=darwin GOARCH=arm64 go vet ./...
 
+      # M331（04 §6.11 GATE-30，设计段 2026-10-01-d1-d3-m331-ci-design.md §2.5）：
+      # 改前三腿的 go test 都不带 -v ⇒ 包级 ok 分不清"体内没有 t.Skip"与"有 Skip"，
+      # 台账把 ok 抄成 PASS 就是拿读不出来的量当读数。现由 scripts/ci-go-test.sh
+      # 统一补 -v 并打 M331_READOUT（顶层/子测试的 SKIP 与 FAIL 分开数，与本机
+      # harness 行 6 同口径）。脚本自己吞掉 === RUN/--- PASS 噪声，失败详情行不裁。
       - name: go test -race -count=2
-        run: go test -race -count=2 ./...
+        run: bash scripts/ci-go-test.sh -race -count=2 ./...
 
       # 根包（App 层）与事件/互斥状态机耦合最紧，单独多跑两轮压竞态窗口
       - name: go test -race -count=4（根包）
-        run: go test -race -count=4 .
+        run: bash scripts/ci-go-test.sh -race -count=4 .
 
       # CLI 冒烟：固定数据集上「冷扫 / 缓存首扫 / 缓存复扫」三次结果必须逐项一致，
       # 断言口径是分组路径集合与可释放字节（files_total 属阶段口径，见脚本说明）。
@@ -129,6 +134,12 @@ jobs:
       # "runner 挂不上任何文件系统"与"7 条判据全部成立"都是绿：这条唯一的
       # 真实跨卷防线可以在无人察觉时失效。现在 rc=2 仍不阻断（环境受限不该
       # 怪代码），但会在作业摘要与日志里留下**醒目告警**，不再与全绿同形。
+      # 〔当日更正 2026-10-01，D3（用户解封）：上面那句"rc=2 仍不阻断（环境受限
+      # 不该怪代码）"已被推翻——下面 `2)` 分支现在**一律 exit 1**，两种成因（脚本自认
+      # 为跳过 / rc=2 却没有行首 SKIP 自证）都红，只在摘要里分开写清。理由：这条是
+      # 全仓唯一能实证"硬链接跨卷必失败"的防线，它消失时流水线不能还是绿的。
+      # 代价已核：run 36820677331 的 ubuntu 腿真挂上两卷（卷 A dev=2049 ｜ 卷 B dev=1792）
+      # 并跑完 7 条判据 rc=0 ⇒ 判红不是常红。本机 harness 的 SKIP 语义一字未动。〕
       #
       # ★ M133（04 §6.11 GATE-7，设计段随 §23.9 一并记）：上面那段只解决了"跳过与
       # 全绿同形"，没解决"真失败与跳过同形"。smoke-symlink.sh 自己的契约（:19-22、
@@ -159,20 +170,25 @@ jobs:
                  echo "超时按失败处理：阻塞与判据不成立都需要人来看。"
                } >>"$GITHUB_STEP_SUMMARY"
                exit 1 ;;
-            2) if ! grep -q '^SKIP' /tmp/smoke-symlink.log; then
-                 echo "::error::rc=2 但输出里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为跳过（M133）"
-                 exit 1
+            2) if grep -q '^SKIP' /tmp/smoke-symlink.log; then
+                 # D3（推翻 M8/M133 的"环境受限不该怪代码"定性，2026-10-01 用户解封）：
+                 # 脚本自己认领为跳过 ⇒ 判据没跑，唯一一条真跨卷防线这一轮不存在。
+                 msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行；按 D3 裁定判红，不再与全绿同形"
+                 why="环境受限：loop/tmpfs/sudo 任一条不可用。判据 ①「硬链接跨卷必失败」只能在真实独立卷上实证，同卷无法降级验证。"
+               else
+                 # M133 那一半原样保留：rc=2 却没有行首 SKIP 自证 ⇒ 是真失败，不是跳过。
+                 msg="rc=2 但输出里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为跳过（M133）"
+                 why="被测脚本整体是 set -euo pipefail，中途任何命令以 2 退出都会长这样——必须人来分清是哪一种。"
                fi
-               msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行，不等于通过"
-               echo "::warning title=冒烟未执行::$msg"
+               echo "::error::$msg"
                {
-                 echo '## ⚠️ 跨卷软链接冒烟未执行'
+                 echo '## ❌ 跨卷软链接冒烟未通过（rc=2 一律判红，D3）'
                  echo
                  echo "$msg"
                  echo
-                 echo "判据 ①「硬链接跨卷必失败」只能在真实独立卷上实证，"
-                 echo "同卷环境下无法降级验证。请检查 runner 的 loop/tmpfs 可用性。"
-               } >>"$GITHUB_STEP_SUMMARY" ;;
+                 echo "$why"
+               } >>"$GITHUB_STEP_SUMMARY"
+               exit 1 ;;
             *) echo "::error::跨卷软链接冒烟失败（rc=${rc}）"; exit "$rc" ;;
           esac
 
@@ -273,11 +289,11 @@ jobs:
         run: go vet ./...
 
       - name: go test -race -count=2
-        run: go test -race -count=2 ./...
+        run: bash scripts/ci-go-test.sh -race -count=2 ./...
 
       # 根包（App 层）与事件/互斥状态机耦合最紧，多跑两轮压竞态窗口（与 linux 腿同配方）
       - name: go test -race -count=4（根包）
-        run: go test -race -count=4 .
+        run: bash scripts/ci-go-test.sh -race -count=4 .
 
       # 确定性 E2E 三跑对账。刻意**不加** `timeout …` 前缀：GNU timeout 不在 macOS
       # 默认环境里，命令不存在时这一步会以 127 红在"缺工具"上而不是红在"结果不一致"上。

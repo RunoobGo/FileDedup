@@ -116,7 +116,13 @@ jobs:
         working-directory: ./frontend
         shell: bash
         run: |
-          if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+          # D1 Step 1（2026-10-01 解冻，设计段 §2.1）：改前是
+          # `if [ -f package-lock.json ]; then npm ci; else npm install; fi`。
+          # frontend/package-lock.json 由 git 跟踪 ⇒ else 分支在真机上不可达，
+          # 留着它只有一个作用：锁文件被误删或与 package.json 不同步时，
+          # **静默改用最新依赖树**出一个从没被测过的发布包。npm ci 让这两种情况当场红。
+          # 口径与 ci.yml 三腿一致（那三条都是裸 npm ci）。
+          npm ci
           npm run build
 
       # ================= 3. Go & Wails 环境 =================
@@ -155,7 +161,16 @@ jobs:
       # ================= 4. Go 测试（发布门槛） =================
       - name: Run Go Tests
         if: matrix.platform != 'windows'
-        run: go test -count=1 ./...
+        # D1 Step 2（2026-10-01 解冻）：补 -race。本步是发布门槛，改前的
+        # `go test -count=1 ./...` 与 CI 的 check/macos 腿（都带 -race）不是同一把尺子
+        # ——同一个提交可能 CI 绿、这里也绿，而竞态只在 CI 那两条腿上被验过；
+        # 现在两条腿口径一致。
+        # 前提：-race 需要 cgo 工具链。linux 腿上面已装 build-essential，
+        # macOS 两条腿有 Xcode CLT ⇒ 成立。windows 腿走 test-windows-quarantine.sh，
+        # 本轮刻意不给它加 -race（mingw 不在依赖清单里）。
+        # ★ 未兑现：加 -race 后的时长只有 tag/dispatch 跑才拿得到（作业级
+        #   timeout-minutes: 40）。超时是**红**、不会被读成绿，但没有实测数。
+        run: go test -race -count=1 ./...
 
       # B3-4：Windows 测试改为阻断式白名单门禁。原先 continue-on-error 让整个
       # 平台的测试不设防（任何回归都被"仅告警"吞掉）。现在只有清单内逐条列明
@@ -239,6 +254,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15   # M120：只做"下载产物 + 建 release"，15 分钟足够宽
+    # D1 Step 3b（R4-6，2026-10-01 解冻）：并发闸。改前同 ref 上连发两个 tag
+    # （或一次重放）会**并发**跑两个 release 腿，往同一个 Release 里交替写产物——
+    # 后写的那个覆盖先写的，而两条都报 success，没人知道发布内容被换过。
+    # group 按 ref 分桶：同一 tag 排队串行，不同 tag 互不阻塞。
+    # cancel-in-progress: false（刻意）：true 会把正在出包的四腿 build 一起取消，
+    # 比双发更坏；这里是"后来者等前者跑完"，而不是"打断先来者"。
+    # ★ 这一格的语法只有 GitHub 自己认（本地 YAML 解析只挡语法错），
+    #   兑现要等一次 tag/dispatch 触发 ⇒ 本轮记"代码已改、CI 验证未兑现"。
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:

@@ -333,8 +333,11 @@ while IFS= read -r f; do
 	fi
 done <<< "$scan_list"
 # 下界：清单为空 / glob 没展开时，"没有命中"是假的通过（M119 同一个坑）。
+# ★ 2026-10-01 本批改口：M331 新增 `scripts/ci-go-test.sh` ⇒ 扫描面从 8 个升到 9 个
+#   （8 个 scripts/*.sh + ci.yml）。**下界仍是 8**（它是"塌空"判据，不是等值判据），
+#   只有这句解释性话术需要跟着实现走（M150 那一族的教训：守契约的实现改了，说明书最后跟）。
 if [ "$scanned" -lt 8 ]; then
-	bad "只扫到 ${scanned} 个文件（7 个 scripts/*.sh + ci.yml = 8）⇒ 扫描面本身没成立，不读作通过"
+	bad "只扫到 ${scanned} 个文件（下界 8；现值应为 8 个 scripts/*.sh + ci.yml = 9）⇒ 扫描面本身没成立，不读作通过"
 elif [ -z "$m134_bad" ]; then
 	ok "${scanned} 个门禁脚本的代码行里没有 \$VAR 紧邻全角字符"
 else
