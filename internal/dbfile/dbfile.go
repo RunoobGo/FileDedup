@@ -59,6 +59,48 @@ func Exists(path string) bool {
 // 生产走 os.Rename，测试注入"仅某个侧文件改名失败"来取 M213 的回滚红。
 var renameFile = os.Rename
 
+// sidecarSuffixes 是 SQLite WAL 模式下的伴随文件后缀。**这份列表在本包只有一份**：
+// Quarantine 的"连侧文件一起隔离"与 HardenSidecars 的"连侧文件一起收档"问的是同一个
+// 问题（这个库的伴随文件有哪些），两处各写一遍就是 I5 的分叉面（M382 同一理由）。
+var sidecarSuffixes = []string{"-wal", "-shm"}
+
+// SidecarModeFailure 是一个没能收紧的伴随文件（路径 + 系统原文）。
+type SidecarModeFailure struct {
+	Path string
+	Err  error
+}
+
+// HardenSidecars 把 base 的 WAL 伴随文件逐个交给 chmod 收紧，返回**需要出声**的失败。
+//
+// ★ `ErrNotExist` 在这里被滤掉，不当成失败：`-shm` 在只读打开或无共享内存时本就不存在，
+//
+//	`-wal` 在 checkpoint 之后随最后一个连接退出被 SQLite 删除 ⇒ "没有这个文件"是常态。
+//	把它报出去，就等于每一次正常写回都可能出声（负控制 P-56 钉这一格）。
+//
+// ★ 本函数不出声、也不决定"要不要中止"：出声话术属于调用方（cache 与 history 的 M376
+//
+//	措辞各不相同），而"收档失败绝不上升为写腿失败"是两包共同的口径。
+//	chmod 用哪一枚函数留在调用方（各自的 `hardenSidecarMode` 接缝），与两包各自的
+//	`hardenFileMode` 同形——这里不收 seam，是为了不让 dbfile 长出"权限"这个新职责面。
+//
+// ★ 窗口只能缩小、不能归零（M379，2026-10-01 裁-1）：SQLite 建 `-wal` 的那一刻按进程
+//
+//	umask 落 0644，从这里补档到那一刻之间仍在。要把窗口归零得把所在目录收成 0700，
+//	那是裁-1 明确没选的取向。
+func HardenSidecars(base string, chmod func(string) error) []SidecarModeFailure {
+	var fails []SidecarModeFailure
+	for _, suffix := range sidecarSuffixes {
+		p := base + suffix
+		if err := chmod(p); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			fails = append(fails, SidecarModeFailure{Path: p, Err: err})
+		}
+	}
+	return fails
+}
+
 // Quarantine 把库文件连同 -wal/-shm 改名隔离，返回主文件的隔离后路径。
 //
 // 只改名、不删除：回撤账本一旦被误判清空就是不可恢复的用户数据丢失；
@@ -79,8 +121,8 @@ func Quarantine(path string) (string, error) {
 		return "", err
 	}
 	// 已成功改名的侧文件（回滚时按逆序挪回原位）。
-	moved := make([]string, 0, 2)
-	for _, suffix := range []string{"-wal", "-shm"} {
+	moved := make([]string, 0, len(sidecarSuffixes))
+	for _, suffix := range sidecarSuffixes {
 		if _, err := os.Stat(path + suffix); err != nil {
 			continue // 侧文件不存在：无需跟随
 		}

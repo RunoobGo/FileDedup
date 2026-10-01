@@ -76,6 +76,7 @@ func (s *Store) BeginOp(kind, targetDir string, histID int64, undoable bool, ite
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
 	return opID, nil
 }
 
@@ -92,6 +93,7 @@ func (s *Store) FinishItem(opID int64, origPath, destPath, linkSrc, state, errMs
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("操作 %d 中不存在计划条目: %s", opID, origPath)
 	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
 	return nil
 }
 
@@ -134,7 +136,11 @@ func (s *Store) FinalizeOp(opID int64, reclaimed uint64) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("操作记录不存在（id=%d）", opID)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	return nil
 }
 
 // MarkItemUndo 记录单条回撤状态：执行前写 undoing（写前，I6），
@@ -150,6 +156,7 @@ func (s *Store) MarkItemUndo(itemID int64, state, errMsg string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("操作条目不存在（id=%d）", itemID)
 	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
 	return nil
 }
 
@@ -271,5 +278,8 @@ func (s *Store) ClearOps() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM op_records`)
+	if err == nil {
+		hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	}
 	return err
 }

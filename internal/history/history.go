@@ -182,6 +182,26 @@ func initConn(path string) (*sql.DB, error) {
 //	（M360/M354 的现读与措辞纪律）。
 var hardenFileMode = func(path string) error { return os.Chmod(path, 0o600) }
 
+// hardenSidecarMode / hardenSidecars 是账本伴随文件（`-wal` / `-shm`）那一档的注入点与调用面
+// （M379，2026-10-01 裁-1「写入腿各补收紧」；理由与边界逐字同 internal/cache 同名那一组）。
+//
+// ★ 与上面那枚"两包各一枚、不抽公共 helper"不矛盾：这里共享的是"**这个库的伴随文件有哪些、
+//
+//	不存在算不算失败**"这份判据，它本来就已经住在 `dbfile`（Quarantine 的侧文件列表）；
+//	再抄一份进 history 和 cache 才是分叉面。出声话术与 chmod 接缝仍各留各的。
+//
+// ★ 账本这一侧泄露的不是哈希，是用户机器上的**全部文件路径**（含回收站落位路径）——
+//
+//	未 checkpoint 的条目都躺在 -wal 里，0644 就是同机其他用户可读。
+var hardenSidecarMode = func(path string) error { return os.Chmod(path, 0o600) }
+
+func hardenSidecars(base string) {
+	for _, f := range dbfile.HardenSidecars(base, hardenSidecarMode) {
+		fmt.Fprintf(os.Stderr, "[history] WAL 伴随文件档位收紧失败 %s（文件按现有权限保留，账本照常可用；系统原文：%v）\n",
+			filepath.Base(f.Path), f.Err)
+	}
+}
+
 // Open 打开或创建历史库。**仅**在库影像确证损坏时改名隔离并重建
 // （2026-09-18 审查 C4：原先对任何打开错误都无条件删库，busy/只读/满盘一次误判
 // 就会清空用户全部回撤账本）。启动收尾：上次进程死于执行中的 planned
@@ -229,6 +249,9 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// M379：伴随文件补档，放在两条启动收尾 UPDATE **之后**——那两步才是本次会话里 -wal 的
+	// 出生点，收在它们前面就只照顾到上次退出的残留、把自己刚造的 0644 留在原地。
+	hardenSidecars(path)
 	return &Store{db: db, path: path, quarantined: quarantinedName}, nil
 }
 

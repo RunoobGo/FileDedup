@@ -467,7 +467,11 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 			return sum, err
 		}
 	}
-	return sum, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return sum, err
+	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	return sum, nil
 }
 
 // localScanKeys 一条集合式语句读回本地全部扫描自然键 → 行 id。

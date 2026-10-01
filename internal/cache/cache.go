@@ -190,6 +190,33 @@ func (c *Cache) markCorruption(err error) {
 //	0666（M354 现读），真访问权由所在目录的 NTFS ACL 继承 ⇒ 手册与用例都按分平台措辞写。
 var hardenFileMode = func(path string) error { return os.Chmod(path, 0o600) }
 
+// hardenSidecarMode 是伴随文件（`-wal` / `-shm`）那一档的注入点，与上面那枚同形。
+var hardenSidecarMode = func(path string) error { return os.Chmod(path, 0o600) }
+
+// hardenSidecars 把库影像的 WAL 伴随文件收成 0600（M379，2026-10-01 裁-1「写入腿各补收紧」）。
+//
+// 为什么主库补档不够：`hardenFileMode` 只改得到 `<base>` 本身，而 SQLite 建 `-wal` 时按进程
+// umask 落 0644 ⇒ 尚未 checkpoint 的哈希条目（含扫描根下的**文件路径**）在同机其他用户眼里
+// 是可读的。第八轮划账 §6.69 那次一次性探针实测到的就是这个形状（主库 0600、`-wal` 0644）。
+//
+// ★ 哪些点调用它：**每一条会自己新建 `-wal` 的写腿，在事务提交之后补一次**
+//
+//	（Open / Store / Touch / evictLocked / reclaimLocked 五条，全部现读点齐）。判据只到
+//	"写腿收口"，不主张更细的时序——`-wal` 一旦被 SQLite 删除又重建，
+//	新文件仍按 umask 落 0644，直到下一个调用点才被收紧；窗口只能缩小，不能归零（裁-1 没选
+//	目录 0700 那条路）。Touch 与 evictLocked 各算一条是因为它们能在"一轮纯命中型扫描"里
+//	单独发生（Store 收到空列表直接返回，那时唯一动库的就是这两条）。
+//
+// ★ 失败只出声，不上升为写腿失败（口径沿用 M376）：这里真会失败的实际形状是"文件属别人/
+//
+//	被外部工具锁住"，把一次加固失败变成"缓存写回失败"是拿可用性换一份看不见的收益。
+func hardenSidecars(base string) {
+	for _, f := range dbfile.HardenSidecars(base, hardenSidecarMode) {
+		fmt.Fprintf(os.Stderr, "[cache] WAL 伴随文件档位收紧失败 %s（文件按现有权限保留，缓存照常可用；系统原文：%v）\n",
+			filepath.Base(f.Path), f.Err)
+	}
+}
+
 // Open 打开或创建缓存库。
 //
 // **仅**在库影像确证损坏时改名隔离并重建（最坏退化为首扫速度）；
@@ -233,6 +260,10 @@ func Open(path string) (*Cache, error) {
 		db.Close()
 		return nil, err
 	}
+	// M379：伴随文件补档。放在 enforceAlgoVersion **之后**是有意的——版本不符那一步会发
+	// 一条 DELETE，那才是本次会话里 -wal 的出生点；放在它前面就等于给"上次异常退出留下的
+	// 残留"收了档，却把自己刚造出来的那个 0644 留在原地。
+	hardenSidecars(path)
 	return &Cache{db: db, path: path, quarantined: quarantinedTo}, nil
 }
 
@@ -486,7 +517,8 @@ func (c *Cache) Store(entries []Entry) (err error) {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	c.cntValid = false // C5：写入后计数失效，下次统计/淘汰判定重算一次
+	hardenSidecars(c.path) // M379：这次写回就是 -wal 的出生点（写腿收口处补档）
+	c.cntValid = false     // C5：写入后计数失效，下次统计/淘汰判定重算一次
 	// M75(a)：走到这里**哈希已经落库**，淘汰失败是另一件事。改前这里直接
 	// `return c.evictLocked()`，上游把两种失败一律写成"缓存写回失败"（假话）。
 	if e := evictFn(c); e != nil {
@@ -528,7 +560,13 @@ func (c *Cache) Touch(paths []string) (err error) {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// M379：命中续期可能是本次会话**唯一**的一条写腿（Store 收到空列表直接返回、
+	// 一轮纯命中型的扫描就是这么跑的），漏掉它等于留一条 -wal 以 0644 躺在盘上。
+	hardenSidecars(c.path)
+	return nil
 }
 
 // LastHit 读取条目 last_hit（诊断/测试用：验证命中续期语义）。
@@ -575,6 +613,7 @@ func (c *Cache) evictLocked() error {
 		SELECT path FROM hash_cache ORDER BY last_hit ASC, path ASC LIMIT ?)`, over); err != nil {
 		return err
 	}
+	hardenSidecars(c.path) // M379：淘汰是一条独立的写腿（它可以在一次纯命中扫描里单独发生）
 	c.cnt -= over
 	c.lastEvicted = over
 	// ★ 淘汰后整组计数失效，而不只是 cnt。
@@ -659,6 +698,9 @@ func (c *Cache) reclaimLocked() error {
 	if err != nil {
 		return err
 	}
+	// M379：checkpoint 之后补一次档。这一步在"清空"这条腿上，是 -wal 被截断、也可能被
+	// 删除重建的时刻 ⇒ 放在 busy 判定**之前**，busy=1（没做完）那一档同样要收。
+	hardenSidecars(c.path)
 	// ★ busy=1 不是 error：用 Exec 一发不管返回值，就会把"没回收成功"读成"回收成功"，
 	// 那等于把本条的假话从"字节没减"升级成"报告说字节减了"。认不准就不说成功（同 IsBusy 的纪律）。
 	if busy != 0 {

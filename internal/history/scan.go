@@ -145,6 +145,7 @@ func (s *Store) SaveScan(cfg model.ScanConfig, groups []*model.DuplicateGroup, f
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
 	return histID, nil
 }
 
@@ -327,6 +328,7 @@ func (s *Store) UpdateKeepPaths(histID int64, paths []string) error {
 	if n == 0 {
 		return fmt.Errorf("历史记录 %d 不存在（可能已被删除或裁剪），保留决策未写入", histID)
 	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
 	return nil
 }
 
@@ -397,7 +399,11 @@ func (s *Store) PruneScanFiles(histID int64, gone map[string]bool) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	return nil
 }
 
 // DeleteScan 删除一条历史（级联清组/文件行）。
@@ -405,6 +411,9 @@ func (s *Store) DeleteScan(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM scan_history WHERE id = ?`, id)
+	if err == nil {
+		hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	}
 	return err
 }
 
@@ -413,5 +422,8 @@ func (s *Store) ClearScans() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM scan_history`)
+	if err == nil {
+		hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	}
 	return err
 }
