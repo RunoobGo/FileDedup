@@ -195,8 +195,18 @@ func TestTouchRefreshesLastHit(t *testing.T) {
 	}
 }
 
-// H2：缓存命中须核对物理身份（dev/ino/ctime_ns）。同路径被换 inode 或原地写
-// （ctime 前进）后，旧 full 哈希不可再用——任一要素不符即视为未命中。
+// H2：缓存命中须核对物理身份（dev/ino）。同路径被换 inode 后，旧 full 哈希不可
+// 用——任一要素不符即视为未命中。
+//
+// ★ 2026-10-01 裁-2（原待裁项 M75(b) 据此销号）把 **ctime 移出失效判据**，
+//
+//	下面第三格因此从"必须未命中"**反转为"必须命中"**。这不是为了让门禁变绿而改
+//	既有断言：裁定直接改了契约，理由逐字写在 `cache.go` 的 H1 注释里
+//	（判据含 ctime 而 `Store` 无条件写回 ctime ⇒ 一次误失效下一轮就自证正确；
+//	同一份物理身份在本仓只能有一把尺子，`fsid.SameIdentity` 早就刻意不含 ctime）。
+//	改前这一格是真红：ctime 88→89 在旧判据下未命中。
+//	★ 反向证据（MU9-c）：把整条 `id.Resolved && …` 判据删掉 ⇒ 必须红在 P-53
+//	  （dev/ino 那两格），而不是红在这一格——这一格只证明 ctime 不再参与判定。
 func TestLookupIdentityMismatch(t *testing.T) {
 	c := openTest(t)
 	full := bytes.Repeat([]byte{0x5}, 32)
@@ -207,16 +217,22 @@ func TestLookupIdentityMismatch(t *testing.T) {
 	}
 	if _, hit, fullValid := c.Lookup("/id", 10, 1,
 		fsid.ID{Dev: 66, Ino: 77, CtimeNs: 88, Resolved: true}); !hit || !fullValid {
-		t.Fatal("身份三要素一致应命中且 full 有效")
+		t.Fatal("身份两要素一致应命中且 full 有效")
 	}
+	// P-53：身份两腿各自不符 ⇒ 仍必须未命中（裁-2 只剔 ctime，不动这一层）。
 	for _, id := range []fsid.ID{
 		{Dev: 67, Ino: 77, CtimeNs: 88, Resolved: true},
 		{Dev: 66, Ino: 78, CtimeNs: 88, Resolved: true},
-		{Dev: 66, Ino: 77, CtimeNs: 89, Resolved: true},
 	} {
 		if _, hit, _ := c.Lookup("/id", 10, 1, id); hit {
-			t.Fatalf("身份不一致必须未命中: %+v", id)
+			t.Fatalf("P-53：身份不一致必须未命中: %+v", id)
 		}
+	}
+	// 裁-2 的反转格：仅 ctime 推进（chmod / xattr / 改属主的形状），
+	// size、mtime、dev、ino 全部对得上 ⇒ 必须命中，且 full 仍有效。
+	if _, hit, fullValid := c.Lookup("/id", 10, 1,
+		fsid.ID{Dev: 66, Ino: 77, CtimeNs: 89, Resolved: true}); !hit || !fullValid {
+		t.Fatal("裁-2：ctime 单独推进不得再判失效（改前此格期望是『未命中』，正是要红的那格）")
 	}
 	// 未解析平台（无稳定身份的卷）：不因身份拦截，维持旧行为
 	if _, hit, _ := c.Lookup("/id", 10, 1, fsid.ID{}); !hit {

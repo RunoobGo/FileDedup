@@ -1,5 +1,6 @@
 // Package cache 哈希缓存（04 M4-T01，01 §7.3）：
-// SQLite WAL；键 (path, size, mtime_ns, dev, ino, ctime_ns)；
+// SQLite WAL；列 (path, size, mtime_ns, dev, ino, ctime_ns)，命中判定用
+// path+size+mtime_ns+dev+ino 五格 —— ctime_ns **继续入库但不参与判定**（2026-10-01 裁-2，见 Lookup 的 H1 注释）；
 // 命中后仍须四点采样比对，全一致才复用 full；
 // 批量 UPSERT 单事务写回；last_hit 上限淘汰。
 // 损坏处理分两层，都不是"自愈"（M96）：**打开时**确证影像损坏 ⇒ 改名隔离后重建；
@@ -35,7 +36,7 @@ type Entry struct {
 	Mid2    uint64 // xxHash64 3size/4 处 64KiB
 	Dev     uint64 // 物理身份的卷号：unix 取 fstat 的 st_dev（fsid_unix.go:16），Windows 取句柄查询的卷序列号（fsid_windows.go:201，I7 起**不再恒 0**）
 	Ino     uint64 // 同上腿的 inode / 文件索引
-	CtimeNs int64
+	CtimeNs int64  // 继续写入（留证），但**不参与命中判定**（2026-10-01 裁-2）
 	Full    []byte // BLAKE3-256；nil = 未算过全量（大文件预筛后被淘汰）
 }
 
@@ -57,7 +58,8 @@ const MaxEntries = 500_000
 
 // AlgoVersion 缓存语义版本（P0-2 / P2）。
 //
-// 命中判定只比 (path, size, mtime)，因此缓存行的含义一旦变化，旧行就可能
+// 命中判定比 (path, size, mtime) 再加身份两腿 (dev, ino)（v3 起；ctime 不参与，
+// 见 Lookup 的 H1 注释），因此缓存行的含义一旦变化，旧行就可能
 // 给出错误的分组依据。需要 bump 本版本的改动包括但不限于：
 //   - 全量/采样哈希算法或长度（blake3-256 → 其他）
 //   - hasher.HeadTailChunk / SmallFileMax 等采样参数
@@ -74,6 +76,11 @@ const MaxEntries = 500_000
 // 跨代混排行**（新 size/mtime/partial + 旧 full）无法靠新判据回收——守卫只在
 // 写入时起作用 ⇒ 只能整表作废重扫一次。代价是一次全量重算，换掉的是
 // "假重复组"这一类数据丢失形状（缓存只是加速手段，不是等价证明）。
+//
+// ★ 2026-10-01 裁-2 把 ctime 移出失效判据**不需要 bump 本版本**：这一改只放松命中，
+//
+//	v4 行的含义一字未动（旧行本来就带 content 对应的 full/partial）。v3/v4 那两次
+//	必须整表作废，是因为它们**收紧**或**改变了行的语义**——放松不产生新的错误命中形状。
 const AlgoVersion = "blake3-256+xxh64-4pt+id-v4"
 
 // metaKey 元信息表主键。
@@ -345,8 +352,9 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// Lookup 命中判定：path 存在且 size/mtime 与物理身份 (dev, ino, ctime_ns)
-// 完全一致。id 未解析时身份比较平凡通过（这一格与平台无关，见下方 F1④ 说明），
+// Lookup 命中判定：path 存在且 size/mtime 与物理身份 (dev, ino) 一致。
+// ctime **不参与判定**（2026-10-01 裁-2，原待裁项 M75(b) 据此销号）——理由见下方 H1。
+// id 未解析时身份比较平凡通过（这一格与平台无关，见下方 F1④ 说明），
 // 兜底仍靠四点采样。
 // 返回条目与 full 是否有效（决定阶段 3 是否跳过）。
 func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Entry, bool, bool) {
@@ -374,9 +382,22 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 	if e.Size != size || e.MtimeNs != mtimeNs {
 		return Entry{}, false, false // 元数据变化 → 未命中（重算）
 	}
-	// H1：mtime 无法证明内容未变（粗粒度卷/原地改写保 mtime），ctime 与
-	// inode 身份提供第二重证据：写内容、rename、chmod 都会推进 ctime；
+	// H1：mtime 无法证明内容未变（粗粒度卷/原地改写保 mtime），inode 身份提供第二重证据：
 	// 路径被换成另一文件则 dev/ino 必不同。不一致宁可当次未命中重算。
+	//
+	// ★ ctime 那一腿已于 2026-10-01 按裁-2 **移出判定**（原待裁项 M75(b) 销号，M383 同批面）。
+	//   两个理由：
+	//   ① `chmod` / `xattr` / 改属主这类**没有改动内容**的合法操作都会推进 ctime，而
+	//      `Store`（:450 的 UPSERT）无条件把 `dev/ino/ctime_ns` 写回 —— 一次误失效之后
+	//      下一次扫描就把新 ctime 落成"正确"的了，用户看不到任何异常，只是那一轮缓存白算。
+	//      判据与写回不对称，才是这条待裁项当初被记下来的原因。
+	//   ② 同一份物理身份在本仓只有**一把尺子**（I5）：`fsid.SameIdentity`（fsid.go:41）
+	//      早就刻意不含 ctime，理由逐字是「chmod/xattr 等合法元数据操作会推进 ctime，
+	//      但文件未被替换」。缓存命中判定留着 ctime 就是两份不一致的身份判据。
+	//   ★ "原地改写内容却保住 mtime **且**保住 inode"这一档确实归不了缓存管，它交棒给
+	//     paranoid 逐字节比对与**破坏性操作前的全量哈希复核**（docs/09 §6.1 第 3 条），
+	//     本处不再冒充 ctime 兜得住。`ctime_ns` 列**继续写入**（留证、也留给将来复盘）。
+	//
 	// ★ F1④：跳过这一道比较的条件是 `!id.Resolved`（身份没解析出来），**与平台无关**——
 	//   Windows 自 fsid I7 起走句柄查询，正常也有卷号+索引；只有查询失败或卷不提供
 	//   稳定索引（FAT/exFAT 等，见 fsid_windows.go:191 的 index==0 判定）才落到这一格。
@@ -385,10 +406,13 @@ func (c *Cache) Lookup(path string, size uint64, mtimeNs int64, id fsid.ID) (Ent
 	//   〔2026-09-27 M271 追加〕上面那句"normal 也有"对 dev/ino 成立，对 **ctime 那一腿不成立**：
 	//   `fileBasicInfoClass` 曾是错常数（1=FILE_STANDARD_INFO），Windows 上 CtimeNs 恒 0，
 	//   于是 H1 宣称的第二重证据在 Windows 上实际只剩 inode 一重——不是"该卷不维护 change
-	//   time"，是读错了结构。常数已修，判据见 `fsid_ctime_m271_test.go`。
-	//   ★ 一次性的后果要如实说：修前落盘的行 `ctime_ns=0`，修后现读得到真值 ⇒ 三腿比较
-	//   不命中 → **老缓存条目全量失效一次**（表现为一次重算，不是数据错误；方向是 fail-closed）。
-	if id.Resolved && (e.Dev != id.Dev || e.Ino != id.Ino || e.CtimeNs != id.CtimeNs) {
+	//   time"，是读错了结构。常数已修，判据见 `fsid_ctime_m271_test.go`（那条读的是
+	//   **字段有没有读错**，与"要不要参与失效"无关，裁-2 不许借机降级它）。
+	//   〔2026-10-01 裁-2 追记〕M271 那段"一次性后果"（修前落盘的行 `ctime_ns=0` ⇒ 三腿比较
+	//   不命中 ⇒ 老缓存条目全量失效一次）随 ctime 出判定而**不再发生**：那些老行只要
+	//   dev/ino 与 mtime/size 对得上就重新命中。这不是放松——失效判据本来就只剩身份两腿，
+	//   而内容层面的把关在 paranoid 与操作前复核那两侧。
+	if id.Resolved && (e.Dev != id.Dev || e.Ino != id.Ino) {
 		return Entry{}, false, false
 	}
 	e.Head, e.Tail, e.Mid1, e.Mid2 = decodePartial(partial)

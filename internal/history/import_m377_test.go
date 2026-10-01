@@ -13,6 +13,12 @@ package history
 //   手搓源库会让"导出的东西导不回来"这一格永远绿着。
 // ★ P-41/P-42 两条负控制与 P-39 同批存在：把判重改严很容易一路改成"永远不判重"，
 //   那是另一种数据丢失（导两次翻一倍）。
+//
+// ★ 2026-10-01 第九轮批 B2（裁-3，M383）改了本文件的一条期望：键里**去掉**
+//   groups_count / files_count / reclaimable 三列（它们会被 PruneScanFiles 重写），
+//   于是上面那句"四列补齐"只剩 **threads / paranoid / orig_files** 三列，
+//   而 P-40 的 `reclaimable` 那一档期望反转。判据本体与反转后的那一格在
+//   `import_m383_scankey_test.go`。本文件其余格子（P-39/P-41/P-42）不受影响。
 
 import (
 	"path/filepath"
@@ -139,16 +145,24 @@ func TestM377DifferentParanoidIsNotADuplicate(t *testing.T) {
 	}
 }
 
-// TestM377OtherThreeParamsEachBreakDedup 是 P-40：另三档各单独变一变，三条都必须认成新行。
-// ★ 一格一参：只补 paranoid 而漏掉另三列是本批最容易交出去的"半修"（变异 MU-x 钉它）。
-func TestM377OtherThreeParamsEachBreakDedup(t *testing.T) {
+// TestM377OtherTwoParamsEachBreakDedup 是 P-40：另两档各单独变一变，两条都必须认成新行。
+// ★ 一格一参：只补 paranoid 而漏掉另几列是本批最容易交出去的"半修"（变异 MU-x 钉它）。
+//
+// ★ 这一档原有**三条**（threads / orig_files / **reclaimable**）。2026-10-01 裁-3 把
+//
+//	`reclaimable` 判定为**派生值**（`PruneScanFiles` 会在一条事务里重写
+//	groups_count / files_count / reclaimable），它出键 ⇒ 此档期望**反转**为"仍判重复"，
+//	改写并搬到 `import_m383_scankey_test.go` 的 P-51 相邻格。
+//	★ 这不是"测试本来就红"，也不是为了让门禁变绿而改断言：**裁定直接改写了契约**，
+//	测试跟着新契约走；旧契约那半边（threads/orig_files 仍须认成新行）由下面两格继续钉住，
+//	并另立负控制 P-52（见 P-42 那格的处置）。
+func TestM377OtherTwoParamsEachBreakDedup(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(t int64, p bool, o, r int64) (int64, bool, int64, int64)
 	}{
 		{"threads", func(t int64, p bool, o, r int64) (int64, bool, int64, int64) { return t + 4, p, o, r }},
 		{"orig_files", func(t int64, p bool, o, r int64) (int64, bool, int64, int64) { return t, p, o + 7, r }},
-		{"reclaimable", func(t int64, p bool, o, r int64) (int64, bool, int64, int64) { return t, p, o, r + 999 }},
 	}
 	lt, lp, lo, lr := baseParams()
 	for _, tc := range cases {

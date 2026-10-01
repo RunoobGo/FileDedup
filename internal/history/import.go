@@ -198,21 +198,26 @@ func checkUndoEvidence(src *sql.DB) error {
 // 判成"本地已有"就静默吞掉一条真记录——那是导入功能自己能造出来的数据丢失形状。
 // ★ 为什么不认 id：id 是各库自己的 AUTOINCREMENT，跨库无意义，照 id 插要么撞主键、
 // 要么错关联。
-// ★ 为什么 threads / paranoid / orig_files / reclaimable 必须在键里（M377，裁定 M375 取向①）：
-// 这四列改变的是这份扫描的**语义结论**——paranoid 决定分组是否可信、orig_files 与
-// reclaimable 是读数本身、threads 是当时的工况。同五字段而参数不同是**两次不同的判断**，
+// ★ 为什么 threads / paranoid / orig_files 必须在键里（M377，裁定 M375 取向①）：
+// 这三列改变的是这份扫描的**语义结论**——paranoid 决定分组是否可信、orig_files 是当时
+// 实际看到的读数、threads 是当时的工况。同五字段而参数不同是**两次不同的判断**，
 // 判成重复不只抑制子行，还会把外来的 ops 关联到本地另一套参数跑出来的那条扫描上
 // （把两份判断合并成一份）。改前的键只有五字段，真读数见 04 §6.69 的 P-39/P-40。
+//
+// ★ 为什么 groups_count / files_count / reclaimable **不在**键里（M383，2026-10-01 裁-3）：
+// 这三列会被本仓自己的 `PruneScanFiles`（scan.go 同一条事务里重写）改掉——清理之后
+// 组数、文件数、可回收量都变小，而这条扫描还是**同一条判断**。把它们放进键，等于
+// "同一份判断被修剪过 ⇒ 判成新扫描"：导入侧多插一行、并把最旧那条按 M356 的裁剪淘汰掉，
+// 用户看到的是一次"清理后重导，历史记录反而多了几条、旧的没了"。
+// 键只装**不可派生**的量：工况（threads/paranoid/roots/filters/saved_at）与保存瞬间的
+// 原始读数（orig_files）。这两半边合起来才是 M377 与本批共同的方向。
 type scanKey struct {
-	SavedAt     int64
-	Roots       string
-	Filters     string
-	GroupsCount int
-	FilesCount  int
-	Threads     int64
-	Paranoid    bool
-	OrigFiles   int64
-	Reclaimable int64
+	SavedAt   int64
+	Roots     string
+	Filters   string
+	Threads   int64
+	Paranoid  bool
+	OrigFiles int64
 }
 
 type opKey struct {
@@ -408,9 +413,7 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 	scanMap := make(map[int64]int64, len(scans))
 	for _, sc := range scans {
 		k := scanKey{SavedAt: sc.savedAt, Roots: sc.roots, Filters: sc.filters,
-			GroupsCount: int(sc.groupsCount), FilesCount: int(sc.filesCount),
-			Threads: sc.threads, Paranoid: sc.paranoid,
-			OrigFiles: sc.origFiles, Reclaimable: sc.reclaimable}
+			Threads: sc.threads, Paranoid: sc.paranoid, OrigFiles: sc.origFiles}
 		if id, ok := localScans[k]; ok {
 			sum.ScansSkipped++
 			scanMap[sc.id] = id
@@ -470,9 +473,13 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 // localScanKeys 一条集合式语句读回本地全部扫描自然键 → 行 id。
 // 重复键（历史遗留或并发写造成）保留 id 最小的那条：判重只看存在性，
 // 而"指到哪一条"要有一个不随查询计划变化的确定答案。
+//
+// ★ 这里 SELECT 的列**就是键的列**（M383）：groups_count / files_count / reclaimable
+//
+//	已随键一起出局，不要"顺手补回来"——它们是 PruneScanFiles 会重写的派生值，
+//	进键即"修剪过的同一条判断算成新扫描"。
 func (s *Store) localScanKeys() (map[scanKey]int64, error) {
-	rows, err := s.db.Query(`SELECT id, saved_at, roots, filters, groups_count, files_count,
-		threads, paranoid, orig_files, reclaimable
+	rows, err := s.db.Query(`SELECT id, saved_at, roots, filters, threads, paranoid, orig_files
 		FROM scan_history ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -481,17 +488,15 @@ func (s *Store) localScanKeys() (map[scanKey]int64, error) {
 	out := make(map[scanKey]int64)
 	for rows.Next() {
 		var (
-			id                 int64
-			k                  scanKey
-			roots, filters     []byte
-			groupsCount, files int64
+			id             int64
+			k              scanKey
+			roots, filters []byte
 		)
-		if err := rows.Scan(&id, &k.SavedAt, &roots, &filters, &groupsCount, &files,
-			&k.Threads, &k.Paranoid, &k.OrigFiles, &k.Reclaimable); err != nil {
+		if err := rows.Scan(&id, &k.SavedAt, &roots, &filters,
+			&k.Threads, &k.Paranoid, &k.OrigFiles); err != nil {
 			return nil, err
 		}
 		k.Roots, k.Filters = string(roots), string(filters)
-		k.GroupsCount, k.FilesCount = int(groupsCount), int(files)
 		if _, dup := out[k]; !dup {
 			out[k] = id
 		}

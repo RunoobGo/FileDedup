@@ -1,6 +1,11 @@
 // Package model 定义 FileDedup 全部核心数据结构（与 docs/01 §7 一致）。
 package model
 
+import (
+	"path/filepath"
+	"strings"
+)
+
 // FileKey 平台物理文件标识抽象（硬链接识别）。
 // unix 平台遍历时由 lstat 顺带填充；Windows 按需解析（仅候选组内）。
 type FileKey struct {
@@ -141,20 +146,25 @@ func (e *FileEntry) ActualBytes() uint64 {
 // 定义在此而非各调用点：界面、CLI、历史三处若各写一遍，"未知"与"为 0"
 // 迟早会在一处被混掉。
 //
-// ★ 总体必须与 ReclaimActual 一致，只看 files[1:]（MODEL-1，2026-09-21 审查）。
-// 本标志是**那个数字**的"已统计"标记，不是"组里有任何一条读数"：保留项 files[0]
-// 从不参与可释放量，把它算进来会造出"标志为真、数字纯是回退值"的跨卷形状
-// （界面把回退值显示成已统计，正是 M6-P2 立双口径要防的互相冒充）。
+// ★ 总体必须与 ReclaimActual 一致，只看**默认保留项之外**的成员（MODEL-1，2026-09-21 审查；
+//
+//	M382 把"哪一条是保留项"从下标约定改成判据本身）。本标志是**那个数字**的"已统计"标记，
+//	不是"组里有任何一条读数"：保留项从不参与可释放量，把它算进来会造出"标志为真、
+//	数字纯是回退值"的跨卷形状（界面把回退值显示成已统计，正是 M6-P2 立双口径要防的互相冒充）。
 func (g *DuplicateGroup) AnyActualKnown() bool {
 	return actualKnownIn(g.Files)
 }
 
-// actualKnownIn 与 ReclaimActual 共用同一段下标约定（从 1 起 = 只看冗余项）。
+// actualKnownIn 与 ReclaimActual 共用同一段总体（除默认保留项外的成员）。
 func actualKnownIn(files []*FileEntry) bool {
 	if len(files) < 2 {
 		return false
 	}
-	for _, f := range files[1:] {
+	keep := PickDefaultKeepIndex(files)
+	for i, f := range files {
+		if i == keep {
+			continue
+		}
 		if f.ActualKnown {
 			return true
 		}
@@ -162,18 +172,65 @@ func actualKnownIn(files []*FileEntry) bool {
 	return false
 }
 
-// ReclaimActual 组内**冗余成员**的实占之和。约定 files[0] 为保留项，与
-// Reclaimable 的 (n-1) 口径逐字对齐——把保留项计进来会把可释放空间凭空
-// 多报一整份文件（变异 M-P2-c 钉住这一点）。
+// ReclaimActual 组内**冗余成员**的实占之和。扣掉的是 PickDefaultKeepIndex 选出的
+// 那一条——不是"下标 0 那一条"（M382，第九轮批 B1）。
+//
+// 为什么这条改判据而不是改注释：扫描流水线在存组之前按**路径字典序**排过成员
+// （internal/dedup/pipeline_stages.go 的 sortEntries），而默认保留策略选的是
+// "先非隐藏、再路径最短"那一条 —— 两者通常不是同一个下标。原先按 files[1:] 扣，
+// 等于把真正保留的那一份算进可释放量、又把一条实际会被清掉的冗余项当成保留项，
+// 报出来的数因此**虚高一份、又少算一份**。把保留策略的判据上收到这里，
+// 求和与决策从此同一把尺子（I5：同一判据只许有一份实现）。
 func ReclaimActual(files []*FileEntry) uint64 {
 	if len(files) < 2 {
 		return 0
 	}
+	keep := PickDefaultKeepIndex(files)
 	var sum uint64
-	for _, f := range files[1:] {
+	for i, f := range files {
+		if i == keep {
+			continue
+		}
 		sum += f.ActualBytes()
 	}
 	return sum
+}
+
+// PickDefaultKeepIndex 默认保留者的下标：先非隐藏、再路径最短，两者都相同时取下标小的那条；
+// 空切片返回 -1。
+//
+// ★ 这份实现原先在 internal/ops/keep.go 的 pickShortest（01 §9 默认建议），M382 把它上收到
+//
+//	model —— 因为"实占可释放量"必须按**真正会留下的那一条**扣，而 model 不能反向依赖 ops。
+//	ops.pickShortest 现在委托这里，取值与顺序一字未动（负控制见 P-49）。
+func PickDefaultKeepIndex(files []*FileEntry) int {
+	best := -1
+	for i, f := range files {
+		if best < 0 {
+			best = i
+			continue
+		}
+		bi, gi := isHiddenPath(f.Path), isHiddenPath(files[best].Path)
+		switch {
+		case bi != gi:
+			if !bi {
+				best = i
+			}
+		case len(f.Path) < len(files[best].Path):
+			best = i
+		}
+	}
+	return best
+}
+
+// isHiddenPath 路径上任一segment以 . 开头即隐藏（"." 与 ".." 不算）。
+func isHiddenPath(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if strings.HasPrefix(seg, ".") && seg != "." && seg != ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // FailedItem 失败清单条目（扫描与操作共用）。

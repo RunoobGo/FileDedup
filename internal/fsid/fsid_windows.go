@@ -70,6 +70,9 @@ const (
 	// CtimeNs 在 NTFS/exFAT/FAT32 三卷上**一律 0**，Windows 的 change time 从未取到过。
 	// 后果不在身份解析这一层，在**缓存命中判定**（`internal/cache` 的 dev/ino/ctime 三腿）：
 	// ctime 那一腿存 0 读 0、平凡通过，宣称的"第二重证据"实际只剩 inode 一重。
+	// 〔2026-10-01 裁-2 追记〕这句描述的**当时**后果成立；现在 ctime 已整体移出缓存失效判据
+	// （`internal/cache/cache.go` 的 H1 注释给了理由），这一腿不再兜任何东西，M271 修的
+	// 是"字段有没有读错"，那个问题独立于"要不要参与判定"而存在、也独立于本次裁定而值得修。
 	fileBasicInfoClass = 0
 
 	// CreateFileW 参数常量（取自 Win32 头文件）。

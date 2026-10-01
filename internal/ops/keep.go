@@ -95,29 +95,12 @@ func pickBy(g *model.DuplicateGroup, cmp func(a, b *model.FileEntry) bool) int {
 }
 
 // pickShortest 路径最短且不在隐藏目录（01 §9 默认建议）。
+//
+// M382（第九轮批 B1）：判据本体上收进 model.PickDefaultKeepIndex —— 实占可释放量
+// (model.ReclaimActual) 必须按"真正会留下的那一条"扣，两边各写一遍必然分叉（I5）。
+// 取值与顺序一字未动，空组现在交回 -1（原先 0）；三个调用点都有 len 守卫。
 func pickShortest(g *model.DuplicateGroup) int {
-	best := 0
-	for i := 1; i < len(g.Files); i++ {
-		bi, gi := hidden(g.Files[i].Path), hidden(g.Files[best].Path)
-		switch {
-		case bi != gi:
-			if !bi {
-				best = i
-			}
-		case len(g.Files[i].Path) < len(g.Files[best].Path):
-			best = i
-		}
-	}
-	return best
-}
-
-func hidden(p string) bool {
-	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
-		if strings.HasPrefix(seg, ".") && seg != "." && seg != ".." {
-			return true
-		}
-	}
-	return false
+	return model.PickDefaultKeepIndex(g.Files)
 }
 
 // pickByDirectoryPriority 按目录优先级顺序取首个命中目录的保留者，
