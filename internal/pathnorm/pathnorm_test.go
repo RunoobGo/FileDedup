@@ -115,3 +115,96 @@ func TestUnderEmptyParentMeansWholeVolume(t *testing.T) {
 		t.Errorf("Under(\"a/b\", \"\") 应为 false：相对路径不该被算进盘根")
 	}
 }
+
+// dirKeyCorpus 是 A3 那四格形状（盘符 / UNC 全形 / 尾分隔符 / 相对形）的落点。
+//
+// ★ 出处与自纠：`docs/05` §0.2 A3 原文写的是"前端 pathpolicy 混例（盘符 / UNC /
+// 尾分隔符 / 相对路径）是 node 用例，不必真机"。现读两处都不成立——
+// ① `frontend/src/utils/pathpolicy.ts` 只剩 `isGroupCrossVolume` 一条判据，输入是后端
+//
+//	算好的卷标识（`vid:<id>` / `root:<VolumeName>`），**函数体不解析任何路径**
+//	（D-1 已把那份路径判据删掉，因为它是在 `internal/ops/keep.go` 之外的第二份实现，
+//	正是 M64 那一族）；node 面现有 8 条用例（`frontend/tests/pathpolicy-crossvolume.test.ts`
+//	U-1~U-8），盘符那一格保留为 U-6。
+//
+// ② 设计段 §7.2 那张覆盖表里"UNC 只有根、没有 `\\server\share` 全形"（△）与
+//
+//	"相对路径零命中"（✗）**两格是错的**——本文件现读 `:42-43` 就有 `a\b`、`a\b\c`、
+//	`\\server\share\x`。落笔前被现读推翻，按 §6.23 二·1 的规矩就地撤回，不写进账。
+//
+// ⇒ 真正没有直接读数的只有一处：**`DirKey` 零直接用例**（现读 `grep -rn "DirKey" --include=*.go`
+//
+//	只有定义 `pathnorm.go:71` 与 `internal/filter/filter.go:150`、`:289` 两个调用点）。
+//	它是一条**承重函数**：ExcludeDirs 的条目侧与遍历侧共用它做归一（:283 的注释原话），
+//	而"两侧口径不一致"就是 M64 立这个包的理由。
+//
+// ★ 本用例钉的是**不解释**：DirKey 只做"换 sep 那一字符 + 保根去尾"，
+//
+//	不吞根、不补根、不猜绝对、不认 Windows 形状。每一条 `want` 都是这个意思。
+func TestDirKeyShapesAreNotInterpreted(t *testing.T) {
+	cases := []struct {
+		p, sep, want, why string
+	}{
+		// —— 盘符：只换字符，不认"这是一个卷" ——
+		{`C:\a\b`, `\`, `C:/a/b`, "盘符条目：换字符后就是普通键"},
+		{`C:\a\b`, "/", `C:\a\b`, "非 Windows 宿主的 sep 给 `/`：反斜杠是合法文件名字符，不得被吞"},
+		{`C:\`, `\`, `C:`, "盘符根去尾后是 `C:` 而不是 `C:/`——TrimTailKeepRoot 只保 len==1 的那个 `/`（unix 盘根），Windows 盘根不在它的保护范围内。★ 这一格设计段初稿写的是保住尾斜杠，落笔前被现读推翻"},
+
+		// —— UNC 全形：前导双分隔符原样保留，不折成单根 ——
+		{`\\server\share\a\`, `\`, `//server/share/a`, "UNC 全形带尾分隔符：只去尾那一个"},
+		{`\\server\share`, `\`, `//server/share`, "UNC 无前导尾杠：两个前导字符都在（不折成 /server/share）"},
+		{`\\server\share\`, `\`, `//server/share`, "UNC 带尾杠与上一行必须同键——ExcludeDirs 两种写法同义"},
+
+		// —— 尾分隔符：条目侧写过与没写过要同键 ——
+		{`/a/b`, `\`, `/a/b`, "绝对 unix 形：无命中，原样返回"},
+		{`/a/b/`, `\`, `/a/b`, "尾斜杠写没写过同键"},
+		{`/a//b//`, `\`, `/a//b`, "只去**尾部连续**的，中间的双分隔符不归一（那是另一个判据，不在这条里）"},
+		{`/`, `\`, `/`, "盘根：len>1 才去，所以根永远还是 `/`——去光了'保护盘根'就与'什么都不保护'同形"},
+
+		// —— 相对形：不补根、不猜绝对 ——
+		{`a\b\c`, `\`, `a/b/c`, "相对 Windows 形：换字符，但**不**补前导 `/`"},
+		{`./a/b/`, `\`, `./a/b`, "相对点形：只去尾，不做 Clean（做了就长出第五份实现）"},
+		{`..\a\b`, `\`, `../a/b`, "上跳形同样原样交给键空间——归一不是本包的职责"},
+
+		// —— 空 sep 守卫与空条目 ——
+		{`C:\a\`, "", `C:\a\`, "sep 传空串 ⇒ 原样返回（Slash:27-28 明写这是必须守卫而非防御）"},
+		{"", `\`, "", "空条目得空键 ⇒ 丢弃是消费方的判据（见 TestDirKeyEmptyKeyIsWhyCallerMustDrop）"},
+	}
+	for _, c := range cases {
+		if got := DirKey(c.p, c.sep); got != c.want {
+			t.Errorf("DirKey(%q, %q) = %q, want %q（%s）", c.p, c.sep, got, c.want, c.why)
+		}
+	}
+	// 上一表里 `C:\` → `C:` 那一格的**后果**必须当场读到：盘根键被去尾之后仍要能当父键用，
+	// 否则"去尾"就不是无害归一而是把 Windows 盘根条目废掉。键空间里 Windows 路径恒是 `C:/…` 形，
+	// 所以 `C:` ＋ Under 的 `parent+"/"` 恰好接得上——这一条就是这个组合成立的证明。
+	if !Under(DirKey(`C:\a\b`, `\`), DirKey(`C:\`, `\`)) {
+		t.Errorf("盘根条目归一后必须仍能圈住同卷子路径：Under(%q, %q) 判否",
+			DirKey(`C:\a\b`, `\`), DirKey(`C:\`, `\`))
+	}
+}
+
+// TestDirKeyEmptyKeyIsWhyCallerMustDrop 钉住包注释 :69-70 那句"丢弃判据归消费方"：
+// 空键在 Under 里对**任何绝对路径恒真**，所以"什么都不排除"与"全盘排除"会长成同一个样子。
+// 本用例不测 DirKey 的输出（那由上表钉），测的是这条危险形状确实存在 ⇒ 消费方
+// （internal/filter/filter.go:150 的条目侧）必须丢弃空白条目，且不许由 DirKey 代劳。
+func TestDirKeyEmptyKeyIsWhyCallerMustDrop(t *testing.T) {
+	if DirKey("   ", `\`) != "   " {
+		t.Fatal(`DirKey 不得替消费方做 TrimSpace——它连"空白"这一判据都不该有`)
+	}
+	if !Under("/etc/passwd", DirKey("", `\`)) {
+		t.Errorf("空键对绝对路径恒真——这正是消费方必须丢弃空白条目的理由，别把它改成'不恒真'")
+	}
+}
+
+// TestDirKeyMatchesTwoLegComposition 是"两条腿合成"的对照：本包三条判据
+// （Slash + TrimTailKeepRoot）合成出的 DirKey 必须逐字等于 sysguard.normalize 的旧语义。
+// 上面的表是**形状**判据，这条是**等价**判据——形状表可以被一份错的天真实现满足，
+// 等价腿不能（04 §6.8.0：前提自检必须独立于被测物）。
+func TestDirKeyMatchesTwoLegComposition(t *testing.T) {
+	for _, p := range slashCorpus {
+		if got, want := DirKey(p, `\`), goldNormalize(p); got != want {
+			t.Errorf("DirKey(%q, `\\`) = %q, want %q（sysguard.normalize 旧语义）", p, got, want)
+		}
+	}
+}

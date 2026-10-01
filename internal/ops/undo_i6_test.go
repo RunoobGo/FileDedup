@@ -6,7 +6,6 @@ package ops
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -132,10 +131,19 @@ func TestAlreadyRestoredRequiresFullEvidence(t *testing.T) {
 }
 
 // 硬链接回撤：拆链已完成（原位独立、内容等于记录）→ 重试记成功而非「inode 不符」。
+//
+// ★ A2（2026-10-01，docs/05 §0.2 A2／设计段 §6）：这里原来有一格
+// `if runtime.GOOS == "windows" { t.Skip("Windows 上 inode 身份未解析，走的是大小降级分支") }`，
+// 前提已被两处现读推翻——① fsid I7（句柄身份解析）；② **同文件紧邻的兄弟用例**
+// `TestUndoHardlinkReplacedByThirdPartyStillBlocked` 用同一批原语（`HardlinkMerge(keep, dup,
+// fsid.ID{}, fsid.ID{})` ＋ 身份复核）却**没有**这格 Skip，而它不在 windows 腿那份
+// **完整**名单里（`roster_top=28 ≡ skip_top=28` 自证完整，M404 之后才谈得上）⇒ 按 §6.73
+// 判据链＝在 windows 上跑过且绿。Skip 留着就是"用一条作废的前提把一条承重路径永久藏起来"。
+// ★ 兑现边界如实：本机是 darwin，删掉 Skip **证不了** windows 会绿；真正的读数在推送后那一跑的
+//
+//	windows 腿，而按 §6.21 七"本批自己触发的 run 不回写" ⇒ **windows 兑现落在下一批**引用本批日志时。
+//	若那一跑它红了，那是 A2 的本意（暴露被 Skip 掩盖的路径），按新缺陷取号，不当夹具问题抹掉。
 func TestUndoHardlinkSelfHealsAfterUnlinkCrash(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 上 inode 身份未解析，走的是大小降级分支")
-	}
 	dir := t.TempDir()
 	content := []byte("I6-HARDLINK-RESIDUE!!!")
 	keep := filepath.Join(dir, "keep.bin")
