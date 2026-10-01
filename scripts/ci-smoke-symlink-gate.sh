@@ -13,7 +13,8 @@
 # 只做三处**环境耦合入口**，不改判定：
 #   SMOKE_GATE_CMD     = 被测命令（默认 `sudo bash scripts/smoke-symlink.sh`）
 #   SMOKE_GATE_LOG     = 输出留档路径（默认 /tmp/smoke-symlink.log，与改前同一处）
-#   SMOKE_GATE_SUMMARY = 步骤摘要落笔处（默认 $GITHUB_STEP_SUMMARY，没有则临时文件）
+#   SMOKE_GATE_SUMMARY = 步骤摘要落笔处；**未指定时沿用 $GITHUB_STEP_SUMMARY**（与改前的内联块
+#                        同一处，M407），两者都没有才落一次性临时文件
 # ⇒ `scripts/smoke-symlink-assert.sh` 的 H 组能用桩把四条臂各打一次，**每次门禁都执行 `2)` 那一臂**。
 #
 # ★ 摘要为什么也是判据对象：D3 的价值有一半在"红的时候人看得见原因"。
@@ -29,8 +30,13 @@ LOG="${SMOKE_GATE_LOG:-/tmp/smoke-symlink.log}"
 SUMMARY_OWNED=0
 if [ -n "${SMOKE_GATE_SUMMARY:-}" ]; then
 	SUMMARY="$SMOKE_GATE_SUMMARY"
+elif [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+	# ★ 与改前的内联块同一处：CI 上判红文案必须由 runner 发布出去。
+	SUMMARY="$GITHUB_STEP_SUMMARY"
 else
-	SUMMARY="$(mktemp -t fdd-smoke-gate-summary)"
+	# 模板必须自带 XXXXXX：BSD mktemp 的 `-t 前缀` 会自动补，GNU 直接把参数当模板、
+	# 没有 X 就报 "too few X's"（M407：本机全绿、CI ubuntu 腿第一步就红在这一格）。
+	SUMMARY="$(mktemp "${TMPDIR:-/tmp}/fdd-smoke-gate-summary.XXXXXX")"
 	SUMMARY_OWNED=1
 fi
 

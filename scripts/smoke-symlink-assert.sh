@@ -69,8 +69,12 @@ fails=0
 #   是"少跑到就一定红"）；而**任一整段新增组被删掉**都会红——删 G 少 2 条（26）、删 H 少 8 条（20），
 #   两者都低于 27。改前那句"下限 15"对这两段是**瞎的**（15 ≤ 26、15 ≤ 20），这正是 M119 反复
 #   点名的"下界不跟着现值走 = 闸门形同虚设"，本批把它补上。
+# ★ 2026-10-01 划账笔之后 CI 首红（run 36866748734，ubuntu 腿的 D3 步骤）暴露出"H 组四臂都喂了
+#   SMOKE_GATE_SUMMARY ⇒ 默认摘要入口本机从未执行"这一格覆盖盲区，补 I 组 4 条（CI 形状落点、
+#   文案真的进 GITHUB_STEP_SUMMARY、两个入口都没有时的临时文件回退、mktemp 的 `-t` 静态锚）
+#   ⇒ 本机实跑读数 **32**，下限照同一算法抬到 **31 = 现值 − 1**。删掉整个 I 组会红（28 < 31）。
 checks=0
-MIN_CHECKS=27
+MIN_CHECKS=31
 ok() { checks=$((checks + 1)); printf '  ✓ %s\n' "$1"; }
 bad() {
 	checks=$((checks + 1))
@@ -437,6 +441,56 @@ else
 	arm tout 1 '超时按失败处理' 'exit 124'
 fi
 
+# ---- I：默认摘要入口（CI 上真实走的那一条）＋ mktemp 便携性锚（M407）----
+say_title 'I 未指定 SMOKE_GATE_SUMMARY 时的落点与临时文件回退（M407：run 36866748734 的红因）'
+if [ ! -f "$GATE" ]; then
+	bad "scripts/ci-smoke-symlink-gate.sh 不在场 ⇒ 本组整段没被执行"
+else
+	# H 组四臂都显式喂 SMOKE_GATE_SUMMARY ⇒ 脚本里"没喂时落哪儿"那一格本机从未执行，
+	# 而 CI 走的就是那一格。它当时把模板写成 `-t 前缀`形式：BSD 的 mktemp 会把参数当前缀
+	# 自动补 X，GNU 把参数当**模板**、没有 XXXXXX 直接 "too few X's" ⇒ ubuntu 腿在跑被测
+	# 命令之前就 exit 1；即便不炸，文案也落进一次性文件，runner 什么也发布不出来。
+	printf '%s\n' 'echo "SKIP（跳过，非通过）: runner 无法挂载独立文件系统"; exit 2' >"$STUBS/i-gha.sh"
+	chmod +x "$STUBS/i-gha.sh"
+	sum_gha="$STUBS/i-gha.summary"
+	: >"$sum_gha"
+	env -u SMOKE_GATE_SUMMARY GITHUB_STEP_SUMMARY="$sum_gha" \
+		SMOKE_GATE_CMD="bash $STUBS/i-gha.sh" SMOKE_GATE_LOG="$STUBS/i-gha.log" \
+		$RUN_TIMEOUT bash "$GATE" >"$STUBS/i-gha.out" 2>&1
+	gha_rc=$?
+	if [ "$gha_rc" = 1 ]; then
+		ok "只给 GITHUB_STEP_SUMMARY（CI 的形状）时 skip2 臂仍判红（rc=1）"
+	else
+		bad "只给 GITHUB_STEP_SUMMARY 时 rc=${gha_rc}，应为 1（输出：$(tr '\n' ' ' <"$STUBS/i-gha.out" | cut -c1-160)）"
+	fi
+	if [ -s "$sum_gha" ] && LC_ALL=C grep -qF -- '本轮未被执行' "$sum_gha"; then
+		ok "判红文案落在 GITHUB_STEP_SUMMARY 指向的文件里（runner 发布的那份），不再掉进一次性临时文件"
+	else
+		bad "判红文案没出现在 GITHUB_STEP_SUMMARY 指向的文件里（实得：$(tr '\n' ' ' <"$sum_gha" | cut -c1-160)）"
+	fi
+
+	# 两个入口都不在 ⇒ 走一次性临时文件。断言"它跑到了判定"，而不是在 mktemp 那一行就死了。
+	env -u SMOKE_GATE_SUMMARY -u GITHUB_STEP_SUMMARY \
+		SMOKE_GATE_CMD="bash $STUBS/i-gha.sh" SMOKE_GATE_LOG="$STUBS/i-none.log" \
+		$RUN_TIMEOUT bash "$GATE" >"$STUBS/i-none.out" 2>&1
+	none_rc=$?
+	if [ "$none_rc" = 1 ] && LC_ALL=C grep -qF '::error::' "$STUBS/i-none.out"; then
+		ok "两个摘要入口都不在时照常判红并打出 ::error::（临时文件回退没把脚本自己炸掉）"
+	else
+		bad "临时文件回退那一格 rc=${none_rc}（应 1）或输出里没有 ::error::（＝脚本在 mktemp 那行就死了）：$(tr '\n' ' ' <"$STUBS/i-none.out" | cut -c1-160)"
+	fi
+
+	# 静态锚：门禁脚本的代码行里不许出现 mktemp 的 `-t 前缀`写法（BSD 当前缀、GNU 当模板的分裂点）。
+	# 模式用字符类拼出来（不写成那串字面量），否则本行自己就是命中；注释行按 G 组同一规矩跳过。
+	mk_t="$(LC_ALL=C grep -nE 'mktemp[[:space:]]+-t' "$REPO_ROOT"/scripts/*.sh 2>/dev/null |
+		LC_ALL=C grep -vE ':[0-9]+:[[:space:]]*#' | tr '\n' ' ')"
+	if [ -n "$mk_t" ]; then
+		bad "M407 复发：scripts 的代码行里有 mktemp 的 -t 前缀写法（GNU 上要求模板自带六个 X）⇒${mk_t}"
+	else
+		ok "scripts/*.sh 代码行里没有 mktemp 的 -t 前缀写法（便携性静态锚，M407）"
+	fi
+fi
+
 printf '\n'
 printf 'smoke-symlink-assert: 走到断言 %s 条（下限 %s 条），其中失败 %s 条\n' \
 	"$checks" "$MIN_CHECKS" "$fails"
@@ -450,5 +504,5 @@ if [ "$checks" -lt "$MIN_CHECKS" ]; then
 		"⇒ 有分支整段没被执行，不读作通过" >&2
 	exit 1
 fi
-echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归 / G 包装接线锚 / H 四臂判红）"
+echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归 / G 包装接线锚 / H 四臂判红 / I 默认摘要入口）"
 exit 0
