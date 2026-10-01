@@ -1,12 +1,13 @@
 // 扫描任务全局状态（Pinia，M2-T03）。
 import { defineStore } from 'pinia'
 import { api, onEvent, offEvent, isBackendAvailable } from '../wails'
-import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind, PendingPage } from '../wails'
+import type { Filters, ProgressEvent, GroupView, FailedItem, Settings, ScanSummary, OpsProgress, OpsResult, HistoryMeta, OpRecord, UndoResult, OpKind, PendingPage, PagedResult, ResultQuery } from '../wails'
 import { reactive, ref, computed, watch, onScopeDispose } from 'vue'
 import { useToastStore } from './toast'
 import { undoBlockedText } from '../utils/undoReason'
 import { errWithDetail } from '../utils/errShell'
 import { replaySelection } from '../utils/selection'
+import { projectionReload } from '../utils/pageload'
 // AS-H6（2026-09-20）：路径归属判据收回后端，这里不再 import 前端的 dirContains
 // 与大小写猜测——判据只有一份才不会再漂移。utils/pathpolicy.ts 只剩卷比较用的纯函数。
 
@@ -318,16 +319,44 @@ export const useScanStore = defineStore('scan', () => {
     const gen = resultGen
     loadingPage.value = true
     try {
-      const r = await api.getResultGroups({
-        page: append ? resultPage.value : 0,
-        pageSize,
+      // M386（第九轮 P1-5）：显示偏好重取（非 append + keepSelection）要取回**已加载的那一段**，
+      // 不是只有第 0 页。判据、以及"为什么不是一次大请求"（后端把 pageSize 钳在 500）
+      // 都写在 utils/pageload.ts 的头注释里。
+      const loaded = groups.value.length
+      const plan = !append && keepSelection ? projectionReload(loaded, pageSize) : null
+      const size = plan ? plan.segmentSize : pageSize
+      const base: Omit<ResultQuery, 'page' | 'pageSize'> = {
         sort: resultSort.value,
         ext: resultExt.value,
         // 功能 3：开着「隐藏非拟处理项」才把策略目录随查询上送（见 hideNonPending 注释）。
         ...(hideNonPending.value
           ? { dirs: usableProcDirs(), excludeDirs: usableProcExcludeDirs() }
           : {}),
-      })
+      }
+      let r: PagedResult
+      if (plan && plan.segments > 1) {
+        // 分段取回。每段之间复查 resultGen（换代即整趟作废，与单段路径同一条纪律）；
+        // 任一段回包不满 segmentSize 就是后端已到底，后续段不必再发。
+        // ★ 段边界上的并发换代（同一结果集内视图被重建）会让拼接处重复或缺一行为，
+        //   这与改前的追加腿是同一族暴露（resultPage 记的是页不是行），本批不扩大处理。
+        const acc: GroupView[] = []
+        let head: PagedResult | null = null
+        for (let i = 0; i < plan.segments; i++) {
+          const part = await api.getResultGroups({ ...base, page: i, pageSize: size })
+          if (gen !== resultGen) return
+          if (head === null) head = part
+          acc.push(...part.groups)
+          if (part.groups.length < size) break
+        }
+        if (head === null) return // 一段都没回（立刻被换代打断），整趟作废
+        r = { ...head, groups: acc.slice(0, loaded) }
+      } else {
+        r = await api.getResultGroups({
+          ...base,
+          page: append ? resultPage.value : 0,
+          pageSize: size,
+        })
+      }
       if (gen !== resultGen) return // 结果集已被新扫描/新历史作废，回包不得盖回界面
       if (append) {
         groups.value.push(...r.groups)
@@ -338,7 +367,9 @@ export const useScanStore = defineStore('scan', () => {
         // 勾选一字不变"）。
         const prevSel = keepSelection ? new Set(selection.value) : null
         groups.value = r.groups
-        resultPage.value = 1
+        // M386：重取了 loaded 行 ⇒ 页号要回到"已加载段之后"，否则下一次追加会从头重复取；
+        // 其余非 append 重取（排序/筛选/换代）仍是回到第 1 页，一字不变。
+        resultPage.value = plan ? plan.nextPage : 1
         if (prevSel && prevSel.size > 0) {
           // 回放的判据在 utils/selection.ts（纯函数、有单测）：
           //   仍可见且可勾 ⇒ 留；被这一轮隐藏（或就是保留项）⇒ 不再背着勾。

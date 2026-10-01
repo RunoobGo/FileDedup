@@ -105,16 +105,52 @@
 
 ### D1　显示偏好重取不塌行集（拟 M386）
 
+> ★ **实施期更正（本段原文有错，按现读代码改写；下面 D1 的改法与判据以本更正为准）**
+>
+> 1. **"一次请求取回已加载的那一段"取不到**：后端 `app_result.go:34-38` 把 `PageSize` 钳到
+>    **500**（`> 500` 时钳到上限，M10 的溢出钉子就钉在这个值上），而 `DEFAULT_LOAD_CAP` 初始就是
+>    2000（`scan.ts:65`）。若照本段原写"size=loaded、resultPage=ceil(loaded/100)"，800 组那一档
+>    实际只回 500 行却把 `resultPage` 写成 8 ⇒ 下一次追加从偏移 800 起，**第 500~799 组被永久跳过**
+>    ——修法本身比原缺陷更会丢数据。因此改法换成**分段取回**：每段 `pageSize` 不超过后端上限，
+>    段数 = `ceil(loaded / 段大小)`，取回后截到 `loaded` 行，再写回 `resultPage = ceil(loaded / 100)`。
+> 2. **"pinia store 打不进 node --test"这句是错的**（本段 §八.3 同错）：`tests/harness.mjs` 自 M16
+>    起就能在 node 里实例化真 store（`tests/scan-resultset.test.ts` 就是活例，它断言的正是
+>    `doLoadResultPage` 发出的查询参数）。所以 P-58 从"静态接线锚"**升级为 store 级行为探针**，
+>    真能跑到"累积 800 行 → 翻开关 → 行集与勾选"这一格。`utils/selection.ts:3-5` 那句同源过期话术
+>    一并更正（M210：文档跟着代码走）。
+>
+> 更正后的判据（标号不变，读数在划账笔现取）：
+>
+> - **P-57**（纯函数）：`projectionReload(800, 100)` ⇒ `{segmentSize:500, segments:2, nextPage:8}`；
+>   `projectionReload(50, 100)` ⇒ `{100, 1, 1}`（原样，负控制）；`projectionReload(0, 100)` ⇒ 同上；
+>   `projectionReload(2000, 100)` ⇒ `{500, 4, 20}`；再加两条**算术不变量**格：
+>   `segments × segmentSize ≥ loaded`（取不回已加载段就是错）与 `nextPage × pageSize ≥ loaded`
+>   （追加腿不得跳过已加载段之外的行）。★ 后一条正是原设计漏掉的那格。
+> - **P-58**（行为探针，非静态锚）：桩具造 800 组分页数据 → `loadMore` 累积到 800 → 勾第 150 行后的
+>   项 → 翻「隐藏非拟处理项」⇒ 断言 `groups.length` 仍为 800 **且**勾选仍在。改前必红（塌回 100 行、
+>   勾选被 `replaySelection` 判为不可见而丢）。
+> - **P-58b**（负控制）：同一桩具下 `append` 腿与不带 `keepSelection` 的重取**一字不变**（仍发
+>   `page=…, pageSize=100`），防止把"分段"泄漏到放量路径上。
+
 - 抽纯函数进 `frontend/src/utils/pageload.ts`（可被 `node --test` 导入，形状同 `utils/selection.ts`）：
   ```ts
-  export function projectionReload(loaded: number, pageSize: number): { size: number; nextPage: number }
-  // loaded<=pageSize ⇒ {size: pageSize, nextPage: 1}
-  // 否则 ⇒ {size: loaded, nextPage: ceil(loaded / pageSize)}  // 一次取回已加载的那一段
+  export const MAX_PAGE_SIZE = 500 // 与 app_result.go:36-38 的钳位值同值，两处必须一起改
+  export interface ReloadPlan { segmentSize: number; segments: number; nextPage: number }
+  export function projectionReload(loaded: number, pageSize: number, maxPageSize = MAX_PAGE_SIZE): ReloadPlan
+  // loaded<=pageSize ⇒ {pageSize, 1, 1}                       // 一页都不到，行为与改前同形
+  // 否则           ⇒ segmentSize=min(loaded,maxPageSize)
+  //                 segments=ceil(loaded/segmentSize)         // 分段取，每段不触后端钳位
+  //                 nextPage =ceil(loaded/pageSize)           // 写回 resultPage 的页号
   ```
-  `doLoadResultPage` 在 `keepSelection && !append` 分支里用它取 `pageSize` 并回写 `resultPage = nextPage`；append 腿与 `loadMore` 一字不动。
-- 判据（**P-57**，node）：`projectionReload(800, 100)` ⇒ `size=800, nextPage=8`；`projectionReload(50,100)` ⇒ 原样；`projectionReload(0,100)` ⇒ 原样（负控制）。★ 这一格是纯函数红，**行为级红拿不到**（store 依赖 pinia，`.vue` 打不进 node —— M116/M118 同族限制），因此再补：
-- 判据（**P-58**，接线锚）：钉 `scan.ts` 的非 append+keepSelection 分支确实调用 `projectionReload`，且 `resultPage` 由它给。
-- 残余风险如实写：一次取回 2000 组的响应比一次 100 组大，内存里本来就有同量数据，但**首屏抖动**与后端单次查询时间会变长；若实测不可接受，退回取向是"重取后按页依次补齐"（本批不做两版）。
+  `doLoadResultPage` 在 `keepSelection && !append` 分支里用它决定请求段数与 `pageSize`，逐段
+  `await`（每段之间复查 `resultGen`，换代即整趟作废）、按 `page=i, pageSize=segmentSize` 取，
+  拼起来截到 `loaded` 行，并回写 `resultPage = nextPage`；任一段回包不满 `segmentSize` 就停止后续段
+  （后端已到底）。append 腿与 `loadMore` 一字不动。
+- 残余风险如实写：① 分段之间结果视图可能被并发换代（`viewCache` 的 guard 变化后重新排序），
+  段边界上的行可能重复或缺一——这与**改前的追加腿本来就有**的暴露面同一族（`resultPage` 记账数的是
+  页而不是行），本批不扩大处理，只在注释点名；② 一次重取从 1 次 IPC 变成最多 4 次（2000/500），
+  首屏抖动与后端单次查询时间的代价由"分段"承担而不是放大；③ `loaded` 非 `pageSize` 整数倍只可能
+  出现在"结果集已到底"之后（追加腿每次 +100），那时没有后续行可跳，`nextPage` 的向上取整无害。
 
 ### D2　`safeHref` 补白名单判据（拟 M387，观察项拟 M389）
 
@@ -152,8 +188,9 @@
 | P-54 | B3 边界 | `fsid_ctime_m271_test.go` 一字不动（前提自检） |
 | P-55 | C M379 | 400 条 Store 在飞时 `-wal` 读回 0600 |
 | P-56 | C 负控制 | 关闭后伴随文件已不存在 ⇒ 不出声不报错 |
-| P-57 | D1 纯函数 | `projectionReload(800,100) = {800, 8}` |
-| P-58 | D1 接线锚 | 非 append+keepSelection 分支调用 `projectionReload` |
+| P-57 | D1 纯函数 | `projectionReload(800,100) = {500, 2, 8}`（分段计划，含两条算术不变量格） |
+| P-58 | D1 行为探针（store） | 累积 800 行后翻显示偏好 ⇒ 行集不塌、第 100 行后的勾选仍在 |
+| P-58b | D1 负控制 | append 腿与普通重取仍发 `pageSize=100`（分段不得泄漏到放量路径） |
 | P-59 | D2 白名单 | `javascript:`/`data:`/`vbscript:` ⇒ null（六格逐条） |
 | MU9-a | A1 | 删回撤那一问 ⇒ 红在 P-44 |
 | MU9-b | A1 | 把问挪到锁外 ⇒ 红在 P-44 |
@@ -168,7 +205,7 @@
 
 1. **本批改 `app.go`/`app_ops.go` 的行数会把 §一 里所有 `app.go:NNN` 推走**——本段与报告写的坐标一律标注为"`ccdea3d` 现读"，划账笔必须现取复跑，不许照抄。
 2. **Windows 真机面零读数**：A2 的后端门禁在 windows 腿同样生效（纯 Go 逻辑），但 P-55（伴随文件档位）在 Windows 上按 M354 只能读回 0666 ⇒ **不得**写"三平台已验"；CI 三条腿只给编译与 vet 证据。
-3. **P-47 / P-58 是接线锚不是行为探针**：`.vue` 与 pinia store 打不进 `node --test`（M116/M118 同族限制），措辞只能是"静态锚 + 纯函数红"。
+3. **P-47 是接线锚不是行为探针**：`.vue` 组件打不进 `node --test`（M116/M118 同族限制），措辞只能是"静态锚"。★ **但这一条不适用于 pinia store**：`tests/harness.mjs`（M16）能在 node 里实例化真 store，所以本批的 D1 判据按更正走**行为探针**（见 §五 D1 的实施期更正），原写"只能静态锚"那句作废。
 4. **B1 只修默认策略那一档**：手动改选保留项后的分叉登记为 M388，本批不修 ⇒ 对用户说"实占口径已一致"不成立，成立的说法是"默认策略路径已一致，手动覆盖仍有已知分叉"。
 5. **`-wal` 创建瞬间仍是 0644**：窗口只能缩小（裁-1 未选目录级取向）。这句必须进 09/10 的边界句，防止手册读成"写入期也仅所有者可读"。
 6. **协议相对 URL 放行**是现行为、不是已裁定（M389）。
