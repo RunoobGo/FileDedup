@@ -19,10 +19,16 @@
 #   - 每行的 rc 一律取**该命令自己**的退出码（ PIPESTATUS 显式取，不让管道尾巴盖掉）。
 #   - 计数行（top_PASS / src_test / data_race …）只是**留证**，不参与判定；
 #     判定只看 rc 与 gofmt 的文件数、以及 DATA RACE 必须为 0。
+#     ★ M405（2026-10-01）给行 6 开了一条例外，且**不是**把"计数"升成判据：
+#       `roster_top ≡ top_SKIP` 钉的是"我外显的名单全不全"（取数通道自身的完整性），
+#       与"有多少条 skip"无关——有 skip 照旧不判红（合法环境性 skip 先例在册，M331 的取向）。
 #
 # 用法：
 #   bash scripts/run-gates.sh              # 全 15 行
 #   bash scripts/run-gates.sh --fast       # 跳掉最贵的三行（6 的 -v 全量 / 7 / 8 两轮 race）
+#   GATE_LOGDIR=/tmp/gates bash scripts/run-gates.sh   # 指定日志目录（M405）：
+#     ★ 指定时**全绿也不删**（默认路径的 mktemp 会在绿的时候把行 6 的 SKIP 名单一起回收）。
+#     行 6 的清册单独落 `$LOGDIR/6-skip-{top,sub}.roster`，同时逐条打到 stdout。
 # 输出全部走 stdout（划账时整段重定向进带时间戳的文件再引用，别读旧报告）。
 
 set -u
@@ -31,8 +37,18 @@ cd "$(dirname "$0")/.." || exit 3
 FAST=0
 [[ "${1:-}" == "--fast" ]] && FAST=1
 
-LOGDIR="$(mktemp -d)"
-
+# ★ M405（2026-10-01，设计段 §1.2 之一）：LOGDIR 给一个可指定入口。
+# 原来这里恒是 `mktemp -d`，而 gates_cleanup() 在**全绿时 rm -rf** ⇒ 行 6 那份 `6-test.log`
+# 连同 SKIP 名单一起被回收，"哪几条 skip 了"永久拿不到（§6.72 七·5 实录：同一时间窗
+# 行 6 报 7、包装脚本报 6，两边都对得上各自的账，却没有任何一份名单可用来做差集归因）。
+# 入口惯例照仓内既有的负控制入口（M134_SCAN_FILES / ANCH_SRCLIST / FRONTEND_DIR）：
+# **默认行为一字不变**；调用方给路径时只保证目录存在，**不删调用方的目录**（见 gates_cleanup）。
+LOGDIR="${GATE_LOGDIR:-$(mktemp -d)}"
+LOGDIR_OWNED=1
+if [ -n "${GATE_LOGDIR:-}" ]; then
+	mkdir -p "$LOGDIR" || exit 3
+	LOGDIR_OWNED=0
+fi
 # 判定累加器：三态 PASS / SKIP / FAIL，最后逐行打印。
 ROWS=()
 VERDICTS=()
@@ -50,6 +66,12 @@ gates_cleanup() {
 	if [[ $FAILS -gt 0 ]]; then
 		printf '日志保留在 %s（有 %s 行 FAIL：逐行 .log 还在，划账直接抄明细，不必重跑）\n' \
 			"$LOGDIR" "$FAILS"
+		return
+	fi
+	# ★ M405：LOGDIR_OWNED=0（调用方给了 GATE_LOGDIR）⇒ **全绿也保留**（这正是这一格存在的理由：
+	#   要归因的恰恰是"什么都没坏的那一跑里名单长什么样"）。自建的临时目录照旧清。
+	if [[ $LOGDIR_OWNED -eq 0 ]]; then
+		printf '日志保留在 %s（GATE_LOGDIR 由调用方指定，本脚本不删调用方的目录）\n' "$LOGDIR"
 		return
 	fi
 	rm -rf "$LOGDIR"
@@ -143,17 +165,59 @@ else
   go test -count=1 -v ./... >"$LOGDIR/6-test.log" 2>&1
   GO6=$?
   echo "rc=$GO6"
-  grep -c "^ok  " "$LOGDIR/6-test.log" | sed 's/^/ok_pkgs=/'
-  grep -c "no test files" "$LOGDIR/6-test.log" | sed 's/^/no_test_pkgs=/'
-  echo "top_PASS=$(grep -c '^--- PASS' "$LOGDIR/6-test.log")"
-  echo "top_SKIP=$(grep -c '^--- SKIP' "$LOGDIR/6-test.log")"
-  echo "top_FAIL=$(grep -c '^--- FAIL' "$LOGDIR/6-test.log")"
-  echo "sub_PASS=$(grep -c '^    --- PASS' "$LOGDIR/6-test.log")"
-  echo "sub_SKIP=$(grep -c '^    --- SKIP' "$LOGDIR/6-test.log")"
-  echo "sub_FAIL=$(grep -c '^    --- FAIL' "$LOGDIR/6-test.log")"
-  echo "run=$(grep -c '^=== RUN' "$LOGDIR/6-test.log")"
+  # ★ M405：本行读 6-test.log 的**每一处**都带 `-a`（M404 的教训：BSD/GNU grep 一旦把日志判成
+  #   二进制，`-c` 照旧准但匹配行不再打 ⇒ "计数准、名单缺"；本行新增的恰恰是取名单那几处）。
+  #   只给名单加 -a 会留下"数按二进制、列按文本"这种新的不同形 ⇒ 计数与名单同一把尺。
+  grep -a -c "^ok  " "$LOGDIR/6-test.log" | sed 's/^/ok_pkgs=/'
+  grep -a -c "no test files" "$LOGDIR/6-test.log" | sed 's/^/no_test_pkgs=/'
+  TOP_PASS=$(grep -a -c '^--- PASS' "$LOGDIR/6-test.log")
+  TOP_SKIP=$(grep -a -c '^--- SKIP' "$LOGDIR/6-test.log")
+  TOP_FAIL=$(grep -a -c '^--- FAIL' "$LOGDIR/6-test.log")
+  SUB_PASS=$(grep -a -c '^    --- PASS' "$LOGDIR/6-test.log")
+  SUB_SKIP=$(grep -a -c '^    --- SKIP' "$LOGDIR/6-test.log")
+  SUB_FAIL=$(grep -a -c '^    --- FAIL' "$LOGDIR/6-test.log")
+  echo "top_PASS=${TOP_PASS}"
+  echo "top_SKIP=${TOP_SKIP}"
+  echo "top_FAIL=${TOP_FAIL}"
+  echo "sub_PASS=${SUB_PASS}"
+  echo "sub_SKIP=${SUB_SKIP}"
+  echo "sub_FAIL=${SUB_FAIL}"
+  echo "run=$(grep -a -c '^=== RUN' "$LOGDIR/6-test.log")"
   echo "src_test=$(grep -rh '^func Test' --include='*_test.go' --exclude-dir=node_modules --exclude-dir=.workbuddy . | wc -l | tr -d ' ')"
-  [[ $GO6 -eq 0 ]] && note "6 test -v" PASS || { fail; note "6 test -v" FAIL; }
+
+  # ★ M405（04 §6.11 GATE 族的本机版本，设计段 §1.2 之二）：外显 SKIP **清册**，
+  #   并钉"清册 ≡ 计数"。原形状是八个计数一条名字都不打，而日志随 mktemp 回收
+  #   ⇒ §6.72 七·5 那次"行 6 报 7、包装脚本报 6"永远无法归因（没有名单可做差集）。
+  #   ★ 判红的不是"有 skip"，是"名单不全"：合法环境性 skip 先例在册（requireSymlinkSupport 一族），
+  #     一刀切会把门禁训练成"大家都忽略的那一行"（M331 的取向，一字未改）。
+  #   先落文件再打印：这样"取名单"有独立产物，删掉下面任一条 echo 也骗不出"0 ≡ 0"的绿
+  #   （见下面判据链的第一臂，它读的就是这两个文件在不在——MU-2 顶的正是这一格）。
+  #   sed 只去掉耗时尾巴，行首形状与 scripts/ci-go-test.sh 的清册**逐字同形** ⇒ 两份可直接 comm。
+  grep -a '^--- SKIP' "$LOGDIR/6-test.log" | sed -E 's/ \([0-9.]+s\)$//' >"$LOGDIR/6-skip-top.roster"
+  grep -a '^    --- SKIP' "$LOGDIR/6-test.log" | sed -E 's/ \([0-9.]+s\)$//' >"$LOGDIR/6-skip-sub.roster"
+  ROSTER_TOP=$(grep -a -c . "$LOGDIR/6-skip-top.roster" 2>/dev/null)
+  ROSTER_SUB=$(grep -a -c . "$LOGDIR/6-skip-sub.roster" 2>/dev/null)
+  ROSTER_TOP=${ROSTER_TOP:-0}
+  ROSTER_SUB=${ROSTER_SUB:-0}
+  echo "roster_top=${ROSTER_TOP}"
+  echo "roster_sub=${ROSTER_SUB}"
+  echo "-- 6-skip-roster-begin"
+  cat "$LOGDIR/6-skip-top.roster" "$LOGDIR/6-skip-sub.roster" 2>/dev/null
+  echo "-- 6-skip-roster-end"
+  if [[ ! -f "$LOGDIR/6-skip-top.roster" || ! -f "$LOGDIR/6-skip-sub.roster" ]]; then
+    echo "FAIL: 6-skip-*.roster 不在场 ⇒ SKIP 名单通道本身缺失，本轮 SKIP 读数不可信（M405）"
+    fail
+    note "6 test -v" FAIL
+  elif [[ $ROSTER_TOP -ne $TOP_SKIP || $ROSTER_SUB -ne $SUB_SKIP ]]; then
+    echo "FAIL: SKIP 清册与计数不同源（roster_top=${ROSTER_TOP} vs top_SKIP=${TOP_SKIP}，roster_sub=${ROSTER_SUB} vs sub_SKIP=${SUB_SKIP}）⇒ 名单被截断（M405）"
+    fail
+    note "6 test -v" FAIL
+  elif [[ $GO6 -ne 0 ]]; then
+    fail
+    note "6 test -v" FAIL
+  else
+    note "6 test -v" PASS
+  fi
 fi
 
 # 7~8) 竞态面：rc=0 还不够，**DATA RACE 必须为 0**（race detector 报在 ok 行之后时
