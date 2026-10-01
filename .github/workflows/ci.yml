@@ -147,50 +147,19 @@ jobs:
       # 而本步骤改前只认裸 rc=2；该脚本整体是 `set -euo pipefail`，中途任何命令以 2
       # 退出（mount 参数错、grep 读不出）都会在这里被降级成"被跳过 + 告警"、作业仍绿。
       # 本地那份 harness 同一格已按 M123 补成双条件，这里补齐云端这一半。
+      #
+      # ★ 2026-10-01 D3 收归（设计段 §4）：上面那三段历史描述的 shell 逻辑**搬进
+      #   scripts/ci-smoke-symlink-gate.sh**，本步骤只调用它。原因是这一格一直只有
+      #   反事实——`2)` 那一臂住在内联 run: 里没有可调用入口，而 ubuntu 腿恒 rc=0
+      #   ⇒ 它从未被执行过，"改对了"零读数。收归后 smoke-symlink-assert.sh 的 H 组
+      #   用桩把四条臂（0 / 2+SKIP / 2 无自证 / 124）各打一次、逐臂断言 rc 与摘要内容，
+      #   每次门禁都执行 `2)` 那一臂。迁移是**行为等价**的：判据、文案、退出码、
+      #   `::error::`、摘要落笔、PIPESTATUS 取码逐字照搬（划账给了 diff）。
+      # 本步骤与改前同效：`timeout-minutes: 10` 留在原位，被测命令默认值仍是
+      # `sudo bash scripts/smoke-symlink.sh`，日志仍是 /tmp/smoke-symlink.log。
       - name: 跨卷软链接冒烟（独立卷 + 7 条判据）
         timeout-minutes: 10
-        run: |
-          set +e
-          # step 级 timeout（AS-K5）：mount/losetup 坏的时候是**阻塞**而不是报错，
-          # 只靠作业级 timeout-minutes 会把整个 job 连日志一起废掉。
-          # M133：输出一份留档，供 rc=2 那一格核对自证标记（PIPESTATUS 取 timeout 的码，
-          # 不是 tee 的——取错就变成"只要 tee 成功就算通过"）。
-          timeout --signal=TERM --kill-after=30s 420s \
-            sudo bash scripts/smoke-symlink.sh 2>&1 | tee /tmp/smoke-symlink.log
-          rc=${PIPESTATUS[0]}
-          set -e
-          case "$rc" in
-            0) echo "跨卷软链接 7 条判据全部成立" ;;
-            124|137|143) msg="跨卷软链接冒烟超时（420s 未完成，rc=${rc}）——多半是 mount/losetup 阻塞"
-               echo "::error::$msg"
-               {
-                 echo '## ⏱ 跨卷软链接冒烟超时'
-                 echo
-                 echo "$msg"
-                 echo "超时按失败处理：阻塞与判据不成立都需要人来看。"
-               } >>"$GITHUB_STEP_SUMMARY"
-               exit 1 ;;
-            2) if grep -q '^SKIP' /tmp/smoke-symlink.log; then
-                 # D3（推翻 M8/M133 的"环境受限不该怪代码"定性，2026-10-01 用户解封）：
-                 # 脚本自己认领为跳过 ⇒ 判据没跑，唯一一条真跨卷防线这一轮不存在。
-                 msg="跨卷软链接冒烟被跳过（runner 无法挂载独立文件系统）——该防线本轮未被执行；按 D3 裁定判红，不再与全绿同形"
-                 why="环境受限：loop/tmpfs/sudo 任一条不可用。判据 ①「硬链接跨卷必失败」只能在真实独立卷上实证，同卷无法降级验证。"
-               else
-                 # M133 那一半原样保留：rc=2 却没有行首 SKIP 自证 ⇒ 是真失败，不是跳过。
-                 msg="rc=2 但输出里没有以 SKIP 开头的那行自证 ⇒ 按真失败判，不降级为跳过（M133）"
-                 why="被测脚本整体是 set -euo pipefail，中途任何命令以 2 退出都会长这样——必须人来分清是哪一种。"
-               fi
-               echo "::error::$msg"
-               {
-                 echo '## ❌ 跨卷软链接冒烟未通过（rc=2 一律判红，D3）'
-                 echo
-                 echo "$msg"
-                 echo
-                 echo "$why"
-               } >>"$GITHUB_STEP_SUMMARY"
-               exit 1 ;;
-            *) echo "::error::跨卷软链接冒烟失败（rc=${rc}）"; exit "$rc" ;;
-          esac
+        run: bash scripts/ci-smoke-symlink-gate.sh
 
       # 冒烟脚本自身的判据（退出码契约 + loop 设备不泄漏 + 失败信息可排查）。
       # 不需要 root：它用桩命令驱动 smoke-symlink.sh 的各分支。
