@@ -11,13 +11,16 @@
 #   C. `fail "...（%d）..."`：fail() 用 printf '%s' 渲染，%d 是**字面量**，
 #      失败信息里看不到设备号——恰是排查最需要的数字。
 #
-# 本套断言在当前代码上**全绿**（2026-09-23 本机复跑：18 条断言、rc=0）；它守卫以下**五**类回归
+# 本套断言在当前代码上**全绿**（2026-10-01 本机复跑：**28** 条断言、rc=0；18 是 G/H 两组进来之前
+# 的读数，2026-09-23 R4-3 补 D0 三条后是 18）；它守卫以下**七**类回归
 # （回归一旦复现，本脚本必须红）：
 #   A 跳过与全绿同形（必须 rc=2 + SKIP 标记）
 #   B loop 泄漏（必须按 --find 返回的那个设备释放）
 #   C 设备号 %d 字面量（失败信息里必须出现真数字）
 #   D0 设备号闸门**放行**那一支（两卷不同号时必须越过闸门；R4-3，2026-09-23）
 #   D 真失败分支（rc=1、含 FAIL 不含 SKIP、FAIL 即终止、设备号是真数字、同样释放 loop）
+#   G workflows 里不许出现裸 `run: go test`、且包装接线数不许低于 5（M401，2026-10-01）
+#   H 冒烟门禁四条臂（0 / 2+SKIP / 2 无自证 / 124）逐臂断言 rc **与步骤摘要**（D3 收归，2026-10-01）
 # ★ AS-K3（2026-09-20 全仓审计）：修正前本套**只驱动 skip 路径**——把被测脚本
 # fail() 里的 `exit 1` 删掉，本套与 CI 两步仍全绿，即"能失败"这件事从未被验证。
 # 现在补 D 组：桩出"挂载成功但两卷同号"，必须 rc=1、输出含 FAIL 不含 SKIP，
@@ -61,8 +64,13 @@ fails=0
 # 只设**下限**不设等号：以后加断言不必回来改这里，而"少跑到"一定会红。
 # ★ 2026-09-23 R4-3 加了 D0 三条 ⇒ 本机实跑读数已是 **18**；下限**照旧不动**（15 是"少跑到"
 #   的那道闸，不是"当前应有几条"的等号），这里只把"15 = 实跑读数"那句改成历史说明。
+# ★ 2026-10-01（设计段 §4.3 第三条纪律）G 组 2 条 ＋ H 组 8 条进来 ⇒ 本机实跑读数 **28**，
+#   下限随之重取为 **27 = 现值 − 1**。算术写死在这句里：以后再加断言要回来一起抬（这不是等号，
+#   是"少跑到就一定红"）；而**任一整段新增组被删掉**都会红——删 G 少 2 条（26）、删 H 少 8 条（20），
+#   两者都低于 27。改前那句"下限 15"对这两段是**瞎的**（15 ≤ 26、15 ≤ 20），这正是 M119 反复
+#   点名的"下界不跟着现值走 = 闸门形同虚设"，本批把它补上。
 checks=0
-MIN_CHECKS=15
+MIN_CHECKS=27
 ok() { checks=$((checks + 1)); printf '  ✓ %s\n' "$1"; }
 bad() {
 	checks=$((checks + 1))
@@ -309,7 +317,10 @@ NA_BYTE="$(printf '\200-\377')"
 if [ -n "${M134_SCAN_FILES:-}" ]; then
 	scan_list="$M134_SCAN_FILES"
 else
-	scan_list="$(printf '%s\n' "$REPO_ROOT"/scripts/*.sh "$REPO_ROOT/.github/workflows/ci.yml")"
+	# ★ M177/M334（2026-10-01 随 M401 一起抬面，设计段 §3.2 之三）：面从"scripts/*.sh + ci.yml"
+	#   抬成"scripts/*.sh + **两份** workflows"。只扫 ci.yml 挡不住 build.yml 被改回裸写法
+	#   ——那正是 M401 这格要防的事，而它第一次撞的就是 `run: go test` 的**跨文件**形状。
+	scan_list="$(printf '%s\n' "$REPO_ROOT"/scripts/*.sh "$REPO_ROOT"/.github/workflows/*.yml)"
 fi
 scanned=0
 m134_bad=''
@@ -333,15 +344,97 @@ while IFS= read -r f; do
 	fi
 done <<< "$scan_list"
 # 下界：清单为空 / glob 没展开时，"没有命中"是假的通过（M119 同一个坑）。
-# ★ 2026-10-01 本批改口：M331 新增 `scripts/ci-go-test.sh` ⇒ 扫描面从 8 个升到 9 个
-#   （8 个 scripts/*.sh + ci.yml）。**下界仍是 8**（它是"塌空"判据，不是等值判据），
-#   只有这句解释性话术需要跟着实现走（M150 那一族的教训：守契约的实现改了，说明书最后跟）。
-if [ "$scanned" -lt 8 ]; then
-	bad "只扫到 ${scanned} 个文件（下界 8；现值应为 8 个 scripts/*.sh + ci.yml = 9）⇒ 扫描面本身没成立，不读作通过"
+# ★ 2026-10-01 本批把**清单与下界一起抬**（M177/M334 欠的那半件事，随 M401 一起做）：
+#   面 = 9 个 scripts/*.sh（新增 ci-smoke-symlink-gate.sh）+ 2 份 workflows/*.yml = **11**，
+#   下界随现值重取为 **11**。仍是**下限不是等号**——以后再加门禁脚本不必回来改这里，
+#   但**删掉/漏扫**任何一份一定会红（这正是 M401 那条锚要的"面不能缩"）。
+if [ "$scanned" -lt 11 ]; then
+	bad "只扫到 ${scanned} 个文件（下界 11；现值应为 9 个 scripts/*.sh + 2 份 workflows/*.yml = 11）⇒ 扫描面本身没成立，不读作通过"
 elif [ -z "$m134_bad" ]; then
-	ok "${scanned} 个门禁脚本的代码行里没有 \$VAR 紧邻全角字符"
+	ok "${scanned} 个门禁脚本与 workflow 的代码行里没有 \$VAR 紧邻全角字符"
 else
 	bad "M134 复发：\$VAR 直接贴着全角字符，bash 3.2 会把全角首字节读进变量名 ⇒${m134_bad}"
+fi
+
+# ---- G：workflows 里的 go test 必须全部经包装脚本（M401 静态防回归）----
+say_title 'G workflows 里没有裸 run: go test、且包装接线数 ≥ 5（M401 静态锚）'
+# 两条判据**缺一即红**（设计段 §3.2）：
+#   判据 1 挡"把 `run: bash scripts/ci-go-test.sh …` 改回裸 `run: go test …`"——
+#     改回去这一腿就分不清 PASS 与 SKIP，而 15 行门禁照绿（M331 的读数通道是 CI 独有的）。
+#   判据 2 挡"把那五步整段删掉"：删干净**同样满足**判据 1（零命中＝假绿）。
+#     这正是 M119／M108 在本仓反复点名的"下限自证"那一格，MU-4 顶的就是它。
+# 整行 `#` 注释里的举例不构成运行时风险（`ci.yml:241`、`:250-251` 那两处正文里就写着
+# `go test -race -count=2 ./...`），不跳会误伤——与 E 组同一口径。
+wf_count=0
+m401_bare=''
+m401_wired=0
+for f in "$REPO_ROOT"/.github/workflows/*.yml; do
+	[ -f "$f" ] || continue
+	wf_count=$((wf_count + 1))
+	hit=$(LC_ALL=C grep -nE '^[[:space:]]*-?[[:space:]]*run:.*[[:space:]]go[[:space:]]+test' "$f" |
+		LC_ALL=C grep -vE '^[0-9]+:[[:space:]]*#' | head -3)
+	if [ -n "$hit" ]; then
+		m401_bare="$m401_bare ${f##*/}:$(printf '%s' "$hit" | tr '\n' ' ')"
+	fi
+	n=$(LC_ALL=C grep -c 'run: bash scripts/ci-go-test.sh' "$f")
+	m401_wired=$((m401_wired + ${n:-0}))
+done
+if [ "$wf_count" -lt 2 ]; then
+	bad "只扫到 ${wf_count} 份 workflow（应为 2：ci.yml ＋ build.yml）⇒ 面本身没成立，下面两条判据一律不读作通过"
+elif [ -n "$m401_bare" ]; then
+	bad "M401 复发：workflows 里有裸调 go test 的代码行 ⇒${m401_bare}"
+else
+	ok "${wf_count} 份 workflow 的代码行里没有裸 run: go test（都经 scripts/ci-go-test.sh）"
+fi
+if [ "$m401_wired" -lt 5 ]; then
+	bad "包装接线只有 ${m401_wired} 处（下界 5＝ci.yml 4 ＋ build.yml 1）⇒ 有人删掉了包装步骤而不是改回裸调；判据 1 对"删步骤"是瞎的（M119 同一格）"
+else
+	ok "包装接线数 ${m401_wired} ≥ 5（ci.yml 4 ＋ build.yml 1，build.yml 那一处是 M402）"
+fi
+
+# ---- H：D3 判红臂的四条臂在本机各打一次（收归后第一次有可调用入口）----
+say_title 'H 冒烟门禁的四条臂逐臂断言 rc 与步骤摘要（D3 收归，设计段 §4.3）'
+# 改前形状：这段判定只住在 `.github/workflows/ci.yml` 的内联 `run:` 里，而 ubuntu 腿
+# 恒 rc=0 ⇒ `2)` 那一臂**在 CI 上一次都没执行过**、本机也没有入口——"D3 改对了"只有反事实。
+# 收归成 scripts/ci-smoke-symlink-gate.sh 后，本组用桩把四条臂各打一次：
+# ★ 摘要也必须断言——D3 的价值有一半在"红的时候人看得见原因"，只断言退出码等于把那一半丢了。
+GATE="$REPO_ROOT/scripts/ci-smoke-symlink-gate.sh"
+if [ ! -f "$GATE" ]; then
+	bad "scripts/ci-smoke-symlink-gate.sh 不在场 ⇒ D3 判红臂没有可调用入口，本组整段没被执行"
+else
+	# arm 标签 期望rc 摘要必须含(空串=必须不含"未通过"/"超时") 桩体
+	arm() {
+		local tag="$1" want="$2" want_in="$3" body="$4"
+		local sum="$STUBS/h-$tag.summary"
+		printf '%s\n' "$body" >"$STUBS/h-$tag.sh"
+		chmod +x "$STUBS/h-$tag.sh"
+		: >"$sum"
+		SMOKE_GATE_CMD="bash $STUBS/h-$tag.sh" SMOKE_GATE_LOG="$STUBS/h-$tag.log" \
+			SMOKE_GATE_SUMMARY="$sum" $RUN_TIMEOUT bash "$GATE" >"$STUBS/h-$tag.out" 2>&1
+		local got=$?
+		if [ "$got" = "$want" ]; then
+			ok "$tag 臂退出码 = ${want}"
+		else
+			bad "$tag 臂退出码 = ${got}，应为 ${want}（输出：$(tr '\n' ' ' <"$STUBS/h-$tag.out" | cut -c1-160)）"
+		fi
+		if [ -n "$want_in" ]; then
+			if LC_ALL=C grep -qF -- "$want_in" "$sum"; then
+				ok "$tag 臂摘要点名原因（含「${want_in}」）"
+			else
+				bad "$tag 臂摘要没有点名原因（要找「${want_in}」，实得：$(tr '\n' ' ' <"$sum" | cut -c1-160)）"
+			fi
+		else
+			if LC_ALL=C grep -qE '未通过|超时' "$sum"; then
+				bad "$tag 臂（真通过那一臂）的摘要里出现了「未通过／超时」⇒ 判红误伤"
+			else
+				ok "$tag 臂摘要没有判红文案（rc=0 与全绿同形是**对的**，其余三臂不是）"
+			fi
+		fi
+	}
+	arm pass 0 '' 'echo "卷 A dev=2049 ｜ 卷 B dev=1792"; echo "①…⑦ 七条判据成立"; exit 0'
+	arm skip2 1 '本轮未被执行' 'echo "SKIP（跳过，非通过）: runner 无法挂载独立文件系统"; exit 2'
+	arm bare2 1 '按真失败判' 'echo "两个目录仍在同一设备"; exit 2'
+	arm tout 1 '超时按失败处理' 'exit 124'
 fi
 
 printf '\n'
@@ -357,5 +450,5 @@ if [ "$checks" -lt "$MIN_CHECKS" ]; then
 		"⇒ 有分支整段没被执行，不读作通过" >&2
 	exit 1
 fi
-echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归）"
+echo "smoke-symlink-assert: 全部断言通过（A 跳过 / B 释放 / C 设备号 / D0 闸门放行 / D 真失败 / E 静态防回归 / G 包装接线锚 / H 四臂判红）"
 exit 0

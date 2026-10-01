@@ -170,7 +170,19 @@ jobs:
         # 本轮刻意不给它加 -race（mingw 不在依赖清单里）。
         # ★ 未兑现：加 -race 后的时长只有 tag/dispatch 跑才拿得到（作业级
         #   timeout-minutes: 40）。超时是**红**、不会被读成绿，但没有实测数。
-        run: go test -race -count=1 ./...
+        #
+        # M402（04 §6.11，设计段 2026-10-01-unfulfilled-closure-design.md §2）：
+        # 改前这一行是裸 `go test -race -count=1 ./...`——发布腿三条（linux /
+        # macos-14 / macos-latest）分不清 PASS 与 SKIP，而 windows 腿经
+        # test-windows-quarantine.sh 早已走同一把尺子，属**不对称**形状。现改走
+        # scripts/ci-go-test.sh（内部补 -v、外显 M331_READOUT 与 SKIP 清册）。
+        # 不是新引入的未验证形状：该脚本已在 **ci.yml 的 macos 腿**真跑过
+        # （run 36850278294，job 110330025681，READOUT `skip_top=14 roster_top=14`
+        # ≡ 自证完整名单）。★ 注意这是 **CI workflow** 的 macos 腿，不是发布腿——
+        # 发布腿（本步骤）在 GitHub 托管 macos runner 上的第一次读数见下面那行兑现边界。
+        # ★ 兑现边界：发布腿只在 tag／dispatch 上跑，本批 §5 那一跑才是它的第一份
+        #   读数；在那之前不得写"发布腿已能分 PASS／SKIP"。
+        run: bash scripts/ci-go-test.sh -race -count=1 ./...
 
       # B3-4：Windows 测试改为阻断式白名单门禁。原先 continue-on-error 让整个
       # 平台的测试不设防（任何回归都被"仅告警"吞掉）。现在只有清单内逐条列明
