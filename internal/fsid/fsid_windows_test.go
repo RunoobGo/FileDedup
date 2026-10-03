@@ -67,6 +67,8 @@ func TestWindowsIdentitySurvivesRename(t *testing.T) {
 	// ★ 2026-09-27（M306）：这里原本是 `after != before`（**整结构**相等，含 CtimeNs），
 	//   M271 把 change time 真正读出来之后它开始红。现读归因（探针读数同批落盘
 	//   `build/m7scratch/m306_ctime_rename_readings.txt`）：**NTFS 改名会推进 change time**
+	//   〔2026-10-03 追记〕上面那枚 `build/m7scratch/` 指针**不可复取**（该目录从未入库，本机已于本批按用户
+	//   裁定清理）；+514200 ns 这类读数是抄进本注释的字面，判据以注释自身为准，不必去找原件。
 	//   （第一次改名实测 +514200 ns；写内容同样推进；两次纯查询之间恒定为 0，
 	//   所以不是读数竞态）。⇒ "改名后 ctime 不变"这条前提本来就不成立，
 	//   要钉的不变量是**身份两腿（卷号 + 文件索引）随文件走**，也就是 `SameIdentity`。
@@ -118,6 +120,8 @@ func TestWindowsDistinctFilesDiffer(t *testing.T) {
 //	（实测 8 次里 4 次未推进；单跑 `go test ./internal/fsid/` 则是绿的——这就是它躲过
 //	本轮前面所有绿的原因）。真机读数（探针 `$TEMP/fdd_probe_tick`，同批落盘
 //	`build/m7scratch/m306_ctime_rename_readings.txt`）：
+//	〔2026-10-03 追记〕上面这枚指针**不可复取**（该目录从未入库，本机已于本批按用户裁定清理）；下面
+//	A/B 两臂的 4/8 与 0/8 是抄进本注释的字面读数，判据以注释自身为准，不必去找原件。
 //	  A 无间隔直接写  ：未推进 4/8      ← NTFS 的时间戳有刻度，同一刻度内的两次操作读出同一个值
 //	  B 间隔 1ms 后写 ：未推进 0/8
 //	另测：两次纯查询之间差值恒为 0 ⇒ 读数本身稳定，不是竞态也不是缓存。
