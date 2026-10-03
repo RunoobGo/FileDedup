@@ -50,7 +50,17 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 	}
 	a.mu.Lock()
 	busy := a.opsRunning || a.scanInFlight
+	maint := a.maintaining
 	a.mu.Unlock()
+	if maint != "" {
+		// APP-40：这一问是 `app.go` 覆盖清单里「未接闩」那一项。
+		// 后果不是数据损坏而是**悬空 id**：`DeleteScanHistory`/`ClearScanHistory`
+		// 占住闩、把那行删掉之后才释放，而下面 :110 的 `a.curHistID = id` 若落在
+		// 释放之后，它就指向一条已不存在的行 ⇒ 后续清理的 `PruneScanFiles` 拿
+		// `ErrNoRows`，整笔裁剪回滚，用户看到的是一句与真实原因无关的
+		// 「历史裁剪失败…请先重扫」。与 ExecuteOperation / UndoOperation 同一道第三问。
+		return ScanSummary{}, fmt.Errorf("%s进行中，请等待完成后再打开历史", maint)
+	}
 	if busy {
 		return ScanSummary{}, fmt.Errorf("扫描/清理进行中，请稍后再打开历史")
 	}
@@ -98,6 +108,12 @@ func (a *App) LoadScanHistory(id int64) (ScanSummary, error) {
 	if a.opsRunning || a.scanInFlight {
 		a.mu.Unlock()
 		return ScanSummary{}, fmt.Errorf("任务已开始，历史未载入")
+	}
+	// APP-40：与入口那一问同源，**必须落在同一个临界区**里——挪到 a.mu.Lock() 之前
+	// 的话，维护恰好在这个暂停点上占住闩，这一格照样放行（与 M380 那条静态锚同款理由）。
+	if a.maintaining != "" {
+		a.mu.Unlock()
+		return ScanSummary{}, fmt.Errorf("%s进行中，历史未载入", a.maintaining)
 	}
 	a.groups = groups
 	a.byID = byID

@@ -339,6 +339,9 @@ export interface RecordsExportResult {
 // RecordsImportResult 是「导入记录」的回执（M352）。
 // 五个计数一个都不能少：少了 skipped 说不清"是不是已经导过了"，
 // 少了 orphaned 说不清导入的清理记录还能不能联动。
+// DDP-9 补两个：导入进来的可回撤记录若落点不在本机扫描根之下会被标成不可撤，
+// 这两个字段让界面能如实显示「导入了 N 笔、其中 M 笔在本机不能回撤」——
+// 不说的话用户会以为回撤按钮坏了。
 export interface RecordsImportResult {
   cancelled: boolean
   source: string
@@ -347,6 +350,8 @@ export interface RecordsImportResult {
   opsAdded: number
   opsSkipped: number
   opsOrphaned: number
+  opsUndoDowngraded: number
+  opsUndoDowngradeNote: string
 }
 
 export interface PreviewData {

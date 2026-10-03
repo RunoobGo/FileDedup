@@ -29,6 +29,7 @@ package history
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -36,6 +37,7 @@ import (
 	"strings"
 
 	"filededup/internal/dbfile"
+	"filededup/internal/pathnorm"
 	"filededup/internal/sqlconn"
 
 	"modernc.org/sqlite"
@@ -54,6 +56,14 @@ type ImportSummary struct {
 	// ★ M371：只计**真的落库**的行——被去重跳过的重复导入不在这里记账，
 	// 否则回执会出现"没新增任何东西，却发现 N 条孤儿"这种自相矛盾。
 	OpsOrphaned int `json:"opsOrphaned"`
+	// OpsUndoDowngraded 是 DDP-9 那一闸降级的笔数：外来可回撤记录里，
+	// 落点不在本机任何扫描根之下（或不在任何已知路径清单里）的那几笔，
+	// 导入时已被标成 **undoable=0**，即在本机没有任何入口能发起回撤。
+	// 记在回执里是因为"导入了 5 笔、有 2 笔不能回撤"必须看得见，
+	// 否则用户会以为回撤按钮坏了。
+	OpsUndoDowngraded int `json:"opsUndoDowngraded"`
+	// OpsUndoDowngradeNote 是那句降级说明（为空即没有发生降级）。非空时前端应当显示。
+	OpsUndoDowngradeNote string `json:"opsUndoDowngradeNote"`
 }
 
 // importTableSpec 是一张外来表必须具备的名字与列（前置校验的判据）。
@@ -190,6 +200,258 @@ func checkUndoEvidence(src *sql.DB) error {
 		"这种条目一旦导入，回撤会跳过内容比对与身份复核，可能按外来路径搬动本机文件，"+
 		"因此本次导入已拒绝，本地记录未改动。请在本机重新扫描并清理后再导出，或只导入新版导出的记录",
 		badItems, badOps, undoEvidenceLen)
+}
+
+// ─── DDP-9：路径侧的同一道闸 ───
+//
+// checkUndoEvidence 封的是**内容证据**那一半，DDP-9 封的是**路径**那一半。两者缺一，
+// 威胁模型就只完成一半：补上 hash 之后，攻击者仍可填 `orig_path` / `dest_path` /
+// `size` / `state` 四个字段，让"回撤"变成"把本机 P 处那份文件 rename 到任意外部 Q，
+// 并在 Q 之下 MkdirAll 出任意目录树"。
+//
+// 为什么这两半必须成对：`internal/ops` 侧对 OrigPath **零校验**——
+// undoSourceCheck（undo.go:91）只 Lstat/IsRegular/size/BLAKE3 校验 **DestPath**，
+// restoreInPlace（undo.go:160/209）拿 OrigPath 直接 MkdirAll + renameFile。
+// 也就是说 DestPath 的校验拦的是"搬错文件"，**没有一条判据管"搬到哪里去"**。
+//
+// ★ 取向与 M355 同源（裁定 R-8-1 的"只在导入侧 fail-closed"）：这条闸也只落导入侧，
+//   不加列、不改回撤腿、不动本地老账本的零值放行分支。差别只在"合法来源"的定义：
+//   M355 认「满长非零内容证据」，本闸认「路径落在本机某次扫描的根下」——
+//   后者才是"这份记录说的是本机的文件"这句话在**路径**上的对应物。
+//
+// ★ 为什么不用「精确同值」那条更保守的取向：用户把 A 机的账本导到 B 机是**这个功能的
+//   正当用途**（手册 09 §6.8「只导入自己导出过的文件」讲的是"别导来路不明的"，
+//   不是"只许导回本机"）。而两机的用户目录布局通常相同 ⇒ 根前缀对得上而完整路径逐字
+//   不同。精确同值会把这一档正常用法打死，那与"用全表拦截换一条绿"是同一种假修法
+//   （M355 的注释里点名过这个形状）。
+//
+// ★ 一处刻意的**不拦**：本机一个扫描都没有时（全新安装、刚导入第一份账本），
+//   根集合是空的 ⇒ 外来可回撤条目一律拒。理由是这时"本机扫描根"这个概念还不存在，
+//   而放行等于把闸整个关掉。代价如实说：那台机器上第一份外来账本导不进可回撤条目，
+//   用户先扫一次盘即可。这与手册 09 §6.8 已有的那句代价同向、可叠加。
+
+// foreignUndoPathSQL 问的是与 undoEvidenceSQL **同一个集合**里每条条目的 op_id 与 orig_path。
+// 只取 orig_path：DestPath 在回撤侧已被 undoSourceCheck 全量校验（存在 + 常规文件 +
+// size + BLAKE3），而 OrigPath 一路到 renameFile 都没人看。
+const foreignUndoPathSQL = `SELECT i.op_id, i.orig_path
+	FROM op_items i
+	JOIN op_records r ON r.id = i.op_id
+	WHERE r.undoable = 1 AND i.state IN (?, ?)`
+
+// localScanRootsSQL 取本机全部扫描根。判据取"任一根下即放行"而不是"所有根下"：
+// 前者是"这条路径有没有可能来自本机"，后者是"必须同时属于每一次扫描"，那会拦掉
+// 同一台机器上先后扫过不同目录的正常账本。
+const localScanRootsSQL = `SELECT roots FROM scan_history`
+
+// foreignPathSep 是外来账本路径的归一分隔符：取**字面** "\\" 而不是
+// string(filepath.Separator)——这里处理的是**账本里存下来的字符串**，
+// 那份账本可能是在 Windows 上写的，而 Windows 的 `\` 在 POSIX 上是合法文件名字符。
+// 与 sysguard 的跨平台保护清单同款（pathnorm 包注释里点名的第二种合法给法）。
+const foreignPathSep = "\\"
+
+// markForeignUndoPaths 把"落点越界"的外来可回撤记录在本机**标成不可撤**，
+// 返回被标了多少笔（外加一句给界面看的说明，非空即发生了降级）。
+//
+// ★ 为什么是"降级"而不是"整单拒绝"——这一格改过一次取向，值得把理由写全：
+//
+//	第一版是整单拒绝。实测打脸：既有夹具（TestM355ImportAcceptsItemWithFullContentEvidence
+//	等 7 条）造的是「本地根 /mine/a + 外来根 /theirs/c」，模拟的正是**跨机导入**，
+//	而两机布局不同是这一档的常态。整单拒绝把"把 A 机的账本导到 B 机看"这个功能的
+//	正当用途整条打死 ⇒ 那就是 M355 注释里点名的"用一刀拦截换一条绿"，
+//	而且是与 M355 自己立的"负控制必须能单独红"纪律同性质的假修法。
+//
+//	降级取向为什么足够：威胁是"**回撤**能按外来路径搬本机文件"。
+//	把 undoable 标成 0 之后，这条记录在本机就**没有任何入口**能发起回撤——
+//	不是"多点一次会失败"，是记录页不摆「回撤」按钮、批量回撤不收它、
+//	GetOp 读出的 Undoable 为 false 直接回绝（app_ops.go:331）。
+//	能力被摘掉，威胁随之消失，而"看记录"这一档一点没少。
+//
+//	这也是 R-8-1 那句"不加列、不改回撤腿"的延伸：不加列（复用已有的
+//	op_records.undoable），不改回撤腿（一行代码都不动），只改**导入时写进去的值**。
+//	本地老账本的 undoable=1 一条不动——那些是本机自己写的，落点天然有本机来源。
+func markForeignUndoPaths(src, local *sql.DB) (badOps map[int64]bool, note string, err error) {
+	roots, err := localScanRoots(local)
+	if err != nil {
+		return nil, "", err
+	}
+	known, err := localKnownPaths(local)
+	if err != nil {
+		return nil, "", err
+	}
+	rows, err := src.Query(foreignUndoPathSQL, StateDone, StateUndoFailed)
+	if err != nil {
+		return nil, "", fmt.Errorf("读外来账本的回撤落点失败（本地记录未改动）: %w", err)
+	}
+	defer rows.Close()
+
+	// 越界的**源侧 op_id 集合**。降级作用在 op_records.undoable 上（那是回撤唯一读的列），
+	// 所以按 op 归并而不是按 item：一个 op 里 100 个条目只要有 1 个越界，
+	// 那一笔就不能整笔回撤——回撤是整笔触发的，留一条缝就等于没封。
+	badOps = make(map[int64]bool)
+	var sample []string
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var opID int64
+		var p string
+		if err := rows.Scan(&opID, &p); err != nil {
+			return nil, "", fmt.Errorf("读外来账本的回撤落点失败（本地记录未改动）: %w", err)
+		}
+		if p != "" && foreignPathAllowed(p, roots, known) {
+			continue
+		}
+		badOps[opID] = true
+		// 同一个越界路径在账本里出现几百次（一次清理动了几百个文件），
+		// 文案里只点一份，其余只报计数 —— 否则文案会变成一份路径清单。
+		if p != "" && !seen[p] {
+			seen[p] = true
+			if len(sample) < foreignPathSampleMax {
+				sample = append(sample, p)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("读外来账本的回撤落点失败（本地记录未改动）: %w", err)
+	}
+	if len(badOps) == 0 {
+		return nil, "", nil
+	}
+	return badOps, foreignPathDowngradeNote(len(badOps), sample, len(roots)), nil
+}
+
+// foreignPathSampleMax 是降级说明里最多列几个示例路径。
+const foreignPathSampleMax = 3
+
+// foreignPathDowngradeNote 组一句给界面看的降级说明。
+// 两套文案（有根/无根）：无根时"请先扫一次盘"是真出路，有根时不是。
+func foreignPathDowngradeNote(n int, sample []string, rootCount int) string {
+	const shown = foreignPathSampleMax
+	detail := strings.Join(sample[:min(len(sample), shown)], "、")
+	more := ""
+	if len(sample) > shown {
+		more = fmt.Sprintf("（另有若干同样越界的路径未列）")
+	}
+	if rootCount == 0 {
+		return fmt.Sprintf("%d 笔外来清理记录的落点不在本机任何扫描根之下（示例：%s%s），"+
+			"已按不可回撤导入：回撤会按那些落点搬动文件并创建对应目录，而本机从未扫描过那些位置。"+
+			"若要在本机回撤这些条目，请先在本机扫描一次再重新导入；"+
+			"只想查看记录不受影响", n, detail, more)
+	}
+	return fmt.Sprintf("%d 笔外来清理记录的落点落在本机扫描根之外（示例：%s%s），"+
+		"已按不可回撤导入：回撤会按那些落点搬动文件并创建对应目录，而本机从未扫描过那些位置。"+
+		"若要在本机回撤这些条目，请在本机重新扫描后重新导出导入；只想查看记录不受影响",
+		n, detail, more)
+}
+
+// localScanRoots 取本机全部扫描根，归一成可前缀比较的键。
+// roots 存的是 JSON 数组字符串；解不开的行按"没有根"处理（跳过）——
+// 那一格若发生，本机那条扫描本来也读不出根，对本闸的贡献是零。
+func localScanRoots(local *sql.DB) ([]string, error) {
+	rows, err := local.Query(localScanRootsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("读本机扫描根失败（本地记录未改动）: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("读本机扫描根失败（本地记录未改动）: %w", err)
+		}
+		var rs []string
+		if err := json.Unmarshal(raw, &rs); err != nil {
+			continue // 形状不可控的一行：贡献零根，不是错误
+		}
+		for _, r := range rs {
+			if k := pathnorm.DirKey(r, foreignPathSep); k != "" {
+				out = append(out, k)
+			}
+		}
+	}
+	return out, rows.Err()
+}
+
+// localKnownPaths 取本机"见过"的精确路径键（hist_files.path + op_items.orig_path）。
+// 这是 foreignPathAllowed 的条件 2/3；两处并成一张表是因为它们回答同一个问题。
+func localKnownPaths(local *sql.DB) (map[string]bool, error) {
+	out := make(map[string]bool)
+	for _, q := range []string{`SELECT path FROM hist_files`, `SELECT orig_path FROM op_items`} {
+		rows, err := local.Query(q)
+		if err != nil {
+			return nil, fmt.Errorf("读本机路径清单失败（本地记录未改动）: %w", err)
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("读本机路径清单失败（本地记录未改动）: %w", err)
+			}
+			if p == "" {
+				continue
+			}
+			if k := pathnorm.DirKey(p, foreignPathSep); k != "" {
+				out[k] = true
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("读本机路径清单失败（本地记录未改动）: %w", err)
+		}
+	}
+	return out, nil
+}
+
+// foreignPathAllowed 判一条外来 orig_path 是否有本机来源。
+//
+// 获准的条件（三条任一）：
+//  1. 解析后落在本机某条扫描根之下（正规用法：同机导出导回、或同布局的另一台机）；
+//  2. 归一后与本机某条 hist_files.path 精确同值（扫描后用户搬过家目录的兜底）；
+//  3. 归一后与本机某条 op_items.orig_path 精确同值（同上，另一条来源腿）。
+//
+// 条件 2/3 是为"本机那条扫描已被 MaxScanHistory 裁掉"留的出口——
+// 裁剪删的是最旧的扫描行，而 op_items 里的回撤条目可能还在。
+//
+// 归一口径走 `internal/pathnorm`（Slash + DirKey），不自己写一份分隔符判据：
+// M64 的教训是同一判据在本仓曾有四份实现、四份对 `\` 的取径不一致。
+// 斜杠键空间里判前缀一律走 pathnorm.Under（不许自己拼 HasPrefix）。
+func foreignPathAllowed(p string, roots []string, known map[string]bool) bool {
+	key := pathnorm.DirKey(p, foreignPathSep)
+	if key == "" {
+		return false
+	}
+	if !absoluteKey(key) {
+		return false
+	}
+	for _, r := range roots {
+		if pathnorm.Under(key, r) {
+			return true
+		}
+	}
+	return known[key]
+}
+
+// absoluteKey 判归一后的键是不是"绝对路径"。
+//
+// ★ 为什么不能只认前导 `/`：账本是**跨平台**字符串，一份 Windows 账本归一后是
+// `C:/Users/me/x.bin`，它不以 `/` 开头但**绝对不相对**——只认 `/` 会把
+// "外来 Windows 账本 + 本机 Windows 扫描根"这一档正常用法全判成相对路径
+// （本机实测踩过：P-10/P-11 两格在收进这条判据之前就是这么红的）。
+//
+// 三条判据任一即真：前导 `/`（POSIX 绝对，UNC `//host/share` 归一后仍以 `/`
+// 开头，由这一条一并覆盖）、`X:` 盘符（Windows 绝对）。
+//
+// 反过来说，判否的那一档是 `relative/x.bin` 与 `C:relative`（**无斜杠**的盘符
+// 形式是 Windows 的"当前盘目录"，相对性等同相对路径）——这正是要在回撤侧
+// 相对当时工作目录解析、而 GUI 进程的 CWD 可能是 `/` 的那两种形状。
+func absoluteKey(key string) bool {
+	if strings.HasPrefix(key, "/") {
+		return true // 含 UNC：//host/share 去掉尾斜杠后仍以 / 开头
+	}
+	if len(key) >= 2 && key[1] == ':' {
+		c := key[0]
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	return false
 }
 
 // scanKey 与 opKey 是两条自然键（裁定 R-2 的判重依据）。
@@ -370,6 +632,16 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		return sum, err
 	}
 
+	// DDP-9：内容证据那一半封住之后，**路径**那一半仍开着——ops 侧对 OrigPath 零校验，
+	// 落点由外来账本说了算。这一闸同样在写之前、与上一闸同一集合（不多拦也不少拦），
+	// 但**取向是降级而不是拒收**：见 markForeignUndoPaths 的注释（整单拒绝会打死
+	// "把 A 机的账本导到 B 机看"这个功能的正当用途）。返回的是源侧 op_id 集合，
+	// 写入时按 op.id 匹配。
+	badOps, downgradeNote, err := markForeignUndoPaths(src, s.db)
+	if err != nil {
+		return sum, err
+	}
+
 	// M363（第八轮审查批 2）：读集合 → 判重 → 写 tx → Commit 必须在**同一个** s.mu 临界区里。
 	// 本方法是 internal/history 里唯一一个不取 s.mu 的写者（非测试代码 16 处 s.mu.Lock，
 	// import.go 原先一处都没有），而 Store 的注释明写"全部方法内部串行化"。
@@ -461,6 +733,15 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 		if orphan {
 			sum.OpsOrphaned++
 		}
+		// DDP-9：落点越界的外来可回撤记录按**不可撤**落库。降级写在同一事务里——
+		// 与 insertOpRow 分两次提交的话，中途失败会留下"op 行已落、undoable 还没改"的
+		// 窗口，而那个窗口里它是可撤的（威胁正是"可撤"）。回撤腿一行代码都没动。
+		if badOps[op.id] {
+			if _, err := tx.Exec(`UPDATE op_records SET undoable = 0 WHERE id = ?`, opID); err != nil {
+				return sum, fmt.Errorf("把越界落点的外来记录标成不可撤失败（本地记录未改动）: %w", err)
+			}
+			sum.OpsUndoDowngraded++
+		}
 		localOps[k] = opID
 		sum.OpsAdded++
 		if err := mergeOpItems(tx, src, op.id, opID); err != nil {
@@ -470,7 +751,9 @@ func (s *Store) ImportFrom(srcPath string) (ImportSummary, error) {
 	if err := tx.Commit(); err != nil {
 		return sum, err
 	}
-	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」）
+	// 降级说明只在真有降级时非空；贴在回执上让界面能显示"导入了、有 N 笔不能回撤"。
+	sum.OpsUndoDowngradeNote = downgradeNote
+	hardenSidecars(s.path) // M379：写腿收口处补档（裁-1「写入腿各补收紧」)
 	return sum, nil
 }
 

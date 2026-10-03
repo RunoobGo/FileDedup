@@ -328,7 +328,8 @@ func (a *App) UndoOperation(opLogID int64) (string, error) {
 		release()
 		return "", shellRPCError(err) // M367：回撤腿同样不许把驱动原话直接端给界面
 	}
-	if !meta.Undoable {
+	// APP-41：判据本体在 opUndoAllowed（两条腿共用一处，见它的注释）。
+	if !opUndoAllowed(meta) {
 		release()
 		return "", fmt.Errorf("%s", undoReasonCode(meta.Kind))
 	}
@@ -405,6 +406,28 @@ func (a *App) undoExecuteItem(hs *history.Store, kind string, it history.OpItem)
 	return restored, nil
 }
 
+// opUndoAllowed 是回撤两条腿（整笔 UndoOperation / 单项 UndoOperationItem）
+// 共用的可撤判据，**全包唯一实现**。
+//
+// ★ APP-41（2026-10-03 审查，I5 形状收口）：改前两条腿各自写 `if !meta.Undoable`，
+//
+//	只读账本里那一列 `op_records.undoable`。而那一列是**记账那一刻**按当时的平台写的
+//	（`beginJournal` → `undoableFor(kind, runtime.GOOS)`），于是"账本说可撤"与
+//	"本机真能撤"成了两份判据：把一份在 Windows 上写好的账本拿到 macOS 打开，
+//	或者反之，那一列就与本机能力不一致 ⇒ 用户会点到一个注定失败的动作。
+//	两条腿都改成 `meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)`：
+//	账本那一列仍然认（它是记账时的判断，保留历史语义），但**平台判据在本机重新问一次**。
+//
+// ★ 为什么这一格此前是"待裁"而不是"必改"（M82 那一批的取向）：
+//
+//	DDP-9 落地后外来账本的 `undoable` 已在**导入时**被压成 0，
+//	所以"跨机账本骗过回撤"那条主路已经封了；本条是**纵深防御**——
+//	它把"两份判据"这个 I5 形状本身收掉，代价是零（对同一台机器写下的账本，
+//	两列本来就同值 ⇒ 这一句是恒真的 no-op，只在账本与本机平台不一致时才起作用）。
+func opUndoAllowed(meta *history.OpMeta) bool {
+	return meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)
+}
+
 // UndoOperationItem 回撤记录中的单个条目（全部回撤之外的增量通道）：
 // done 与 undo_failed（修正后重试）可撤；互斥/可撤性/条目状态入口同步校验，
 // 受理后异步执行，终止事件与批量回撤同构（ops:undo:done）。
@@ -447,7 +470,8 @@ func (a *App) UndoOperationItem(opLogID, itemID int64) (string, error) {
 		release()
 		return "", shellRPCError(err) // M367：回撤腿同样不许把驱动原话直接端给界面
 	}
-	if !meta.Undoable {
+	// APP-41：判据本体在 opUndoAllowed（两条腿共用一处，见它的注释）。
+	if !opUndoAllowed(meta) {
 		release()
 		return "", fmt.Errorf("%s", undoReasonCode(meta.Kind))
 	}

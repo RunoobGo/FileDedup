@@ -344,14 +344,14 @@ function onConfirm(targetDir?: string) {
           <span class="kd-idx" :title="`优先级 ${i + 1}`">{{ i + 1 }}</span>
           <span class="kd-path" :title="d">{{ d }}</span>
           <button class="btn-ghost xs" :disabled="i === 0" title="上移（提高优先级）"
-            aria-label="上移目录" @click="store.moveKeepDir(i, -1)">↑</button>
+            aria-label="上移目录" @click="store.moveKeepDir(i, -1)"><Icon name="arrow-up" :size="13" /></button>
           <button class="btn-ghost xs" :disabled="i === store.keepDirs.length - 1"
-            title="下移（降低优先级）" aria-label="下移目录" @click="store.moveKeepDir(i, 1)">↓</button>
+            title="下移（降低优先级）" aria-label="下移目录" @click="store.moveKeepDir(i, 1)"><Icon name="arrow-down" :size="13" /></button>
           <button class="btn-ghost xs" title="移除该目录" aria-label="移除目录"
-            @click="store.removeKeepDir(i)">✕</button>
+            @click="store.removeKeepDir(i)"><Icon name="close" :size="13" /></button>
         </div>
         <div class="kd-add">
-          <button class="btn-ghost" @click="pickKeepDir">＋ 添加目录</button>
+          <button class="btn-ghost" @click="pickKeepDir"><Icon name="plus" :size="13" /> 添加目录</button>
           <input v-model="keepDirInput" type="text" aria-label="粘贴目录路径"
             placeholder="粘贴目录路径后回车添加" @keyup.enter="addKeepDirInput" />
           <span v-if="!store.keepDirs.length" class="kd-hint">
@@ -387,10 +387,10 @@ function onConfirm(targetDir?: string) {
                那是错的心理模型。 -->
           <span class="kd-path" :title="d">{{ d }}</span>
           <button class="btn-ghost xs" title="移除该目录" aria-label="移除目录"
-            @click="store.removeProcDir(i)">✕</button>
+            @click="store.removeProcDir(i)"><Icon name="close" :size="13" /></button>
         </div>
         <div class="kd-add">
-          <button class="btn-ghost" @click="pickProcDir">＋ 添加目录</button>
+          <button class="btn-ghost" @click="pickProcDir"><Icon name="plus" :size="13" /> 添加目录</button>
           <input v-model="procDirInput" type="text" aria-label="粘贴优先处理的目录路径"
             placeholder="粘贴目录后回车添加" @keyup.enter="addProcDirInput" />
           <span v-if="!store.procDirs.length" class="kd-hint">
@@ -420,10 +420,10 @@ function onConfirm(targetDir?: string) {
           <!-- 同样无序号无排序：并集语义，与白名单一侧同一个理由。 -->
           <span class="kd-path" :title="d">{{ d }}</span>
           <button class="btn-ghost xs" title="移除该目录" aria-label="移除不处理目录"
-            @click="store.removeProcExcludeDir(i)">✕</button>
+            @click="store.removeProcExcludeDir(i)"><Icon name="close" :size="13" /></button>
         </div>
         <div class="kd-add">
-          <button class="btn-ghost" @click="pickProcExcludeDir">＋ 添加不处理目录</button>
+          <button class="btn-ghost" @click="pickProcExcludeDir"><Icon name="plus" :size="13" /> 添加不处理目录</button>
           <input v-model="procExcludeInput" type="text" aria-label="粘贴不处理的目录路径"
             placeholder="粘贴目录后回车添加" @keyup.enter="addProcExcludeInput" />
         </div>

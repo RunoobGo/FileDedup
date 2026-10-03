@@ -50,6 +50,27 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 	// FAT/exFAT 不提供稳定索引、句柄被独占锁占住的场合无从比对，强行判否会让
 	// 这些卷上完全无法操作（在册口径，见 verify.go 的 identityStill 注释）。
 	srcID, _ := pathIdentity(src)
+
+	// APP-39（M204 那一格画漏的一处）：**目标树本身**也要过复审，而且必须早于
+	// MkdirAll。改前复审只作用于 `dst.path`（claimDst 之后的那个完整落点），
+	// 而 `os.MkdirAll(targetDir)` 在 :53、远在复审之前 —— 于是"授权树之外被创建出
+	// 目录树"这一格没被算进 M204 的自觉代价（那段注释只讨论了"外部会先多出一个
+	// 零字节占位、随即由 release 清掉"，目录树不在其中）。
+	//
+	// 触发形状：用户授权 D:\Data、目标填 D:\Data\sub（尚不存在），入口
+	// moveTargetAllowed 通过（resolveTargetPath 上溯到已存在的 D:\Data 再接回 sub）；
+	// 派发窗口内第三方把 D:\Data\sub 换成指向别处的链接 ⇒ MkdirAll 顺着链接在授权树
+	// 之外创建出目录，claimDst 造出零字节占位，复审拒绝、release 删掉占位 ——
+	// **目录留着**。数据一个字节没出去，但"授权边界外凭空多出一棵目录树"本身就是
+	// 应用不该做的事（用户没授权创建它，它也不会自动清掉）。
+	//
+	// 两道合起来才把"目标树"与"落点"都圈进授权范围，且各自的必要性不同：
+	// 这一道问"树在不在授权内"，后一道问"树里的那个名字在不在授权内"。
+	if checkLanding != nil {
+		if err := checkLanding(targetDir); err != nil {
+			return "", false, err
+		}
+	}
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return "", false, err
 	}
@@ -63,6 +84,7 @@ func moveFileDetailed(src, targetDir string, checkLanding func(landingPath strin
 	// ★ 自觉代价（设计稿 §2-4）：claimDst 的 O_EXCL 创建早于这一点，所以目标树
 	// 若已被换成外部链接，外部会先多出一个**零字节**占位，随即由 release 按
 	// 身份证明清掉；数据一个字节都不出去。
+	//   （目录树那一半由上面 APP-39 那一道提前圈住，不再落在这个自觉代价里。）
 	if checkLanding != nil {
 		if err := checkLanding(dst.path); err != nil {
 			dst.release()

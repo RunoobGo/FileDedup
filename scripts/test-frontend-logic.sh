@@ -403,6 +403,47 @@ wiring 'src/stores/scan.ts' "if (!guard('清空全部历史')) return" '' \
 wiring 'src/stores/scan.ts' "if (!guard('删除历史记录')) return" '' \
 	'deleteHistory 走 store 的同一道忙门（M381：同上）'
 
+# ---- FE-44 / FE-45（2026-10-03 审查 P1-4 / P2）----
+# FE-44：明细抽屉是**本页唯一**缺代际锁的异步回写（store 里 resultGen / histGen /
+#   procReqSeq / pendingReqSeq 四处同类都有）。缺它：A→B 快速切换且 A 的回包后到时，
+#   opDetail 被写成 A 的明细而 expandedOp 仍是 B ⇒ B 行渲染 A 的条目。
+#   ★ 后端**不会**搬错文件（UndoOperationItem 有归属校验），但用户会拿到一条
+#   与真实原因无关的报错、点「直达保留原目录」还会打开 A 条目的目录。
+# ★ .vue 组件打不进 node --test（M116/M118 同族限制）⇒ 这里是**静态接线锚**，
+#   不得读作行为级红；行为半边由后端 app_ops.go 的归属校验兜住（本组不测那一格，
+#   它在 M380 那批里）。
+wiring 'src/views/RecordsView.vue' 'let detailSeq = 0' '' \
+	'FE-44：明细抽屉有代际锁（改前本页四处同类回写都有锁，唯独它没有）'
+wiring 'src/views/RecordsView.vue' 'if (seq !== detailSeq) return' '' \
+	'FE-44：回写前校验代际（缺这一行则锁只是摆设，后发的旧回包照样盖回界面）'
+wiring_count 'src/views/RecordsView.vue' 'if (seq !== detailSeq) return' 3 \
+	'FE-44：三处代际校验（toggleOpDetail 的成功腿 + 失败腿 + reloadDetail）都得出这一句；少一处就那条腿仍会作废当行'
+wiring 'src/views/RecordsView.vue' 'const seq = ++detailSeq' '' \
+	'FE-44：序号在发请求**之前**自增（先发后自增的话，两趟的 seq 会相同）'
+# FE-45：扫描历史/清理记录两个 tab 只有视觉态（.on），屏幕阅读器与色觉障碍用户
+#   都判不出当前选中的是哪个 ⇒ 加 :aria-pressed（ResultView 的 hideNonPending
+#   开关已有同款先例）。
+wiring_count 'src/views/RecordsView.vue' ':aria-pressed="tab ===' 2 \
+	'FE-45：两个 tab 都带 aria-pressed（缺一枚则那一枚仍只有视觉态）'
+# FE-46（DDP-9 的可见半边）：导入降级说明**常驻**，不靠 toast。
+#   为什么不能只靠 toast：那句话解释的是"为什么这批记录没有回撤按钮"，
+#   而用户是**翻记录页**时才看到这件事的 —— 那时 toast 早没了。
+#   M296 那条取向在这里继续成立：把原因摆成可见文本，不挂在会消失的浮层里。
+wiring 'src/views/RecordsView.vue' 'const importDowngradeNote = ref(' '' \
+	'FE-46：导入降级说明有自己的常驻态（挂在 toast 上则超时即失，用户看不到原因）'
+wiring 'src/views/RecordsView.vue' 'v-if="importDowngradeNote"' '' \
+	'FE-46：横幅真的渲染出来了（少这一行则状态有了但界面不显示）'
+wiring_count 'src/views/RecordsView.vue' 'res.opsUndoDowngradeNote' 1 \
+	'FE-46：后端那句话被原样转达（出现两处即有人在前端另拼一句，两句口径会分叉）'
+wiring 'src/views/RecordsView.vue' 'role="status"' 'role="alert"' \
+	'FE-46：横幅带 role="status"（不是 alert —— 它不是出错，只是少一个能力，alert 会打断朗读）'
+wiring 'src/views/RecordsView.vue' 'aria-label="关闭这条说明"' '' \
+	'FE-46：关闭钮有可访问名（只有图标时读屏只会念成"按钮"）'
+# ★ 底色/文字色这一格是**对比度判据**：改前 --text-3 在 --primary-weak 合成底上只有
+#   3.01:1（不达 AA 4.5），--text 是 14.72:1。这一条不许退回 --text-2/--text-3。
+wiring 'src/views/RecordsView.vue' 'background: var(--primary-weak)' '' \
+	'FE-46：横幅底色走 --primary-weak（记录照常导入了、只是少一个能力，不是坏消息 ⇒ 不用 --warn-weak）'
+
 if [ "$wiring_fail" -ne 0 ]; then
 	printf 'test-frontend-logic: %s 条接线断言失败\n' "$wiring_fail" >&2
 	exit 1

@@ -103,23 +103,37 @@ const expandedOp = ref<number | null>(null)
 const opDetail = ref<OpRecordItem[] | null>(null)
 const opDetailLoading = ref(false)
 
+// FE-44：明细抽屉的代际锁。★ 这是本页**唯一**缺这道锁的异步回写——
+// store 里 resultGen / histGen / procReqSeq / pendingReqSeq 四处同类操作都有，
+// 唯独这里没有。缺它的形状：A→B 快速切换时若 A 的回包**后到**，opDetail 被写成
+// A 的明细而 expandedOp 仍是 B ⇒ 模板在 B 行渲染 A 的条目。
+//
+// 后端**不会**因此搬错文件（UndoOperationItem 在 GetOp 的 items 里按 id 查、
+// 跨记录找不到就拒，见 app_ops.go 的归属校验），但用户会拿到一条与真实原因
+// 无关的报错，点「直达保留原目录」还会打开 A 条目的目录。
+let detailSeq = 0
+
 async function toggleOpDetail(m: OpRecord) {
   if (expandedOp.value === m.id) {
     expandedOp.value = null
     opDetail.value = null
+    detailSeq++
     return
   }
+  const seq = ++detailSeq
   expandedOp.value = m.id
   opDetail.value = null
   opDetailLoading.value = true
   try {
     const d = await api.getOpRecord(m.id)
+    if (seq !== detailSeq) return // 期间又点了别的行：本趟作废
     opDetail.value = d.list ?? []
   } catch (e: any) {
+    if (seq !== detailSeq) return
     toast.notifyError('读取记录明细失败', e)
     expandedOp.value = null
   } finally {
-    opDetailLoading.value = false
+    if (seq === detailSeq) opDetailLoading.value = false
   }
 }
 
@@ -167,8 +181,13 @@ async function undoOne(m: OpRecord, it: OpRecordItem) {
 
 async function reloadDetail() {
   if (expandedOp.value === null) return
+  // FE-44：与 toggleOpDetail 共用同一把代际锁。收尾刷新这条腿由 opsRunning 下降沿触发，
+  // 频率低，但它与用户点击**并发**——不加锁时它可能把旧明细盖回刚展开的那一行。
+  const seq = ++detailSeq
+  const wantID = expandedOp.value
   try {
-    const d = await api.getOpRecord(expandedOp.value)
+    const d = await api.getOpRecord(wantID)
+    if (seq !== detailSeq) return
     opDetail.value = d.list ?? []
   } catch {
     // 明细刷新失败不打断：列表计数已由 refreshOps 更新
@@ -238,6 +257,12 @@ async function importRecords() {
       `新增清理记录 ${formatCount(res.opsAdded)} 条（跳过重复 ${formatCount(res.opsSkipped)}）` +
       (res.opsOrphaned > 0 ? ` · ${formatCount(res.opsOrphaned)} 条未能关联到本地扫描历史` : '')
     )
+    // DDP-9 / FE-46：落点越界的外来可回撤记录被标成不可撤。后端已把原因写成人话
+    // （opsUndoDowngradeNote），这里**常驻显示**而不是塞进上面那句成功提示、也不只靠 toast ——
+    // 理由见 importDowngradeNote 的注释（一句话：那几笔的「回撤」按钮不出现，
+    // 而用户是翻记录页时才看到这件事的，那时 toast 早没了）。
+    // 没发生降级时清空：连着导两次、第二次没有降级，那第一次的说法已经过期。
+    importDowngradeNote.value = res.opsUndoDowngraded > 0 ? res.opsUndoDowngradeNote : ''
     // 两个列表都要刷：导入同时新增扫描历史与清理记录，只刷当前 tab 会让另一侧停留在旧读数。
     await Promise.all([store.refreshHistory(), store.refreshOps()])
   } catch (e: any) {
@@ -246,6 +271,22 @@ async function importRecords() {
     importing.value = false
   }
 }
+
+// FE-46（DDP-9 的可见半边）：导入降级说明**常驻**，不靠 toast。
+//
+// ★ 为什么不能只靠 toast：那条说明够长（六十字以上）、带一串路径，且它解释的是
+//   "为什么这些记录没有回撤按钮"——一个**用户不主动找就看不见**的机制。
+//   toast 6~10 秒后自动消失，而用户点完「确认导入」通常立刻去翻记录页看结果，
+//   那时横幅已经没了 ⇒ 他看到的只是"这批记录没有回撤按钮"，与导入操作对不上号，
+//   于是极可能误判成"导入漏了字段"或"回撤按钮坏了"。
+//   M296 那条取向在这里同样成立：把"为什么是灰的"摆成**可见文本**，
+//   而不是只挂在会消失的浮层里。
+//
+// 形状：一条可手动关掉的横幅（关掉即本会话不再打扰，不写盘——它是一次性告知，
+// 不是需要跨会话记住的状态）。同时只留最新一条：连着导两次时，前一次的说法已被
+// 后一次覆盖，两条并排只会让人以为有两种原因。
+const importDowngradeNote = ref('')
+function dismissDowngradeNote() { importDowngradeNote.value = '' }
 
 // 明细表「去向」列：trash/move 看 destPath，链接类（hardlink/symlink）看 linkSrc
 // destSummary 条目「去向」列的文案。
@@ -270,8 +311,15 @@ function destSummary(it: OpRecordItem): string {
 <template>
   <div class="records-view">
     <div class="tabs panel">
-      <button :class="{ on: tab === 'scans' }" @click="tab = 'scans'">扫描历史</button>
-      <button :class="{ on: tab === 'ops' }" @click="tab = 'ops'">清理记录</button>
+      <!-- FE-45：标准 tab 模式，但改前两个按钮只有视觉态（.on 给底色 + 主色字），
+           屏幕阅读器只能听到两个普通按钮，无法得知当前选中的是哪个；.on 的唯一
+           区分手段是背景色，对色觉障碍用户也失效。:aria-pressed 是成本最低的一档
+           （ResultView 的 hideNonPending 开关已有同款先例）；
+           role="tablist"/"tab" + aria-selected 更规范，但那是较大改动。 -->
+      <button :aria-pressed="tab === 'scans'" :class="{ on: tab === 'scans' }"
+        @click="tab = 'scans'">扫描历史</button>
+      <button :aria-pressed="tab === 'ops'" :class="{ on: tab === 'ops' }"
+        @click="tab = 'ops'">清理记录</button>
       <span class="spacer"></span>
       <!-- M353：导出/导入两个入口常驻（不随 tab 隐藏）——账本是两张表，任一表的恢复
            都需要成对导出，藏在 tab 里会让人以为"这个 tab 才导这个 tab 的记录"。 -->
@@ -292,6 +340,16 @@ function destSummary(it: OpRecordItem): string {
            这也是 M286 那条取向的落地：把"为什么是灰的"摆成**可见文本**，
            而不是只挂在 title 上等 OS 绘制（M293 证过那层浮窗合成不出来）。 -->
       <span v-if="store.busy" class="undo-hint">{{ store.busyTip }}</span>
+      <!-- FE-46：导入降级横幅。role="status"（不是 alert）——它不是"出错了"，
+           只是"有一批记录少了个能力"，用 alert 会让屏幕阅读器打断当前朗读。
+           可手动关掉：关掉即本会话不再打扰（一次性告知，不写盘）。 -->
+      <div v-if="importDowngradeNote" class="downgrade-note" role="status">
+        <Icon name="info" :size="14" />
+        <span class="downgrade-text">{{ importDowngradeNote }}</span>
+        <button class="btn-ghost xs" aria-label="关闭这条说明" @click="dismissDowngradeNote">
+          <Icon name="close" :size="13" />
+        </button>
+      </div>
       <template v-if="tab === 'scans' && store.histList.length">
         <!-- M381：两枚按钮补 :disabled，形状与 ops 腿（下方 clearingOps 那两枚）逐字对齐。 -->
         <button v-if="!confirmClear" class="btn-ghost" :disabled="store.busy || clearingHistory"
@@ -497,37 +555,55 @@ function destSummary(it: OpRecordItem): string {
 .ops-col .del:hover { color: var(--danger-ink); border-color: var(--danger-ink); }
 /* ---------- 清理记录 ---------- */
 .undo-hint { font-size: var(--fs-sm); color: var(--text-3); }
+/* FE-46：导入降级横幅。底色走 --primary-weak 而不是灰 —— 这一条**不是**坏消息
+   （记录照常导入了、只是少一个能力），用 --warn-weak 会读成"出了什么问题"。
+   文字色走 --text（不是 --text-3/2）：--primary-weak 上 --text-3 的对比度不够
+   （M286/M293 那条"可见文本必须能被读到"在此继续成立）。 */
+.downgrade-note {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  margin: var(--sp-3) var(--sp-4) 0;
+  padding: var(--sp-3);
+  background: var(--primary-weak);
+  border: 1px solid var(--primary-ink);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+.downgrade-note :deep(svg) { flex: 0 0 auto; margin-top: 2px; color: var(--primary-ink); }
+.downgrade-text { flex: 1 1 auto; min-width: 0; }
+.downgrade-note .btn-ghost { flex: 0 0 auto; }
 .hist-table tr.expanded td { background: var(--primary-weak); }
 .kind-badge {
   display: inline-block; padding: 1px var(--sp-2); border-radius: 999px;
-  font-size: var(--fs-xs, 12px); border: 1px solid var(--border); color: var(--text-2);
+  font-size: var(--fs-xs); border: 1px solid var(--border); color: var(--text-2);
 }
 .kind-badge.k-delete { color: var(--danger-ink); border-color: var(--danger-ink); }
 .kind-badge.k-trash { color: var(--primary-ink); border-color: var(--primary-ink); }
-.no-undo { margin-left: 6px; font-size: var(--fs-xs, 12px); color: var(--text-3); }
+.no-undo { margin-left: 6px; font-size: var(--fs-xs); color: var(--text-3); }
 /* 「数据在保留源，需手动放回」——这一格摆的是**可行动作**，不是坏消息，
    所以用中性色而不是 .no-undo 的灰、更不是 .dangling-tag 的红（红留给真出错的那一行）。
    为什么做成可见文本而不是只挂 title：04 §6.50 M293 定了 UIA 能读 title、但 OS 那层
    浮窗合成不出来 ⇒ "文案挂在元素上"证得了，"用户看得见"证不了（M286 同一条取向）。 */
 .keep-hint {
   margin-left: 6px; padding: 0 6px; border-radius: 999px;
-  font-size: var(--fs-xs, 12px); color: var(--text-2);
+  font-size: var(--fs-xs); color: var(--text-2);
   border: 1px solid var(--border);
 }
-.detail-row > td { background: var(--bg-2, rgba(127, 127, 127, 0.05)); padding: var(--sp-1) var(--sp-3) var(--sp-3); }
+.detail-row > td { background: var(--bg-hover); padding: var(--sp-1) var(--sp-3) var(--sp-3); }
 .detail-loading { padding: var(--sp-3); color: var(--text-3); font-size: var(--fs-sm); }
-.item-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs, 12px); }
+.item-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
 .item-table th, .item-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
 .item-table th { color: var(--text-3); font-weight: 500; white-space: nowrap; }
 .item-table tr:last-child td { border-bottom: none; }
 .st { display: inline-block; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
 .st-ok { color: var(--primary-ink); background: var(--primary-weak); }
-.st-done { color: var(--text-2); background: rgba(127, 127, 127, 0.14); }
+.st-done { color: var(--text-2); background: var(--bg-active); }
 /* 状态胶囊：底色弱红一律走 --danger-weak。原先三处各自写成 rgba(220,80,80,·)
    的 α 变体——那是**亮色谱**的红：暗色主题里 --danger 已换成 #f87171 一系，
    写死的 RGB 不跟随，浅红底配深色 bg-panel 会变成脏红。 */
 .st-bad { color: var(--danger-ink); background: var(--danger-weak); }
-.st-mute { color: var(--text-3); background: rgba(127, 127, 127, 0.1); }
+.st-mute { color: var(--text-3); background: var(--bg-hover); }
 .err-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-ink); }
 /* 悬空链接行：整行淡红底 + 行内红标。
    为什么要整行着色而不是只标一个图标：明细表可能有几十行，

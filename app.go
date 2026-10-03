@@ -389,9 +389,12 @@ func NewApp() *App {
 //	扫描历史都读不到这个闩，话术比代码多报了一半。本批补齐后的**真实**清单：
 //	   - 已接闩：扫描（app_scan.go）、清理（app_ops.go ExecuteOperation）、
 //	     回撤两条腿（app_ops.go）、删除/清空扫描历史（app_history.go）、清空清理记录、清空缓存
-//	   - **未接闩**：载入历史（LoadScanHistory 只问 opsRunning/scanInFlight）、导出/导入
-//	     （app_records_io.go 只问 opsRunning）。后果与裁定去向登记在 `docs/04` 号表。
-//	清单要跟着代码走，不是代码跟着清单走（M210）。
+//	   - **未接闩**：~~载入历史（LoadScanHistory 只问 opsRunning/scanInFlight）~~、
+//	     ~~导出/导入（app_records_io.go 只问 opsRunning）~~ —— **APP-40（2026-10-03）已补齐**：
+//	     LoadScanHistory 两处、ExportRecords、ImportRecords 现在都问 `maintaining`，
+//	     ImportRecords 另补了 `scanInFlight` 一问（扫描收尾写 SaveScan，而导入按
+//	     localScanKeys 判重，依据会被改写）。⇒ **本清单已无未接项**；
+//	     再新增绑定方法时，"问没问这个闩"仍然是必答项（清单要跟着代码走，M210）。
 //
 // 两个名字分开给：
 //   - name   写进 a.maintaining，是"别人被拒时听到的那半句"里的事名（要短、要说得出在等什么）

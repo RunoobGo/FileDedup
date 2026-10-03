@@ -79,16 +79,33 @@ func TestM204LandingCheckerSeesActualLandingOncePerItem(t *testing.T) {
 	}
 	var got []string
 	res := Execute(Options{
-		Groups:             []*model.DuplicateGroup{fx.group},
-		MoveLandingAllowed: func(landing string) error { got = append(got, landing); return nil },
+		Groups: []*model.DuplicateGroup{fx.group},
+		MoveLandingAllowed: func(landing string) error {
+			got = append(got, landing)
+			return nil
+		},
 	}, model.OpRequest{Kind: "move", FileIDs: []uint64{fx.dup1.ID, fx.dup2.ID}, TargetDir: target})
 
 	if len(res.OK) != 2 {
 		t.Fatalf("checker 恒放行时应照常成功：ok=%d failed=%d", len(res.OK), len(res.Failed))
 	}
-	if len(got) != 2 {
-		t.Fatalf("两个条目应各问一次，实得 %d 次: %v", len(got), got)
+	// ★ APP-39 之后同一个 checker 会多收一次**目标树**的问（moveFileDetailed 在 MkdirAll
+	//   之前先问一次 targetDir，见 move.go 的 APP-39 段）。本判据只关心**逐条目的落点问**
+	//   ——它验的是"复审看到的是递增之后的那个名字"，所以先把树问摘出去。
+	//   早先按 len(got) 直接数，会把这一次算进来，于是本用例在 APP-39 落地时红了，
+	//   而它红的理由与本用例要验的东西无关（M204 的判据没有错，是计数口径要跟着实现更新）。
+	var all []string
+	all = got // 留一份完整的（含树问）以便报错时展示
+	var landings []string
+	for _, p := range all {
+		if p != target {
+			landings = append(landings, p)
+		}
 	}
+	if len(landings) != 2 {
+		t.Fatalf("两个条目应各问一次落点，实得 %d 次落点问（全部 %d 次问：%v）", len(landings), len(all), all)
+	}
+	got = landings
 	if got[0] == occupied || filepath.Base(got[0]) == "dup1.bin" {
 		t.Errorf("第 1 次问的是名义名 %q 而不是递增后的实际落点（递增形 = dup1_1.bin）", got[0])
 	}

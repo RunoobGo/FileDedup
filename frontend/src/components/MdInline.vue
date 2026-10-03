@@ -26,7 +26,7 @@ const segs = computed<Seg[]>(() => parseInline(props.text))
 <style scoped>
 .md-code {
   font-family: var(--mono);
-  font-size: 0.94em;
+  font-size: var(--fs-sm);
   padding: 1px 5px;
   border-radius: var(--r-sm);
   background: var(--bg-hover);

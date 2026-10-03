@@ -57,6 +57,13 @@ type RecordsImportResult struct {
 	OpsAdded     int    `json:"opsAdded"`
 	OpsSkipped   int    `json:"opsSkipped"`
 	OpsOrphaned  int    `json:"opsOrphaned"`
+	// OpsUndoDowngraded / OpsUndoDowngradeNote（DDP-9）：导入进来的可回撤记录里，
+	// **落点越界**（不在本机任何扫描根之下、也不与本机任何已知路径精确同值）的那几笔，
+	// 已按 `undoable=0` 落库——记录照常可见、可读，但本机没有任何入口能发起回撤。
+	// 这两个字段让界面能显示「导入了 5 笔，其中 2 笔在本机不能回撤」，
+	// 不说的话用户只看到"这批记录没有回撤按钮"，会误判成按钮坏了或导入漏了字段。
+	OpsUndoDowngraded    int    `json:"opsUndoDowngraded"`
+	OpsUndoDowngradeNote string `json:"opsUndoDowngradeNote"`
 }
 
 // 对话框接缝（惯例同 cache.evictFn / dbfile.renameFile / cacheClearSnapshot）。
@@ -101,8 +108,15 @@ func (a *App) ExportRecords() (RecordsExportResult, error) {
 	var res RecordsExportResult
 	a.mu.Lock()
 	busy := a.opsRunning
+	maint := a.maintaining
 	ctx := a.ctx
 	a.mu.Unlock()
+	// APP-40：导出读的是账本，而维护闩（清空扫描历史 / 清空清理记录 / 清空缓存）
+	// 期间账本正在被整表改写 ⇒ 导出出来的镜像可能是**改写中的一致性切片**。
+	// 原文案点名在等什么，与同页两个「清空」拒绝扫描/清理时的话术同款。
+	if maint != "" {
+		return res, fmt.Errorf("%s进行中，请等待完成后再导出记录", maint)
+	}
 	if busy {
 		return res, fmt.Errorf("清理/回撤操作执行中，请等待结束后再导出记录")
 	}
@@ -248,10 +262,27 @@ func (a *App) ImportRecords() (RecordsImportResult, error) {
 	var res RecordsImportResult
 	a.mu.Lock()
 	busy := a.opsRunning
+	scan := a.scanInFlight
+	maint := a.maintaining
 	ctx := a.ctx
 	a.mu.Unlock()
+	// APP-40：这一问原先只问 opsRunning，是 `app.go` 覆盖清单里「未接闩」那一项。
+	// 具体后果是**回执说谎**：「清空清理记录」占住闩、调 `hs.ClearOps()` 整表删除期间
+	// 导入照样跑完（两者只在 s.mu 上串行，而串行不等于互斥），前端弹出「导入成功、
+	// 新增 M 条」，而那 M 条连同其 op_items 已被那次整表删除抽走，用户界面上
+	// 从未存在过。补上闩之后这一格是"在途被点名拒绝"。
+	if maint != "" {
+		return res, fmt.Errorf("%s进行中，请等待完成后再导入记录", maint)
+	}
 	if busy {
 		return res, fmt.Errorf("清理/回撤操作执行中，请等待结束后再导入记录")
+	}
+	// 扫描在途这一问是同批补的：扫描收尾写 SaveScan，而导入要判重扫描自然键
+	// （localScanKeys），两者不共享 s.mu 之外的任何东西，但**判重的依据会被改写**——
+	// 扫描刚写进来的那条按"本地已有"被跳过，用户看到"新增 0 条（跳过 1 条）"，
+	// 而那其实是他自己一分钟前刚扫出来的东西。
+	if scan {
+		return res, fmt.Errorf("扫描进行中，请等待结束后再导入记录")
 	}
 	hs := a.histSnapshot()
 	if hs == nil {
@@ -271,5 +302,7 @@ func (a *App) ImportRecords() (RecordsImportResult, error) {
 	}
 	res.Source, res.ScansAdded, res.ScansSkipped = path, sum.ScansAdded, sum.ScansSkipped
 	res.OpsAdded, res.OpsSkipped, res.OpsOrphaned = sum.OpsAdded, sum.OpsSkipped, sum.OpsOrphaned
+	res.OpsUndoDowngraded = sum.OpsUndoDowngraded
+	res.OpsUndoDowngradeNote = sum.OpsUndoDowngradeNote
 	return res, nil
 }

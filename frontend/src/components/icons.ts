@@ -25,6 +25,9 @@ export type IconName =
   | 'history' // 记录（导航）—— 扫描历史 / 清理记录
   | 'undo' // 回撤（清理记录）
   | 'filter' // 处理范围已收窄（处理策略的过滤提示）—— 漏斗，语义直白
+  | 'plus' // 新增一行（添加保留/处理目录）
+  | 'arrow-up' // 上移（提高优先级）
+  | 'arrow-down' // 下移（降低优先级）
 
 export interface IconDef {
   /** 一段或多段 path 的 d 属性 */
@@ -93,6 +96,13 @@ export const ICONS: Record<IconName, IconDef> = {
   info: { viewBox: ICON_SIZE, d: ['M12 16v-4', 'M12 8h.01'], circle: [12, 12, 10] },
   skip: { viewBox: ICON_SIZE, d: ['m15 14 5-5-5-5', 'M4 20v-7a4 4 0 0 1 4-4h12'] },
   'chevron-down': { viewBox: ICON_SIZE, d: ['m6 9 6 6 6-6'] },
+  // ★ 2026-10-03 补（P2）：这三枚的来源是 ResultView 的三对**字符**按钮
+  //   （`✕` / `↑` / `↓` / `＋`）。字符当图标的坏处与 emoji 同源——字形随平台字体变、
+  //   粗细与相邻 SVG 不一致，而 Icon.vue 的 B 类 dingbang 结论早就把 `✕冗余`
+  //   列为「已被统一图标集取代」，`close` 那一枚的几何（m18 6 6 18 / m6 6 12 12）正是 ✕。
+  plus: { viewBox: ICON_SIZE, d: ['M5 12h14', 'M12 5v14'] },
+  'arrow-up': { viewBox: ICON_SIZE, d: ['m5 12 7-7 7 7', 'M12 19V5'] },
+  'arrow-down': { viewBox: ICON_SIZE, d: ['M12 5v14', 'm19 12-7 7-7-7'] },
   // lucide external-link：交给系统默认应用打开（与 eye「应用内预览」是两件事）
   external: {
     viewBox: ICON_SIZE,
