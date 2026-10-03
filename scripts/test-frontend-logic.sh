@@ -319,6 +319,22 @@ wiring 'src/views/ResultView.vue' 'g.files.some(f => f.isPending)' '' \
 wiring 'src/views/ResultView.vue' 'store.toggleHideNonPending()' '' \
 	'开关走 store 动作（重取/上送链收在 store，视图不自拼请求，功能 3）'
 
+# M409（2026-10-03 判据批，销 04 §6.80 的 B 态一格）：结果页两个筛选控件的 v-model 必须绑在 store 上。
+#   09-17 那份外部补丁把这里从局部 ref 改回 store（不然选了排序不生效），但**把它改坏两条通道都不红**：
+#   node 用例与 vue-tsc 都抓不住——`resultSort`／`resultExt` 在 scan.ts 一起导出，互换绑定在类型上完全合法；
+#   改前现读 `grep -n "resultSort" scripts/test-frontend-logic.sh` 零命中。
+# ★ 锚必须**带上元素标签**（`<select …`／`<input …`），只锚"绑定+处理器"那一对还不够：
+#   变异 V-a 实测——把两控件的 (v-model, @change) **成对互换**后，
+#   `v-model="store.resultSort" @change="changeSort"` 这串只是从 `<select>` 挪到了 `<input>` 上，
+#   全文件 `grep -qF`（wiring 的判据形态，无行锚无上下文）照样 rc=0 ⇒ 配对锚在这一格假绿。
+#   带上标签后同一格必红（互换=整对搬家，`<select` 前缀串消失）。
+#   裸 `v-model="store.resultSort"` 更早就假绿了（R4-4 在 M80 那条锚上实测抓到过同一形状，负控制读数在 04 §30.13）。
+# ★ .vue 打不进 node --test（M116／M118 同族限制），所以这两条是**接线锚**，不得称行为级红。
+wiring 'src/views/ResultView.vue' '<select v-model="store.resultSort" @change="changeSort"' '' \
+	'排序下拉绑 store.resultSort 且挂 changeSort（M409：绑回局部 ref、两控件成对互换都必红）'
+wiring 'src/views/ResultView.vue' '<input v-model="store.resultExt" @change="changeExt"' '' \
+	'扩展名过滤框绑 store.resultExt 且挂 changeExt（M409 同形：与排序同用一份 store，漂回即静默失效）'
+
 # 功能 4（2026-09-23「失败清单逐行打开文件/所在目录」）：抽屉的按钮腿。
 # 交接与抛错这两件事由 frontend/tests/failed-reveal-path.test.ts 钉（那是 wails.ts
 # 的 api 包装，node 打得进）；这里钉的是"抽屉有没有真的去调这两个包装"。

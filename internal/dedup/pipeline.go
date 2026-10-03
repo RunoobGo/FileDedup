@@ -381,15 +381,7 @@ func (p *Pipeline) Run(parent context.Context, cfg model.ScanConfig) (groups []*
 		}
 	}
 
-	threads := cfg.Threads
-	if threads < 1 {
-		threads = autoThreads(cfg.Roots)
-	} else if threads > MaxThreads {
-		// P2：并发度必须有上限。修正前只兜 <1，threads=100000 会真的开 10 万
-		// worker，每个大文件 worker 另占 (depth+1)×16MiB 环形段缓冲 → 直接 OOM。
-		// 按「后端是最后防线」的原则，钳制而非报错：设置界面不该能拖垮进程。
-		threads = MaxThreads
-	}
+	threads := normalizeThreads(cfg.Threads, cfg.Roots)
 	workers := threads
 	pool := hasher.NewPool()
 
@@ -590,6 +582,24 @@ func defaultThreads() int {
 func autoThreads(roots []string) int {
 	base := defaultThreads()
 	return media.AutoWorkers(media.RootsClass(roots, media.Probe), base)
+}
+
+// normalizeThreads 并发度归一：n<1 走自动腿，n>MaxThreads 钳到上限，其余原样。
+//
+// 语句逐字搬自 Scan（M410，2026-10-03 判据批）——抽出来的唯一理由是钳后值原先是 Scan 的
+// 局部变量，没有观察通道，于是那两层上钳全仓零判据。
+//
+// P2：并发度必须有上限。修正前只兜 <1，threads=100000 会真的开 10 万
+// worker，每个大文件 worker 另占 (depth+1)×16MiB 环形段缓冲 → 直接 OOM。
+// 按「后端是最后防线」的原则，钳制而非报错：设置界面不该能拖垮进程。
+func normalizeThreads(n int, roots []string) int {
+	if n < 1 {
+		return autoThreads(roots)
+	}
+	if n > MaxThreads {
+		return MaxThreads
+	}
+	return n
 }
 
 func sumSize(files []*model.FileEntry) uint64 {
