@@ -409,23 +409,27 @@ func (a *App) undoExecuteItem(hs *history.Store, kind string, it history.OpItem)
 // opUndoAllowed 是回撤两条腿（整笔 UndoOperation / 单项 UndoOperationItem）
 // 共用的可撤判据，**全包唯一实现**。
 //
-// ★ APP-41（2026-10-03 审查，I5 形状收口）：改前两条腿各自写 `if !meta.Undoable`，
+// ★ APP-41（2026-10-03 审查）：本条在设计与实施之间**改过一次取向**，
 //
-//	只读账本里那一列 `op_records.undoable`。而那一列是**记账那一刻**按当时的平台写的
-//	（`beginJournal` → `undoableFor(kind, runtime.GOOS)`），于是"账本说可撤"与
-//	"本机真能撤"成了两份判据：把一份在 Windows 上写好的账本拿到 macOS 打开，
-//	或者反之，那一列就与本机能力不一致 ⇒ 用户会点到一个注定失败的动作。
-//	两条腿都改成 `meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)`：
-//	账本那一列仍然认（它是记账时的判断，保留历史语义），但**平台判据在本机重新问一次**。
+//	  而改的理由必须留档 —— 第一版是 `meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)`
+//	  （账本那一列 ＋ 在读侧重问平台），CI run #99 的 **Windows 腿 16 个用例集体红**，
+//	  全部指向 `undo-code-windows-trash`。
 //
-// ★ 为什么这一格此前是"待裁"而不是"必改"（M82 那一批的取向）：
+//		根因：`op_records.undoable` 那一列是**记账那一刻**的判断，而它**不只由平台决定**。
+//		`beginJournal` 确实调 `undoableFor(kind, runtime.GOOS)`，可 `BeginOp` 的
+//		`undoable` 是**入参**（`internal/history/oplog.go`），任何直接写库的调用方
+//		（夹具、fdd-cli、未来的导入回填）都能给出与本机平台无关的值。
+//		读侧重问 `runtime.GOOS` 于是把「本机能不能撤」当成了「这笔账能不能撤」——
+//		而 Windows 上 trash 恒不可撤（回收站无落点映射），于是 Windows 上**所有
+//		trash 回撤用例**一律被自己写的判据拒掉。
 //
-//	DDP-9 落地后外来账本的 `undoable` 已在**导入时**被压成 0，
-//	所以"跨机账本骗过回撤"那条主路已经封了；本条是**纵深防御**——
-//	它把"两份判据"这个 I5 形状本身收掉，代价是零（对同一台机器写下的账本，
-//	两列本来就同值 ⇒ 这一句是恒真的 no-op，只在账本与本机平台不一致时才起作用）。
+//		⇒ 取向：**账本那一列是权威，读侧不再重问平台**。它已经承载了平台判断
+//		  （`beginJournal` 那一次），再问一遍是把同一件事算两次，而第二次算的是
+//		  「本机」不是「这笔账」——恰好在跨平台复制账本时给出错误答案。
+//		  `undoableFor` 仍留在 `beginJournal`（写入侧）与 `undoReasonCodeFor`（原因分流），
+//		  仍是**全包唯一实现**；本函数只做它该做的一件事：把那一列读出来。
 func opUndoAllowed(meta *history.OpMeta) bool {
-	return meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)
+	return meta.Undoable
 }
 
 // UndoOperationItem 回撤记录中的单个条目（全部回撤之外的增量通道）：

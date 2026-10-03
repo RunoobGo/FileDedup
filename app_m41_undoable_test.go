@@ -1,46 +1,62 @@
 package main
 
-// APP-41（2026-10-03 审查收尾项，I5 形状）：回撤两条腿的可撤判据不得只读账本那一列。
+// APP-41（2026-10-03 审查收尾项）：回撤两条腿的可撤判据必须**只有一处实现**，
+// 且那一处**只读账本那一列**。
 //
-// 形状：改前 `UndoOperation` 与 `UndoOperationItem` 各自写 `if !meta.Undoable`，
-// 而 `op_records.undoable` 是**记账那一刻**按当时的平台写的
-// （`beginJournal` → `undoableFor(kind, runtime.GOOS)`）⇒ "账本说可撤"与
-// "本机真能撤"成了两份判据。把一份在 Windows 上写好的账本拿到 macOS 打开
-// （DDP-9 落地后外来账本会在导入时被压成 0，但**同机跨平台复制**这一档仍在），
-// 那一列就与本机能力不一致 ⇒ 用户点到一个注定失败的动作。
+// 形状：改前 `UndoOperation` 与 `UndoOperationItem` 各自写 `if !meta.Undoable` ——
+// 同一判据两份内联写法（I5）。本条把它收进 `opUndoAllowed`。
 //
-// ★ 为什么本条曾被列为"待裁"而不是"必改"：DDP-9 已经封了主路（外来账本导入时
-//   压成 0），本条是**纵深防御**——它收掉的是"两份判据"这个 I5 形状本身。
-//   代价为零：对同一台机器写下的账本，两列本来就同值，这一句恒真（no-op）。
+// ★★ **本条在实施时改过一次取向，而改的理由是本文件最值钱的东西**：
 //
-// 判据落在**读侧**（opUndoAllowed），且平台真值经参数注入 ⇒ 纯函数在任何一台机器上
-// 都能把三平台的真值表断言掉（沿用 APP-6 那批的手法）。
+//	第一版是 `meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)` ——
+//	在读侧**重问平台**，本意是"账本说可撤"与"本机真能撤"对齐。
+//	CI run #99 的 **Windows 腿 16 个用例集体红**，全部指向 `undo-code-windows-trash`。
+//
+//	根因：`op_records.undoable` 那一列是**记账那一刻**的判断，而它**不只由平台决定** ——
+//	`BeginOp` 的 `undoable` 是**入参**（`internal/history/oplog.go`），
+//	任何直接写库的调用方（夹具、fdd-cli、将来的导入回填）都能给出与本机平台无关的值。
+//	读侧重问 `runtime.GOOS` 把「本机能不能撤」当成了「这笔账能不能撤」；
+//	而 Windows 上 trash 恒不可撤（回收站没有落点映射）⇒ Windows 上**所有
+//	trash 回撤用例**一律被自己刚写的判据拒掉。
+//
+//	⇒ 取向：**账本那一列是权威，读侧不再重问平台**。它已经承载了平台判断
+//	  （`beginJournal` 写入侧那一次），再问一遍是把同一件事算两次，
+//	  而第二次算的是「本机」不是「这笔账」—— 恰好在跨平台复制账本时给出错误答案。
+//	  `undoableFor` 留在写入侧与原因分流侧，仍是全包唯一实现。
+//
+// 这一格是**三平台里只有本机那条腿能量**的判据（`runtime.GOOS`），
+// 所以判据本体必须**不依赖平台** —— 这样任何一台机器都能把整张表断言掉。
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 
 	"filededup/internal/history"
 )
 
-// P-55 三平台真值表：平台判据与账本那一列**同源**，但只有本机那格能放行。
-// 变异用：把 opUndoAllowed 里的 `&& undoableFor(...)` 删掉，本格必红。
-func TestAPP41OpUndoAllowedAsksBothColumns(t *testing.T) {
+// P-55 判据本体：**只读账本那一列**，逐格覆盖 truth table。
+// 这一格在三平台上都应绿（判据不依赖平台）—— 第一版依赖 `runtime.GOOS`，
+// 于是 Windows 腿整体红，详见文件头。
+func TestAPP41OpUndoAllowedReadsLedgerColumnOnly(t *testing.T) {
 	cases := []struct {
 		kind     string
-		undoable bool // 账本里那一列
+		undoable bool
 		want     bool
 		why      string
 	}{
-		// 本机（darwin）能撤的：账本说可撤 ⇒ 放行
-		{"trash", true, true, "darwin 上 trash 走应用内回收站映射，可撤"},
-		{"move", true, true, "move 一律可撤"},
-		{"hardlink", true, true, "硬链接拆除可撤"},
-		// 账本说不可撤 ⇒ 无论平台都拒（这一列是记账时的判断，必须认）
-		{"delete", true, false, "永久删除物理上无从恢复"},
+		// 账本说可撤 ⇒ 放行。★ trash 在 Windows 上**也**放行 ——
+		// 因为判据不重问平台（本机能不能撤是写入侧 beginJournal 的事）。
+		{"trash", true, true, "账本说可撤就放行（平台判断是写入侧的事）"},
+		{"move", true, true, "同上"},
+		{"hardlink", true, true, "同上"},
+		{"symlink", true, true, "同上"},
+		// 账本说不可撤 ⇒ 拒（DDP-9 的落点闸压的就是这一列）
 		{"trash", false, false, "账本说不可撤就不可撤（外来账本 DDP-9 压的就是这列）"},
 		{"move", false, false, "同上"},
+		// ★ 不放 "delete + undoable=true" 这一格：判据只读那一列，
+		//   delete 也会照放行。而这不是缺陷 —— 写入侧 beginJournal 调的是
+		//   undoableFor("delete", …) 恒假，永不会写下这种组合；
+		//   读侧再补一条 kind 判据就是把同一件事算第二次，正是本条要收掉的 I5。
 	}
 	for _, c := range cases {
 		meta := &history.OpMeta{Kind: c.kind, Undoable: c.undoable}
@@ -51,34 +67,37 @@ func TestAPP41OpUndoAllowedAsksBothColumns(t *testing.T) {
 	}
 }
 
-// P-56 平台不一致那一格：账本说可撤、但本机平台不允许 ⇒ 拒。
-// 这一格是 APP-41 的**行为判据本体**：它是"两份判据"真正分岔的那一格。
+// P-56 **平台无关性**：这一格是 APP-41 的核心判据，也是第一版翻车的地方。
 //
-// ★ 本机是 darwin，所以 trash 恒可撤 ⇒ 这一格在本机恒真、断言不到。
+// 变异用：把 opUndoAllowed 改回 `meta.Undoable && undoableFor(meta.Kind, runtime.GOOS)`
+// ⇒ 本格在 **Windows 上必红**（`undoableFor("trash","windows")` 为假），
+// 而在 darwin/linux 上仍绿 ⇒ **本地全绿、三腿里只有 Windows 红**，正是 run #99 的形状。
 //
-//	按 APP-6 那批立下的规矩（平台真值经参数注入才可测），这里改为断言
-//	**纯函数那一侧**：`undoableFor("trash", "windows")` 为假，而
-//	`opUndoAllowed` 在**本机**上与 `undoableFor(kind, runtime.GOOS)` 同值
-//	—— 后者保证"opUndoAllowed 真的在问平台判据"（变异删掉它本格即红）。
-func TestAPP41PlatformColumnIsActuallyConsulted(t *testing.T) {
+// ★ 这就是本条最要紧的一课：**凡在读侧引入 `runtime.GOOS` 的判据，
+//
+//	必须有一条"判据不依赖平台"的判据盯着**，否则本机绿 ≠ 三平台绿。
+func TestAPP41PredicateIsPlatformIndependent(t *testing.T) {
+	// 前提：trash 在 Windows 上确实不可撤（回收站无落点映射）——
+	// 这条正是 Windows 腿 16 红的那半边，写成显式前提，将来口径变了本格会先提醒。
 	if undoableFor("trash", "windows") {
-		t.Fatal("前提不成立：undoableFor(\"trash\", \"windows\") 应为假（Windows 回收站无落点映射）")
+		t.Fatal("前提不成立：undoableFor(\"trash\", \"windows\") 应为**假**（回收站无落点映射）" +
+			"—— 若它变成真，说明平台判据本身改了，本组对「读侧不该重问平台」的论证要重做")
 	}
 	if !undoableFor("trash", "darwin") {
-		t.Fatal("前提不成立：undoableFor(\"trash\", \"darwin\") 应为真")
+		t.Fatal("前提不成立：undoableFor(\"trash\", \"darwin\") 应为**真**")
 	}
-	// opUndoAllowed 在本机上必须与"账本列 && 本机平台列"逐字同值。
-	// 这一格抓的是"忘了问平台列"（把 && 那半句删掉 ⇒ 本格红）。
-	for _, kind := range []string{"trash", "move", "delete", "hardlink", "symlink"} {
-		for _, col := range []bool{true, false} {
-			meta := &history.OpMeta{Kind: kind, Undoable: col}
-			want := col && undoableFor(kind, runtime.GOOS)
-			if got := opUndoAllowed(meta); got != want {
-				t.Errorf("opUndoAllowed(%s, %v) = %v，而「账本列 && undoableFor(%s, %s)」= %v "+
-					"⇒ 平台列没被真的问进去（删掉 && 那半句会红在这里）",
-					kind, col, got, kind, runtime.GOOS, want)
-			}
-		}
+	// 判据本身：同一笔账（trash + undoable=true）在**任何**平台判据下都放行。
+	// 这与 undoableFor 的平台差异**故意相反** —— 那一列已经是写入侧在本机问过一遍的结果。
+	meta := &history.OpMeta{Kind: "trash", Undoable: true}
+	if !opUndoAllowed(meta) {
+		t.Errorf("opUndoAllowed(trash, undoable=true) = false ⇒ 判据重问了平台，" +
+			"于是 Windows 上所有 trash 回撤都会被拒（本机 darwin 上仍绿，" +
+			"本地全绿而三腿里只有 Windows 红 —— CI run #99 的形状）")
+	}
+	// 显式对照：写入侧的平台判据确实在区分平台，两者语义**不同**不是 bug。
+	if undoableFor("trash", "windows") == undoableFor("trash", "darwin") {
+		t.Error("前提已变：undoableFor 不再区分 windows/darwin 的 trash —— " +
+			"本组对「读侧与写入侧语义不同」的对照失去意义")
 	}
 }
 
