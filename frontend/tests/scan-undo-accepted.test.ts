@@ -29,7 +29,7 @@ function setup() {
     GetResultGroups: () => ({ groups: [], total: 0, totalReclaimable: 0 }),
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
     ListScanHistory: () => [],
   })
@@ -73,7 +73,7 @@ test('RPC 抛错时仍是"已受理"（收尾归 opsRunning 下降沿，不是�
     GetResultGroups: () => ({ groups: [], total: 0, totalReclaimable: 0 }),
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
     ListScanHistory: () => [],
   })

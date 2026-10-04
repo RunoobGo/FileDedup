@@ -52,7 +52,7 @@ function setup(useProcDirs = false) {
     GetResultGroups: () => ({ groups: [], total: 0, totalReclaimable: 0 }),
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
     ListScanHistory: () => [],
   })

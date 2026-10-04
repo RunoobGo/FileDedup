@@ -104,7 +104,7 @@ function setupStore(state = { size: 1000 }) {
     GetFailedItems: () => [],
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
   })
   const store = useScanStore()

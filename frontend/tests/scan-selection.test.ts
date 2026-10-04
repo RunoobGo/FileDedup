@@ -31,7 +31,7 @@ function setup(groups: any[] = []) {
     GetFailedItems: () => [],
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
     ListScanHistory: () => [],
   })

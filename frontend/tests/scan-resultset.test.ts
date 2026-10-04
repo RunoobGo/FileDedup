@@ -23,7 +23,7 @@ function setup() {
     GetFailedItems: () => [],
     GetStatus: () => 'Idle',
     GetSettings: () => ({ theme: 'light' }),
-    GetVersion: () => '0.5.0',
+    GetVersion: () => '0.1.0',
     GetStartupNotice: () => '',
     ListScanHistory: () => [{ id: 77, roots: ['/a'], savedAt: 1, groups: 5, reclaimable: 555 }],
     LoadScanHistory: () => ({ groups: 5, reclaimable: 555, durationMs: 3, filesTotal: 20 }),
